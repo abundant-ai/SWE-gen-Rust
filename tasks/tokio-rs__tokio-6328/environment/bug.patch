@@ -1,0 +1,191 @@
+diff --git a/examples/dump.rs b/examples/dump.rs
+index c7ece458..4d8ff19c 100644
+--- a/examples/dump.rs
++++ b/examples/dump.rs
+@@ -47,10 +47,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+             // capture a dump, and print each trace
+             println!("{:-<80}", "");
+             if let Ok(dump) = timeout(Duration::from_secs(2), handle.dump()).await {
+-                for task in dump.tasks().iter() {
+-                    let id = task.id();
++                for (i, task) in dump.tasks().iter().enumerate() {
+                     let trace = task.trace();
+-                    println!("TASK {id}:");
++                    println!("TASK {i}:");
+                     println!("{trace}\n");
+                 }
+             } else {
+diff --git a/tokio/src/runtime/dump.rs b/tokio/src/runtime/dump.rs
+index aea23811..994b7f9c 100644
+--- a/tokio/src/runtime/dump.rs
++++ b/tokio/src/runtime/dump.rs
+@@ -2,7 +2,6 @@
+ //!
+ //! See [Handle::dump][crate::runtime::Handle::dump].
+ 
+-use crate::task::Id;
+ use std::fmt;
+ 
+ /// A snapshot of a runtime's state.
+@@ -26,7 +25,6 @@ pub struct Tasks {
+ /// See [Handle::dump][crate::runtime::Handle::dump].
+ #[derive(Debug)]
+ pub struct Task {
+-    id: Id,
+     trace: Trace,
+ }
+ 
+@@ -59,28 +57,12 @@ impl Tasks {
+ }
+ 
+ impl Task {
+-    pub(crate) fn new(id: Id, trace: super::task::trace::Trace) -> Self {
++    pub(crate) fn new(trace: super::task::trace::Trace) -> Self {
+         Self {
+-            id,
+             trace: Trace { inner: trace },
+         }
+     }
+ 
+-    /// Returns a [task ID] that uniquely identifies this task relative to other
+-    /// tasks spawned at the time of the dump.
+-    ///
+-    /// **Note**: This is an [unstable API][unstable]. The public API of this type
+-    /// may break in 1.x releases. See [the documentation on unstable
+-    /// features][unstable] for details.
+-    ///
+-    /// [task ID]: crate::task::Id
+-    /// [unstable]: crate#unstable-features
+-    #[cfg(tokio_unstable)]
+-    #[cfg_attr(docsrs, doc(cfg(tokio_unstable)))]
+-    pub fn id(&self) -> Id {
+-        self.id
+-    }
+-
+     /// A trace of this task's state.
+     pub fn trace(&self) -> &Trace {
+         &self.trace
+diff --git a/tokio/src/runtime/scheduler/current_thread/mod.rs b/tokio/src/runtime/scheduler/current_thread/mod.rs
+index 36bcefc4..55a43970 100644
+--- a/tokio/src/runtime/scheduler/current_thread/mod.rs
++++ b/tokio/src/runtime/scheduler/current_thread/mod.rs
+@@ -470,7 +470,7 @@ impl Handle {
+ 
+             traces = trace_current_thread(&self.shared.owned, local, &self.shared.inject)
+                 .into_iter()
+-                .map(|(id, trace)| dump::Task::new(id, trace))
++                .map(dump::Task::new)
+                 .collect();
+ 
+             // Avoid double borrow panic
+diff --git a/tokio/src/runtime/scheduler/multi_thread/worker/taskdump.rs b/tokio/src/runtime/scheduler/multi_thread/worker/taskdump.rs
+index 31267303..d310d9f6 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/worker/taskdump.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/worker/taskdump.rs
+@@ -42,7 +42,7 @@ impl Handle {
+         // was created with.
+         let traces = unsafe { trace_multi_thread(owned, &mut local, synced, injection) }
+             .into_iter()
+-            .map(|(id, trace)| dump::Task::new(id, trace))
++            .map(dump::Task::new)
+             .collect();
+ 
+         let result = dump::Dump::new(traces);
+diff --git a/tokio/src/runtime/task/mod.rs b/tokio/src/runtime/task/mod.rs
+index aa799bf2..6b05f4d7 100644
+--- a/tokio/src/runtime/task/mod.rs
++++ b/tokio/src/runtime/task/mod.rs
+@@ -376,17 +376,6 @@ impl<S: 'static> Task<S> {
+                 None
+             }
+         }
+-
+-        /// Returns a [task ID] that uniquely identifies this task relative to other
+-        /// currently spawned tasks.
+-        ///
+-        /// [task ID]: crate::task::Id
+-        #[cfg(tokio_unstable)]
+-        #[cfg_attr(docsrs, doc(cfg(tokio_unstable)))]
+-        pub(crate) fn id(&self) -> crate::task::Id {
+-            // Safety: The header pointer is valid.
+-            unsafe { Header::get_id(self.raw.header_ptr()) }
+-        }
+     }
+ }
+ 
+diff --git a/tokio/src/runtime/task/trace/mod.rs b/tokio/src/runtime/task/trace/mod.rs
+index ec2e8432..7c9acc03 100644
+--- a/tokio/src/runtime/task/trace/mod.rs
++++ b/tokio/src/runtime/task/trace/mod.rs
+@@ -1,7 +1,6 @@
+ use crate::loom::sync::Arc;
+ use crate::runtime::context;
+ use crate::runtime::scheduler::{self, current_thread, Inject};
+-use crate::task::Id;
+ 
+ use backtrace::BacktraceFrame;
+ use std::cell::Cell;
+@@ -271,7 +270,7 @@ pub(in crate::runtime) fn trace_current_thread(
+     owned: &OwnedTasks<Arc<current_thread::Handle>>,
+     local: &mut VecDeque<Notified<Arc<current_thread::Handle>>>,
+     injection: &Inject<Arc<current_thread::Handle>>,
+-) -> Vec<(Id, Trace)> {
++) -> Vec<Trace> {
+     // clear the local and injection queues
+ 
+     let mut dequeued = Vec::new();
+@@ -304,7 +303,7 @@ cfg_rt_multi_thread! {
+         local: &mut multi_thread::queue::Local<Arc<multi_thread::Handle>>,
+         synced: &Mutex<Synced>,
+         injection: &Shared<Arc<multi_thread::Handle>>,
+-    ) -> Vec<(Id, Trace)> {
++    ) -> Vec<Trace> {
+         let mut dequeued = Vec::new();
+ 
+         // clear the local queue
+@@ -332,7 +331,7 @@ cfg_rt_multi_thread! {
+ ///
+ /// This helper presumes exclusive access to each task. The tasks must not exist
+ /// in any other queue.
+-fn trace_owned<S: Schedule>(owned: &OwnedTasks<S>, dequeued: Vec<Notified<S>>) -> Vec<(Id, Trace)> {
++fn trace_owned<S: Schedule>(owned: &OwnedTasks<S>, dequeued: Vec<Notified<S>>) -> Vec<Trace> {
+     let mut tasks = dequeued;
+     // Notify and trace all un-notified tasks. The dequeued tasks are already
+     // notified and so do not need to be re-notified.
+@@ -352,9 +351,8 @@ fn trace_owned<S: Schedule>(owned: &OwnedTasks<S>, dequeued: Vec<Notified<S>>) -
+         .into_iter()
+         .map(|task| {
+             let local_notified = owned.assert_owner(task);
+-            let id = local_notified.task.id();
+             let ((), trace) = Trace::capture(|| local_notified.run());
+-            (id, trace)
++            trace
+         })
+         .collect()
+ }
+diff --git a/tokio/tests/dump.rs b/tokio/tests/dump.rs
+index c946f384..ecb4495b 100644
+--- a/tokio/tests/dump.rs
++++ b/tokio/tests/dump.rs
+@@ -41,9 +41,8 @@ fn current_thread() {
+         assert_eq!(tasks.len(), 3);
+ 
+         for task in tasks {
+-            let id = task.id();
+             let trace = task.trace().to_string();
+-            eprintln!("\n\n{id}:\n{trace}\n\n");
++            eprintln!("\n\n{trace}\n\n");
+             assert!(trace.contains("dump::a"));
+             assert!(trace.contains("dump::b"));
+             assert!(trace.contains("dump::c"));
+@@ -79,9 +78,8 @@ fn multi_thread() {
+         assert_eq!(tasks.len(), 3);
+ 
+         for task in tasks {
+-            let id = task.id();
+             let trace = task.trace().to_string();
+-            eprintln!("\n\n{id}:\n{trace}\n\n");
++            eprintln!("\n\n{trace}\n\n");
+             assert!(trace.contains("dump::a"));
+             assert!(trace.contains("dump::b"));
+             assert!(trace.contains("dump::c"));

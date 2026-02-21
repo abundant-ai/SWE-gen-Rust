@@ -1,0 +1,261 @@
+diff --git a/tower-balance/Cargo.toml b/tower-balance/Cargo.toml
+index 5ca87b8..ba82037 100644
+--- a/tower-balance/Cargo.toml
++++ b/tower-balance/Cargo.toml
+@@ -40,6 +40,7 @@ tower-layer = { version = "=0.3.0-alpha.1", path = "../tower-layer" }
+ tower-load = { version = "=0.3.0-alpha.1", path = "../tower-load" }
+ tower-service = "=0.3.0-alpha.1"
+ tower-make = { version = "=0.3.0-alpha.1", path = "../tower-make" }
++tower-util = { version = "=0.3.0-alpha.1", path = "../tower-util" }
+ slab = "0.4"
+ 
+ [dev-dependencies]
+diff --git a/tower-balance/src/p2c/service.rs b/tower-balance/src/p2c/service.rs
+index 2b9b3f1..ab84d11 100644
+--- a/tower-balance/src/p2c/service.rs
++++ b/tower-balance/src/p2c/service.rs
+@@ -4,7 +4,6 @@ use futures_util::{stream, try_future, try_future::TryFutureExt};
+ use indexmap::IndexMap;
+ use pin_project::pin_project;
+ use rand::{rngs::SmallRng, FromEntropy};
+-use std::marker::PhantomData;
+ use std::{
+     future::Future,
+     pin::Pin,
+@@ -14,6 +13,7 @@ use tokio_sync::oneshot;
+ use tower_discover::{Change, Discover};
+ use tower_load::Load;
+ use tower_service::Service;
++use tower_util::Ready;
+ use tracing::{debug, trace};
+ 
+ /// Distributes requests across inner services using the [Power of Two Choices][p2c].
+@@ -50,8 +50,6 @@ pub struct Balance<D: Discover, Req> {
+     next_ready_index: Option<usize>,
+ 
+     rng: SmallRng,
+-
+-    _req: PhantomData<Req>,
+ }
+ 
+ #[pin_project]
+@@ -63,9 +61,8 @@ struct UnreadyService<K, S, Req> {
+     key: Option<K>,
+     #[pin]
+     cancel: oneshot::Receiver<()>,
+-    service: Option<S>,
+-
+-    _req: PhantomData<Req>,
++    #[pin]
++    ready: tower_util::Ready<S, Req>,
+ }
+ 
+ enum Error<E> {
+@@ -87,8 +84,6 @@ where
+             cancelations: IndexMap::default(),
+             unready_services: stream::FuturesUnordered::new(),
+             next_ready_index: None,
+-
+-            _req: PhantomData,
+         }
+     }
+ 
+@@ -144,9 +139,8 @@ where
+         self.cancelations.insert(key.clone(), tx);
+         self.unready_services.push(UnreadyService {
+             key: Some(key),
+-            service: Some(svc),
++            ready: Ready::new(svc),
+             cancel: rx,
+-            _req: PhantomData,
+         });
+     }
+ 
+@@ -348,18 +342,15 @@ impl<K, S: Service<Req>, Req> Future for UnreadyService<K, S, Req> {
+             return Poll::Ready(Err((key, Error::Canceled)));
+         }
+ 
+-        let res = ready!(this
+-            .service
+-            .as_mut()
+-            .expect("poll after ready")
+-            .poll_ready(cx));
+-
+-        let key = this.key.take().expect("polled after ready");
+-        let svc = this.service.take().expect("polled after ready");
+-
+-        match res {
+-            Ok(()) => Poll::Ready(Ok((key, svc))),
+-            Err(e) => Poll::Ready(Err((key, Error::Inner(e)))),
++        match ready!(this.ready.poll(cx)) {
++            Ok(svc) => {
++                let key = this.key.take().expect("polled after ready");
++                Poll::Ready(Ok((key, svc)))
++            }
++            Err(e) => {
++                let key = this.key.take().expect("polled after ready");
++                Poll::Ready(Err((key, Error::Inner(e))))
++            }
+         }
+     }
+ }
+diff --git a/tower-spawn-ready/Cargo.toml b/tower-spawn-ready/Cargo.toml
+index 2634654..6fa8c1a 100644
+--- a/tower-spawn-ready/Cargo.toml
++++ b/tower-spawn-ready/Cargo.toml
+@@ -28,6 +28,7 @@ futures-util-preview = "=0.3.0-alpha.18"
+ pin-project = "=0.4.0-alpha.11"
+ tower-service = "=0.3.0-alpha.1"
+ tower-layer = { version = "=0.3.0-alpha.1", path = "../tower-layer" }
++tower-util = { version = "=0.3.0-alpha.1", path = "../tower-util" }
+ tokio-executor = "=0.2.0-alpha.4"
+ tokio-sync = "=0.2.0-alpha.4"
+ 
+diff --git a/tower-spawn-ready/src/future.rs b/tower-spawn-ready/src/future.rs
+index fb31641..8ccc760 100644
+--- a/tower-spawn-ready/src/future.rs
++++ b/tower-spawn-ready/src/future.rs
+@@ -3,7 +3,6 @@
+ use crate::error::Error;
+ use futures_core::ready;
+ use pin_project::pin_project;
+-use std::marker::PhantomData;
+ use std::{
+     future::Future,
+     pin::Pin,
+@@ -12,13 +11,18 @@ use std::{
+ use tokio_executor::TypedExecutor;
+ use tokio_sync::oneshot;
+ use tower_service::Service;
++use tower_util::Ready;
+ 
+ #[pin_project]
+ /// Drives a service to readiness.
+-pub struct BackgroundReady<T, Request> {
+-    service: Option<T>,
++pub struct BackgroundReady<T, Request>
++where
++    T: Service<Request>,
++    T::Error: Into<Error>,
++{
++    #[pin]
++    ready: Ready<T, Request>,
+     tx: Option<oneshot::Sender<Result<T, Error>>>,
+-    _req: PhantomData<Request>,
+ }
+ 
+ /// This trait allows you to use either Tokio's threaded runtime's executor or
+@@ -51,9 +55,8 @@ where
+ {
+     let (tx, rx) = oneshot::channel();
+     let bg = BackgroundReady {
+-        service: Some(service),
++        ready: Ready::new(service),
+         tx: Some(tx),
+-        _req: PhantomData,
+     };
+     (bg, rx)
+ }
+@@ -72,9 +75,7 @@ where
+             return Poll::Ready(());
+         }
+ 
+-        let result = ready!(this.service.as_mut().expect("illegal state").poll_ready(cx))
+-            .map(|()| this.service.take().expect("illegal state"));
+-
++        let result = ready!(this.ready.poll(cx));
+         let _ = this
+             .tx
+             .take()
+diff --git a/tower-util/src/ready.rs b/tower-util/src/ready.rs
+index cc11628..3ce57be 100644
+--- a/tower-util/src/ready.rs
++++ b/tower-util/src/ready.rs
+@@ -13,38 +13,42 @@ use tower_service::Service;
+ ///
+ /// `Ready` values are produced by `ServiceExt::ready`.
+ #[pin_project]
+-pub struct Ready<'a, T, Request> {
+-    inner: &'a mut T,
++pub struct Ready<T, Request> {
++    inner: Option<T>,
+     _p: PhantomData<fn() -> Request>,
+ }
+ 
+-impl<'a, T, Request> Ready<'a, T, Request>
++impl<T, Request> Ready<T, Request>
+ where
+     T: Service<Request>,
+ {
+-    pub fn new(service: &'a mut T) -> Self {
++    pub fn new(service: T) -> Self {
+         Ready {
+-            inner: service,
++            inner: Some(service),
+             _p: PhantomData,
+         }
+     }
+ }
+ 
+-impl<'a, T, Request> Future for Ready<'a, T, Request>
++impl<T, Request> Future for Ready<T, Request>
+ where
+     T: Service<Request>,
+ {
+-    type Output = Result<(), T::Error>;
++    type Output = Result<T, T::Error>;
+ 
+     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+         let this = self.project();
+-        ready!(this.inner.poll_ready(cx))?;
++        ready!(this
++            .inner
++            .as_mut()
++            .expect("called `poll` after future completed")
++            .poll_ready(cx))?;
+ 
+-        Poll::Ready(Ok(()))
++        Poll::Ready(Ok(this.inner.take().unwrap()))
+     }
+ }
+ 
+-impl<'a, T, Request> fmt::Debug for Ready<'a, T, Request>
++impl<T, Request> fmt::Debug for Ready<T, Request>
+ where
+     T: fmt::Debug,
+ {
+diff --git a/tower/src/util.rs b/tower/src/util.rs
+index 8eea103..237188f 100644
+--- a/tower/src/util.rs
++++ b/tower/src/util.rs
+@@ -14,7 +14,7 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
+ /// adapters
+ pub trait ServiceExt<Request>: Service<Request> {
+     /// A future yielding the service when it is ready to accept a request.
+-    fn ready(&mut self) -> Ready<'_, Self, Request>
++    fn ready(self) -> Ready<Self, Request>
+     where
+         Self: Sized,
+     {
+diff --git a/tower/tests/builder.rs b/tower/tests/builder.rs
+index cbb76e8..5cbae48 100644
+--- a/tower/tests/builder.rs
++++ b/tower/tests/builder.rs
+@@ -17,7 +17,7 @@ async fn builder_service() {
+     pin_mut!(handle);
+ 
+     let policy = MockPolicy;
+-    let mut client = ServiceBuilder::new()
++    let client = ServiceBuilder::new()
+         .layer(BufferLayer::new(5))
+         .layer(ConcurrencyLimitLayer::new(5))
+         .layer(RateLimitLayer::new(5, Duration::from_secs(1)))
+@@ -28,7 +28,7 @@ async fn builder_service() {
+     // allow a request through
+     handle.allow(1);
+ 
+-    client.ready().await.unwrap();
++    let mut client = client.ready().await.unwrap();
+     let fut = client.call("hello");
+     let (request, rsp) = poll_fn(|cx| handle.as_mut().poll_request(cx))
+         .await

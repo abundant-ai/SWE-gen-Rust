@@ -1,0 +1,412 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 8dbaf5c..a0fcd88 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -14,7 +14,7 @@ members = [
+   "tower-reconnect",
+   "tower-retry",
+   "tower-service",
+-  # "tower-spawn-ready",
++  "tower-spawn-ready",
+   "tower-test",
+   "tower-timeout",
+   "tower-make",
+diff --git a/tower-spawn-ready/CHANGELOG.md b/tower-spawn-ready/CHANGELOG.md
+index baca0fc..9ff7f60 100644
+--- a/tower-spawn-ready/CHANGELOG.md
++++ b/tower-spawn-ready/CHANGELOG.md
+@@ -1 +1,5 @@
++# 0.3.0-alpha.1
++
++- Move to `std::future`
++
+ # 0.1.0 (unreleased)
+diff --git a/tower-spawn-ready/Cargo.toml b/tower-spawn-ready/Cargo.toml
+index 4c206bd..7cc8e5e 100644
+--- a/tower-spawn-ready/Cargo.toml
++++ b/tower-spawn-ready/Cargo.toml
+@@ -8,13 +8,13 @@ name = "tower-spawn-ready"
+ #   - README.md
+ # - Update CHANGELOG.md.
+ # - Create "v0.1.x" git tag.
+-version = "0.1.0"
++version = "0.3.0-alpha.1"
+ authors = ["Tower Maintainers <team@tower-rs.com>"]
+ license = "MIT"
+ readme = "README.md"
+ repository = "https://github.com/tower-rs/tower"
+ homepage = "https://github.com/tower-rs/tower"
+-documentation = "https://docs.rs/tower-spawn-ready/0.1.0"
++documentation = "https://docs.rs/tower-spawn-ready/0.3.0-alpha.1"
+ description = """
+ Drives service readiness via a spawned task
+ """
+@@ -23,13 +23,15 @@ edition = "2018"
+ publish = false # FIXME
+ 
+ [dependencies]
+-futures = "0.1.25"
+-tower-service = "0.2.0"
+-tower-layer = "0.1.0"
+-tower-util = "0.1.0"
+-tokio-executor = "0.1.7"
+-tokio-sync = "0.1.0"
++futures-core-preview = "0.3.0-alpha.18"
++futures-util-preview = "0.3.0-alpha.18"
++pin-project = "0.4.0-alpha.10"
++tower-service = "0.3.0-alpha.1"
++tower-layer = { version = "0.3.0-alpha.1", path = "../tower-layer" }
++tower-util = { version = "0.3.0-alpha.1", path = "../tower-util" }
++tokio-executor = "0.2.0-alpha.4"
++tokio-sync = "0.2.0-alpha.4"
+ 
+ [dev-dependencies]
+-tower = { version = "0.1.0", path = "../tower" }
+-tower-test = { version = "0.1.0", path = "../tower-test" }
++tower-test = { version = "0.3.0-alpha.1", path = "../tower-test" }
++tokio-test = "0.2.0-alpha.4"
+diff --git a/tower-spawn-ready/src/future.rs b/tower-spawn-ready/src/future.rs
+index a5e16db..8ccc760 100644
+--- a/tower-spawn-ready/src/future.rs
++++ b/tower-spawn-ready/src/future.rs
+@@ -1,18 +1,26 @@
+ //! Background readiness types
+ 
+ use crate::error::Error;
+-use futures::{Async, Future, Poll};
++use futures_core::ready;
++use pin_project::pin_project;
++use std::{
++    future::Future,
++    pin::Pin,
++    task::{Context, Poll},
++};
+ use tokio_executor::TypedExecutor;
+ use tokio_sync::oneshot;
+ use tower_service::Service;
+ use tower_util::Ready;
+ 
++#[pin_project]
+ /// Drives a service to readiness.
+ pub struct BackgroundReady<T, Request>
+ where
+     T: Service<Request>,
+     T::Error: Into<Error>,
+ {
++    #[pin]
+     ready: Ready<T, Request>,
+     tx: Option<oneshot::Sender<Result<T, Error>>>,
+ }
+@@ -58,27 +66,22 @@ where
+     T: Service<Request>,
+     T::Error: Into<Error>,
+ {
+-    type Item = ();
+-    type Error = ();
++    type Output = ();
+ 
+-    fn poll(&mut self) -> Poll<(), ()> {
+-        match self.tx.as_mut().expect("illegal state").poll_close() {
+-            Ok(Async::Ready(())) | Err(()) => return Err(()),
+-            Ok(Async::NotReady) => {}
+-        }
++    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        let this = self.project();
+ 
+-        let result = match self.ready.poll() {
+-            Ok(Async::NotReady) => return Ok(Async::NotReady),
+-            Ok(Async::Ready(svc)) => Ok(svc),
+-            Err(e) => Err(e.into()),
+-        };
++        if let Poll::Ready(_) = Pin::new(this.tx.as_mut().expect("illegal state")).poll_closed(cx) {
++            return Poll::Ready(());
++        }
+ 
+-        self.tx
++        let result = ready!(this.ready.poll(cx));
++        let _ = this
++            .tx
+             .take()
+             .expect("illegal state")
+-            .send(result)
+-            .map_err(|_| ())?;
++            .send(result.map_err(Into::into));
+ 
+-        Ok(Async::Ready(()))
++        Poll::Ready(())
+     }
+ }
+diff --git a/tower-spawn-ready/src/layer.rs b/tower-spawn-ready/src/layer.rs
+index 6efca7e..ceddf9c 100644
+--- a/tower-spawn-ready/src/layer.rs
++++ b/tower-spawn-ready/src/layer.rs
+@@ -1,54 +1,21 @@
+ use crate::MakeSpawnReady;
+-use std::fmt;
+-use tokio_executor::DefaultExecutor;
+ use tower_layer::Layer;
+ 
+ /// Spawns tasks to drive its inner service to readiness.
+-pub struct SpawnReadyLayer<E = DefaultExecutor> {
+-    executor: E,
+-}
++#[derive(Debug, Clone)]
++pub struct SpawnReadyLayer;
+ 
+-impl SpawnReadyLayer<DefaultExecutor> {
++impl SpawnReadyLayer {
+     /// Builds a SpawnReady layer with the default executor.
+     pub fn new() -> Self {
+-        Self {
+-            executor: DefaultExecutor::current(),
+-        }
++        Self
+     }
+ }
+ 
+-impl<E: Clone> SpawnReadyLayer<E> {
+-    /// Builds a SpawnReady layer with the provided executor.
+-    pub fn with_executor(executor: E) -> Self {
+-        Self { executor }
+-    }
+-}
+-
+-impl<E, S> Layer<S> for SpawnReadyLayer<E>
+-where
+-    E: Clone,
+-{
+-    type Service = MakeSpawnReady<S, E>;
++impl<S> Layer<S> for SpawnReadyLayer {
++    type Service = MakeSpawnReady<S>;
+ 
+     fn layer(&self, service: S) -> Self::Service {
+-        MakeSpawnReady::with_executor(service, self.executor.clone())
+-    }
+-}
+-
+-impl<E: Clone> Clone for SpawnReadyLayer<E> {
+-    fn clone(&self) -> Self {
+-        Self {
+-            executor: self.executor.clone(),
+-        }
+-    }
+-}
+-
+-impl<E> fmt::Debug for SpawnReadyLayer<E>
+-where
+-    // Require E: Debug in case we want to print the executor at a later date
+-    E: fmt::Debug,
+-{
+-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+-        f.debug_struct("SpawnReadyLayer").finish()
++        MakeSpawnReady::new(service)
+     }
+ }
+diff --git a/tower-spawn-ready/src/lib.rs b/tower-spawn-ready/src/lib.rs
+index 66f01e8..ca8eb2d 100644
+--- a/tower-spawn-ready/src/lib.rs
++++ b/tower-spawn-ready/src/lib.rs
+@@ -1,4 +1,4 @@
+-#![doc(html_root_url = "https://docs.rs/tower-spawn-ready/0.1.0")]
++#![doc(html_root_url = "https://docs.rs/tower-spawn-ready/0.3.0-alpha.1")]
+ #![deny(missing_docs, rust_2018_idioms, warnings)]
+ #![allow(elided_lifetimes_in_paths)]
+ 
+diff --git a/tower-spawn-ready/src/make.rs b/tower-spawn-ready/src/make.rs
+index e9ba97b..3a50c0e 100644
+--- a/tower-spawn-ready/src/make.rs
++++ b/tower-spawn-ready/src/make.rs
+@@ -1,60 +1,63 @@
+ use crate::SpawnReady;
+-use futures::{try_ready, Future, Poll};
+-use tokio_executor::DefaultExecutor;
++use futures_core::ready;
++use pin_project::pin_project;
++use std::{
++    future::Future,
++    pin::Pin,
++    task::{Context, Poll},
++};
+ use tower_service::Service;
+ 
+ /// Builds SpawnReady instances with the result of an inner Service.
+ #[derive(Clone, Debug)]
+-pub struct MakeSpawnReady<S, E = DefaultExecutor> {
++pub struct MakeSpawnReady<S> {
+     inner: S,
+-    executor: E,
++}
++
++impl<S> MakeSpawnReady<S> {
++    /// Creates a new `MakeSpawnReady` wrapping `service`.
++    pub fn new(service: S) -> Self {
++        Self { inner: service }
++    }
+ }
+ 
+ /// Builds a SpawnReady with the result of an inner Future.
++#[pin_project]
+ #[derive(Debug)]
+-pub struct MakeFuture<F, E = DefaultExecutor> {
++pub struct MakeFuture<F> {
++    #[pin]
+     inner: F,
+-    executor: E,
+-}
+-
+-impl<S, E> MakeSpawnReady<S, E> {
+-    pub(crate) fn with_executor(inner: S, executor: E) -> Self {
+-        Self { inner, executor }
+-    }
+ }
+ 
+-impl<S, E, Target> Service<Target> for MakeSpawnReady<S, E>
++impl<S, Target> Service<Target> for MakeSpawnReady<S>
+ where
+     S: Service<Target>,
+-    E: Clone,
+ {
+-    type Response = SpawnReady<S::Response, E>;
++    type Response = SpawnReady<S::Response>;
+     type Error = S::Error;
+-    type Future = MakeFuture<S::Future, E>;
++    type Future = MakeFuture<S::Future>;
+ 
+-    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+-        self.inner.poll_ready()
++    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
++        self.inner.poll_ready(cx)
+     }
+ 
+     fn call(&mut self, target: Target) -> Self::Future {
+         MakeFuture {
+             inner: self.inner.call(target),
+-            executor: self.executor.clone(),
+         }
+     }
+ }
+ 
+-impl<F, E> Future for MakeFuture<F, E>
++impl<F, T, E> Future for MakeFuture<F>
+ where
+-    F: Future,
+-    E: Clone,
++    F: Future<Output = Result<T, E>>,
+ {
+-    type Item = SpawnReady<F::Item, E>;
+-    type Error = F::Error;
++    type Output = Result<SpawnReady<T>, E>;
+ 
+-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+-        let inner = try_ready!(self.inner.poll());
+-        let svc = SpawnReady::with_executor(inner, self.executor.clone());
+-        Ok(svc.into())
++    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        let this = self.project();
++        let inner = ready!(this.inner.poll(cx))?;
++        let svc = SpawnReady::new(inner);
++        Poll::Ready(Ok(svc))
+     }
+ }
+diff --git a/tower-spawn-ready/src/service.rs b/tower-spawn-ready/src/service.rs
+index 9e68338..cc80a68 100644
+--- a/tower-spawn-ready/src/service.rs
++++ b/tower-spawn-ready/src/service.rs
+@@ -2,16 +2,21 @@ use crate::{
+     error::{Error, SpawnError},
+     future::{background_ready, BackgroundReadyExecutor},
+ };
+-use futures::{future, try_ready, Async, Future, Poll};
+-use tokio_executor::DefaultExecutor;
++use futures_core::ready;
++use futures_util::try_future::{MapErr, TryFutureExt};
++use std::{
++    future::Future,
++    pin::Pin,
++    task::{Context, Poll},
++};
++use tokio_executor::{DefaultExecutor, TypedExecutor};
+ use tokio_sync::oneshot;
+ use tower_service::Service;
+ 
+ /// Spawns tasks to drive an inner service to readiness.
+ ///
+ /// See crate level documentation for more details.
+-pub struct SpawnReady<T, E> {
+-    executor: E,
++pub struct SpawnReady<T> {
+     inner: Inner<T>,
+ }
+ 
+@@ -20,60 +25,42 @@ enum Inner<T> {
+     Future(oneshot::Receiver<Result<T, Error>>),
+ }
+ 
+-impl<T> SpawnReady<T, DefaultExecutor> {
++impl<T> SpawnReady<T> {
+     /// Creates a new `SpawnReady` wrapping `service`.
+-    ///
+-    /// The default Tokio executor is used to drive service readiness, which
+-    /// means that this method must be called while on the Tokio runtime.
+     pub fn new(service: T) -> Self {
+-        Self::with_executor(service, DefaultExecutor::current())
+-    }
+-}
+-
+-impl<T, E> SpawnReady<T, E> {
+-    /// Creates a new `SpawnReady` wrapping `service`.
+-    ///
+-    /// `executor` is used to spawn a new `BackgroundReady` task that is
+-    /// dedicated to driving the inner service to readiness.
+-    pub fn with_executor(service: T, executor: E) -> Self {
+         Self {
+-            executor,
+             inner: Inner::Service(Some(service)),
+         }
+     }
+ }
+ 
+-impl<T, E, Request> Service<Request> for SpawnReady<T, E>
++impl<T, Request> Service<Request> for SpawnReady<T>
+ where
+     T: Service<Request> + Send,
+     T::Error: Into<Error>,
+-    E: BackgroundReadyExecutor<T, Request>,
++    DefaultExecutor: BackgroundReadyExecutor<T, Request>,
+ {
+     type Response = T::Response;
+     type Error = Error;
+-    type Future = future::MapErr<T::Future, fn(T::Error) -> Error>;
++    type Future = MapErr<T::Future, fn(T::Error) -> Error>;
+ 
+-    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
++    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+         loop {
+             self.inner = match self.inner {
+                 Inner::Service(ref mut svc) => {
+-                    if svc
+-                        .as_mut()
+-                        .expect("illegal state")
+-                        .poll_ready()
+-                        .map_err(Into::into)?
+-                        .is_ready()
+-                    {
+-                        return Ok(Async::Ready(()));
++                    if let Poll::Ready(r) = svc.as_mut().expect("illegal state").poll_ready(cx) {
++                        return Poll::Ready(r.map_err(Into::into));
+                     }
+ 
+                     let (bg, rx) = background_ready(svc.take().expect("illegal state"));
+-                    self.executor.spawn(bg).map_err(SpawnError::new)?;
++                    DefaultExecutor::current()
++                        .spawn(bg)
++                        .map_err(SpawnError::new)?;
+ 
+                     Inner::Future(rx)
+                 }
+                 Inner::Future(ref mut fut) => {
+-                    let svc = try_ready!(fut.poll())?;
++                    let svc = ready!(Pin::new(fut).poll(cx))??;
+                     Inner::Service(Some(svc))
+                 }
+             }

@@ -1,0 +1,1182 @@
+diff --git a/.github/workflows/CI.yml b/.github/workflows/CI.yml
+index f8d11f58..126b8f71 100644
+--- a/.github/workflows/CI.yml
++++ b/.github/workflows/CI.yml
+@@ -62,11 +62,11 @@ jobs:
+ 
+         include:
+           - rust: stable
+-            features: "--features full,backports"
++            features: "--features full"
+           - rust: beta
+-            features: "--features full,backports"
++            features: "--features full"
+           - rust: nightly
+-            features: "--features full,nightly,backports"
++            features: "--features full,nightly"
+             benches: true
+ 
+     runs-on: ${{ matrix.os }}
+diff --git a/Cargo.toml b/Cargo.toml
+index d54d7031..a76b210a 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -109,9 +109,6 @@ tcp = [
+ # C-API support (currently unstable (no semver))
+ ffi = ["libc"]
+ 
+-# enable 1.0 backports
+-backports = []
+-
+ # internal features used in CI
+ nightly = []
+ __internal_happy_eyeballs_tests = []
+diff --git a/src/client/conn.rs b/src/client/conn.rs
+index a8b41e4a..3eb12b42 100644
+--- a/src/client/conn.rs
++++ b/src/client/conn.rs
+@@ -54,11 +54,6 @@
+ //! # }
+ //! ```
+ 
+-#[cfg(all(feature = "backports", feature = "http1"))]
+-pub mod http1;
+-#[cfg(all(feature = "backports", feature = "http2"))]
+-pub mod http2;
+-
+ use std::error::Error as StdError;
+ use std::fmt;
+ #[cfg(not(all(feature = "http1", feature = "http2")))]
+diff --git a/src/client/conn/http1.rs b/src/client/conn/http1.rs
+deleted file mode 100644
+index d8936d86..00000000
+--- a/src/client/conn/http1.rs
++++ /dev/null
+@@ -1,539 +0,0 @@
+-//! HTTP/1 client connections
+-
+-use std::error::Error as StdError;
+-use std::fmt;
+-
+-use bytes::Bytes;
+-use http::{Request, Response};
+-use httparse::ParserConfig;
+-use tokio::io::{AsyncRead, AsyncWrite};
+-
+-use crate::body::{Body as IncomingBody, HttpBody as Body};
+-use super::super::dispatch;
+-use crate::common::{
+-    task, Future, Pin, Poll,
+-};
+-use crate::proto;
+-use crate::upgrade::Upgraded;
+-
+-type Dispatcher<T, B> =
+-    proto::dispatch::Dispatcher<proto::dispatch::Client<B>, B, T, proto::h1::ClientTransaction>;
+-
+-/// The sender side of an established connection.
+-pub struct SendRequest<B> {
+-    dispatch: dispatch::Sender<Request<B>, Response<IncomingBody>>,
+-}
+-
+-/// Deconstructed parts of a `Connection`.
+-///
+-/// This allows taking apart a `Connection` at a later time, in order to
+-/// reclaim the IO object, and additional related pieces.
+-#[derive(Debug)]
+-pub struct Parts<T> {
+-    /// The original IO object used in the handshake.
+-    pub io: T,
+-    /// A buffer of bytes that have been read but not processed as HTTP.
+-    ///
+-    /// For instance, if the `Connection` is used for an HTTP upgrade request,
+-    /// it is possible the server sent back the first bytes of the new protocol
+-    /// along with the response upgrade.
+-    ///
+-    /// You will want to check for any existing bytes if you plan to continue
+-    /// communicating on the IO object.
+-    pub read_buf: Bytes,
+-    _inner: (),
+-}
+-
+-
+-/// A future that processes all HTTP state for the IO object.
+-///
+-/// In most cases, this should just be spawned into an executor, so that it
+-/// can process incoming and outgoing messages, notice hangups, and the like.
+-#[must_use = "futures do nothing unless polled"]
+-pub struct Connection<T, B>
+-where
+-    T: AsyncRead + AsyncWrite + Send + 'static,
+-    B: Body + 'static,
+-{
+-    inner: Option<Dispatcher<T, B>>,
+-}
+-
+-impl<T, B> Connection<T, B>
+-where
+-    T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+-    B: Body + 'static,
+-    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+-{
+-    /// Return the inner IO object, and additional information.
+-    ///
+-    /// Only works for HTTP/1 connections. HTTP/2 connections will panic.
+-    pub fn into_parts(self) -> Parts<T> {
+-        let (io, read_buf, _) = self.inner.expect("already upgraded").into_inner();
+-        Parts {
+-            io,
+-            read_buf,
+-            _inner: (),
+-        }
+-    }
+-
+-    /// Poll the connection for completion, but without calling `shutdown`
+-    /// on the underlying IO.
+-    ///
+-    /// This is useful to allow running a connection while doing an HTTP
+-    /// upgrade. Once the upgrade is completed, the connection would be "done",
+-    /// but it is not desired to actually shutdown the IO object. Instead you
+-    /// would take it back using `into_parts`.
+-    ///
+-    /// Use [`poll_fn`](https://docs.rs/futures/0.1.25/futures/future/fn.poll_fn.html)
+-    /// and [`try_ready!`](https://docs.rs/futures/0.1.25/futures/macro.try_ready.html)
+-    /// to work with this function; or use the `without_shutdown` wrapper.
+-    pub fn poll_without_shutdown(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
+-        self.inner.as_mut().expect("algready upgraded").poll_without_shutdown(cx)
+-    }
+-}
+-
+-/// A builder to configure an HTTP connection.
+-///
+-/// After setting options, the builder is used to create a handshake future.
+-#[derive(Clone, Debug)]
+-pub struct Builder {
+-    h09_responses: bool,
+-    h1_parser_config: ParserConfig,
+-    h1_writev: Option<bool>,
+-    h1_title_case_headers: bool,
+-    h1_preserve_header_case: bool,
+-    #[cfg(feature = "ffi")]
+-    h1_preserve_header_order: bool,
+-    h1_read_buf_exact_size: Option<usize>,
+-    h1_max_buf_size: Option<usize>,
+-}
+-
+-/// Returns a handshake future over some IO.
+-///
+-/// This is a shortcut for `Builder::new().handshake(io)`.
+-/// See [`client::conn`](crate::client::conn) for more.
+-pub async fn handshake<T, B>(
+-    io: T,
+-) -> crate::Result<(SendRequest<B>, Connection<T, B>)>
+-where
+-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+-    B: Body + 'static,
+-    B::Data: Send,
+-    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+-{
+-    Builder::new().handshake(io).await
+-}
+-
+-// ===== impl SendRequest
+-
+-impl<B> SendRequest<B> {
+-    /// Polls to determine whether this sender can be used yet for a request.
+-    ///
+-    /// If the associated connection is closed, this returns an Error.
+-    pub fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
+-        self.dispatch.poll_ready(cx)
+-    }
+-
+-    /// Waits until the dispatcher is ready
+-    ///
+-    /// If the associated connection is closed, this returns an Error.
+-    pub async fn ready(&mut self) -> crate::Result<()> {
+-        futures_util::future::poll_fn(|cx| self.poll_ready(cx)).await
+-    }
+-
+-    /*
+-    pub(super) async fn when_ready(self) -> crate::Result<Self> {
+-        let mut me = Some(self);
+-        future::poll_fn(move |cx| {
+-            ready!(me.as_mut().unwrap().poll_ready(cx))?;
+-            Poll::Ready(Ok(me.take().unwrap()))
+-        })
+-        .await
+-    }
+-
+-    pub(super) fn is_ready(&self) -> bool {
+-        self.dispatch.is_ready()
+-    }
+-
+-    pub(super) fn is_closed(&self) -> bool {
+-        self.dispatch.is_closed()
+-    }
+-    */
+-}
+-
+-impl<B> SendRequest<B>
+-where
+-    B: Body + 'static,
+-{
+-    /// Sends a `Request` on the associated connection.
+-    ///
+-    /// Returns a future that if successful, yields the `Response`.
+-    ///
+-    /// # Note
+-    ///
+-    /// There are some key differences in what automatic things the `Client`
+-    /// does for you that will not be done here:
+-    ///
+-    /// - `Client` requires absolute-form `Uri`s, since the scheme and
+-    ///   authority are needed to connect. They aren't required here.
+-    /// - Since the `Client` requires absolute-form `Uri`s, it can add
+-    ///   the `Host` header based on it. You must add a `Host` header yourself
+-    ///   before calling this method.
+-    /// - Since absolute-form `Uri`s are not required, if received, they will
+-    ///   be serialized as-is.
+-    pub fn send_request(
+-        &mut self,
+-        req: Request<B>,
+-    ) -> impl Future<Output = crate::Result<Response<IncomingBody>>> {
+-        let sent = self.dispatch.send(req);
+-
+-        async move {
+-            match sent {
+-                Ok(rx) => match rx.await {
+-                    Ok(Ok(resp)) => Ok(resp),
+-                    Ok(Err(err)) => Err(err),
+-                    // this is definite bug if it happens, but it shouldn't happen!
+-                    Err(_canceled) => panic!("dispatch dropped without returning error"),
+-                },
+-                Err(_req) => {
+-                    tracing::debug!("connection was not ready");
+-
+-                    Err(crate::Error::new_canceled().with("connection was not ready"))
+-                }
+-            }
+-        }
+-    }
+-
+-    /*
+-    pub(super) fn send_request_retryable(
+-        &mut self,
+-        req: Request<B>,
+-    ) -> impl Future<Output = Result<Response<Body>, (crate::Error, Option<Request<B>>)>> + Unpin
+-    where
+-        B: Send,
+-    {
+-        match self.dispatch.try_send(req) {
+-            Ok(rx) => {
+-                Either::Left(rx.then(move |res| {
+-                    match res {
+-                        Ok(Ok(res)) => future::ok(res),
+-                        Ok(Err(err)) => future::err(err),
+-                        // this is definite bug if it happens, but it shouldn't happen!
+-                        Err(_) => panic!("dispatch dropped without returning error"),
+-                    }
+-                }))
+-            }
+-            Err(req) => {
+-                tracing::debug!("connection was not ready");
+-                let err = crate::Error::new_canceled().with("connection was not ready");
+-                Either::Right(future::err((err, Some(req))))
+-            }
+-        }
+-    }
+-    */
+-}
+-
+-impl<B> fmt::Debug for SendRequest<B> {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        f.debug_struct("SendRequest").finish()
+-    }
+-}
+-
+-// ===== impl Connection
+-
+-impl<T, B> fmt::Debug for Connection<T, B>
+-where
+-    T: AsyncRead + AsyncWrite + fmt::Debug + Send + 'static,
+-    B: Body + 'static,
+-{
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        f.debug_struct("Connection").finish()
+-    }
+-}
+-
+-impl<T, B> Future for Connection<T, B>
+-where
+-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+-    B: Body + Send + 'static,
+-    B::Data: Send,
+-    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+-{
+-    type Output = crate::Result<()>;
+-
+-    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+-        match ready!(Pin::new(self.inner.as_mut().unwrap()).poll(cx))? {
+-            proto::Dispatched::Shutdown => Poll::Ready(Ok(())),
+-            proto::Dispatched::Upgrade(pending) => match self.inner.take() {
+-                Some(h1) => {
+-                    let (io, buf, _) = h1.into_inner();
+-                    pending.fulfill(Upgraded::new(io, buf));
+-                    Poll::Ready(Ok(()))
+-                }
+-                _ => {
+-                    drop(pending);
+-                    unreachable!("Upgraded twice");
+-                }
+-            },
+-        }
+-    }
+-}
+-
+-// ===== impl Builder
+-
+-impl Builder {
+-    /// Creates a new connection builder.
+-    #[inline]
+-    pub fn new() -> Builder {
+-        Builder {
+-            h09_responses: false,
+-            h1_writev: None,
+-            h1_read_buf_exact_size: None,
+-            h1_parser_config: Default::default(),
+-            h1_title_case_headers: false,
+-            h1_preserve_header_case: false,
+-            #[cfg(feature = "ffi")]
+-            h1_preserve_header_order: false,
+-            h1_max_buf_size: None,
+-        }
+-    }
+-
+-    /// Set whether HTTP/0.9 responses should be tolerated.
+-    ///
+-    /// Default is false.
+-    pub fn http09_responses(&mut self, enabled: bool) -> &mut Builder {
+-        self.h09_responses = enabled;
+-        self
+-    }
+-
+-    /// Set whether HTTP/1 connections will accept spaces between header names
+-    /// and the colon that follow them in responses.
+-    ///
+-    /// You probably don't need this, here is what [RFC 7230 Section 3.2.4.] has
+-    /// to say about it:
+-    ///
+-    /// > No whitespace is allowed between the header field-name and colon. In
+-    /// > the past, differences in the handling of such whitespace have led to
+-    /// > security vulnerabilities in request routing and response handling. A
+-    /// > server MUST reject any received request message that contains
+-    /// > whitespace between a header field-name and colon with a response code
+-    /// > of 400 (Bad Request). A proxy MUST remove any such whitespace from a
+-    /// > response message before forwarding the message downstream.
+-    ///
+-    /// Note that this setting does not affect HTTP/2.
+-    ///
+-    /// Default is false.
+-    ///
+-    /// [RFC 7230 Section 3.2.4.]: https://tools.ietf.org/html/rfc7230#section-3.2.4
+-    pub fn allow_spaces_after_header_name_in_responses(
+-        &mut self,
+-        enabled: bool,
+-    ) -> &mut Builder {
+-        self.h1_parser_config
+-            .allow_spaces_after_header_name_in_responses(enabled);
+-        self
+-    }
+-
+-    /// Set whether HTTP/1 connections will accept obsolete line folding for
+-    /// header values.
+-    ///
+-    /// Newline codepoints (`\r` and `\n`) will be transformed to spaces when
+-    /// parsing.
+-    ///
+-    /// You probably don't need this, here is what [RFC 7230 Section 3.2.4.] has
+-    /// to say about it:
+-    ///
+-    /// > A server that receives an obs-fold in a request message that is not
+-    /// > within a message/http container MUST either reject the message by
+-    /// > sending a 400 (Bad Request), preferably with a representation
+-    /// > explaining that obsolete line folding is unacceptable, or replace
+-    /// > each received obs-fold with one or more SP octets prior to
+-    /// > interpreting the field value or forwarding the message downstream.
+-    ///
+-    /// > A proxy or gateway that receives an obs-fold in a response message
+-    /// > that is not within a message/http container MUST either discard the
+-    /// > message and replace it with a 502 (Bad Gateway) response, preferably
+-    /// > with a representation explaining that unacceptable line folding was
+-    /// > received, or replace each received obs-fold with one or more SP
+-    /// > octets prior to interpreting the field value or forwarding the
+-    /// > message downstream.
+-    ///
+-    /// > A user agent that receives an obs-fold in a response message that is
+-    /// > not within a message/http container MUST replace each received
+-    /// > obs-fold with one or more SP octets prior to interpreting the field
+-    /// > value.
+-    ///
+-    /// Default is false.
+-    ///
+-    /// [RFC 7230 Section 3.2.4.]: https://tools.ietf.org/html/rfc7230#section-3.2.4
+-    pub fn allow_obsolete_multiline_headers_in_responses(
+-        &mut self,
+-        enabled: bool,
+-    ) -> &mut Builder {
+-        self.h1_parser_config
+-            .allow_obsolete_multiline_headers_in_responses(enabled);
+-        self
+-    }
+-
+-    /// Set whether HTTP/1 connections will silently ignored malformed header lines.
+-    ///
+-    /// If this is enabled and and a header line does not start with a valid header
+-    /// name, or does not include a colon at all, the line will be silently ignored
+-    /// and no error will be reported.
+-    ///
+-    /// Default is false.
+-    pub fn ignore_invalid_headers_in_responses(
+-        &mut self,
+-        enabled: bool,
+-    ) -> &mut Builder {
+-        self.h1_parser_config
+-            .ignore_invalid_headers_in_responses(enabled);
+-        self
+-    }
+-
+-    /// Set whether HTTP/1 connections should try to use vectored writes,
+-    /// or always flatten into a single buffer.
+-    ///
+-    /// Note that setting this to false may mean more copies of body data,
+-    /// but may also improve performance when an IO transport doesn't
+-    /// support vectored writes well, such as most TLS implementations.
+-    ///
+-    /// Setting this to true will force hyper to use queued strategy
+-    /// which may eliminate unnecessary cloning on some TLS backends
+-    ///
+-    /// Default is `auto`. In this mode hyper will try to guess which
+-    /// mode to use
+-    pub fn writev(&mut self, enabled: bool) -> &mut Builder {
+-        self.h1_writev = Some(enabled);
+-        self
+-    }
+-
+-    /// Set whether HTTP/1 connections will write header names as title case at
+-    /// the socket level.
+-    ///
+-    /// Default is false.
+-    pub fn title_case_headers(&mut self, enabled: bool) -> &mut Builder {
+-        self.h1_title_case_headers = enabled;
+-        self
+-    }
+-
+-    /// Set whether to support preserving original header cases.
+-    ///
+-    /// Currently, this will record the original cases received, and store them
+-    /// in a private extension on the `Response`. It will also look for and use
+-    /// such an extension in any provided `Request`.
+-    ///
+-    /// Since the relevant extension is still private, there is no way to
+-    /// interact with the original cases. The only effect this can have now is
+-    /// to forward the cases in a proxy-like fashion.
+-    ///
+-    /// Default is false.
+-    pub fn preserve_header_case(&mut self, enabled: bool) -> &mut Builder {
+-        self.h1_preserve_header_case = enabled;
+-        self
+-    }
+-
+-    /// Set whether to support preserving original header order.
+-    ///
+-    /// Currently, this will record the order in which headers are received, and store this
+-    /// ordering in a private extension on the `Response`. It will also look for and use
+-    /// such an extension in any provided `Request`.
+-    ///
+-    /// Default is false.
+-    #[cfg(feature = "ffi")]
+-    pub fn preserve_header_order(&mut self, enabled: bool) -> &mut Builder {
+-        self.h1_preserve_header_order = enabled;
+-        self
+-    }
+-
+-    /// Sets the exact size of the read buffer to *always* use.
+-    ///
+-    /// Note that setting this option unsets the `max_buf_size` option.
+-    ///
+-    /// Default is an adaptive read buffer.
+-    pub fn read_buf_exact_size(&mut self, sz: Option<usize>) -> &mut Builder {
+-        self.h1_read_buf_exact_size = sz;
+-        self.h1_max_buf_size = None;
+-        self
+-    }
+-
+-    /// Set the maximum buffer size for the connection.
+-    ///
+-    /// Default is ~400kb.
+-    ///
+-    /// Note that setting this option unsets the `read_exact_buf_size` option.
+-    ///
+-    /// # Panics
+-    ///
+-    /// The minimum value allowed is 8192. This method panics if the passed `max` is less than the minimum.
+-    pub fn max_buf_size(&mut self, max: usize) -> &mut Self {
+-        assert!(
+-            max >= proto::h1::MINIMUM_MAX_BUFFER_SIZE,
+-            "the max_buf_size cannot be smaller than the minimum that h1 specifies."
+-        );
+-
+-        self.h1_max_buf_size = Some(max);
+-        self.h1_read_buf_exact_size = None;
+-        self
+-    }
+-
+-    /// Constructs a connection with the configured options and IO.
+-    /// See [`client::conn`](crate::client::conn) for more.
+-    ///
+-    /// Note, if [`Connection`] is not `await`-ed, [`SendRequest`] will
+-    /// do nothing.
+-    pub fn handshake<T, B>(
+-        &self,
+-        io: T,
+-    ) -> impl Future<Output = crate::Result<(SendRequest<B>, Connection<T, B>)>>
+-    where
+-        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+-        B: Body + 'static,
+-        B::Data: Send,
+-        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+-    {
+-        let opts = self.clone();
+-
+-        async move {
+-            tracing::trace!("client handshake HTTP/1");
+-
+-            let (tx, rx) = dispatch::channel();
+-            let mut conn = proto::Conn::new(io);
+-            conn.set_h1_parser_config(opts.h1_parser_config);
+-            if let Some(writev) = opts.h1_writev {
+-                if writev {
+-                    conn.set_write_strategy_queue();
+-                } else {
+-                    conn.set_write_strategy_flatten();
+-                }
+-            }
+-            if opts.h1_title_case_headers {
+-                conn.set_title_case_headers();
+-            }
+-            if opts.h1_preserve_header_case {
+-                conn.set_preserve_header_case();
+-            }
+-            #[cfg(feature = "ffi")]
+-            if opts.h1_preserve_header_order {
+-                conn.set_preserve_header_order();
+-            }
+-
+-            if opts.h09_responses {
+-                conn.set_h09_responses();
+-            }
+-
+-            if let Some(sz) = opts.h1_read_buf_exact_size {
+-                conn.set_read_buf_exact_size(sz);
+-            }
+-            if let Some(max) = opts.h1_max_buf_size {
+-                conn.set_max_buf_size(max);
+-            }
+-            let cd = proto::h1::dispatch::Client::new(rx);
+-            let proto = proto::h1::Dispatcher::new(cd, conn);
+-
+-            Ok((
+-                SendRequest { dispatch: tx },
+-                Connection { inner: Some(proto) },
+-            ))
+-        }
+-    }
+-}
+diff --git a/src/client/conn/http2.rs b/src/client/conn/http2.rs
+deleted file mode 100644
+index fd0adf89..00000000
+--- a/src/client/conn/http2.rs
++++ /dev/null
+@@ -1,427 +0,0 @@
+-//! HTTP/2 client connections
+-
+-use std::error::Error as StdError;
+-use std::fmt;
+-use std::marker::PhantomData;
+-use std::sync::Arc;
+-use std::time::Duration;
+-
+-use http::{Request, Response};
+-use tokio::io::{AsyncRead, AsyncWrite};
+-
+-use super::super::dispatch;
+-use crate::body::{HttpBody as Body, Body as IncomingBody};
+-use crate::common::{
+-    exec::{BoxSendFuture, Exec},
+-    task, Future, Pin, Poll,
+-};
+-use crate::proto;
+-use crate::rt::Executor;
+-
+-/// The sender side of an established connection.
+-pub struct SendRequest<B> {
+-    dispatch: dispatch::UnboundedSender<Request<B>, Response<IncomingBody>>,
+-}
+-
+-impl<B> Clone for SendRequest<B> {
+-    fn clone(&self) -> SendRequest<B> {
+-        SendRequest { dispatch: self.dispatch.clone() }
+-    }
+-}
+-
+-/// A future that processes all HTTP state for the IO object.
+-///
+-/// In most cases, this should just be spawned into an executor, so that it
+-/// can process incoming and outgoing messages, notice hangups, and the like.
+-#[must_use = "futures do nothing unless polled"]
+-pub struct Connection<T, B>
+-where
+-    T: AsyncRead + AsyncWrite + Send + 'static,
+-    B: Body + 'static,
+-{
+-    inner: (PhantomData<T>, proto::h2::ClientTask<B>),
+-}
+-
+-/// A builder to configure an HTTP connection.
+-///
+-/// After setting options, the builder is used to create a handshake future.
+-#[derive(Clone, Debug)]
+-pub struct Builder {
+-    pub(super) exec: Exec,
+-    h2_builder: proto::h2::client::Config,
+-}
+-
+-/// Returns a handshake future over some IO.
+-///
+-/// This is a shortcut for `Builder::new().handshake(io)`.
+-/// See [`client::conn`](crate::client::conn) for more.
+-pub async fn handshake<E, T, B>(
+-    exec: E,
+-    io: T,
+-) -> crate::Result<(SendRequest<B>, Connection<T, B>)>
+-where
+-    E: Executor<BoxSendFuture> + Send + Sync + 'static,
+-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+-    B: Body + 'static,
+-    B::Data: Send,
+-    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+-{
+-    Builder::new(exec).handshake(io).await
+-}
+-
+-// ===== impl SendRequest
+-
+-impl<B> SendRequest<B> {
+-    /// Polls to determine whether this sender can be used yet for a request.
+-    ///
+-    /// If the associated connection is closed, this returns an Error.
+-    pub fn poll_ready(&mut self, _cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
+-        if self.is_closed() {
+-            Poll::Ready(Err(crate::Error::new_closed()))
+-        } else {
+-            Poll::Ready(Ok(()))
+-        }
+-    }
+-
+-    /// Waits until the dispatcher is ready
+-    ///
+-    /// If the associated connection is closed, this returns an Error.
+-    pub async fn ready(&mut self) -> crate::Result<()> {
+-        futures_util::future::poll_fn(|cx| self.poll_ready(cx)).await
+-    }
+-
+-    /*
+-    pub(super) async fn when_ready(self) -> crate::Result<Self> {
+-        let mut me = Some(self);
+-        future::poll_fn(move |cx| {
+-            ready!(me.as_mut().unwrap().poll_ready(cx))?;
+-            Poll::Ready(Ok(me.take().unwrap()))
+-        })
+-        .await
+-    }
+-
+-    pub(super) fn is_ready(&self) -> bool {
+-        self.dispatch.is_ready()
+-    }
+-    */
+-
+-    pub(super) fn is_closed(&self) -> bool {
+-        self.dispatch.is_closed()
+-    }
+-}
+-
+-impl<B> SendRequest<B>
+-where
+-    B: Body + 'static,
+-{
+-    /// Sends a `Request` on the associated connection.
+-    ///
+-    /// Returns a future that if successful, yields the `Response`.
+-    ///
+-    /// # Note
+-    ///
+-    /// There are some key differences in what automatic things the `Client`
+-    /// does for you that will not be done here:
+-    ///
+-    /// - `Client` requires absolute-form `Uri`s, since the scheme and
+-    ///   authority are needed to connect. They aren't required here.
+-    /// - Since the `Client` requires absolute-form `Uri`s, it can add
+-    ///   the `Host` header based on it. You must add a `Host` header yourself
+-    ///   before calling this method.
+-    /// - Since absolute-form `Uri`s are not required, if received, they will
+-    ///   be serialized as-is.
+-    pub fn send_request(
+-        &mut self,
+-        req: Request<B>,
+-    ) -> impl Future<Output = crate::Result<Response<IncomingBody>>> {
+-        let sent = self.dispatch.send(req);
+-
+-        async move {
+-            match sent {
+-                Ok(rx) => match rx.await {
+-                    Ok(Ok(resp)) => Ok(resp),
+-                    Ok(Err(err)) => Err(err),
+-                    // this is definite bug if it happens, but it shouldn't happen!
+-                    Err(_canceled) => panic!("dispatch dropped without returning error"),
+-                },
+-                Err(_req) => {
+-                    tracing::debug!("connection was not ready");
+-
+-                    Err(crate::Error::new_canceled().with("connection was not ready"))
+-                }
+-            }
+-        }
+-    }
+-
+-    /*
+-    pub(super) fn send_request_retryable(
+-        &mut self,
+-        req: Request<B>,
+-    ) -> impl Future<Output = Result<Response<Body>, (crate::Error, Option<Request<B>>)>> + Unpin
+-    where
+-        B: Send,
+-    {
+-        match self.dispatch.try_send(req) {
+-            Ok(rx) => {
+-                Either::Left(rx.then(move |res| {
+-                    match res {
+-                        Ok(Ok(res)) => future::ok(res),
+-                        Ok(Err(err)) => future::err(err),
+-                        // this is definite bug if it happens, but it shouldn't happen!
+-                        Err(_) => panic!("dispatch dropped without returning error"),
+-                    }
+-                }))
+-            }
+-            Err(req) => {
+-                tracing::debug!("connection was not ready");
+-                let err = crate::Error::new_canceled().with("connection was not ready");
+-                Either::Right(future::err((err, Some(req))))
+-            }
+-        }
+-    }
+-    */
+-}
+-
+-impl<B> fmt::Debug for SendRequest<B> {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        f.debug_struct("SendRequest").finish()
+-    }
+-}
+-
+-// ===== impl Connection
+-
+-impl<T, B> Connection<T, B>
+-where
+-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+-    B: Body + Unpin + Send + 'static,
+-    B::Data: Send,
+-    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+-{
+-    /// Returns whether the [extended CONNECT protocol][1] is enabled or not.
+-    ///
+-    /// This setting is configured by the server peer by sending the
+-    /// [`SETTINGS_ENABLE_CONNECT_PROTOCOL` parameter][2] in a `SETTINGS` frame.
+-    /// This method returns the currently acknowledged value received from the
+-    /// remote.
+-    ///
+-    /// [1]: https://datatracker.ietf.org/doc/html/rfc8441#section-4
+-    /// [2]: https://datatracker.ietf.org/doc/html/rfc8441#section-3
+-    pub fn is_extended_connect_protocol_enabled(&self) -> bool {
+-        self.inner.1.is_extended_connect_protocol_enabled()
+-    }
+-}
+-
+-impl<T, B> fmt::Debug for Connection<T, B>
+-where
+-    T: AsyncRead + AsyncWrite + fmt::Debug + Send + 'static,
+-    B: Body + 'static,
+-{
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        f.debug_struct("Connection").finish()
+-    }
+-}
+-
+-impl<T, B> Future for Connection<T, B>
+-where
+-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+-    B: Body + Send + 'static,
+-    B::Data: Send,
+-    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+-{
+-    type Output = crate::Result<()>;
+-
+-    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+-        match ready!(Pin::new(&mut self.inner.1).poll(cx))? {
+-            proto::Dispatched::Shutdown => Poll::Ready(Ok(())),
+-            #[cfg(feature = "http1")]
+-            proto::Dispatched::Upgrade(_pending) => unreachable!("http2 cannot upgrade"),
+-        }
+-    }
+-}
+-
+-// ===== impl Builder
+-
+-impl Builder {
+-    /// Creates a new connection builder.
+-    #[inline]
+-    pub fn new<E>(exec: E) -> Builder 
+-    where
+-        E: Executor<BoxSendFuture> + Send + Sync + 'static,
+-    {
+-        use std::sync::Arc;
+-        Builder {
+-            exec: Exec::Executor(Arc::new(exec)),
+-            h2_builder: Default::default(),
+-        }
+-    }
+-
+-    /// Provide an executor to execute background HTTP2 tasks.
+-    pub fn executor<E>(&mut self, exec: E) -> &mut Builder
+-    where
+-        E: Executor<BoxSendFuture> + Send + Sync + 'static,
+-    {
+-        self.exec = Exec::Executor(Arc::new(exec));
+-        self
+-    }
+-
+-    /// Sets the [`SETTINGS_INITIAL_WINDOW_SIZE`][spec] option for HTTP2
+-    /// stream-level flow control.
+-    ///
+-    /// Passing `None` will do nothing.
+-    ///
+-    /// If not set, hyper will use a default.
+-    ///
+-    /// [spec]: https://http2.github.io/http2-spec/#SETTINGS_INITIAL_WINDOW_SIZE
+-    pub fn initial_stream_window_size(&mut self, sz: impl Into<Option<u32>>) -> &mut Self {
+-        if let Some(sz) = sz.into() {
+-            self.h2_builder.adaptive_window = false;
+-            self.h2_builder.initial_stream_window_size = sz;
+-        }
+-        self
+-    }
+-
+-    /// Sets the max connection-level flow control for HTTP2
+-    ///
+-    /// Passing `None` will do nothing.
+-    ///
+-    /// If not set, hyper will use a default.
+-    pub fn initial_connection_window_size(
+-        &mut self,
+-        sz: impl Into<Option<u32>>,
+-    ) -> &mut Self {
+-        if let Some(sz) = sz.into() {
+-            self.h2_builder.adaptive_window = false;
+-            self.h2_builder.initial_conn_window_size = sz;
+-        }
+-        self
+-    }
+-
+-    /// Sets whether to use an adaptive flow control.
+-    ///
+-    /// Enabling this will override the limits set in
+-    /// `initial_stream_window_size` and
+-    /// `initial_connection_window_size`.
+-    pub fn adaptive_window(&mut self, enabled: bool) -> &mut Self {
+-        use proto::h2::SPEC_WINDOW_SIZE;
+-
+-        self.h2_builder.adaptive_window = enabled;
+-        if enabled {
+-            self.h2_builder.initial_conn_window_size = SPEC_WINDOW_SIZE;
+-            self.h2_builder.initial_stream_window_size = SPEC_WINDOW_SIZE;
+-        }
+-        self
+-    }
+-
+-    /// Sets the maximum frame size to use for HTTP2.
+-    ///
+-    /// Passing `None` will do nothing.
+-    ///
+-    /// If not set, hyper will use a default.
+-    pub fn max_frame_size(&mut self, sz: impl Into<Option<u32>>) -> &mut Self {
+-        if let Some(sz) = sz.into() {
+-            self.h2_builder.max_frame_size = sz;
+-        }
+-        self
+-    }
+-
+-    /// Sets an interval for HTTP2 Ping frames should be sent to keep a
+-    /// connection alive.
+-    ///
+-    /// Pass `None` to disable HTTP2 keep-alive.
+-    ///
+-    /// Default is currently disabled.
+-    #[cfg(feature = "runtime")]
+-    pub fn keep_alive_interval(
+-        &mut self,
+-        interval: impl Into<Option<Duration>>,
+-    ) -> &mut Self {
+-        self.h2_builder.keep_alive_interval = interval.into();
+-        self
+-    }
+-
+-    /// Sets a timeout for receiving an acknowledgement of the keep-alive ping.
+-    ///
+-    /// If the ping is not acknowledged within the timeout, the connection will
+-    /// be closed. Does nothing if `keep_alive_interval` is disabled.
+-    ///
+-    /// Default is 20 seconds.
+-    #[cfg(feature = "runtime")]
+-    pub fn keep_alive_timeout(&mut self, timeout: Duration) -> &mut Self {
+-        self.h2_builder.keep_alive_timeout = timeout;
+-        self
+-    }
+-
+-    /// Sets whether HTTP2 keep-alive should apply while the connection is idle.
+-    ///
+-    /// If disabled, keep-alive pings are only sent while there are open
+-    /// request/responses streams. If enabled, pings are also sent when no
+-    /// streams are active. Does nothing if `keep_alive_interval` is
+-    /// disabled.
+-    ///
+-    /// Default is `false`.
+-    #[cfg(feature = "runtime")]
+-    pub fn keep_alive_while_idle(&mut self, enabled: bool) -> &mut Self {
+-        self.h2_builder.keep_alive_while_idle = enabled;
+-        self
+-    }
+-
+-    /// Sets the maximum number of HTTP2 concurrent locally reset streams.
+-    ///
+-    /// See the documentation of [`h2::client::Builder::max_concurrent_reset_streams`] for more
+-    /// details.
+-    ///
+-    /// The default value is determined by the `h2` crate.
+-    ///
+-    /// [`h2::client::Builder::max_concurrent_reset_streams`]: https://docs.rs/h2/client/struct.Builder.html#method.max_concurrent_reset_streams
+-    pub fn max_concurrent_reset_streams(&mut self, max: usize) -> &mut Self {
+-        self.h2_builder.max_concurrent_reset_streams = Some(max);
+-        self
+-    }
+-
+-    /// Set the maximum write buffer size for each HTTP/2 stream.
+-    ///
+-    /// Default is currently 1MB, but may change.
+-    ///
+-    /// # Panics
+-    ///
+-    /// The value must be no larger than `u32::MAX`.
+-    pub fn max_send_buf_size(&mut self, max: usize) -> &mut Self {
+-        assert!(max <= std::u32::MAX as usize);
+-        self.h2_builder.max_send_buffer_size = max;
+-        self
+-    }
+-
+-    /// Constructs a connection with the configured options and IO.
+-    /// See [`client::conn`](crate::client::conn) for more.
+-    ///
+-    /// Note, if [`Connection`] is not `await`-ed, [`SendRequest`] will
+-    /// do nothing.
+-    pub fn handshake<T, B>(
+-        &self,
+-        io: T,
+-    ) -> impl Future<Output = crate::Result<(SendRequest<B>, Connection<T, B>)>>
+-    where
+-        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+-        B: Body + 'static,
+-        B::Data: Send,
+-        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+-    {
+-        let opts = self.clone();
+-
+-        async move {
+-            tracing::trace!("client handshake HTTP/1");
+-
+-            let (tx, rx) = dispatch::channel();
+-            let h2 = proto::h2::client::handshake(io, rx, &opts.h2_builder, opts.exec)
+-                .await?;
+-            Ok((
+-                SendRequest {
+-                    dispatch: tx.unbound(),
+-                },
+-                Connection {
+-                    inner: (PhantomData, h2),
+-                },
+-            ))
+-        }
+-    }
+-}
+diff --git a/src/client/dispatch.rs b/src/client/dispatch.rs
+index 771c40da..0d70dbcc 100644
+--- a/src/client/dispatch.rs
++++ b/src/client/dispatch.rs
+@@ -128,15 +128,6 @@ impl<T, U> UnboundedSender<T, U> {
+             .map(move |_| rx)
+             .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+     }
+-
+-    #[cfg(all(feature = "backports", feature = "http2"))]
+-    pub(crate) fn send(&mut self, val: T) -> Result<Promise<U>, T> {
+-        let (tx, rx) = oneshot::channel();
+-        self.inner
+-            .send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
+-            .map(move |_| rx)
+-            .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+-    }
+ }
+ 
+ #[cfg(feature = "http2")]
+diff --git a/tests/client.rs b/tests/client.rs
+index 965c21bb..54fad53e 100644
+--- a/tests/client.rs
++++ b/tests/client.rs
+@@ -2246,130 +2246,6 @@ mod conn {
+         future::join(server, client).await;
+     }
+ 
+-    #[cfg(feature = "backports")]
+-    mod backports {
+-        use super::*;
+-        #[tokio::test]
+-        async fn get() {
+-            let _ = ::pretty_env_logger::try_init();
+-            let listener = TkTcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+-                .await
+-                .unwrap();
+-            let addr = listener.local_addr().unwrap();
+-
+-            let server = async move {
+-                let mut sock = listener.accept().await.unwrap().0;
+-                let mut buf = [0; 4096];
+-                let n = sock.read(&mut buf).await.expect("read 1");
+-
+-                // Notably:
+-                // - Just a path, since just a path was set
+-                // - No host, since no host was set
+-                let expected = "GET /a HTTP/1.1\r\n\r\n";
+-                assert_eq!(s(&buf[..n]), expected);
+-
+-                sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+-                    .await
+-                    .unwrap();
+-            };
+-
+-            let client = async move {
+-                let tcp = tcp_connect(&addr).await.expect("connect");
+-                let (mut client, conn) = conn::http1::handshake(tcp).await.expect("handshake");
+-
+-                tokio::task::spawn(async move {
+-                    conn.await.expect("http conn");
+-                });
+-
+-                let req: Request<Body> = Request::builder()
+-                    .uri("/a")
+-                    .body(Default::default())
+-                    .unwrap();
+-                let mut res = client.send_request(req).await.expect("send_request");
+-                assert_eq!(res.status(), hyper::StatusCode::OK);
+-                assert!(res.body_mut().next().await.is_none());
+-            };
+-
+-            future::join(server, client).await;
+-        }
+-
+-        #[tokio::test]
+-        async fn http2_detect_conn_eof() {
+-            use futures_util::future;
+-            use hyper::service::{make_service_fn, service_fn};
+-            use hyper::{Response, Server};
+-
+-            let _ = pretty_env_logger::try_init();
+-
+-            let server = Server::bind(&([127, 0, 0, 1], 0).into())
+-                .http2_only(true)
+-                .serve(make_service_fn(|_| async move {
+-                    Ok::<_, hyper::Error>(service_fn(|_req| {
+-                        future::ok::<_, hyper::Error>(Response::new(Body::empty()))
+-                    }))
+-                }));
+-            let addr = server.local_addr();
+-            let (shdn_tx, shdn_rx) = oneshot::channel();
+-            tokio::task::spawn(async move {
+-                server
+-                    .with_graceful_shutdown(async move {
+-                        let _ = shdn_rx.await;
+-                    })
+-                    .await
+-                    .expect("server")
+-            });
+-
+-            struct TokioExec;
+-            impl<F> hyper::rt::Executor<F> for TokioExec
+-            where
+-                F: std::future::Future + Send + 'static,
+-                F::Output: Send + 'static,
+-            {
+-                fn execute(&self, fut: F) {
+-                    tokio::spawn(fut);
+-                }
+-            }
+-
+-            let io = tcp_connect(&addr).await.expect("tcp connect");
+-            let (mut client, conn) = conn::http2::Builder::new(TokioExec)
+-                .handshake::<_, Body>(io)
+-                .await
+-                .expect("http handshake");
+-
+-            tokio::task::spawn(async move {
+-                conn.await.expect("client conn");
+-            });
+-
+-            // Sanity check that client is ready
+-            future::poll_fn(|ctx| client.poll_ready(ctx))
+-                .await
+-                .expect("client poll ready sanity");
+-
+-            let req = Request::builder()
+-                .uri(format!("http://{}/", addr))
+-                .body(Body::empty())
+-                .expect("request builder");
+-
+-            client.send_request(req).await.expect("req1 send");
+-
+-            // Sanity check that client is STILL ready
+-            future::poll_fn(|ctx| client.poll_ready(ctx))
+-                .await
+-                .expect("client poll ready after");
+-
+-            // Trigger the server shutdown...
+-            let _ = shdn_tx.send(());
+-
+-            // Allow time for graceful shutdown roundtrips...
+-            tokio::time::sleep(Duration::from_millis(100)).await;
+-
+-            // After graceful shutdown roundtrips, the client should be closed...
+-            future::poll_fn(|ctx| client.poll_ready(ctx))
+-                .await
+-                .expect_err("client should be closed");
+-        }
+-    }
+-
+     #[tokio::test]
+     async fn get_obsolete_line_folding() {
+         let _ = ::pretty_env_logger::try_init();

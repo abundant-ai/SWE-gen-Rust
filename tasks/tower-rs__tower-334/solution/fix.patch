@@ -1,0 +1,539 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 086acb6..1a72042 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -6,7 +6,7 @@ members = [
+   "tower-buffer",
+   "tower-discover",
+   "tower-filter",
+-  # "tower-hedge",
++  "tower-hedge",
+   "tower-layer",
+   "tower-limit",
+   "tower-load",
+diff --git a/tower-hedge/Cargo.toml b/tower-hedge/Cargo.toml
+index 9fcf134..64caa39 100644
+--- a/tower-hedge/Cargo.toml
++++ b/tower-hedge/Cargo.toml
+@@ -1,18 +1,20 @@
+ [package]
+ name = "tower-hedge"
+-version = "0.1.0"
++version = "0.3.0-alpha.1"
+ authors = ["Alex Leong <adlleong@gmail.com>"]
++edition = "2018"
+ publish = false
+ 
+ [dependencies]
+-futures = "0.1"
+ hdrhistogram = "6.0"
+ log = "0.4.1"
+-tower-service = "0.2.0"
+-tower-filter = { version = "0.1", path = "../tower-filter" }
+-tokio-mock-task = { git = "https://github.com/carllerche/tokio-mock-task" }
+-tokio-timer = "0.2.6"
++tower-service = "0.3.0-alpha.1"
++tower-filter = { version = "0.3.0-alpha.1", path = "../tower-filter" }
++tokio-timer = "0.3.0-alpha.4"
++futures-util-preview = "0.3.0-alpha.18"
++pin-project = "0.4.0-alpha.10"
+ 
+ [dev-dependencies]
+-tower-test = { version = "0.1", path = "../tower-test" }
+-tokio-executor = "0.1.2"
++tower-test = { version = "0.3.0-alpha.1", path = "../tower-test" }
++tokio-test = "0.2.0-alpha.4"
++tokio-executor = "0.2.0-alpha.4"
+diff --git a/tower-hedge/src/delay.rs b/tower-hedge/src/delay.rs
+index 21ff048..e94691f 100644
+--- a/tower-hedge/src/delay.rs
++++ b/tower-hedge/src/delay.rs
+@@ -1,7 +1,12 @@
+-use futures::{Async, Future, Poll};
+-use tower_service::Service;
+-
++use futures_util::ready;
++use pin_project::{pin_project, project};
+ use std::time::Duration;
++use std::{
++    future::Future,
++    pin::Pin,
++    task::{Context, Poll},
++};
++use tower_service::Service;
+ 
+ /// A policy which specifies how long each request should be delayed for.
+ pub trait Policy<Request> {
+@@ -16,16 +21,19 @@ pub struct Delay<P, S> {
+     service: S,
+ }
+ 
++#[pin_project]
+ #[derive(Debug)]
+ pub struct ResponseFuture<Request, S, F> {
+     service: S,
++    #[pin]
+     state: State<Request, F>,
+ }
+ 
++#[pin_project]
+ #[derive(Debug)]
+ enum State<Request, F> {
+-    Delaying(tokio_timer::Delay, Option<Request>),
+-    Called(F),
++    Delaying(#[pin] tokio_timer::Delay, Option<Request>),
++    Called(#[pin] F),
+ }
+ 
+ impl<P, S> Delay<P, S> {
+@@ -49,8 +57,8 @@ where
+     type Error = super::Error;
+     type Future = ResponseFuture<Request, S, S::Future>;
+ 
+-    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+-        self.service.poll_ready().map_err(|e| e.into())
++    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
++        self.service.poll_ready(cx).map_err(|e| e.into())
+     }
+ 
+     fn call(&mut self, request: Request) -> Self::Future {
+@@ -63,37 +71,36 @@ where
+         };
+         ResponseFuture {
+             service: orig,
+-            state: State::Delaying(tokio_timer::Delay::new(deadline), Some(request)),
++            state: State::Delaying(tokio_timer::delay(deadline), Some(request)),
+         }
+     }
+ }
+ 
+-impl<Request, S, F> Future for ResponseFuture<Request, S, F>
++impl<Request, S, F, T, E> Future for ResponseFuture<Request, S, F>
+ where
+-    F: Future,
+-    F::Error: Into<super::Error>,
+-    S: Service<Request, Future = F, Response = F::Item, Error = F::Error>,
++    F: Future<Output = Result<T, E>>,
++    E: Into<super::Error>,
++    S: Service<Request, Future = F, Response = T, Error = E>,
+ {
+-    type Item = F::Item;
+-    type Error = super::Error;
++    type Output = Result<T, super::Error>;
++
++    #[project]
++    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        let mut this = self.project();
+ 
+-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+         loop {
+-            let next = match self.state {
+-                State::Delaying(ref mut delay, ref mut req) => match delay.poll() {
+-                    Ok(Async::NotReady) => return Ok(Async::NotReady),
+-                    Ok(Async::Ready(())) => {
+-                        let req = req.take().expect("Missing request in delay");
+-                        let fut = self.service.call(req);
+-                        State::Called(fut)
+-                    }
+-                    Err(e) => return Err(e.into()),
+-                },
+-                State::Called(ref mut fut) => {
+-                    return fut.poll().map_err(|e| e.into());
++            #[project]
++            match this.state.project() {
++                State::Delaying(delay, req) => {
++                    ready!(delay.poll(cx));
++                    let req = req.take().expect("Missing request in delay");
++                    let fut = this.service.call(req);
++                    this.state.set(State::Called(fut));
++                }
++                State::Called(fut) => {
++                    return fut.poll(cx).map_err(Into::into);
+                 }
+             };
+-            self.state = next;
+         }
+     }
+ }
+diff --git a/tower-hedge/src/latency.rs b/tower-hedge/src/latency.rs
+index 5633857..20065b6 100644
+--- a/tower-hedge/src/latency.rs
++++ b/tower-hedge/src/latency.rs
+@@ -1,9 +1,14 @@
+-use futures::{Async, Future, Poll};
++use futures_util::ready;
++use pin_project::pin_project;
++use std::time::{Duration, Instant};
++use std::{
++    future::Future,
++    pin::Pin,
++    task::{Context, Poll},
++};
+ use tokio_timer::clock;
+ use tower_service::Service;
+ 
+-use std::time::{Duration, Instant};
+-
+ /// Record is the interface for accepting request latency measurements.  When
+ /// a request completes, record is called with the elapsed duration between
+ /// when the service was called and when the future completed.
+@@ -19,10 +24,12 @@ pub struct Latency<R, S> {
+     service: S,
+ }
+ 
++#[pin_project]
+ #[derive(Debug)]
+ pub struct ResponseFuture<R, F> {
+     start: Instant,
+     rec: R,
++    #[pin]
+     inner: F,
+ }
+ 
+@@ -42,15 +49,15 @@ where
+ impl<S, R, Request> Service<Request> for Latency<R, S>
+ where
+     S: Service<Request>,
+-    S::Error: Into<super::Error>,
++    super::Error: From<S::Error>,
+     R: Record + Clone,
+ {
+     type Response = S::Response;
+     type Error = super::Error;
+     type Future = ResponseFuture<R, S::Future>;
+ 
+-    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+-        self.service.poll_ready().map_err(|e| e.into())
++    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
++        self.service.poll_ready(cx).map_err(|e| e.into())
+     }
+ 
+     fn call(&mut self, request: Request) -> Self::Future {
+@@ -62,24 +69,20 @@ where
+     }
+ }
+ 
+-impl<R, F> Future for ResponseFuture<R, F>
++impl<R, F, T, E> Future for ResponseFuture<R, F>
+ where
+     R: Record,
+-    F: Future,
+-    F::Error: Into<super::Error>,
++    F: Future<Output = Result<T, E>>,
++    super::Error: From<E>,
+ {
+-    type Item = F::Item;
+-    type Error = super::Error;
++    type Output = Result<T, super::Error>;
+ 
+-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+-        match self.inner.poll() {
+-            Ok(Async::NotReady) => Ok(Async::NotReady),
+-            Ok(Async::Ready(rsp)) => {
+-                let duration = clock::now() - self.start;
+-                self.rec.record(duration);
+-                Ok(Async::Ready(rsp))
+-            }
+-            Err(e) => Err(e.into()),
+-        }
++    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        let this = self.project();
++
++        let rsp = ready!(this.inner.poll(cx))?;
++        let duration = clock::now() - *this.start;
++        this.rec.record(duration);
++        Poll::Ready(Ok(rsp))
+     }
+ }
+diff --git a/tower-hedge/src/lib.rs b/tower-hedge/src/lib.rs
+index dc4b761..c95638b 100644
+--- a/tower-hedge/src/lib.rs
++++ b/tower-hedge/src/lib.rs
+@@ -3,18 +3,16 @@
+ 
+ #![deny(warnings)]
+ #![deny(missing_docs)]
+-extern crate futures;
+-extern crate hdrhistogram;
+-#[macro_use]
+-extern crate log;
+-extern crate tokio_timer;
+-extern crate tower_filter;
+-extern crate tower_service;
+-
+-use futures::future::FutureResult;
+-use futures::{future, Poll};
++
++use futures_util::future;
++use log::error;
++use pin_project::pin_project;
+ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
++use std::{
++    pin::Pin,
++    task::{Context, Poll},
++};
+ use tower_filter::Filter;
+ 
+ mod delay;
+@@ -38,12 +36,16 @@ type Service<S, P> = select::Select<
+ /// future or the retry future completes, that value is used.
+ #[derive(Debug)]
+ pub struct Hedge<S, P>(Service<S, P>);
++
++#[pin_project]
+ /// The Future returned by the hedge Service.
+-pub struct Future<S, P, Request>(<Service<S, P> as tower_service::Service<Request>>::Future)
++pub struct Future<S, Request>
+ where
+-    S: tower_service::Service<Request> + Clone,
+-    S::Error: Into<Error>,
+-    P: Policy<Request> + Clone;
++    S: tower_service::Service<Request>,
++{
++    #[pin]
++    inner: S::Future,
++}
+ 
+ type Error = Box<dyn std::error::Error + Send + Sync>;
+ 
+@@ -58,15 +60,20 @@ pub trait Policy<Request> {
+     fn can_retry(&self, req: &Request) -> bool;
+ }
+ 
++// NOTE: these are pub only because they appear inside a Future<F>
++
++#[doc(hidden)]
+ #[derive(Clone, Debug)]
+-struct PolicyPredicate<P>(P);
++pub struct PolicyPredicate<P>(P);
++#[doc(hidden)]
+ #[derive(Debug)]
+-struct DelayPolicy {
++pub struct DelayPolicy {
+     histo: Histo,
+     latency_percentile: f32,
+ }
++#[doc(hidden)]
+ #[derive(Debug)]
+-struct SelectPolicy<P> {
++pub struct SelectPolicy<P> {
+     policy: P,
+     histo: Histo,
+     min_data_points: u64,
+@@ -83,7 +90,7 @@ impl<S, P> Hedge<S, P> {
+     ) -> Hedge<S, P>
+     where
+         S: tower_service::Service<Request> + Clone,
+-        S::Error: Into<Error>,
++        Error: From<S::Error>,
+         P: Policy<Request> + Clone,
+     {
+         let histo = Arc::new(Mutex::new(RotatingHistogram::new(period)));
+@@ -102,7 +109,7 @@ impl<S, P> Hedge<S, P> {
+     ) -> Hedge<S, P>
+     where
+         S: tower_service::Service<Request> + Clone,
+-        S::Error: Into<Error>,
++        Error: From<S::Error>,
+         P: Policy<Request> + Clone,
+     {
+         let histo = Arc::new(Mutex::new(RotatingHistogram::new(period)));
+@@ -124,7 +131,7 @@ impl<S, P> Hedge<S, P> {
+     ) -> Hedge<S, P>
+     where
+         S: tower_service::Service<Request> + Clone,
+-        S::Error: Into<Error>,
++        Error: From<S::Error>,
+         P: Policy<Request> + Clone,
+     {
+         // Clone the underlying service and wrap both copies in a middleware that
+@@ -157,33 +164,33 @@ impl<S, P> Hedge<S, P> {
+ impl<S, P, Request> tower_service::Service<Request> for Hedge<S, P>
+ where
+     S: tower_service::Service<Request> + Clone,
+-    S::Error: Into<Error>,
++    Error: From<S::Error>,
+     P: Policy<Request> + Clone,
+ {
+     type Response = S::Response;
+     type Error = Error;
+-    type Future = Future<S, P, Request>;
++    type Future = Future<Service<S, P>, Request>;
+ 
+-    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+-        self.0.poll_ready()
++    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
++        self.0.poll_ready(cx)
+     }
+ 
+     fn call(&mut self, request: Request) -> Self::Future {
+-        Future(self.0.call(request))
++        Future {
++            inner: self.0.call(request),
++        }
+     }
+ }
+ 
+-impl<S, P, Request> futures::Future for Future<S, P, Request>
++impl<S, Request> std::future::Future for Future<S, Request>
+ where
+-    S: tower_service::Service<Request> + Clone,
+-    S::Error: Into<Error>,
+-    P: Policy<Request> + Clone,
++    S: tower_service::Service<Request>,
++    Error: From<S::Error>,
+ {
+-    type Item = S::Response;
+-    type Error = Error;
++    type Output = Result<S::Response, Error>;
+ 
+-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+-        self.0.poll()
++    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        self.project().inner.poll(cx).map_err(Into::into)
+     }
+ }
+ 
+@@ -213,19 +220,19 @@ where
+     P: Policy<Request>,
+ {
+     type Future = future::Either<
+-        FutureResult<(), tower_filter::error::Error>,
+-        future::Empty<(), tower_filter::error::Error>,
++        future::Ready<Result<(), tower_filter::error::Error>>,
++        future::Pending<Result<(), tower_filter::error::Error>>,
+     >;
+ 
+     fn check(&mut self, request: &Request) -> Self::Future {
+         if self.0.can_retry(request) {
+-            future::Either::A(future::ok(()))
++            future::Either::Left(future::ready(Ok(())))
+         } else {
+             // If the hedge retry should not be issued, we simply want to wait
+             // for the result of the original request.  Therefore we don't want
+-            // to return an error here.  Instead, we use future::empty to ensure
++            // to return an error here.  Instead, we use future::pending to ensure
+             // that the original request wins the select.
+-            future::Either::B(future::empty())
++            future::Either::Right(future::pending())
+         }
+     }
+ }
+diff --git a/tower-hedge/src/rotating_histogram.rs b/tower-hedge/src/rotating_histogram.rs
+index 7caea77..0fbb965 100644
+--- a/tower-hedge/src/rotating_histogram.rs
++++ b/tower-hedge/src/rotating_histogram.rs
+@@ -1,8 +1,8 @@
+ extern crate tokio_timer;
+ 
+ use hdrhistogram::Histogram;
++use log::trace;
+ use std::time::{Duration, Instant};
+-
+ use tokio_timer::clock;
+ 
+ /// This represents a "rotating" histogram which stores two histogram, one which
+diff --git a/tower-hedge/src/select.rs b/tower-hedge/src/select.rs
+index a78a6a1..54d6f09 100644
+--- a/tower-hedge/src/select.rs
++++ b/tower-hedge/src/select.rs
+@@ -1,4 +1,9 @@
+-use futures::{Async, Future, Poll};
++use pin_project::pin_project;
++use std::{
++    future::Future,
++    pin::Pin,
++    task::{Context, Poll},
++};
+ use tower_service::Service;
+ 
+ /// A policy which decides which requests can be cloned and sent to the B
+@@ -18,9 +23,12 @@ pub struct Select<P, A, B> {
+     b: B,
+ }
+ 
++#[pin_project]
+ #[derive(Debug)]
+ pub struct ResponseFuture<AF, BF> {
++    #[pin]
+     a_fut: AF,
++    #[pin]
+     b_fut: Option<BF>,
+ }
+ 
+@@ -41,21 +49,20 @@ impl<P, A, B, Request> Service<Request> for Select<P, A, B>
+ where
+     P: Policy<Request>,
+     A: Service<Request>,
+-    A::Error: Into<super::Error>,
++    super::Error: From<A::Error>,
+     B: Service<Request, Response = A::Response>,
+-    B::Error: Into<super::Error>,
++    super::Error: From<B::Error>,
+ {
+     type Response = A::Response;
+     type Error = super::Error;
+     type Future = ResponseFuture<A::Future, B::Future>;
+ 
+-    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+-        let a = self.a.poll_ready().map_err(|e| e.into())?;
+-        let b = self.b.poll_ready().map_err(|e| e.into())?;
+-        if a.is_ready() && b.is_ready() {
+-            Ok(Async::Ready(()))
+-        } else {
+-            Ok(Async::NotReady)
++    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
++        match (self.a.poll_ready(cx), self.b.poll_ready(cx)) {
++            (Poll::Ready(Ok(())), Poll::Ready(Ok(()))) => Poll::Ready(Ok(())),
++            (Poll::Ready(Err(e)), _) => Poll::Ready(Err(e.into())),
++            (_, Poll::Ready(Err(e))) => Poll::Ready(Err(e.into())),
++            _ => Poll::Pending,
+         }
+     }
+ 
+@@ -72,29 +79,26 @@ where
+     }
+ }
+ 
+-impl<AF, BF> Future for ResponseFuture<AF, BF>
++impl<AF, BF, T, AE, BE> Future for ResponseFuture<AF, BF>
+ where
+-    AF: Future,
+-    AF::Error: Into<super::Error>,
+-    BF: Future<Item = AF::Item>,
+-    BF::Error: Into<super::Error>,
++    AF: Future<Output = Result<T, AE>>,
++    super::Error: From<AE>,
++    BF: Future<Output = Result<T, BE>>,
++    super::Error: From<BE>,
+ {
+-    type Item = AF::Item;
+-    type Error = super::Error;
++    type Output = Result<T, super::Error>;
++
++    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        let this = self.project();
+ 
+-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+-        match self.a_fut.poll() {
+-            Ok(Async::NotReady) => {}
+-            Ok(Async::Ready(a)) => return Ok(Async::Ready(a)),
+-            Err(e) => return Err(e.into()),
++        if let Poll::Ready(r) = this.a_fut.poll(cx) {
++            return Poll::Ready(Ok(r?));
+         }
+-        if let Some(ref mut b_fut) = self.b_fut {
+-            match b_fut.poll() {
+-                Ok(Async::NotReady) => {}
+-                Ok(Async::Ready(b)) => return Ok(Async::Ready(b)),
+-                Err(e) => return Err(e.into()),
++        if let Some(b_fut) = this.b_fut.as_pin_mut() {
++            if let Poll::Ready(r) = b_fut.poll(cx) {
++                return Poll::Ready(Ok(r?));
+             }
+         }
+-        return Ok(Async::NotReady);
++        return Poll::Pending;
+     }
+ }

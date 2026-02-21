@@ -1,0 +1,266 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index d2290463..b57bdd98 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -38,7 +38,7 @@ pin-utils = "=0.1.0-alpha.4"
+ time = "0.1"
+ tokio = { version = "=0.2.0-alpha.4", optional = true, default-features = false, features = ["rt-full"] }
+ tower-service = "=0.3.0-alpha.1"
+-tokio-executor = { version = "=0.2.0-alpha.4", features = ["blocking"] }
++tokio-executor = "=0.2.0-alpha.4"
+ tokio-io = "=0.2.0-alpha.4"
+ tokio-sync = "=0.2.0-alpha.4"
+ tokio-net = { version = "=0.2.0-alpha.4", optional = true, features = ["tcp"] }
+diff --git a/benches/end_to_end.rs b/benches/end_to_end.rs
+index 8fa496d1..717d71c9 100644
+--- a/benches/end_to_end.rs
++++ b/benches/end_to_end.rs
+@@ -179,7 +179,7 @@ impl Opts {
+ 
+         let addr = spawn_server(&mut rt, &self);
+ 
+-        let connector = HttpConnector::new();
++        let connector = HttpConnector::new(1);
+         let client = hyper::Client::builder()
+             .http2_only(self.http2)
+             .http2_initial_stream_window_size(self.http2_stream_window)
+diff --git a/src/client/connect/dns.rs b/src/client/connect/dns.rs
+index 77767166..24969f04 100644
+--- a/src/client/connect/dns.rs
++++ b/src/client/connect/dns.rs
+@@ -15,6 +15,7 @@ use std::net::{
+ };
+ use std::str::FromStr;
+ 
++use futures_util::{FutureExt, StreamExt};
+ use tokio_sync::{mpsc, oneshot};
+ 
+ use crate::common::{Future, Never, Pin, Poll, Unpin, task};
+@@ -38,7 +39,10 @@ pub struct Name {
+ /// A resolver using blocking `getaddrinfo` calls in a threadpool.
+ #[derive(Clone)]
+ pub struct GaiResolver {
+-    _priv: (),
++    tx: tokio_executor::threadpool::Sender,
++    /// A handle to keep the threadpool alive until all `GaiResolver` clones
++    /// have been dropped.
++    _threadpool_keep_alive: ThreadPoolKeepAlive,
+ }
+ 
+ #[derive(Clone)]
+@@ -51,7 +55,8 @@ pub struct GaiAddrs {
+ 
+ /// A future to resole a name returned by `GaiResolver`.
+ pub struct GaiFuture {
+-    inner: tokio_executor::blocking::Blocking<Result<IpAddrs, io::Error>>,
++    rx: oneshot::Receiver<Result<IpAddrs, io::Error>>,
++    _threadpool_keep_alive: ThreadPoolKeepAlive,
+ }
+ 
+ impl Name {
+@@ -103,9 +108,40 @@ impl Error for InvalidNameError {}
+ 
+ impl GaiResolver {
+     /// Construct a new `GaiResolver`.
+-    pub fn new() -> Self {
++    ///
++    /// Takes number of DNS worker threads.
++    pub fn new(threads: usize) -> Self {
++        let pool = tokio_executor::threadpool::Builder::new()
++            .name_prefix("hyper-dns-gai-resolver")
++            // not for CPU tasks, so only spawn workers
++            // in blocking mode
++            .pool_size(1)
++            .max_blocking(threads)
++            .build();
++
++        let tx = pool.sender().clone();
++
++        // The pool will start to shutdown once `pool` is dropped,
++        // so to keep it alive, we spawn a future onto the pool itself
++        // that will only resolve once all `GaiResolver` requests
++        // are finished.
++        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
++
++        let on_shutdown = shutdown_rx
++            .into_future()
++            .map(move |(next, _rx)| {
++                match next {
++                    Some(never) => match never {},
++                    None => (),
++                }
++
++                drop(pool)
++            });
++        tx.spawn(on_shutdown).expect("can spawn on self");
++
+         GaiResolver {
+-            _priv: (),
++            tx,
++            _threadpool_keep_alive: ThreadPoolKeepAlive(shutdown_tx),
+         }
+     }
+ }
+@@ -115,14 +151,14 @@ impl Resolve for GaiResolver {
+     type Future = GaiFuture;
+ 
+     fn resolve(&self, name: Name) -> Self::Future {
+-        let blocking = tokio_executor::blocking::run(move || {
+-            debug!("resolving host={:?}", name.host);
+-            (&*name.host, 0).to_socket_addrs()
+-                .map(|i| IpAddrs { iter: i })
+-        });
+-
++        let (tx, rx) = oneshot::channel();
++        self.tx.spawn(GaiBlocking {
++            host: name.host,
++            tx: Some(tx),
++        }).expect("spawn GaiBlocking");
+         GaiFuture {
+-            inner: blocking,
++            rx,
++            _threadpool_keep_alive: self._threadpool_keep_alive.clone(),
+         }
+     }
+ }
+@@ -137,9 +173,10 @@ impl Future for GaiFuture {
+     type Output = Result<GaiAddrs, io::Error>;
+ 
+     fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+-        Pin::new(&mut self.inner).poll(cx).map(|res| match res {
+-            Ok(addrs) => Ok(GaiAddrs { inner: addrs }),
+-            Err(err) => Err(err),
++        Pin::new(&mut self.rx).poll(cx).map(|res| match res {
++            Ok(Ok(addrs)) => Ok(GaiAddrs { inner: addrs }),
++            Ok(Err(err)) => Err(err),
++            Err(_canceled) => unreachable!("GaiResolver threadpool shutdown"),
+         })
+     }
+ }
+diff --git a/src/client/connect/http.rs b/src/client/connect/http.rs
+index 3aabf2f3..41f64749 100644
+--- a/src/client/connect/http.rs
++++ b/src/client/connect/http.rs
+@@ -77,8 +77,9 @@ impl HttpConnector {
+     /// Construct a new HttpConnector.
+     ///
+     /// Takes number of DNS worker threads.
+-    pub fn new() -> HttpConnector {
+-        HttpConnector::new_with_resolver(GaiResolver::new())
++    #[inline]
++    pub fn new(threads: usize) -> HttpConnector {
++        HttpConnector::new_with_resolver(GaiResolver::new(threads))
+     }
+ }
+ 
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index 2d92c1d2..4181b901 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -1023,7 +1023,7 @@ impl Builder {
+         B: Payload + Send,
+         B::Data: Send,
+     {
+-        let mut connector = HttpConnector::new();
++        let mut connector = HttpConnector::new(4);
+         if self.pool_config.enabled {
+             connector.set_keepalive(self.pool_config.keep_alive_timeout);
+         }
+diff --git a/tests/client.rs b/tests/client.rs
+index 7eed383b..6e0861d5 100644
+--- a/tests/client.rs
++++ b/tests/client.rs
+@@ -213,7 +213,7 @@ macro_rules! test {
+         let addr = server.local_addr().expect("local_addr");
+         let rt = $runtime;
+ 
+-        let connector = ::hyper::client::HttpConnector::new();
++        let connector = ::hyper::client::HttpConnector::new(1);
+         let client = Client::builder()
+             .set_host($set_host)
+             .http1_title_case_headers($title_case_headers)
+@@ -781,7 +781,7 @@ mod dispatch_impl {
+         let mut rt = Runtime::new().unwrap();
+         let (closes_tx, closes) = mpsc::channel(10);
+         let client = Client::builder()
+-            .build(DebugConnector::with_http_and_closes(HttpConnector::new(), closes_tx));
++            .build(DebugConnector::with_http_and_closes(HttpConnector::new(1), closes_tx));
+ 
+         let (tx1, rx1) = oneshot::channel();
+ 
+@@ -837,7 +837,7 @@ mod dispatch_impl {
+ 
+         let res = {
+             let client = Client::builder()
+-                .build(DebugConnector::with_http_and_closes(HttpConnector::new(), closes_tx));
++                .build(DebugConnector::with_http_and_closes(HttpConnector::new(1), closes_tx));
+ 
+             let req = Request::builder()
+                 .uri(&*format!("http://{}/a", addr))
+@@ -889,7 +889,7 @@ mod dispatch_impl {
+         });
+ 
+         let client = Client::builder()
+-            .build(DebugConnector::with_http_and_closes(HttpConnector::new(), closes_tx));
++            .build(DebugConnector::with_http_and_closes(HttpConnector::new(1), closes_tx));
+ 
+         let req = Request::builder()
+             .uri(&*format!("http://{}/a", addr))
+@@ -948,7 +948,7 @@ mod dispatch_impl {
+ 
+         let res = {
+             let client = Client::builder()
+-                .build(DebugConnector::with_http_and_closes(HttpConnector::new(), closes_tx));
++                .build(DebugConnector::with_http_and_closes(HttpConnector::new(1), closes_tx));
+ 
+             let req = Request::builder()
+                 .uri(&*format!("http://{}/a", addr))
+@@ -996,7 +996,7 @@ mod dispatch_impl {
+ 
+         let res = {
+             let client = Client::builder()
+-                .build(DebugConnector::with_http_and_closes(HttpConnector::new(), closes_tx));
++                .build(DebugConnector::with_http_and_closes(HttpConnector::new(1), closes_tx));
+ 
+             let req = Request::builder()
+                 .uri(&*format!("http://{}/a", addr))
+@@ -1046,7 +1046,7 @@ mod dispatch_impl {
+ 
+         let client = Client::builder()
+             .keep_alive(false)
+-            .build(DebugConnector::with_http_and_closes(HttpConnector::new(), closes_tx));
++            .build(DebugConnector::with_http_and_closes(HttpConnector::new(1), closes_tx));
+ 
+         let req = Request::builder()
+             .uri(&*format!("http://{}/a", addr))
+@@ -1090,7 +1090,7 @@ mod dispatch_impl {
+         });
+ 
+         let client = Client::builder()
+-            .build(DebugConnector::with_http_and_closes(HttpConnector::new(), closes_tx));
++            .build(DebugConnector::with_http_and_closes(HttpConnector::new(1), closes_tx));
+ 
+         let req = Request::builder()
+             .uri(&*format!("http://{}/a", addr))
+@@ -1527,7 +1527,7 @@ mod dispatch_impl {
+ 
+     impl DebugConnector {
+         fn new() -> DebugConnector {
+-            let http = HttpConnector::new();
++            let http = HttpConnector::new(1);
+             let (tx, _) = mpsc::channel(10);
+             DebugConnector::with_http_and_closes(http, tx)
+         }
+diff --git a/tests/support/mod.rs b/tests/support/mod.rs
+index 601e699e..1d5eae1a 100644
+--- a/tests/support/mod.rs
++++ b/tests/support/mod.rs
+@@ -313,7 +313,7 @@ pub fn __run_test(cfg: __TestConfig) {
+         Version::HTTP_11
+     };
+ 
+-    let connector = HttpConnector::new();
++    let connector = HttpConnector::new(1);
+     let client = Client::builder()
+         .keep_alive_timeout(Duration::from_secs(10))
+         .http2_only(cfg.client_version == 2)

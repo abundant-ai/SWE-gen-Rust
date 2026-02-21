@@ -1,0 +1,145 @@
+diff --git a/complete/_rg b/complete/_rg
+index 07d3833..ec4863b 100644
+--- a/complete/_rg
++++ b/complete/_rg
+@@ -45,6 +45,7 @@ _rg() {
+     '--ignore-file=[specify additional ignore file]:file:_files'
+     '(-v --invert-match)'{-v,--invert-match}'[invert matching]'
+     '(-n -N --line-number --no-line-number)'{-n,--line-number}'[show line numbers]'
++    '(-w -x --line-regexp --word-regexp)'{-x,--line-regexp}'[only show matches surrounded by line boundaries]'
+     '(-M --max-columns)'{-M+,--max-columns=}'[specify max length of lines to print]:number of bytes'
+     '(-m --max-count)'{-m+,--max-count=}'[specify max number of matches per file]:number of matches'
+     '--max-filesize=[specify size above which files should be ignored]:file size'
+@@ -80,7 +81,7 @@ _rg() {
+     '(: -)'{-V,--version}'[display version information]'
+     '(-p --heading --no-heading --pretty)--vimgrep[show results in vim-compatible format]'
+     '(-H --no-filename --with-filename)'{-H,--with-filename}'[prefix each match with name of file that contains it]'
+-    '(-w --word-regexp)'{-w,--word-regexp}'[only show matches surrounded by word boundaries]'
++    '(-w -x --line-regexp --word-regexp)'{-w,--word-regexp}'[only show matches surrounded by word boundaries]'
+     '(-e -f --file --files --regexp --type-list)1: :_rg_pattern'
+     '(--type-list)*:file:_files'
+   )
+diff --git a/doc/convert-to-man b/doc/convert-to-man
+index 7afa441..eeb252e 100755
+--- a/doc/convert-to-man
++++ b/doc/convert-to-man
+@@ -1,4 +1,5 @@
+-#!/bin/sh
++#!/bin/sh -e
+ 
+ pandoc -s -t man rg.1.md -o rg.1
+-sed -i 's/\.TH.*/.TH "rg" "1"/g' rg.1
++sed -i.bak 's/\.TH.*/.TH "rg" "1"/g' rg.1
++rm -f rg.1.bak # BSD `sed` requires the creation of a back-up file
+diff --git a/doc/rg.1 b/doc/rg.1
+index 1dc427b..d09ad9c 100644
+--- a/doc/rg.1
++++ b/doc/rg.1
+@@ -156,6 +156,12 @@ Only show matches surrounded by word boundaries.
+ This is equivalent to putting \\b before and after the search pattern.
+ .RS
+ .RE
++.TP
++.B \-x, \-\-line\-regexp
++Only show matches surrounded by line boundaries.
++This is equivalent to putting ^...$ around the search pattern.
++.RS
++.RE
+ .SH LESS COMMON OPTIONS
+ .TP
+ .B \-A, \-\-after\-context \f[I]NUM\f[]
+diff --git a/doc/rg.1.md b/doc/rg.1.md
+index ffc4495..e18f277 100644
+--- a/doc/rg.1.md
++++ b/doc/rg.1.md
+@@ -105,6 +105,10 @@ Project home page: https://github.com/BurntSushi/ripgrep
+ : Only show matches surrounded by word boundaries. This is equivalent to
+   putting \\b before and after the search pattern.
+ 
++-x, --line-regexp
++: Only show matches surrounded by line boundaries. This is equivalent to
++  putting ^...$ around the search pattern.
++
+ # LESS COMMON OPTIONS
+ 
+ -A, --after-context *NUM*
+diff --git a/src/app.rs b/src/app.rs
+index bb1e89c..43c0301 100644
+--- a/src/app.rs
++++ b/src/app.rs
+@@ -109,7 +109,8 @@ pub fn app() -> App<'static, 'static> {
+         .arg(flag("unrestricted").short("u")
+              .multiple(true))
+         .arg(flag("invert-match").short("v"))
+-        .arg(flag("word-regexp").short("w"))
++        .arg(flag("word-regexp").short("w").overrides_with("line-regexp"))
++        .arg(flag("line-regexp").short("x"))
+         // Third, set up less common flags.
+         .arg(flag("after-context").short("A")
+              .value_name("NUM").takes_value(true)
+@@ -348,6 +349,10 @@ lazy_static! {
+              "Only show matches surrounded by word boundaries. This is \
+               equivalent to putting \\b before and after all of the search \
+               patterns.");
++        doc!(h, "line-regexp",
++             "Only show matches surrounded by line boundaries.",
++             "Only show matches surrounded by line boundaries. This is \
++              equivalent to putting ^...$ around all of the search patterns.");
+ 
+         doc!(h, "after-context",
+              "Show NUM lines after each match.");
+diff --git a/src/args.rs b/src/args.rs
+index fb37c71..ff636d1 100644
+--- a/src/args.rs
++++ b/src/args.rs
+@@ -427,7 +427,8 @@ impl<'a> ArgMatches<'a> {
+     ///
+     /// Note that if -F/--fixed-strings is set, then all patterns will be
+     /// escaped. Similarly, if -w/--word-regexp is set, then all patterns
+-    /// are surrounded by `\b`.
++    /// are surrounded by `\b`, and if -x/--line-regexp is set, then all
++    /// patterns are surrounded by `^...$`.
+     ///
+     /// If any pattern is invalid UTF-8, then an error is returned.
+     fn patterns(&self) -> Result<Vec<String>> {
+@@ -470,7 +471,7 @@ impl<'a> ArgMatches<'a> {
+         Ok(pats)
+     }
+ 
+-    /// Converts an OsStr pattern to a String pattern, including word
++    /// Converts an OsStr pattern to a String pattern, including line/word
+     /// boundaries or escapes if applicable.
+     ///
+     /// If the pattern is not valid UTF-8, then an error is returned.
+@@ -479,10 +480,12 @@ impl<'a> ArgMatches<'a> {
+         Ok(self.str_pattern(s))
+     }
+ 
+-    /// Converts a &str pattern to a String pattern, including word
++    /// Converts a &str pattern to a String pattern, including line/word
+     /// boundaries or escapes if applicable.
+     fn str_pattern(&self, pat: &str) -> String {
+-        let s = self.word_pattern(self.literal_pattern(pat.to_string()));
++        let litpat = self.literal_pattern(pat.to_string());
++        let s = self.line_pattern(self.word_pattern(litpat));
++
+         if s.is_empty() {
+             self.empty_pattern()
+         } else {
+@@ -511,6 +514,16 @@ impl<'a> ArgMatches<'a> {
+         }
+     }
+ 
++    /// Returns the given pattern as a line pattern if the -x/--line-regexp
++    /// flag is set. Otherwise, the pattern is returned unchanged.
++    fn line_pattern(&self, pat: String) -> String {
++        if self.is_present("line-regexp") {
++            format!(r"^(?:{})$", pat)
++        } else {
++            pat
++        }
++    }
++
+     /// Empty pattern returns a pattern that is guaranteed to produce an empty
+     /// regular expression that is valid in any position.
+     fn empty_pattern(&self) -> String {

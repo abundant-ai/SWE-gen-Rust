@@ -1,0 +1,555 @@
+diff --git a/clap_builder/src/builder/arg.rs b/clap_builder/src/builder/arg.rs
+index a40d0cca..d0929e51 100644
+--- a/clap_builder/src/builder/arg.rs
++++ b/clap_builder/src/builder/arg.rs
+@@ -3952,21 +3952,6 @@ impl Arg {
+         Some(longs)
+     }
+ 
+-    /// Get hidden aliases for this argument, if any
+-    #[inline]
+-    pub fn get_aliases(&self) -> Option<Vec<&str>> {
+-        if self.aliases.is_empty() {
+-            None
+-        } else {
+-            Some(
+-                self.aliases
+-                    .iter()
+-                    .filter_map(|(s, v)| if !*v { Some(s.as_str()) } else { None })
+-                    .collect(),
+-            )
+-        }
+-    }
+-
+     /// Get the names of possible values for this argument. Only useful for user
+     /// facing applications, such as building help messages or man files
+     pub fn get_possible_values(&self) -> Vec<PossibleValue> {
+diff --git a/clap_complete/src/dynamic/completer.rs b/clap_complete/src/dynamic/completer.rs
+index 640e2d57..4c6d9c92 100644
+--- a/clap_complete/src/dynamic/completer.rs
++++ b/clap_complete/src/dynamic/completer.rs
+@@ -32,7 +32,7 @@ pub fn complete(
+     args: Vec<OsString>,
+     arg_index: usize,
+     current_dir: Option<&std::path::Path>,
+-) -> Result<Vec<CompletionCandidate>, std::io::Error> {
++) -> Result<Vec<(OsString, Option<StyledStr>)>, std::io::Error> {
+     cmd.build();
+ 
+     let raw_args = clap_lex::RawArgs::new(args);
+@@ -91,7 +91,7 @@ fn complete_arg(
+     current_dir: Option<&std::path::Path>,
+     pos_index: usize,
+     is_escaped: bool,
+-) -> Result<Vec<CompletionCandidate>, std::io::Error> {
++) -> Result<Vec<(OsString, Option<StyledStr>)>, std::io::Error> {
+     debug!(
+         "complete_arg: arg={:?}, cmd={:?}, current_dir={:?}, pos_index={}, is_escaped={}",
+         arg,
+@@ -100,7 +100,7 @@ fn complete_arg(
+         pos_index,
+         is_escaped
+     );
+-    let mut completions = Vec::<CompletionCandidate>::new();
++    let mut completions = Vec::new();
+ 
+     if !is_escaped {
+         if let Some((flag, value)) = arg.to_long() {
+@@ -112,33 +112,23 @@ fn complete_arg(
+                                 .into_iter()
+                                 .map(|(os, help)| {
+                                     // HACK: Need better `OsStr` manipulation
+-                                    CompletionCandidate::new(format!(
+-                                        "--{}={}",
+-                                        flag,
+-                                        os.to_string_lossy()
+-                                    ))
+-                                    .help(help)
+-                                    .visible(true)
++                                    (format!("--{}={}", flag, os.to_string_lossy()).into(), help)
+                                 }),
+                         );
+                     }
+                 } else {
+-                    completions.extend(longs_and_visible_aliases(cmd).into_iter().filter(|comp| {
+-                        comp.get_content()
+-                            .starts_with(format!("--{}", flag).as_str())
+-                    }));
+-
+-                    completions.extend(hidden_longs_aliases(cmd).into_iter().filter(|comp| {
+-                        comp.get_content()
+-                            .starts_with(format!("--{}", flag).as_str())
+-                    }))
++                    completions.extend(longs_and_visible_aliases(cmd).into_iter().filter_map(
++                        |(f, help)| f.starts_with(flag).then(|| (format!("--{f}").into(), help)),
++                    ));
+                 }
+             }
+         } else if arg.is_escape() || arg.is_stdio() || arg.is_empty() {
+             // HACK: Assuming knowledge of is_escape / is_stdio
+-            completions.extend(longs_and_visible_aliases(cmd));
+-
+-            completions.extend(hidden_longs_aliases(cmd));
++            completions.extend(
++                longs_and_visible_aliases(cmd)
++                    .into_iter()
++                    .map(|(f, help)| (format!("--{f}").into(), help)),
++            );
+         }
+ 
+         if arg.is_empty() || arg.is_stdio() || arg.is_short() {
+@@ -152,15 +142,7 @@ fn complete_arg(
+                 shorts_and_visible_aliases(cmd)
+                     .into_iter()
+                     // HACK: Need better `OsStr` manipulation
+-                    .map(|comp| {
+-                        CompletionCandidate::new(format!(
+-                            "{}{}",
+-                            dash_or_arg,
+-                            comp.get_content().to_string_lossy()
+-                        ))
+-                        .help(comp.get_help().cloned())
+-                        .visible(true)
+-                    }),
++                    .map(|(f, help)| (format!("{}{}", dash_or_arg, f).into(), help)),
+             );
+         }
+     }
+@@ -169,21 +151,13 @@ fn complete_arg(
+         .get_positionals()
+         .find(|p| p.get_index() == Some(pos_index))
+     {
+-        completions.extend(
+-            complete_arg_value(arg.to_value(), positional, current_dir)
+-                .into_iter()
+-                .map(|(os, help)| CompletionCandidate::new(os).help(help).visible(true)),
+-        );
++        completions.extend(complete_arg_value(arg.to_value(), positional, current_dir));
+     }
+ 
+     if let Ok(value) = arg.to_value() {
+         completions.extend(complete_subcommand(value, cmd));
+     }
+ 
+-    if completions.iter().any(|a| a.is_visible()) {
+-        completions.retain(|a| a.is_visible())
+-    }
+-
+     Ok(completions)
+ }
+ 
+@@ -200,7 +174,7 @@ fn complete_arg_value(
+             values.extend(possible_values.into_iter().filter_map(|p| {
+                 let name = p.get_name();
+                 name.starts_with(value)
+-                    .then(|| (OsString::from(name), p.get_help().cloned()))
++                    .then(|| (name.into(), p.get_help().cloned()))
+             }));
+         }
+     } else {
+@@ -294,7 +268,7 @@ fn complete_path(
+     completions
+ }
+ 
+-fn complete_subcommand(value: &str, cmd: &clap::Command) -> Vec<CompletionCandidate> {
++fn complete_subcommand(value: &str, cmd: &clap::Command) -> Vec<(OsString, Option<StyledStr>)> {
+     debug!(
+         "complete_subcommand: cmd={:?}, value={:?}",
+         cmd.get_name(),
+@@ -303,44 +277,25 @@ fn complete_subcommand(value: &str, cmd: &clap::Command) -> Vec<CompletionCandid
+ 
+     let mut scs = subcommands(cmd)
+         .into_iter()
+-        .filter(|x| x.content.starts_with(value))
++        .filter(|x| x.0.starts_with(value))
++        .map(|x| (OsString::from(&x.0), x.1))
+         .collect::<Vec<_>>();
+     scs.sort();
+     scs.dedup();
+     scs
+ }
+ 
+-/// Gets all the long options, their visible aliases and flags of a [`clap::Command`] with formatted `--` prefix.
++/// Gets all the long options, their visible aliases and flags of a [`clap::Command`].
+ /// Includes `help` and `version` depending on the [`clap::Command`] settings.
+-fn longs_and_visible_aliases(p: &clap::Command) -> Vec<CompletionCandidate> {
++fn longs_and_visible_aliases(p: &clap::Command) -> Vec<(String, Option<StyledStr>)> {
+     debug!("longs: name={}", p.get_name());
+ 
+     p.get_arguments()
+         .filter_map(|a| {
+             a.get_long_and_visible_aliases().map(|longs| {
+-                longs.into_iter().map(|s| {
+-                    CompletionCandidate::new(format!("--{}", s.to_string()))
+-                        .help(a.get_help().cloned())
+-                        .visible(!a.is_hide_set())
+-                })
+-            })
+-        })
+-        .flatten()
+-        .collect()
+-}
+-
+-/// Gets all the long hidden aliases and flags of a [`clap::Command`].
+-fn hidden_longs_aliases(p: &clap::Command) -> Vec<CompletionCandidate> {
+-    debug!("longs: name={}", p.get_name());
+-
+-    p.get_arguments()
+-        .filter_map(|a| {
+-            a.get_aliases().map(|longs| {
+-                longs.into_iter().map(|s| {
+-                    CompletionCandidate::new(format!("--{}", s.to_string()))
+-                        .help(a.get_help().cloned())
+-                        .visible(false)
+-                })
++                longs
++                    .into_iter()
++                    .map(|s| (s.to_string(), a.get_help().cloned()))
+             })
+         })
+         .flatten()
+@@ -349,18 +304,13 @@ fn hidden_longs_aliases(p: &clap::Command) -> Vec<CompletionCandidate> {
+ 
+ /// Gets all the short options, their visible aliases and flags of a [`clap::Command`].
+ /// Includes `h` and `V` depending on the [`clap::Command`] settings.
+-fn shorts_and_visible_aliases(p: &clap::Command) -> Vec<CompletionCandidate> {
++fn shorts_and_visible_aliases(p: &clap::Command) -> Vec<(char, Option<StyledStr>)> {
+     debug!("shorts: name={}", p.get_name());
+ 
+     p.get_arguments()
+         .filter_map(|a| {
+-            a.get_short_and_visible_aliases().map(|shorts| {
+-                shorts.into_iter().map(|s| {
+-                    CompletionCandidate::new(s.to_string())
+-                        .help(a.get_help().cloned())
+-                        .visible(!a.is_hide_set())
+-                })
+-            })
++            a.get_short_and_visible_aliases()
++                .map(|shorts| shorts.into_iter().map(|s| (s, a.get_help().cloned())))
+         })
+         .flatten()
+         .collect()
+@@ -381,70 +331,14 @@ fn possible_values(a: &clap::Arg) -> Option<Vec<clap::builder::PossibleValue>> {
+ ///
+ /// Subcommand `rustup toolchain install` would be converted to
+ /// `("install", "rustup toolchain install")`.
+-fn subcommands(p: &clap::Command) -> Vec<CompletionCandidate> {
++fn subcommands(p: &clap::Command) -> Vec<(String, Option<StyledStr>)> {
+     debug!("subcommands: name={}", p.get_name());
+     debug!("subcommands: Has subcommands...{:?}", p.has_subcommands());
+     p.get_subcommands()
+         .flat_map(|sc| {
+-            sc.get_name_and_visible_aliases().into_iter().map(|s| {
+-                CompletionCandidate::new(s.to_string())
+-                    .help(sc.get_about().cloned())
+-                    .visible(true)
+-            })
++            sc.get_name_and_visible_aliases()
++                .into_iter()
++                .map(|s| (s.to_string(), sc.get_about().cloned()))
+         })
+         .collect()
+ }
+-
+-/// A completion candidate definition
+-///
+-/// This makes it easier to add more fields to completion candidate,
+-/// rather than using `(OsString, Option<StyledStr>)` or `(String, Option<StyledStr>)` to represent a completion candidate
+-#[derive(Default, Debug, PartialEq, Eq, PartialOrd, Ord)]
+-pub struct CompletionCandidate {
+-    /// Main completion candidate content
+-    content: OsString,
+-
+-    /// Help message with a completion candidate
+-    help: Option<StyledStr>,
+-
+-    /// Whether the completion candidate is visible
+-    visible: bool,
+-}
+-
+-impl CompletionCandidate {
+-    /// Create a new completion candidate
+-    pub fn new(content: impl Into<OsString>) -> Self {
+-        let content = content.into();
+-        Self {
+-            content,
+-            ..Default::default()
+-        }
+-    }
+-
+-    /// Set the help message of the completion candidate
+-    pub fn help(mut self, help: Option<StyledStr>) -> Self {
+-        self.help = help;
+-        self
+-    }
+-
+-    /// Set the visibility of the completion candidate
+-    pub fn visible(mut self, visible: bool) -> Self {
+-        self.visible = visible;
+-        self
+-    }
+-
+-    /// Get the content of the completion candidate
+-    pub fn get_content(&self) -> &OsStr {
+-        &self.content
+-    }
+-
+-    /// Get the help message of the completion candidate
+-    pub fn get_help(&self) -> Option<&StyledStr> {
+-        self.help.as_ref()
+-    }
+-
+-    /// Get the visibility of the completion candidate
+-    pub fn is_visible(&self) -> bool {
+-        self.visible
+-    }
+-}
+diff --git a/clap_complete/src/dynamic/shells/bash.rs b/clap_complete/src/dynamic/shells/bash.rs
+index d01a932b..1308e67a 100644
+--- a/clap_complete/src/dynamic/shells/bash.rs
++++ b/clap_complete/src/dynamic/shells/bash.rs
+@@ -73,11 +73,11 @@ complete -o nospace -o bashdefault -F _clap_complete_NAME BIN
+         let ifs: Option<String> = std::env::var("IFS").ok().and_then(|i| i.parse().ok());
+         let completions = crate::dynamic::complete(cmd, args, index, current_dir)?;
+ 
+-        for (i, candidate) in completions.iter().enumerate() {
++        for (i, (completion, _)) in completions.iter().enumerate() {
+             if i != 0 {
+                 write!(buf, "{}", ifs.as_deref().unwrap_or("\n"))?;
+             }
+-            write!(buf, "{}", candidate.get_content().to_string_lossy())?;
++            write!(buf, "{}", completion.to_string_lossy())?;
+         }
+         Ok(())
+     }
+diff --git a/clap_complete/src/dynamic/shells/elvish.rs b/clap_complete/src/dynamic/shells/elvish.rs
+index 323226c6..57351b17 100644
+--- a/clap_complete/src/dynamic/shells/elvish.rs
++++ b/clap_complete/src/dynamic/shells/elvish.rs
+@@ -47,11 +47,11 @@ set edit:completion:arg-completer[BIN] = { |@words|
+         let ifs: Option<String> = std::env::var("_CLAP_IFS").ok().and_then(|i| i.parse().ok());
+         let completions = crate::dynamic::complete(cmd, args, index, current_dir)?;
+ 
+-        for (i, candidate) in completions.iter().enumerate() {
++        for (i, (completion, _)) in completions.iter().enumerate() {
+             if i != 0 {
+                 write!(buf, "{}", ifs.as_deref().unwrap_or("\n"))?;
+             }
+-            write!(buf, "{}", candidate.get_content().to_string_lossy())?;
++            write!(buf, "{}", completion.to_string_lossy())?;
+         }
+         Ok(())
+     }
+diff --git a/clap_complete/src/dynamic/shells/fish.rs b/clap_complete/src/dynamic/shells/fish.rs
+index 269539e0..cfb95195 100644
+--- a/clap_complete/src/dynamic/shells/fish.rs
++++ b/clap_complete/src/dynamic/shells/fish.rs
+@@ -30,9 +30,9 @@ impl crate::dynamic::Completer for Fish {
+         let index = args.len() - 1;
+         let completions = crate::dynamic::complete(cmd, args, index, current_dir)?;
+ 
+-        for candidate in completions {
+-            write!(buf, "{}", candidate.get_content().to_string_lossy())?;
+-            if let Some(help) = candidate.get_help() {
++        for (completion, help) in completions {
++            write!(buf, "{}", completion.to_string_lossy())?;
++            if let Some(help) = help {
+                 write!(
+                     buf,
+                     "\t{}",
+diff --git a/clap_complete/src/dynamic/shells/zsh.rs b/clap_complete/src/dynamic/shells/zsh.rs
+index 4326cd16..d6e699f7 100644
+--- a/clap_complete/src/dynamic/shells/zsh.rs
++++ b/clap_complete/src/dynamic/shells/zsh.rs
+@@ -54,11 +54,11 @@ compdef _clap_dynamic_completer BIN"#
+         }
+         let completions = crate::dynamic::complete(cmd, args, index, current_dir)?;
+ 
+-        for (i, candidate) in completions.iter().enumerate() {
++        for (i, (completion, _)) in completions.iter().enumerate() {
+             if i != 0 {
+                 write!(buf, "{}", ifs.as_deref().unwrap_or("\n"))?;
+             }
+-            write!(buf, "{}", candidate.get_content().to_string_lossy())?;
++            write!(buf, "{}", completion.to_string_lossy())?;
+         }
+         Ok(())
+     }
+diff --git a/clap_complete/tests/testsuite/dynamic.rs b/clap_complete/tests/testsuite/dynamic.rs
+index df8bac01..fa482782 100644
+--- a/clap_complete/tests/testsuite/dynamic.rs
++++ b/clap_complete/tests/testsuite/dynamic.rs
+@@ -23,35 +23,11 @@ fn suggest_subcommand_subset() {
+         .subcommand(Command::new("hello-moon"))
+         .subcommand(Command::new("goodbye-world"));
+ 
+-    assert_data_eq!(
+-        complete!(cmd, "he"),
+-        snapbox::str![[r#"
++    assert_data_eq!(complete!(cmd, "he"), snapbox::str![[r#"
+ hello-moon
+ hello-world
+ help	Print this message or the help of the given subcommand(s)
+-"#]],
+-    );
+-}
+-
+-#[test]
+-fn suggest_hidden_long_flags() {
+-    let mut cmd = Command::new("exhaustive")
+-        .arg(clap::Arg::new("hello-world-visible").long("hello-world-visible"))
+-        .arg(
+-            clap::Arg::new("hello-world-hidden")
+-                .long("hello-world-hidden")
+-                .hide(true),
+-        );
+-
+-    assert_data_eq!(
+-        complete!(cmd, "--hello-world"),
+-        snapbox::str!["--hello-world-visible"]
+-    );
+-
+-    assert_data_eq!(
+-        complete!(cmd, "--hello-world-h"),
+-        snapbox::str!["--hello-world-hidden"]
+-    )
++"#]],);
+ }
+ 
+ #[test]
+@@ -84,51 +60,6 @@ hello-world-foo"
+     );
+ }
+ 
+-#[test]
+-fn suggest_hidden_long_flag_aliases() {
+-    let mut cmd = Command::new("exhaustive")
+-        .arg(
+-            clap::Arg::new("test_visible")
+-                .long("test_visible")
+-                .visible_alias("test_visible-alias_visible")
+-                .alias("test_visible-alias_hidden"),
+-        )
+-        .arg(
+-            clap::Arg::new("test_hidden")
+-                .long("test_hidden")
+-                .visible_alias("test_hidden-alias_visible")
+-                .alias("test_hidden-alias_hidden")
+-                .hide(true),
+-        );
+-
+-    assert_data_eq!(
+-        complete!(cmd, "--test"),
+-        snapbox::str![
+-            "--test_visible
+---test_visible-alias_visible"
+-        ]
+-    );
+-
+-    assert_data_eq!(
+-        complete!(cmd, "--test_h"),
+-        snapbox::str![
+-            "--test_hidden
+---test_hidden-alias_visible
+---test_hidden-alias_hidden"
+-        ]
+-    );
+-
+-    assert_data_eq!(
+-        complete!(cmd, "--test_visible-alias_h"),
+-        snapbox::str!["--test_visible-alias_hidden"]
+-    );
+-
+-    assert_data_eq!(
+-        complete!(cmd, "--test_hidden-alias_h"),
+-        snapbox::str!["--test_hidden-alias_hidden"]
+-    );
+-}
+-
+ #[test]
+ fn suggest_long_flag_subset() {
+     let mut cmd = Command::new("exhaustive")
+@@ -148,14 +79,11 @@ fn suggest_long_flag_subset() {
+                 .action(clap::ArgAction::Count),
+         );
+ 
+-    assert_data_eq!(
+-        complete!(cmd, "--he"),
+-        snapbox::str![[r#"
++    assert_data_eq!(complete!(cmd, "--he"), snapbox::str![[r#"
+ --hello-world
+ --hello-moon
+ --help	Print help
+-"#]],
+-    );
++"#]],);
+ }
+ 
+ #[test]
+@@ -167,13 +95,10 @@ fn suggest_possible_value_subset() {
+         "goodbye-world".into(),
+     ]));
+ 
+-    assert_data_eq!(
+-        complete!(cmd, "hello"),
+-        snapbox::str![[r#"
++    assert_data_eq!(complete!(cmd, "hello"), snapbox::str![[r#"
+ hello-world	Say hello to the world
+ hello-moon
+-"#]],
+-    );
++"#]],);
+ }
+ 
+ #[test]
+@@ -195,15 +120,12 @@ fn suggest_additional_short_flags() {
+                 .action(clap::ArgAction::Count),
+         );
+ 
+-    assert_data_eq!(
+-        complete!(cmd, "-a"),
+-        snapbox::str![[r#"
++    assert_data_eq!(complete!(cmd, "-a"), snapbox::str![[r#"
+ -aa
+ -ab
+ -ac
+ -ah	Print help
+-"#]],
+-    );
++"#]],);
+ }
+ 
+ #[test]
+@@ -216,16 +138,13 @@ fn suggest_subcommand_positional() {
+         ]),
+     ));
+ 
+-    assert_data_eq!(
+-        complete!(cmd, "hello-world [TAB]"),
+-        snapbox::str![[r#"
++    assert_data_eq!(complete!(cmd, "hello-world [TAB]"), snapbox::str![[r#"
+ --help	Print help (see more with '--help')
+ -h	Print help (see more with '--help')
+ hello-world	Say hello to the world
+ hello-moon
+ goodbye-world
+-"#]],
+-    );
++"#]],);
+ }
+ 
+ fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
+@@ -252,9 +171,9 @@ fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>
+     clap_complete::dynamic::complete(cmd, args, arg_index, current_dir)
+         .unwrap()
+         .into_iter()
+-        .map(|candidate| {
+-            let compl = candidate.get_content().to_str().unwrap();
+-            if let Some(help) = candidate.get_help() {
++        .map(|(compl, help)| {
++            let compl = compl.to_str().unwrap();
++            if let Some(help) = help {
+                 format!("{compl}\t{help}")
+             } else {
+                 compl.to_owned()

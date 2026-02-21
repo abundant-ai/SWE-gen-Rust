@@ -1,0 +1,202 @@
+diff --git a/serde_derive_internals/src/ast.rs b/serde_derive_internals/src/ast.rs
+index dce1acc1..818d301b 100644
+--- a/serde_derive_internals/src/ast.rs
++++ b/serde_derive_internals/src/ast.rs
+@@ -51,7 +51,7 @@ impl<'a> Container<'a> {
+         let mut body = match item.body {
+             syn::Body::Enum(ref variants) => Body::Enum(enum_from_ast(cx, variants)),
+             syn::Body::Struct(ref variant_data) => {
+-                let (style, fields) = struct_from_ast(cx, variant_data, None);
++                let (style, fields) = struct_from_ast(cx, variant_data);
+                 Body::Struct(style, fields)
+             }
+         };
+@@ -103,11 +103,10 @@ fn enum_from_ast<'a>(cx: &Ctxt, variants: &'a [syn::Variant]) -> Vec<Variant<'a>
+         .iter()
+         .map(
+             |variant| {
+-                let attrs = attr::Variant::from_ast(cx, variant);
+-                let (style, fields) = struct_from_ast(cx, &variant.data, Some(&attrs));
++                let (style, fields) = struct_from_ast(cx, &variant.data);
+                 Variant {
+                     ident: variant.ident.clone(),
+-                    attrs: attrs,
++                    attrs: attr::Variant::from_ast(cx, variant),
+                     style: style,
+                     fields: fields,
+                 }
+@@ -116,18 +115,18 @@ fn enum_from_ast<'a>(cx: &Ctxt, variants: &'a [syn::Variant]) -> Vec<Variant<'a>
+         .collect()
+ }
+ 
+-fn struct_from_ast<'a>(cx: &Ctxt, data: &'a syn::VariantData, attrs: Option<&attr::Variant>) -> (Style, Vec<Field<'a>>) {
++fn struct_from_ast<'a>(cx: &Ctxt, data: &'a syn::VariantData) -> (Style, Vec<Field<'a>>) {
+     match *data {
+-        syn::VariantData::Struct(ref fields) => (Style::Struct, fields_from_ast(cx, fields, attrs)),
++        syn::VariantData::Struct(ref fields) => (Style::Struct, fields_from_ast(cx, fields)),
+         syn::VariantData::Tuple(ref fields) if fields.len() == 1 => {
+-            (Style::Newtype, fields_from_ast(cx, fields, attrs))
++            (Style::Newtype, fields_from_ast(cx, fields))
+         }
+-        syn::VariantData::Tuple(ref fields) => (Style::Tuple, fields_from_ast(cx, fields, attrs)),
++        syn::VariantData::Tuple(ref fields) => (Style::Tuple, fields_from_ast(cx, fields)),
+         syn::VariantData::Unit => (Style::Unit, Vec::new()),
+     }
+ }
+ 
+-fn fields_from_ast<'a>(cx: &Ctxt, fields: &'a [syn::Field], attrs: Option<&attr::Variant>) -> Vec<Field<'a>> {
++fn fields_from_ast<'a>(cx: &Ctxt, fields: &'a [syn::Field]) -> Vec<Field<'a>> {
+     fields
+         .iter()
+         .enumerate()
+@@ -135,7 +134,7 @@ fn fields_from_ast<'a>(cx: &Ctxt, fields: &'a [syn::Field], attrs: Option<&attr:
+             |(i, field)| {
+                 Field {
+                     ident: field.ident.clone(),
+-                    attrs: attr::Field::from_ast(cx, i, field, attrs),
++                    attrs: attr::Field::from_ast(cx, i, field),
+                     ty: &field.ty,
+                 }
+             },
+diff --git a/serde_derive_internals/src/attr.rs b/serde_derive_internals/src/attr.rs
+index 7baeb59b..454b8b59 100644
+--- a/serde_derive_internals/src/attr.rs
++++ b/serde_derive_internals/src/attr.rs
+@@ -512,7 +512,6 @@ pub struct Variant {
+     other: bool,
+     serialize_with: Option<syn::Path>,
+     deserialize_with: Option<syn::Path>,
+-    borrow: Option<syn::MetaItem>,
+ }
+ 
+ impl Variant {
+@@ -525,7 +524,6 @@ impl Variant {
+         let mut other = BoolAttr::none(cx, "other");
+         let mut serialize_with = Attr::none(cx, "serialize_with");
+         let mut deserialize_with = Attr::none(cx, "deserialize_with");
+-        let mut borrow = Attr::none(cx, "borrow");
+ 
+         for meta_items in variant.attrs.iter().filter_map(get_serde_meta_items) {
+             for meta_item in meta_items {
+@@ -601,18 +599,6 @@ impl Variant {
+                         }
+                     }
+ 
+-                    // Defer `#[serde(borrow)]` and `#[serde(borrow = "'a + 'b")]`
+-                    MetaItem(ref mi) if mi.name() == "borrow" => {
+-                        match variant.data {
+-                            syn::VariantData::Tuple(ref fields) if fields.len() == 1 => {
+-                                borrow.set(mi.clone());
+-                            }
+-                            _ => {
+-                                cx.error("#[serde(borrow)] may only be used on newtype variants");
+-                            }
+-                        }
+-                    }
+-
+                     MetaItem(ref meta_item) => {
+                         cx.error(format!("unknown serde variant attribute `{}`", meta_item.name()));
+                     }
+@@ -641,7 +627,6 @@ impl Variant {
+             other: other.get(),
+             serialize_with: serialize_with.get(),
+             deserialize_with: deserialize_with.get(),
+-            borrow: borrow.get(),
+         }
+     }
+ 
+@@ -714,7 +699,7 @@ pub enum Default {
+ 
+ impl Field {
+     /// Extract out the `#[serde(...)]` attributes from a struct field.
+-    pub fn from_ast(cx: &Ctxt, index: usize, field: &syn::Field, attrs: Option<&Variant>) -> Self {
++    pub fn from_ast(cx: &Ctxt, index: usize, field: &syn::Field) -> Self {
+         let mut ser_name = Attr::none(cx, "rename");
+         let mut de_name = Attr::none(cx, "rename");
+         let mut skip_serializing = BoolAttr::none(cx, "skip_serializing");
+@@ -733,13 +718,7 @@ impl Field {
+             None => index.to_string(),
+         };
+ 
+-        let variant_borrow = attrs
+-            .map(|variant| &variant.borrow)
+-            .unwrap_or(&None)
+-            .as_ref()
+-            .map(|borrow| vec![MetaItem(borrow.clone())]);
+-
+-        for meta_items in field.attrs.iter().filter_map(get_serde_meta_items).chain(variant_borrow) {
++        for meta_items in field.attrs.iter().filter_map(get_serde_meta_items) {
+             for meta_item in meta_items {
+                 match meta_item {
+                     // Parse `#[serde(rename = "foo")]`
+diff --git a/test_suite/tests/compile-fail/borrow/duplicate_variant.rs b/test_suite/tests/compile-fail/borrow/duplicate_variant.rs
+deleted file mode 100644
+index 5cc3ad3b..00000000
+--- a/test_suite/tests/compile-fail/borrow/duplicate_variant.rs
++++ /dev/null
+@@ -1,21 +0,0 @@
+-// Copyright 2017 Serde Developers
+-//
+-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+-// option. This file may not be copied, modified, or distributed
+-// except according to those terms.
+-
+-#[macro_use]
+-extern crate serde_derive;
+-
+-#[derive(Deserialize)]
+-struct Str<'a>(&'a str);
+-
+-#[derive(Deserialize)] //~ ERROR: proc-macro derive panicked
+-enum Test<'a> {
+-    #[serde(borrow)] //~^^ HELP: duplicate serde attribute `borrow`
+-    S(#[serde(borrow)] Str<'a>)
+-}
+-
+-fn main() {}
+diff --git a/test_suite/tests/compile-fail/borrow/struct_variant.rs b/test_suite/tests/compile-fail/borrow/struct_variant.rs
+deleted file mode 100644
+index 5bab0717..00000000
+--- a/test_suite/tests/compile-fail/borrow/struct_variant.rs
++++ /dev/null
+@@ -1,21 +0,0 @@
+-// Copyright 2017 Serde Developers
+-//
+-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+-// option. This file may not be copied, modified, or distributed
+-// except according to those terms.
+-
+-#[macro_use]
+-extern crate serde_derive;
+-
+-#[derive(Deserialize)]
+-struct Str<'a>(&'a str);
+-
+-#[derive(Deserialize)] //~ ERROR: proc-macro derive panicked
+-enum Test<'a> {
+-    #[serde(borrow)] //~^^ HELP: #[serde(borrow)] may only be used on newtype variants
+-    S { s: Str<'a> }
+-}
+-
+-fn main() {}
+diff --git a/test_suite/tests/test_gen.rs b/test_suite/tests/test_gen.rs
+index 515c2f82..50cd13b7 100644
+--- a/test_suite/tests/test_gen.rs
++++ b/test_suite/tests/test_gen.rs
+@@ -357,12 +357,6 @@ fn test_gen() {
+         s: Str<'a>,
+     }
+ 
+-    #[derive(Serialize, Deserialize)]
+-    enum BorrowVariant<'a> {
+-        #[serde(borrow, with = "StrDef")]
+-        S(Str<'a>),
+-    }
+-
+     mod vis {
+         pub struct S;
+ 

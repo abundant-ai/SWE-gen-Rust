@@ -1,0 +1,964 @@
+diff --git a/serde_derive/src/de.rs b/serde_derive/src/de.rs
+index ef7a2dee..ff7bc42f 100644
+--- a/serde_derive/src/de.rs
++++ b/serde_derive/src/de.rs
+@@ -10,7 +10,6 @@ use fragment::{Expr, Fragment, Match, Stmts};
+ use internals::ast::{Container, Data, Field, Style, Variant};
+ use internals::{attr, replace_receiver, ungroup, Ctxt, Derive};
+ use pretend;
+-use this;
+ 
+ use std::collections::BTreeSet;
+ use std::ptr;
+@@ -112,13 +111,9 @@ struct Parameters {
+     local: syn::Ident,
+ 
+     /// Path to the type the impl is for. Either a single `Ident` for local
+-    /// types (does not include generic parameters) or `some::remote::Path` for
+-    /// remote types.
+-    this_type: syn::Path,
+-
+-    /// Same as `this_type` but using `::<T>` for generic parameters for use in
+-    /// expression position.
+-    this_value: syn::Path,
++    /// types or `some::remote::Ident` for remote types. Does not include
++    /// generic parameters.
++    this: syn::Path,
+ 
+     /// Generics including any explicit and inferred bounds for the impl.
+     generics: syn::Generics,
+@@ -138,8 +133,10 @@ struct Parameters {
+ impl Parameters {
+     fn new(cont: &Container) -> Self {
+         let local = cont.ident.clone();
+-        let this_type = this::this_type(cont);
+-        let this_value = this::this_value(cont);
++        let this = match cont.attrs.remote() {
++            Some(remote) => remote.clone(),
++            None => cont.ident.clone().into(),
++        };
+         let borrowed = borrowed_lifetimes(cont);
+         let generics = build_generics(cont, &borrowed);
+         let has_getter = cont.data.has_getter();
+@@ -147,8 +144,7 @@ impl Parameters {
+ 
+         Parameters {
+             local,
+-            this_type,
+-            this_value,
++            this,
+             generics,
+             borrowed,
+             has_getter,
+@@ -159,7 +155,7 @@ impl Parameters {
+     /// Type name to use in error messages and `&'static str` arguments to
+     /// various Deserializer methods.
+     fn type_name(&self) -> String {
+-        self.this_type.segments.last().unwrap().ident.to_string()
++        self.this.segments.last().unwrap().ident.to_string()
+     }
+ }
+ 
+@@ -362,7 +358,7 @@ fn deserialize_transparent(cont: &Container, params: &Parameters) -> Fragment {
+         Data::Enum(_) => unreachable!(),
+     };
+ 
+-    let this_value = &params.this_value;
++    let this = &params.this;
+     let transparent_field = fields.iter().find(|f| f.attrs.transparent()).unwrap();
+ 
+     let path = match transparent_field.attrs.deserialize_with() {
+@@ -390,7 +386,7 @@ fn deserialize_transparent(cont: &Container, params: &Parameters) -> Fragment {
+     quote_block! {
+         _serde::__private::Result::map(
+             #path(__deserializer),
+-            |__transparent| #this_value { #(#assign),* })
++            |__transparent| #this { #(#assign),* })
+     }
+ }
+ 
+@@ -411,8 +407,7 @@ fn deserialize_try_from(type_try_from: &syn::Type) -> Fragment {
+ }
+ 
+ fn deserialize_unit_struct(params: &Parameters, cattrs: &attr::Container) -> Fragment {
+-    let this_type = &params.this_type;
+-    let this_value = &params.this_value;
++    let this = &params.this;
+     let type_name = cattrs.name().deserialize_name();
+ 
+     let expecting = format!("unit struct {}", params.type_name());
+@@ -422,7 +417,7 @@ fn deserialize_unit_struct(params: &Parameters, cattrs: &attr::Container) -> Fra
+         struct __Visitor;
+ 
+         impl<'de> _serde::de::Visitor<'de> for __Visitor {
+-            type Value = #this_type;
++            type Value = #this;
+ 
+             fn expecting(&self, __formatter: &mut _serde::__private::Formatter) -> _serde::__private::fmt::Result {
+                 _serde::__private::Formatter::write_str(__formatter, #expecting)
+@@ -433,7 +428,7 @@ fn deserialize_unit_struct(params: &Parameters, cattrs: &attr::Container) -> Fra
+             where
+                 __E: _serde::de::Error,
+             {
+-                _serde::__private::Ok(#this_value)
++                _serde::__private::Ok(#this)
+             }
+         }
+ 
+@@ -448,8 +443,7 @@ fn deserialize_tuple(
+     cattrs: &attr::Container,
+     deserializer: Option<TokenStream>,
+ ) -> Fragment {
+-    let this_type = &params.this_type;
+-    let this_value = &params.this_value;
++    let this = &params.this;
+     let (de_impl_generics, de_ty_generics, ty_generics, where_clause) =
+         split_with_de_lifetime(params);
+     let delife = params.borrowed.de_lifetime();
+@@ -463,7 +457,7 @@ fn deserialize_tuple(
+         let local = &params.local;
+         quote!(#local)
+     } else {
+-        quote!(#this_value)
++        quote!(#this)
+     };
+ 
+     let is_enum = variant_ident.is_some();
+@@ -491,7 +485,7 @@ fn deserialize_tuple(
+ 
+     let visitor_expr = quote! {
+         __Visitor {
+-            marker: _serde::__private::PhantomData::<#this_type #ty_generics>,
++            marker: _serde::__private::PhantomData::<#this #ty_generics>,
+             lifetime: _serde::__private::PhantomData,
+         }
+     };
+@@ -516,12 +510,12 @@ fn deserialize_tuple(
+ 
+     quote_block! {
+         struct __Visitor #de_impl_generics #where_clause {
+-            marker: _serde::__private::PhantomData<#this_type #ty_generics>,
++            marker: _serde::__private::PhantomData<#this #ty_generics>,
+             lifetime: _serde::__private::PhantomData<&#delife ()>,
+         }
+ 
+         impl #de_impl_generics _serde::de::Visitor<#delife> for __Visitor #de_ty_generics #where_clause {
+-            type Value = #this_type #ty_generics;
++            type Value = #this #ty_generics;
+ 
+             fn expecting(&self, __formatter: &mut _serde::__private::Formatter) -> _serde::__private::fmt::Result {
+                 _serde::__private::Formatter::write_str(__formatter, #expecting)
+@@ -550,7 +544,7 @@ fn deserialize_tuple_in_place(
+     cattrs: &attr::Container,
+     deserializer: Option<TokenStream>,
+ ) -> Fragment {
+-    let this_type = &params.this_type;
++    let this = &params.this;
+     let (de_impl_generics, de_ty_generics, ty_generics, where_clause) =
+         split_with_de_lifetime(params);
+     let delife = params.borrowed.de_lifetime();
+@@ -606,7 +600,7 @@ fn deserialize_tuple_in_place(
+ 
+     quote_block! {
+         struct __Visitor #in_place_impl_generics #where_clause {
+-            place: &#place_life mut #this_type #ty_generics,
++            place: &#place_life mut #this #ty_generics,
+             lifetime: _serde::__private::PhantomData<&#delife ()>,
+         }
+ 
+@@ -711,9 +705,9 @@ fn deserialize_seq(
+     };
+ 
+     if params.has_getter {
+-        let this_type = &params.this_type;
++        let this = &params.this;
+         result = quote! {
+-            _serde::__private::Into::<#this_type>::into(#result)
++            _serde::__private::Into::<#this>::into(#result)
+         };
+     }
+ 
+@@ -807,14 +801,14 @@ fn deserialize_seq_in_place(
+         }
+     });
+ 
+-    let this_type = &params.this_type;
++    let this = &params.this;
+     let (_, ty_generics, _) = params.generics.split_for_impl();
+     let let_default = match cattrs.default() {
+         attr::Default::Default => Some(quote!(
+-            let __default: #this_type #ty_generics = _serde::__private::Default::default();
++            let __default: #this #ty_generics  = _serde::__private::Default::default();
+         )),
+         attr::Default::Path(path) => Some(quote!(
+-            let __default: #this_type #ty_generics = #path();
++            let __default: #this #ty_generics  = #path();
+         )),
+         attr::Default::None => {
+             // We don't need the default value, to prevent an unused variable warning
+@@ -855,9 +849,9 @@ fn deserialize_newtype_struct(
+ 
+     let mut result = quote!(#type_path(__field0));
+     if params.has_getter {
+-        let this_type = &params.this_type;
++        let this = &params.this;
+         result = quote! {
+-            _serde::__private::Into::<#this_type>::into(#result)
++            _serde::__private::Into::<#this>::into(#result)
+         };
+     }
+ 
+@@ -907,8 +901,7 @@ fn deserialize_struct(
+ ) -> Fragment {
+     let is_enum = variant_ident.is_some();
+ 
+-    let this_type = &params.this_type;
+-    let this_value = &params.this_value;
++    let this = &params.this;
+     let (de_impl_generics, de_ty_generics, ty_generics, where_clause) =
+         split_with_de_lifetime(params);
+     let delife = params.borrowed.de_lifetime();
+@@ -920,7 +913,7 @@ fn deserialize_struct(
+         let local = &params.local;
+         quote!(#local)
+     } else {
+-        quote!(#this_value)
++        quote!(#this)
+     };
+ 
+     let type_path = match variant_ident {
+@@ -948,7 +941,7 @@ fn deserialize_struct(
+ 
+     let visitor_expr = quote! {
+         __Visitor {
+-            marker: _serde::__private::PhantomData::<#this_type #ty_generics>,
++            marker: _serde::__private::PhantomData::<#this #ty_generics>,
+             lifetime: _serde::__private::PhantomData,
+         }
+     };
+@@ -1000,7 +993,7 @@ fn deserialize_struct(
+     let visitor_seed = if is_enum && cattrs.has_flatten() {
+         Some(quote! {
+             impl #de_impl_generics _serde::de::DeserializeSeed<#delife> for __Visitor #de_ty_generics #where_clause {
+-                type Value = #this_type #ty_generics;
++                type Value = #this #ty_generics;
+ 
+                 fn deserialize<__D>(self, __deserializer: __D) -> _serde::__private::Result<Self::Value, __D::Error>
+                 where
+@@ -1018,12 +1011,12 @@ fn deserialize_struct(
+         #field_visitor
+ 
+         struct __Visitor #de_impl_generics #where_clause {
+-            marker: _serde::__private::PhantomData<#this_type #ty_generics>,
++            marker: _serde::__private::PhantomData<#this #ty_generics>,
+             lifetime: _serde::__private::PhantomData<&#delife ()>,
+         }
+ 
+         impl #de_impl_generics _serde::de::Visitor<#delife> for __Visitor #de_ty_generics #where_clause {
+-            type Value = #this_type #ty_generics;
++            type Value = #this #ty_generics;
+ 
+             fn expecting(&self, __formatter: &mut _serde::__private::Formatter) -> _serde::__private::fmt::Result {
+                 _serde::__private::Formatter::write_str(__formatter, #expecting)
+@@ -1064,7 +1057,7 @@ fn deserialize_struct_in_place(
+         return None;
+     }
+ 
+-    let this_type = &params.this_type;
++    let this = &params.this;
+     let (de_impl_generics, de_ty_generics, ty_generics, where_clause) =
+         split_with_de_lifetime(params);
+     let delife = params.borrowed.de_lifetime();
+@@ -1130,7 +1123,7 @@ fn deserialize_struct_in_place(
+         #field_visitor
+ 
+         struct __Visitor #in_place_impl_generics #where_clause {
+-            place: &#place_life mut #this_type #ty_generics,
++            place: &#place_life mut #this #ty_generics,
+             lifetime: _serde::__private::PhantomData<&#delife ()>,
+         }
+ 
+@@ -1219,7 +1212,7 @@ fn deserialize_externally_tagged_enum(
+     variants: &[Variant],
+     cattrs: &attr::Container,
+ ) -> Fragment {
+-    let this_type = &params.this_type;
++    let this = &params.this;
+     let (de_impl_generics, de_ty_generics, ty_generics, where_clause) =
+         split_with_de_lifetime(params);
+     let delife = params.borrowed.de_lifetime();
+@@ -1273,12 +1266,12 @@ fn deserialize_externally_tagged_enum(
+         #variant_visitor
+ 
+         struct __Visitor #de_impl_generics #where_clause {
+-            marker: _serde::__private::PhantomData<#this_type #ty_generics>,
++            marker: _serde::__private::PhantomData<#this #ty_generics>,
+             lifetime: _serde::__private::PhantomData<&#delife ()>,
+         }
+ 
+         impl #de_impl_generics _serde::de::Visitor<#delife> for __Visitor #de_ty_generics #where_clause {
+-            type Value = #this_type #ty_generics;
++            type Value = #this #ty_generics;
+ 
+             fn expecting(&self, __formatter: &mut _serde::__private::Formatter) -> _serde::__private::fmt::Result {
+                 _serde::__private::Formatter::write_str(__formatter, #expecting)
+@@ -1299,7 +1292,7 @@ fn deserialize_externally_tagged_enum(
+             #type_name,
+             VARIANTS,
+             __Visitor {
+-                marker: _serde::__private::PhantomData::<#this_type #ty_generics>,
++                marker: _serde::__private::PhantomData::<#this #ty_generics>,
+                 lifetime: _serde::__private::PhantomData,
+             },
+         )
+@@ -1361,8 +1354,7 @@ fn deserialize_adjacently_tagged_enum(
+     tag: &str,
+     content: &str,
+ ) -> Fragment {
+-    let this_type = &params.this_type;
+-    let this_value = &params.this_value;
++    let this = &params.this;
+     let (de_impl_generics, de_ty_generics, ty_generics, where_clause) =
+         split_with_de_lifetime(params);
+     let delife = params.borrowed.de_lifetime();
+@@ -1423,13 +1415,13 @@ fn deserialize_adjacently_tagged_enum(
+ 
+             let arm = match variant.style {
+                 Style::Unit => quote! {
+-                    _serde::__private::Ok(#this_value::#variant_ident)
++                    _serde::__private::Ok(#this::#variant_ident)
+                 },
+                 Style::Newtype if variant.attrs.deserialize_with().is_none() => {
+                     let span = variant.original.span();
+                     let func = quote_spanned!(span=> _serde::__private::de::missing_field);
+                     quote! {
+-                        #func(#content).map(#this_value::#variant_ident)
++                        #func(#content).map(#this::#variant_ident)
+                     }
+                 }
+                 _ => {
+@@ -1521,12 +1513,12 @@ fn deserialize_adjacently_tagged_enum(
+ 
+         struct __Seed #de_impl_generics #where_clause {
+             field: __Field,
+-            marker: _serde::__private::PhantomData<#this_type #ty_generics>,
++            marker: _serde::__private::PhantomData<#this #ty_generics>,
+             lifetime: _serde::__private::PhantomData<&#delife ()>,
+         }
+ 
+         impl #de_impl_generics _serde::de::DeserializeSeed<#delife> for __Seed #de_ty_generics #where_clause {
+-            type Value = #this_type #ty_generics;
++            type Value = #this #ty_generics;
+ 
+             fn deserialize<__D>(self, __deserializer: __D) -> _serde::__private::Result<Self::Value, __D::Error>
+             where
+@@ -1539,12 +1531,12 @@ fn deserialize_adjacently_tagged_enum(
+         }
+ 
+         struct __Visitor #de_impl_generics #where_clause {
+-            marker: _serde::__private::PhantomData<#this_type #ty_generics>,
++            marker: _serde::__private::PhantomData<#this #ty_generics>,
+             lifetime: _serde::__private::PhantomData<&#delife ()>,
+         }
+ 
+         impl #de_impl_generics _serde::de::Visitor<#delife> for __Visitor #de_ty_generics #where_clause {
+-            type Value = #this_type #ty_generics;
++            type Value = #this #ty_generics;
+ 
+             fn expecting(&self, __formatter: &mut _serde::__private::Formatter) -> _serde::__private::fmt::Result {
+                 _serde::__private::Formatter::write_str(__formatter, #expecting)
+@@ -1646,7 +1638,7 @@ fn deserialize_adjacently_tagged_enum(
+             #type_name,
+             FIELDS,
+             __Visitor {
+-                marker: _serde::__private::PhantomData::<#this_type #ty_generics>,
++                marker: _serde::__private::PhantomData::<#this #ty_generics>,
+                 lifetime: _serde::__private::PhantomData,
+             },
+         )
+@@ -1715,10 +1707,10 @@ fn deserialize_externally_tagged_variant(
+ 
+     match variant.style {
+         Style::Unit => {
+-            let this_value = &params.this_value;
++            let this = &params.this;
+             quote_block! {
+                 try!(_serde::de::VariantAccess::unit_variant(__variant));
+-                _serde::__private::Ok(#this_value::#variant_ident)
++                _serde::__private::Ok(#this::#variant_ident)
+             }
+         }
+         Style::Newtype => deserialize_externally_tagged_newtype_variant(
+@@ -1757,7 +1749,7 @@ fn deserialize_internally_tagged_variant(
+ 
+     match effective_style(variant) {
+         Style::Unit => {
+-            let this_value = &params.this_value;
++            let this = &params.this;
+             let type_name = params.type_name();
+             let variant_name = variant.ident.to_string();
+             let default = variant.fields.get(0).map(|field| {
+@@ -1766,7 +1758,7 @@ fn deserialize_internally_tagged_variant(
+             });
+             quote_block! {
+                 try!(_serde::Deserializer::deserialize_any(#deserializer, _serde::__private::de::InternallyTaggedUnitVisitor::new(#type_name, #variant_name)));
+-                _serde::__private::Ok(#this_value::#variant_ident #default)
++                _serde::__private::Ok(#this::#variant_ident #default)
+             }
+         }
+         Style::Newtype => deserialize_untagged_newtype_variant(
+@@ -1804,7 +1796,7 @@ fn deserialize_untagged_variant(
+ 
+     match effective_style(variant) {
+         Style::Unit => {
+-            let this_value = &params.this_value;
++            let this = &params.this;
+             let type_name = params.type_name();
+             let variant_name = variant.ident.to_string();
+             let default = variant.fields.get(0).map(|field| {
+@@ -1816,7 +1808,7 @@ fn deserialize_untagged_variant(
+                     #deserializer,
+                     _serde::__private::de::UntaggedUnitVisitor::new(#type_name, #variant_name)
+                 ) {
+-                    _serde::__private::Ok(()) => _serde::__private::Ok(#this_value::#variant_ident #default),
++                    _serde::__private::Ok(()) => _serde::__private::Ok(#this::#variant_ident #default),
+                     _serde::__private::Err(__err) => _serde::__private::Err(__err),
+                 }
+             }
+@@ -1851,13 +1843,14 @@ fn deserialize_externally_tagged_newtype_variant(
+     field: &Field,
+     cattrs: &attr::Container,
+ ) -> Fragment {
+-    let this_value = &params.this_value;
++    let this = &params.this;
+ 
+     if field.attrs.skip_deserializing() {
++        let this = &params.this;
+         let default = Expr(expr_is_missing(field, cattrs));
+         return quote_block! {
+             try!(_serde::de::VariantAccess::unit_variant(__variant));
+-            _serde::__private::Ok(#this_value::#variant_ident(#default))
++            _serde::__private::Ok(#this::#variant_ident(#default))
+         };
+     }
+ 
+@@ -1868,7 +1861,7 @@ fn deserialize_externally_tagged_newtype_variant(
+             let func =
+                 quote_spanned!(span=> _serde::de::VariantAccess::newtype_variant::<#field_ty>);
+             quote_expr! {
+-                _serde::__private::Result::map(#func(__variant), #this_value::#variant_ident)
++                _serde::__private::Result::map(#func(__variant), #this::#variant_ident)
+             }
+         }
+         Some(path) => {
+@@ -1877,7 +1870,7 @@ fn deserialize_externally_tagged_newtype_variant(
+                 #wrapper
+                 _serde::__private::Result::map(
+                     _serde::de::VariantAccess::newtype_variant::<#wrapper_ty>(__variant),
+-                    |__wrapper| #this_value::#variant_ident(__wrapper.value))
++                    |__wrapper| #this::#variant_ident(__wrapper.value))
+             }
+         }
+     }
+@@ -1889,20 +1882,20 @@ fn deserialize_untagged_newtype_variant(
+     field: &Field,
+     deserializer: &TokenStream,
+ ) -> Fragment {
+-    let this_value = &params.this_value;
++    let this = &params.this;
+     let field_ty = field.ty;
+     match field.attrs.deserialize_with() {
+         None => {
+             let span = field.original.span();
+             let func = quote_spanned!(span=> <#field_ty as _serde::Deserialize>::deserialize);
+             quote_expr! {
+-                _serde::__private::Result::map(#func(#deserializer), #this_value::#variant_ident)
++                _serde::__private::Result::map(#func(#deserializer), #this::#variant_ident)
+             }
+         }
+         Some(path) => {
+             quote_block! {
+                 let __value: _serde::__private::Result<#field_ty, _> = #path(#deserializer);
+-                _serde::__private::Result::map(__value, #this_value::#variant_ident)
++                _serde::__private::Result::map(__value, #this::#variant_ident)
+             }
+         }
+     }
+@@ -1914,7 +1907,7 @@ fn deserialize_generated_identifier(
+     is_variant: bool,
+     other_idx: Option<usize>,
+ ) -> Fragment {
+-    let this_value = quote!(__Field);
++    let this = quote!(__Field);
+     let field_idents: &Vec<_> = &fields.iter().map(|(_, ident, _)| ident).collect();
+ 
+     let (ignore_variant, fallthrough) = if !is_variant && cattrs.has_flatten() {
+@@ -1934,7 +1927,7 @@ fn deserialize_generated_identifier(
+     };
+ 
+     let visitor_impl = Stmts(deserialize_identifier(
+-        &this_value,
++        &this,
+         fields,
+         is_variant,
+         fallthrough,
+@@ -1989,8 +1982,8 @@ fn deserialize_custom_identifier(
+         attr::Identifier::No => unreachable!(),
+     };
+ 
+-    let this_type = params.this_type.to_token_stream();
+-    let this_value = params.this_value.to_token_stream();
++    let this = &params.this;
++    let this = quote!(#this);
+ 
+     let (ordinary, fallthrough, fallthrough_borrowed) = if let Some(last) = variants.last() {
+         let last_ident = &last.ident;
+@@ -1999,7 +1992,7 @@ fn deserialize_custom_identifier(
+             // last variant (checked in `check_identifier`), so all preceding
+             // are ordinary variants.
+             let ordinary = &variants[..variants.len() - 1];
+-            let fallthrough = quote!(_serde::__private::Ok(#this_value::#last_ident));
++            let fallthrough = quote!(_serde::__private::Ok(#this::#last_ident));
+             (ordinary, Some(fallthrough), None)
+         } else if let Style::Newtype = last.style {
+             let ordinary = &variants[..variants.len() - 1];
+@@ -2009,7 +2002,7 @@ fn deserialize_custom_identifier(
+                         _serde::Deserialize::deserialize(
+                             _serde::__private::de::IdentifierDeserializer::from(#value)
+                         ),
+-                        #this_value::#last_ident)
++                        #this::#last_ident)
+                 }
+             };
+             (
+@@ -2057,7 +2050,7 @@ fn deserialize_custom_identifier(
+         split_with_de_lifetime(params);
+     let delife = params.borrowed.de_lifetime();
+     let visitor_impl = Stmts(deserialize_identifier(
+-        &this_value,
++        &this,
+         &names_idents,
+         is_variant,
+         fallthrough,
+@@ -2070,18 +2063,18 @@ fn deserialize_custom_identifier(
+         #names_const
+ 
+         struct __FieldVisitor #de_impl_generics #where_clause {
+-            marker: _serde::__private::PhantomData<#this_type #ty_generics>,
++            marker: _serde::__private::PhantomData<#this #ty_generics>,
+             lifetime: _serde::__private::PhantomData<&#delife ()>,
+         }
+ 
+         impl #de_impl_generics _serde::de::Visitor<#delife> for __FieldVisitor #de_ty_generics #where_clause {
+-            type Value = #this_type #ty_generics;
++            type Value = #this #ty_generics;
+ 
+             #visitor_impl
+         }
+ 
+         let __visitor = __FieldVisitor {
+-            marker: _serde::__private::PhantomData::<#this_type #ty_generics>,
++            marker: _serde::__private::PhantomData::<#this #ty_generics>,
+             lifetime: _serde::__private::PhantomData,
+         };
+         _serde::Deserializer::deserialize_identifier(__deserializer, __visitor)
+@@ -2089,7 +2082,7 @@ fn deserialize_custom_identifier(
+ }
+ 
+ fn deserialize_identifier(
+-    this_value: &TokenStream,
++    this: &TokenStream,
+     fields: &[(String, Ident, Vec<String>)],
+     is_variant: bool,
+     fallthrough: Option<TokenStream>,
+@@ -2110,11 +2103,11 @@ fn deserialize_identifier(
+ 
+     let constructors: &Vec<_> = &flat_fields
+         .iter()
+-        .map(|(_, ident)| quote!(#this_value::#ident))
++        .map(|(_, ident)| quote!(#this::#ident))
+         .collect();
+     let main_constructors: &Vec<_> = &fields
+         .iter()
+-        .map(|(_, ident, _)| quote!(#this_value::#ident))
++        .map(|(_, ident, _)| quote!(#this::#ident))
+         .collect();
+ 
+     let expecting = expecting.unwrap_or(if is_variant {
+@@ -2628,9 +2621,9 @@ fn deserialize_map(
+ 
+     let mut result = quote!(#struct_path { #(#result),* });
+     if params.has_getter {
+-        let this_type = &params.this_type;
++        let this = &params.this;
+         result = quote! {
+-            _serde::__private::Into::<#this_type>::into(#result)
++            _serde::__private::Into::<#this>::into(#result)
+         };
+     }
+ 
+@@ -2810,15 +2803,15 @@ fn deserialize_map_in_place(
+             }
+         });
+ 
+-    let this_type = &params.this_type;
++    let this = &params.this;
+     let (_, _, ty_generics, _) = split_with_de_lifetime(params);
+ 
+     let let_default = match cattrs.default() {
+         attr::Default::Default => Some(quote!(
+-            let __default: #this_type #ty_generics = _serde::__private::Default::default();
++            let __default: #this #ty_generics = _serde::__private::Default::default();
+         )),
+         attr::Default::Path(path) => Some(quote!(
+-            let __default: #this_type #ty_generics = #path();
++            let __default: #this #ty_generics = #path();
+         )),
+         attr::Default::None => {
+             // We don't need the default value, to prevent an unused variable warning
+@@ -2851,7 +2844,7 @@ fn wrap_deserialize_with(
+     value_ty: &TokenStream,
+     deserialize_with: &syn::ExprPath,
+ ) -> (TokenStream, TokenStream) {
+-    let this_type = &params.this_type;
++    let this = &params.this;
+     let (de_impl_generics, de_ty_generics, ty_generics, where_clause) =
+         split_with_de_lifetime(params);
+     let delife = params.borrowed.de_lifetime();
+@@ -2859,7 +2852,7 @@ fn wrap_deserialize_with(
+     let wrapper = quote! {
+         struct __DeserializeWith #de_impl_generics #where_clause {
+             value: #value_ty,
+-            phantom: _serde::__private::PhantomData<#this_type #ty_generics>,
++            phantom: _serde::__private::PhantomData<#this #ty_generics>,
+             lifetime: _serde::__private::PhantomData<&#delife ()>,
+         }
+ 
+@@ -2910,7 +2903,7 @@ fn unwrap_to_variant_closure(
+     variant: &Variant,
+     with_wrapper: bool,
+ ) -> TokenStream {
+-    let this_value = &params.this_value;
++    let this = &params.this;
+     let variant_ident = &variant.ident;
+ 
+     let (arg, wrapper) = if with_wrapper {
+@@ -2931,23 +2924,23 @@ fn unwrap_to_variant_closure(
+         Style::Struct if variant.fields.len() == 1 => {
+             let member = &variant.fields[0].member;
+             quote! {
+-                |#arg| #this_value::#variant_ident { #member: #wrapper }
++                |#arg| #this::#variant_ident { #member: #wrapper }
+             }
+         }
+         Style::Struct => {
+             let members = variant.fields.iter().map(|field| &field.member);
+             quote! {
+-                |#arg| #this_value::#variant_ident { #(#members: #wrapper.#field_access),* }
++                |#arg| #this::#variant_ident { #(#members: #wrapper.#field_access),* }
+             }
+         }
+         Style::Tuple => quote! {
+-            |#arg| #this_value::#variant_ident(#(#wrapper.#field_access),*)
++            |#arg| #this::#variant_ident(#(#wrapper.#field_access),*)
+         },
+         Style::Newtype => quote! {
+-            |#arg| #this_value::#variant_ident(#wrapper)
++            |#arg| #this::#variant_ident(#wrapper)
+         },
+         Style::Unit => quote! {
+-            |#arg| #this_value::#variant_ident
++            |#arg| #this::#variant_ident
+         },
+     }
+ }
+diff --git a/serde_derive/src/lib.rs b/serde_derive/src/lib.rs
+index 5ec0df9f..02850aa1 100644
+--- a/serde_derive/src/lib.rs
++++ b/serde_derive/src/lib.rs
+@@ -84,7 +84,6 @@ mod de;
+ mod dummy;
+ mod pretend;
+ mod ser;
+-mod this;
+ mod try;
+ 
+ #[proc_macro_derive(Serialize, attributes(serde))]
+diff --git a/serde_derive/src/ser.rs b/serde_derive/src/ser.rs
+index 43695dd0..414cb146 100644
+--- a/serde_derive/src/ser.rs
++++ b/serde_derive/src/ser.rs
+@@ -8,7 +8,6 @@ use fragment::{Fragment, Match, Stmts};
+ use internals::ast::{Container, Data, Field, Style, Variant};
+ use internals::{attr, replace_receiver, Ctxt, Derive};
+ use pretend;
+-use this;
+ 
+ pub fn expand_derive_serialize(
+     input: &mut syn::DeriveInput,
+@@ -83,13 +82,9 @@ struct Parameters {
+     self_var: Ident,
+ 
+     /// Path to the type the impl is for. Either a single `Ident` for local
+-    /// types (does not include generic parameters) or `some::remote::Path` for
+-    /// remote types.
+-    this_type: syn::Path,
+-
+-    /// Same as `this_type` but using `::<T>` for generic parameters for use in
+-    /// expression position.
+-    this_value: syn::Path,
++    /// types or `some::remote::Ident` for remote types. Does not include
++    /// generic parameters.
++    this: syn::Path,
+ 
+     /// Generics including any explicit and inferred bounds for the impl.
+     generics: syn::Generics,
+@@ -110,15 +105,18 @@ impl Parameters {
+             Ident::new("self", Span::call_site())
+         };
+ 
+-        let this_type = this::this_type(cont);
+-        let this_value = this::this_value(cont);
++        let this = match cont.attrs.remote() {
++            Some(remote) => remote.clone(),
++            None => cont.ident.clone().into(),
++        };
++
+         let is_packed = cont.attrs.is_packed();
++
+         let generics = build_generics(cont);
+ 
+         Parameters {
+             self_var,
+-            this_type,
+-            this_value,
++            this,
+             generics,
+             is_remote,
+             is_packed,
+@@ -128,7 +126,7 @@ impl Parameters {
+     /// Type name to use in error messages and `&'static str` arguments to
+     /// various Serializer methods.
+     fn type_name(&self) -> String {
+-        self.this_type.segments.last().unwrap().ident.to_string()
++        self.this.segments.last().unwrap().ident.to_string()
+     }
+ }
+ 
+@@ -429,7 +427,7 @@ fn serialize_variant(
+     variant_index: u32,
+     cattrs: &attr::Container,
+ ) -> TokenStream {
+-    let this_value = &params.this_value;
++    let this = &params.this;
+     let variant_ident = &variant.ident;
+ 
+     if variant.attrs.skip_serializing() {
+@@ -447,32 +445,32 @@ fn serialize_variant(
+             Style::Struct => quote!({ .. }),
+         };
+         quote! {
+-            #this_value::#variant_ident #fields_pat => #skipped_err,
++            #this::#variant_ident #fields_pat => #skipped_err,
+         }
+     } else {
+         // variant wasn't skipped
+         let case = match variant.style {
+             Style::Unit => {
+                 quote! {
+-                    #this_value::#variant_ident
++                    #this::#variant_ident
+                 }
+             }
+             Style::Newtype => {
+                 quote! {
+-                    #this_value::#variant_ident(ref __field0)
++                    #this::#variant_ident(ref __field0)
+                 }
+             }
+             Style::Tuple => {
+                 let field_names = (0..variant.fields.len())
+                     .map(|i| Ident::new(&format!("__field{}", i), Span::call_site()));
+                 quote! {
+-                    #this_value::#variant_ident(#(ref #field_names),*)
++                    #this::#variant_ident(#(ref #field_names),*)
+                 }
+             }
+             Style::Struct => {
+                 let members = variant.fields.iter().map(|f| &f.member);
+                 quote! {
+-                    #this_value::#variant_ident { #(ref #members),* }
++                    #this::#variant_ident { #(ref #members),* }
+                 }
+             }
+         };
+@@ -642,7 +640,7 @@ fn serialize_adjacently_tagged_variant(
+     tag: &str,
+     content: &str,
+ ) -> Fragment {
+-    let this_type = &params.this_type;
++    let this = &params.this;
+     let type_name = cattrs.name().serialize_name();
+     let variant_name = variant.attrs.name().serialize_name();
+ 
+@@ -721,7 +719,7 @@ fn serialize_adjacently_tagged_variant(
+     quote_block! {
+         struct __AdjacentlyTagged #wrapper_generics #where_clause {
+             data: (#(&'__a #fields_ty,)*),
+-            phantom: _serde::__private::PhantomData<#this_type #ty_generics>,
++            phantom: _serde::__private::PhantomData<#this #ty_generics>,
+         }
+ 
+         impl #wrapper_impl_generics _serde::Serialize for __AdjacentlyTagged #wrapper_ty_generics #where_clause {
+@@ -743,7 +741,7 @@ fn serialize_adjacently_tagged_variant(
+         try!(_serde::ser::SerializeStruct::serialize_field(
+             &mut __struct, #content, &__AdjacentlyTagged {
+                 data: (#(#fields_ident,)*),
+-                phantom: _serde::__private::PhantomData::<#this_type #ty_generics>,
++                phantom: _serde::__private::PhantomData::<#this #ty_generics>,
+             }));
+         _serde::ser::SerializeStruct::end(__struct)
+     }
+@@ -973,7 +971,7 @@ fn serialize_struct_variant_with_flatten(
+             variant_index,
+             variant_name,
+         } => {
+-            let this_type = &params.this_type;
++            let this = &params.this;
+             let fields_ty = fields.iter().map(|f| &f.ty);
+             let members = &fields.iter().map(|f| &f.member).collect::<Vec<_>>();
+ 
+@@ -984,7 +982,7 @@ fn serialize_struct_variant_with_flatten(
+             quote_block! {
+                 struct __EnumFlatten #wrapper_generics #where_clause {
+                     data: (#(&'__a #fields_ty,)*),
+-                    phantom: _serde::__private::PhantomData<#this_type #ty_generics>,
++                    phantom: _serde::__private::PhantomData<#this #ty_generics>,
+                 }
+ 
+                 impl #wrapper_impl_generics _serde::Serialize for __EnumFlatten #wrapper_ty_generics #where_clause {
+@@ -1008,7 +1006,7 @@ fn serialize_struct_variant_with_flatten(
+                     #variant_name,
+                     &__EnumFlatten {
+                         data: (#(#members,)*),
+-                        phantom: _serde::__private::PhantomData::<#this_type #ty_generics>,
++                        phantom: _serde::__private::PhantomData::<#this #ty_generics>,
+                     })
+             }
+         }
+@@ -1194,7 +1192,7 @@ fn wrap_serialize_with(
+     field_tys: &[&syn::Type],
+     field_exprs: &[TokenStream],
+ ) -> TokenStream {
+-    let this_type = &params.this_type;
++    let this = &params.this;
+     let (_, ty_generics, where_clause) = params.generics.split_for_impl();
+ 
+     let wrapper_generics = if field_exprs.is_empty() {
+@@ -1214,7 +1212,7 @@ fn wrap_serialize_with(
+     quote!({
+         struct __SerializeWith #wrapper_impl_generics #where_clause {
+             values: (#(&'__a #field_tys, )*),
+-            phantom: _serde::__private::PhantomData<#this_type #ty_generics>,
++            phantom: _serde::__private::PhantomData<#this #ty_generics>,
+         }
+ 
+         impl #wrapper_impl_generics _serde::Serialize for __SerializeWith #wrapper_ty_generics #where_clause {
+@@ -1228,7 +1226,7 @@ fn wrap_serialize_with(
+ 
+         &__SerializeWith {
+             values: (#(#field_exprs, )*),
+-            phantom: _serde::__private::PhantomData::<#this_type #ty_generics>,
++            phantom: _serde::__private::PhantomData::<#this #ty_generics>,
+         }
+     })
+ }
+diff --git a/serde_derive/src/this.rs b/serde_derive/src/this.rs
+deleted file mode 100644
+index 32731d08..00000000
+--- a/serde_derive/src/this.rs
++++ /dev/null
+@@ -1,32 +0,0 @@
+-use internals::ast::Container;
+-use syn::{Path, PathArguments, Token};
+-
+-pub fn this_type(cont: &Container) -> Path {
+-    if let Some(remote) = cont.attrs.remote() {
+-        let mut this = remote.clone();
+-        for segment in &mut this.segments {
+-            if let PathArguments::AngleBracketed(arguments) = &mut segment.arguments {
+-                arguments.colon2_token = None;
+-            }
+-        }
+-        this
+-    } else {
+-        Path::from(cont.ident.clone())
+-    }
+-}
+-
+-pub fn this_value(cont: &Container) -> Path {
+-    if let Some(remote) = cont.attrs.remote() {
+-        let mut this = remote.clone();
+-        for segment in &mut this.segments {
+-            if let PathArguments::AngleBracketed(arguments) = &mut segment.arguments {
+-                if arguments.colon2_token.is_none() {
+-                    arguments.colon2_token = Some(Token![::](arguments.lt_token.span));
+-                }
+-            }
+-        }
+-        this
+-    } else {
+-        Path::from(cont.ident.clone())
+-    }
+-}
+diff --git a/test_suite/tests/test_remote.rs b/test_suite/tests/test_remote.rs
+index c6d276e1..a38eaa32 100644
+--- a/test_suite/tests/test_remote.rs
++++ b/test_suite/tests/test_remote.rs
+@@ -74,14 +74,6 @@ mod remote {
+             &self.b
+         }
+     }
+-
+-    pub struct StructGeneric<T> {
+-        pub value: T,
+-    }
+-
+-    pub enum EnumGeneric<T> {
+-        Variant(T),
+-    }
+ }
+ 
+ #[derive(Serialize, Deserialize)]
+@@ -112,12 +104,6 @@ struct Test {
+ 
+     #[serde(with = "StructPubDef")]
+     struct_pub: remote::StructPub,
+-
+-    #[serde(with = "StructConcrete")]
+-    struct_concrete: remote::StructGeneric<u8>,
+-
+-    #[serde(with = "EnumConcrete")]
+-    enum_concrete: remote::EnumGeneric<u8>,
+ }
+ 
+ #[derive(Serialize, Deserialize)]
+@@ -171,18 +157,6 @@ struct StructPubDef {
+     b: remote::Unit,
+ }
+ 
+-#[derive(Serialize, Deserialize)]
+-#[serde(remote = "remote::StructGeneric<u8>")]
+-struct StructConcrete {
+-    value: u8,
+-}
+-
+-#[derive(Serialize, Deserialize)]
+-#[serde(remote = "remote::EnumGeneric<u8>")]
+-enum EnumConcrete {
+-    Variant(u8),
+-}
+-
+ impl From<PrimitivePrivDef> for remote::PrimitivePriv {
+     fn from(def: PrimitivePrivDef) -> Self {
+         remote::PrimitivePriv::new(def.0)

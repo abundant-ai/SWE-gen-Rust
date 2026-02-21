@@ -1,0 +1,286 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 796c1140..e633f13a 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -51,7 +51,6 @@ serde_derive = "1.0"
+ serde_json = "1.0"
+ tokio = { version = "0.2.2", features = ["fs", "macros", "io-std", "rt-util", "sync", "time", "test-util"] }
+ tokio-test = "0.2"
+-tower-util = "0.3"
+ url = "1.0"
+ 
+ [features]
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index ce598d40..1071de2f 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -50,6 +50,7 @@
+ 
+ use std::fmt;
+ use std::mem;
++use std::sync::Arc;
+ use std::time::Duration;
+ 
+ use futures_channel::oneshot;
+@@ -229,13 +230,14 @@ where
+             other => return ResponseFuture::error_version(other),
+         };
+ 
+-        let pool_key = match extract_domain(req.uri_mut(), is_http_connect) {
++        let domain = match extract_domain(req.uri_mut(), is_http_connect) {
+             Ok(s) => s,
+             Err(err) => {
+                 return ResponseFuture::new(Box::new(future::err(err)));
+             }
+         };
+ 
++        let pool_key = Arc::new(domain);
+         ResponseFuture::new(Box::new(self.retryably_send_request(req, pool_key)))
+     }
+ 
+@@ -279,7 +281,7 @@ where
+         mut req: Request<B>,
+         pool_key: PoolKey,
+     ) -> impl Future<Output = Result<Response<Body>, ClientError<B>>> + Unpin {
+-        let conn = self.connection_for(pool_key);
++        let conn = self.connection_for(req.uri().clone(), pool_key);
+ 
+         let set_host = self.config.set_host;
+         let executor = self.conn_builder.exec.clone();
+@@ -375,6 +377,7 @@ where
+ 
+     fn connection_for(
+         &self,
++        uri: Uri,
+         pool_key: PoolKey,
+     ) -> impl Future<Output = Result<Pooled<PoolClient<B>>, ClientError<B>>> {
+         // This actually races 2 different futures to try to get a ready
+@@ -391,7 +394,7 @@ where
+         //   connection future is spawned into the runtime to complete,
+         //   and then be inserted into the pool as an idle connection.
+         let checkout = self.pool.checkout(pool_key.clone());
+-        let connect = self.connect_to(pool_key);
++        let connect = self.connect_to(uri, pool_key);
+ 
+         let executor = self.conn_builder.exec.clone();
+         // The order of the `select` is depended on below...
+@@ -452,6 +455,7 @@ where
+ 
+     fn connect_to(
+         &self,
++        uri: Uri,
+         pool_key: PoolKey,
+     ) -> impl Lazy<Output = crate::Result<Pooled<PoolClient<B>>>> + Unpin {
+         let executor = self.conn_builder.exec.clone();
+@@ -460,7 +464,7 @@ where
+         let ver = self.config.ver;
+         let is_ver_h2 = ver == Ver::Http2;
+         let connector = self.connector.clone();
+-        let dst = domain_as_uri(pool_key.clone());
++        let dst = uri;
+         hyper_lazy(move || {
+             // Try to take a "connecting lock".
+             //
+@@ -790,22 +794,22 @@ fn authority_form(uri: &mut Uri) {
+     };
+ }
+ 
+-fn extract_domain(uri: &mut Uri, is_http_connect: bool) -> crate::Result<PoolKey> {
++fn extract_domain(uri: &mut Uri, is_http_connect: bool) -> crate::Result<String> {
+     let uri_clone = uri.clone();
+     match (uri_clone.scheme(), uri_clone.authority()) {
+-        (Some(scheme), Some(auth)) => Ok((scheme.clone(), auth.clone())),
++        (Some(scheme), Some(auth)) => Ok(format!("{}://{}", scheme, auth)),
+         (None, Some(auth)) if is_http_connect => {
+             let scheme = match auth.port_u16() {
+                 Some(443) => {
+                     set_scheme(uri, Scheme::HTTPS);
+-                    Scheme::HTTPS
++                    "https"
+                 }
+                 _ => {
+                     set_scheme(uri, Scheme::HTTP);
+-                    Scheme::HTTP
++                    "http"
+                 }
+             };
+-            Ok((scheme, auth.clone()))
++            Ok(format!("{}://{}", scheme, auth))
+         }
+         _ => {
+             debug!("Client requires absolute-form URIs, received: {:?}", uri);
+@@ -814,15 +818,6 @@ fn extract_domain(uri: &mut Uri, is_http_connect: bool) -> crate::Result<PoolKey
+     }
+ }
+ 
+-fn domain_as_uri((scheme, auth): PoolKey) -> Uri {
+-    http::uri::Builder::new()
+-        .scheme(scheme)
+-        .authority(auth)
+-        .path_and_query("/")
+-        .build()
+-        .expect("domain is valid Uri")
+-}
+-
+ fn set_scheme(uri: &mut Uri, scheme: Scheme) {
+     debug_assert!(
+         uri.scheme().is_none(),
+@@ -1131,8 +1126,7 @@ mod unit_tests {
+     #[test]
+     fn test_extract_domain_connect_no_port() {
+         let mut uri = "hyper.rs".parse().unwrap();
+-        let (scheme, host) = extract_domain(&mut uri, true).expect("extract domain");
+-        assert_eq!(scheme, *"http");
+-        assert_eq!(host, "hyper.rs");
++        let domain = extract_domain(&mut uri, true).expect("extract domain");
++        assert_eq!(domain, "http://hyper.rs");
+     }
+ }
+diff --git a/src/client/pool.rs b/src/client/pool.rs
+index e98dcdde..a9f3991c 100644
+--- a/src/client/pool.rs
++++ b/src/client/pool.rs
+@@ -52,7 +52,7 @@ pub(super) enum Reservation<T> {
+ }
+ 
+ /// Simple type alias in case the key type needs to be adjusted.
+-pub(super) type Key = (http::uri::Scheme, http::uri::Authority); //Arc<String>;
++pub(super) type Key = Arc<String>;
+ 
+ struct PoolInner<T> {
+     // A flag that a connection is being established, and the connection
+@@ -755,6 +755,7 @@ impl<T> WeakOpt<T> {
+ 
+ #[cfg(test)]
+ mod tests {
++    use std::sync::Arc;
+     use std::task::Poll;
+     use std::time::Duration;
+ 
+@@ -786,10 +787,6 @@ mod tests {
+         }
+     }
+ 
+-    fn host_key(s: &str) -> Key {
+-        (http::uri::Scheme::HTTP, s.parse().expect("host key"))
+-    }
+-
+     fn pool_no_timer<T>() -> Pool<T> {
+         pool_max_idle_no_timer(::std::usize::MAX)
+     }
+@@ -810,7 +807,7 @@ mod tests {
+     #[tokio::test]
+     async fn test_pool_checkout_smoke() {
+         let pool = pool_no_timer();
+-        let key = host_key("foo");
++        let key = Arc::new("foo".to_string());
+         let pooled = pool.pooled(c(key.clone()), Uniq(41));
+ 
+         drop(pooled);
+@@ -842,7 +839,7 @@ mod tests {
+     #[tokio::test]
+     async fn test_pool_checkout_returns_none_if_expired() {
+         let pool = pool_no_timer();
+-        let key = host_key("foo");
++        let key = Arc::new("foo".to_string());
+         let pooled = pool.pooled(c(key.clone()), Uniq(41));
+ 
+         drop(pooled);
+@@ -857,7 +854,7 @@ mod tests {
+     #[tokio::test]
+     async fn test_pool_checkout_removes_expired() {
+         let pool = pool_no_timer();
+-        let key = host_key("foo");
++        let key = Arc::new("foo".to_string());
+ 
+         pool.pooled(c(key.clone()), Uniq(41));
+         pool.pooled(c(key.clone()), Uniq(5));
+@@ -879,7 +876,7 @@ mod tests {
+     #[test]
+     fn test_pool_max_idle_per_host() {
+         let pool = pool_max_idle_no_timer(2);
+-        let key = host_key("foo");
++        let key = Arc::new("foo".to_string());
+ 
+         pool.pooled(c(key.clone()), Uniq(41));
+         pool.pooled(c(key.clone()), Uniq(5));
+@@ -907,7 +904,7 @@ mod tests {
+             &Exec::Default,
+         );
+ 
+-        let key = host_key("foo");
++        let key = Arc::new("foo".to_string());
+ 
+         pool.pooled(c(key.clone()), Uniq(41));
+         pool.pooled(c(key.clone()), Uniq(5));
+@@ -932,7 +929,7 @@ mod tests {
+         use futures_util::FutureExt;
+ 
+         let pool = pool_no_timer();
+-        let key = host_key("foo");
++        let key = Arc::new("foo".to_string());
+         let pooled = pool.pooled(c(key.clone()), Uniq(41));
+ 
+         let checkout = join(pool.checkout(key), async {
+@@ -951,7 +948,7 @@ mod tests {
+     #[tokio::test]
+     async fn test_pool_checkout_drop_cleans_up_waiters() {
+         let pool = pool_no_timer::<Uniq<i32>>();
+-        let key = host_key("foo");
++        let key = Arc::new("localhost:12345".to_string());
+ 
+         let mut checkout1 = pool.checkout(key.clone());
+         let mut checkout2 = pool.checkout(key.clone());
+@@ -996,7 +993,7 @@ mod tests {
+     #[test]
+     fn pooled_drop_if_closed_doesnt_reinsert() {
+         let pool = pool_no_timer();
+-        let key = host_key("foo");
++        let key = Arc::new("localhost:12345".to_string());
+         pool.pooled(
+             c(key.clone()),
+             CanClose {
+diff --git a/src/client/tests.rs b/src/client/tests.rs
+index cf3248c7..8088f0ea 100644
+--- a/src/client/tests.rs
++++ b/src/client/tests.rs
+@@ -1,30 +1,15 @@
+-use std::io;
+-
+-use futures_util::future;
+-use tokio::net::TcpStream;
+-
+-use super::Client;
++// FIXME: re-implement tests with `async/await`
++/*
++#![cfg(feature = "runtime")]
+ 
+-#[tokio::test]
+-async fn client_connect_uri_argument() {
+-    let connector = tower_util::service_fn(|dst: http::Uri| {
+-        assert_eq!(dst.scheme(), Some(&http::uri::Scheme::HTTP));
+-        assert_eq!(dst.host(), Some("example.local"));
+-        assert_eq!(dst.port(), None);
+-        assert_eq!(dst.path(), "/", "path should be removed");
++use futures::{Async, Future, Stream};
++use futures::future::poll_fn;
++use futures::sync::oneshot;
++use tokio::runtime::current_thread::Runtime;
+ 
+-        future::err::<TcpStream, _>(io::Error::new(io::ErrorKind::Other, "expect me"))
+-    });
++use crate::mock::MockConnector;
++use super::*;
+ 
+-    let client = Client::builder().build::<_, crate::Body>(connector);
+-    let _ = client
+-        .get("http://example.local/and/a/path".parse().unwrap())
+-        .await
+-        .expect_err("response should fail");
+-}
+-
+-/*
+-// FIXME: re-implement tests with `async/await`
+ #[test]
+ fn retryable_request() {
+     let _ = pretty_env_logger::try_init();

@@ -1,0 +1,26 @@
+#!/bin/bash
+
+cd /app/src
+
+export RUST_BACKTRACE=1
+export CARGO_TERM_COLOR=never
+
+# Copy HEAD test files from /tests (overwrites BASE state)
+mkdir -p "clap_complete/tests/testsuite"
+cp "/tests/clap_complete/tests/testsuite/bash.rs" "clap_complete/tests/testsuite/bash.rs"
+mkdir -p "clap_complete/tests/testsuite"
+cp "/tests/clap_complete/tests/testsuite/engine.rs" "clap_complete/tests/testsuite/engine.rs"
+mkdir -p "clap_complete/tests/testsuite"
+cp "/tests/clap_complete/tests/testsuite/fish.rs" "clap_complete/tests/testsuite/fish.rs"
+
+# Run all tests in clap_complete with unstable-dynamic feature
+# This matches the CI command and ensures all completion tests run
+cargo test -p clap_complete -F unstable-dynamic -- --nocapture
+test_status=$?
+
+if [ $test_status -eq 0 ]; then
+  echo 1 > /logs/verifier/reward.txt
+else
+  echo 0 > /logs/verifier/reward.txt
+fi
+exit "$test_status"

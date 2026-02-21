@@ -1,0 +1,244 @@
+diff --git a/serde_derive/src/de.rs b/serde_derive/src/de.rs
+index 1ad97006..af3d3693 100644
+--- a/serde_derive/src/de.rs
++++ b/serde_derive/src/de.rs
+@@ -16,7 +16,6 @@ use bound;
+ use fragment::{Expr, Fragment, Match, Stmts};
+ use internals::ast::{Container, Data, Field, Style, Variant};
+ use internals::{self, attr};
+-use pretend;
+ use try;
+ 
+ use std::collections::BTreeSet;
+@@ -38,13 +37,11 @@ pub fn expand_derive_deserialize(input: &syn::DeriveInput) -> Result<Tokens, Str
+ 
+     let impl_block = if let Some(remote) = cont.attrs.remote() {
+         let vis = &input.vis;
+-        let used = pretend::pretend_used(&cont);
+         quote! {
+             impl #de_impl_generics #ident #ty_generics #where_clause {
+                 #vis fn deserialize<__D>(__deserializer: __D) -> _serde::export::Result<#remote #ty_generics, __D::Error>
+                     where __D: _serde::Deserializer<#delife>
+                 {
+-                    #used
+                     #body
+                 }
+             }
+diff --git a/serde_derive/src/lib.rs b/serde_derive/src/lib.rs
+index 2718f5f8..e885968c 100644
+--- a/serde_derive/src/lib.rs
++++ b/serde_derive/src/lib.rs
+@@ -49,7 +49,6 @@ mod bound;
+ mod fragment;
+ 
+ mod de;
+-mod pretend;
+ mod ser;
+ mod try;
+ 
+diff --git a/serde_derive/src/pretend.rs b/serde_derive/src/pretend.rs
+deleted file mode 100644
+index 0af1b65c..00000000
+--- a/serde_derive/src/pretend.rs
++++ /dev/null
+@@ -1,145 +0,0 @@
+-use proc_macro2::Span;
+-use quote::Tokens;
+-use syn::Ident;
+-
+-use internals::ast::{Container, Data, Field, Style};
+-
+-// Suppress dead_code warnings that would otherwise appear when using a remote
+-// derive. Other than this pretend code, a struct annotated with remote derive
+-// never has its fields referenced and an enum annotated with remote derive
+-// never has its variants constructed.
+-//
+-//     warning: field is never used: `i`
+-//      --> src/main.rs:4:20
+-//       |
+-//     4 | struct StructDef { i: i32 }
+-//       |                    ^^^^^^
+-//
+-//     warning: variant is never constructed: `V`
+-//      --> src/main.rs:8:16
+-//       |
+-//     8 | enum EnumDef { V }
+-//       |                ^
+-//
+-pub fn pretend_used(cont: &Container) -> Tokens {
+-    let pretend_fields = pretend_fields_used(cont);
+-    let pretend_variants = pretend_variants_used(cont);
+-
+-    quote! {
+-        #pretend_fields
+-        #pretend_variants
+-    }
+-}
+-
+-// For structs with named fields, expands to:
+-//
+-//     match None::<T> {
+-//         Some(T { a: ref __v0, b: ref __v1 }) => {}
+-//         _ => {}
+-//     }
+-//
+-// For enums, expands to the following but only including struct variants:
+-//
+-//     match None::<T> {
+-//         Some(T::A { a: ref __v0 }) => {}
+-//         Some(T::B { b: ref __v0 }) => {}
+-//         _ => {}
+-//     }
+-//
+-// The `ref` is important in case the user has written a Drop impl on their
+-// type. Rust does not allow destructuring a struct or enum that has a Drop
+-// impl.
+-fn pretend_fields_used(cont: &Container) -> Tokens {
+-    let type_ident = cont.ident;
+-    let (_, ty_generics, _) = cont.generics.split_for_impl();
+-
+-    let patterns = match cont.data {
+-        Data::Enum(ref variants) => {
+-            variants.iter()
+-                .filter_map(|variant| match variant.style {
+-                    Style::Struct => {
+-                        let variant_ident = variant.ident;
+-                        let pat = struct_pattern(&variant.fields);
+-                        Some(quote!(#type_ident::#variant_ident #pat))
+-                    }
+-                    _ => None,
+-                })
+-                .collect::<Vec<_>>()
+-        }
+-        Data::Struct(Style::Struct, ref fields) => {
+-            let pat = struct_pattern(fields);
+-            vec![quote!(#type_ident #pat)]
+-        }
+-        Data::Struct(_, _) => {
+-            return quote!();
+-        }
+-    };
+-
+-    quote! {
+-        match _serde::export::None::<#type_ident #ty_generics> {
+-            #(
+-                _serde::export::Some(#patterns) => {}
+-            )*
+-            _ => {}
+-        }
+-    }
+-}
+-
+-// Expands to one of these per enum variant:
+-//
+-//     match None {
+-//         Some((__v0, __v1,)) => {
+-//             let _ = E::V { a: __v0, b: __v1 };
+-//         }
+-//         _ => {}
+-//     }
+-//
+-fn pretend_variants_used(cont: &Container) -> Tokens {
+-    let variants = match cont.data {
+-        Data::Enum(ref variants) => variants,
+-        Data::Struct(_, _) => {
+-            return quote!();
+-        }
+-    };
+-
+-    let type_ident = cont.ident;
+-    let (_, ty_generics, _) = cont.generics.split_for_impl();
+-    let turbofish = ty_generics.as_turbofish();
+-
+-    let cases = variants.iter()
+-        .map(|variant| {
+-            let variant_ident = variant.ident;
+-            let ref placeholders = (0..variant.fields.len())
+-                .map(|i| Ident::new(&format!("__v{}", i), Span::call_site()))
+-                .collect::<Vec<_>>();
+-
+-            let pat = match variant.style {
+-                Style::Struct => {
+-                    let names = variant.fields.iter().map(|field| field.ident);
+-                    quote!({ #(#names: #placeholders),* })
+-                }
+-                Style::Tuple | Style::Newtype => {
+-                    quote!(( #(#placeholders),* ))
+-                }
+-                Style::Unit => quote!(),
+-            };
+-
+-            quote! {
+-                match _serde::export::None {
+-                    _serde::export::Some((#(#placeholders,)*)) => {
+-                        let _ = #type_ident::#variant_ident #turbofish #pat;
+-                    }
+-                    _ => {}
+-                }
+-            }
+-        });
+-
+-    quote!(#(#cases)*)
+-}
+-
+-fn struct_pattern(fields: &[Field]) -> Tokens {
+-    let names = fields.iter().map(|field| field.ident);
+-    let placeholders = (0..fields.len())
+-        .map(|i| Ident::new(&format!("__v{}", i), Span::call_site()));
+-    quote!({ #(#names: ref #placeholders),* })
+-}
+diff --git a/serde_derive/src/ser.rs b/serde_derive/src/ser.rs
+index 21c630a5..802aaf5c 100644
+--- a/serde_derive/src/ser.rs
++++ b/serde_derive/src/ser.rs
+@@ -15,7 +15,6 @@ use bound;
+ use fragment::{Fragment, Match, Stmts};
+ use internals::ast::{Container, Data, Field, Style, Variant};
+ use internals::{attr, Ctxt};
+-use pretend;
+ use try;
+ 
+ use std::u32;
+@@ -34,13 +33,11 @@ pub fn expand_derive_serialize(input: &syn::DeriveInput) -> Result<Tokens, Strin
+ 
+     let impl_block = if let Some(remote) = cont.attrs.remote() {
+         let vis = &input.vis;
+-        let used = pretend::pretend_used(&cont);
+         quote! {
+             impl #impl_generics #ident #ty_generics #where_clause {
+                 #vis fn serialize<__S>(__self: &#remote #ty_generics, __serializer: __S) -> _serde::export::Result<__S::Ok, __S::Error>
+                     where __S: _serde::Serializer
+                 {
+-                    #used
+                     #body
+                 }
+             }
+diff --git a/test_suite/tests/test_gen.rs b/test_suite/tests/test_gen.rs
+index d6921e14..e06ec5a8 100644
+--- a/test_suite/tests/test_gen.rs
++++ b/test_suite/tests/test_gen.rs
+@@ -333,7 +333,9 @@ fn test_gen() {
+     #[derive(Serialize, Deserialize)]
+     #[serde(untagged, remote = "Or")]
+     enum OrDef<A, B> {
++        #[allow(dead_code)]
+         A(A),
++        #[allow(dead_code)]
+         B(B),
+     }
+ 
+diff --git a/test_suite/tests/test_remote.rs b/test_suite/tests/test_remote.rs
+index e485bae3..da38ab1a 100644
+--- a/test_suite/tests/test_remote.rs
++++ b/test_suite/tests/test_remote.rs
+@@ -160,8 +160,10 @@ struct StructPrivDef {
+ #[derive(Serialize, Deserialize)]
+ #[serde(remote = "remote::StructPub")]
+ struct StructPubDef {
++    #[allow(dead_code)]
+     a: u8,
+ 
++    #[allow(dead_code)]
+     #[serde(with = "UnitDef")]
+     b: remote::Unit,
+ }

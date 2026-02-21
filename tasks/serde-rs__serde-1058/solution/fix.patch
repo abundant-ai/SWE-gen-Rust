@@ -1,0 +1,184 @@
+diff --git a/serde/src/private/de.rs b/serde/src/private/de.rs
+index a79b5a1f..3d8a2ec3 100644
+--- a/serde/src/private/de.rs
++++ b/serde/src/private/de.rs
+@@ -834,26 +834,43 @@ mod content {
+         type Value = TaggedContent<'de, T>;
+ 
+         fn expecting(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+-            fmt.write_str("any value")
++            fmt.write_str("internally tagged enum")
+         }
+ 
+-        fn visit_map<V>(self, mut visitor: V) -> Result<Self::Value, V::Error>
++        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+         where
+-            V: MapAccess<'de>,
++            S: SeqAccess<'de>,
++        {
++            let tag = match try!(seq.next_element()) {
++                Some(tag) => tag,
++                None => {
++                    return Err(de::Error::missing_field(self.tag_name));
++                }
++            };
++            let rest = de::value::SeqAccessDeserializer::new(seq);
++            Ok(TaggedContent {
++                tag: tag,
++                content: try!(Content::deserialize(rest)),
++            })
++        }
++
++        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
++        where
++            M: MapAccess<'de>,
+         {
+             let mut tag = None;
+-            let mut vec = Vec::with_capacity(size_hint::cautious(visitor.size_hint()));
++            let mut vec = Vec::with_capacity(size_hint::cautious(map.size_hint()));
+             while let Some(k) =
+-                try!(visitor.next_key_seed(TagOrContentVisitor::new(self.tag_name))) {
++                try!(map.next_key_seed(TagOrContentVisitor::new(self.tag_name))) {
+                 match k {
+                     TagOrContent::Tag => {
+                         if tag.is_some() {
+                             return Err(de::Error::duplicate_field(self.tag_name));
+                         }
+-                        tag = Some(try!(visitor.next_value()));
++                        tag = Some(try!(map.next_value()));
+                     }
+                     TagOrContent::Content(k) => {
+-                        let v = try!(visitor.next_value());
++                        let v = try!(map.next_value());
+                         vec.push((k, v));
+                     }
+                 }
+@@ -1802,9 +1819,16 @@ mod content {
+             write!(formatter, "unit variant {}::{}", self.type_name, self.variant_name)
+         }
+ 
+-        fn visit_map<V>(self, _: V) -> Result<(), V::Error>
++        fn visit_seq<S>(self, _: S) -> Result<(), S::Error>
+         where
+-            V: MapAccess<'de>,
++            S: SeqAccess<'de>,
++        {
++            Ok(())
++        }
++
++        fn visit_map<M>(self, _: M) -> Result<(), M::Error>
++        where
++            M: MapAccess<'de>,
+         {
+             Ok(())
+         }
+diff --git a/serde_derive/src/de.rs b/serde_derive/src/de.rs
+index fe064dd5..44ed7fa0 100644
+--- a/serde_derive/src/de.rs
++++ b/serde_derive/src/de.rs
+@@ -222,7 +222,7 @@ fn deserialize_body(cont: &Container, params: &Parameters) -> Fragment {
+                 if fields.iter().any(|field| field.ident.is_none()) {
+                     panic!("struct has unnamed fields");
+                 }
+-                deserialize_struct(None, params, fields, &cont.attrs, None)
++                deserialize_struct(None, params, fields, &cont.attrs, None, Untagged::No)
+             }
+             Body::Struct(Style::Tuple, ref fields) |
+             Body::Struct(Style::Newtype, ref fields) => {
+@@ -488,15 +488,20 @@ fn deserialize_newtype_struct(type_path: &Tokens, params: &Parameters, field: &F
+     }
+ }
+ 
++enum Untagged {
++    Yes,
++    No,
++}
++
+ fn deserialize_struct(
+     variant_ident: Option<&syn::Ident>,
+     params: &Parameters,
+     fields: &[Field],
+     cattrs: &attr::Container,
+     deserializer: Option<Tokens>,
++    untagged: Untagged,
+ ) -> Fragment {
+     let is_enum = variant_ident.is_some();
+-    let is_untagged = deserializer.is_some();
+ 
+     let this = &params.this;
+     let (de_impl_generics, de_ty_generics, ty_generics, where_clause) = split_with_de_lifetime(params,);
+@@ -559,18 +564,19 @@ fn deserialize_struct(
+         quote!(mut __seq)
+     };
+ 
+-    let visit_seq = if is_untagged {
+-        // untagged struct variants do not get a visit_seq method
+-        None
+-    } else {
+-        Some(quote! {
+-            #[inline]
+-            fn visit_seq<__A>(self, #visitor_var: __A) -> _serde::export::Result<Self::Value, __A::Error>
+-                where __A: _serde::de::SeqAccess<#delife>
+-            {
+-                #visit_seq
+-            }
+-        })
++    // untagged struct variants do not get a visit_seq method
++    let visit_seq = match untagged {
++        Untagged::Yes => None,
++        Untagged::No => {
++            Some(quote! {
++                #[inline]
++                fn visit_seq<__A>(self, #visitor_var: __A) -> _serde::export::Result<Self::Value, __A::Error>
++                    where __A: _serde::de::SeqAccess<#delife>
++                {
++                    #visit_seq
++                }
++            })
++        }
+     };
+ 
+     quote_block! {
+@@ -1148,7 +1154,7 @@ fn deserialize_externally_tagged_variant(
+             deserialize_tuple(Some(variant_ident), params, &variant.fields, cattrs, None)
+         }
+         Style::Struct => {
+-            deserialize_struct(Some(variant_ident), params, &variant.fields, cattrs, None)
++            deserialize_struct(Some(variant_ident), params, &variant.fields, cattrs, None, Untagged::No)
+         }
+     }
+ }
+@@ -1175,8 +1181,23 @@ fn deserialize_internally_tagged_variant(
+                 _serde::export::Ok(#this::#variant_ident)
+             }
+         }
+-        Style::Newtype | Style::Struct => {
+-            deserialize_untagged_variant(params, variant, cattrs, deserializer)
++        Style::Newtype => {
++            deserialize_untagged_newtype_variant(
++                variant_ident,
++                params,
++                &variant.fields[0],
++                deserializer,
++            )
++        }
++        Style::Struct => {
++            deserialize_struct(
++                Some(variant_ident),
++                params,
++                &variant.fields,
++                cattrs,
++                Some(deserializer),
++                Untagged::No,
++            )
+         }
+         Style::Tuple => unreachable!("checked in serde_derive_internals"),
+     }
+@@ -1238,6 +1259,7 @@ fn deserialize_untagged_variant(
+                 &variant.fields,
+                 cattrs,
+                 Some(deserializer),
++                Untagged::Yes,
+             )
+         }
+     }

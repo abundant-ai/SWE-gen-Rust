@@ -1,0 +1,39 @@
+FROM ubuntu:24.04
+
+# Base system packages (common to all languages)
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    ca-certificates \
+    patch \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust with nightly from around the PR date
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly-2024-12-20
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /app
+
+# Clone repo at HEAD commit (with fix applied)
+RUN git clone https://github.com/serde-rs/serde.git src && \
+    cd src && \
+    (git fetch --depth 1 origin 2ba97394fb5e5c32b52ab8d82aed45b85fef0db7 || git fetch --depth 1 origin "+refs/pull/1970/head:refs/remotes/origin/pr/1970") && \
+    git checkout --detach FETCH_HEAD && \
+    git submodule update --init --recursive
+
+WORKDIR /app/src
+
+# Reset tracked files to ensure bug.patch applies cleanly
+RUN git reset --hard
+
+# Fix unused imports issue that exists in this commit but was fixed later
+RUN sed -i 's/pub use self::core::{cmp, iter, mem, num, slice, str};/pub use self::core::{cmp, iter, num, slice, str};/' serde/src/lib.rs
+
+# Apply bug.patch to revert to buggy state (BASE)
+COPY bug.patch /tmp/bug.patch
+RUN patch -p1 < /tmp/bug.patch && rm /tmp/bug.patch
+
+RUN rm -rf /app/src/.git
+
+WORKDIR /app/src

@@ -1,0 +1,448 @@
+diff --git a/tower/examples/tower-balance.rs b/tower/examples/tower-balance.rs
+index 649cbeb..eb891c0 100644
+--- a/tower/examples/tower-balance.rs
++++ b/tower/examples/tower-balance.rs
+@@ -58,7 +58,7 @@ async fn main() {
+ 
+     let decay = Duration::from_secs(10);
+     let d = gen_disco();
+-    let pe = lb::p2c::Balance::new(load::PeakEwmaDiscover::new(
++    let pe = lb::p2c::Balance::from_entropy(load::PeakEwmaDiscover::new(
+         d,
+         DEFAULT_RTT,
+         decay,
+@@ -67,7 +67,7 @@ async fn main() {
+     run("P2C+PeakEWMA...", pe).await;
+ 
+     let d = gen_disco();
+-    let ll = lb::p2c::Balance::new(load::PendingRequestsDiscover::new(
++    let ll = lb::p2c::Balance::from_entropy(load::PendingRequestsDiscover::new(
+         d,
+         load::CompleteOnResponse::default(),
+     ));
+diff --git a/tower/src/balance/error.rs b/tower/src/balance/error.rs
+index 59ddbf5..d7f38bf 100644
+--- a/tower/src/balance/error.rs
++++ b/tower/src/balance/error.rs
+@@ -1,8 +1,8 @@
+-//! Error types for the `tower::balance` middleware.
++//! Error types
+ 
+ use std::fmt;
+ 
+-/// The balancer's endpoint discovery stream failed.
++/// An error returned when the balancer's endpoint discovery stream fails.
+ #[derive(Debug)]
+ pub struct Discover(pub(crate) crate::BoxError);
+ 
+diff --git a/tower/src/balance/mod.rs b/tower/src/balance/mod.rs
+index 96860bc..21a3948 100644
+--- a/tower/src/balance/mod.rs
++++ b/tower/src/balance/mod.rs
+@@ -1,57 +1,4 @@
+-//! Middleware that allows balancing load among multiple services.
+-//!
+-//! In larger systems, multiple endpoints are often available for a given service. As load
+-//! increases, you want to ensure that that load is spread evenly across the available services.
+-//! Otherwise, clients could see spikes in latency if their request goes to a particularly loaded
+-//! service, even when spare capacity is available to handle that request elsewhere.
+-//!
+-//! This module provides two pieces of middleware that helps with this type of load balancing:
+-//!
+-//! First, [`p2c`] implements the "[Power of Two Random Choices]" algorithm, a simple but robust
+-//! technique for spreading load across services with only inexact load measurements. Use this if
+-//! the set of available services is not within your control, and you simply want to spread load
+-//! among that set of services.
+-//!
+-//! [Power of Two Random Choices]: http://www.eecs.harvard.edu/~michaelm/postscripts/handbook2001.pdf
+-//!
+-//! Second, [`pool`] implements a dynamically sized pool of services. It estimates the overall
+-//! current load by tracking successful and unsuccessful calls to `poll_ready`, and uses an
+-//! exponentially weighted moving average to add (using [`tower::make_service::MakeService`]) or
+-//! remove (by dropping) services in response to increases or decreases in load. Use this if you
+-//! are able to dynamically add more service endpoints to the system to handle added load.
+-//!
+-//! # Examples
+-//!
+-//! ```rust
+-//! # #[cfg(feature = "util")]
+-//! # #[cfg(feature = "load")]
+-//! # fn warnings_are_errors() {
+-//! use tower::balance::p2c::Balance;
+-//! use tower::load::Load;
+-//! use tower::{Service, ServiceExt};
+-//! use futures_util::pin_mut;
+-//! # use futures_core::Stream;
+-//! # use futures_util::StreamExt;
+-//!
+-//! async fn spread<Req, S: Service<Req> + Load>(svc1: S, svc2: S, reqs: impl Stream<Item = Req>)
+-//! where
+-//!     S::Error: Into<tower::BoxError>,
+-//! # // this bound is pretty unfortunate, and the compiler does _not_ help
+-//!     S::Metric: std::fmt::Debug,
+-//! {
+-//!     // Spread load evenly across the two services
+-//!     let p2c = Balance::new(tower::discover::ServiceList::new(vec![svc1, svc2]));
+-//!
+-//!     // Issue all the requests that come in.
+-//!     // Some will go to svc1, some will go to svc2.
+-//!     pin_mut!(reqs);
+-//!     let mut responses = p2c.call_all(reqs);
+-//!     while let Some(rsp) = responses.next().await {
+-//!         // ...
+-//!     }
+-//! }
+-//! # }
+-//! ```
++//! Load balancing middlewares.
+ 
+ pub mod error;
+ pub mod p2c;
+diff --git a/tower/src/balance/p2c/layer.rs b/tower/src/balance/p2c/layer.rs
+index 3ccae58..a90747a 100644
+--- a/tower/src/balance/p2c/layer.rs
++++ b/tower/src/balance/p2c/layer.rs
+@@ -1,27 +1,17 @@
+-use super::MakeBalance;
++use super::BalanceMake;
+ use rand::{rngs::SmallRng, Rng, SeedableRng};
+ use std::{fmt, marker::PhantomData};
+ use tower_layer::Layer;
+ 
+-/// Construct load balancers ([`Balance`]) over dynamic service sets ([`Discover`]) produced by the
+-/// "inner" service in response to requests coming from the "outer" service.
+-///
+-/// This construction may seem a little odd at first glance. This is not a layer that takes
+-/// requests and produces responses in the traditional sense. Instead, it is more like
+-/// [`MakeService`](tower::make_service::MakeService) in that it takes service _descriptors_ (see
+-/// `Target` on `MakeService`) and produces _services_. Since [`Balance`] spreads requests across a
+-/// _set_ of services, the inner service should produce a [`Discover`], not just a single
+-/// [`Service`], given a service descriptor.
+-///
+-/// See the [module-level documentation](..) for details on load balancing.
++/// Efficiently distributes requests across an arbitrary number of services
+ #[derive(Clone)]
+-pub struct MakeBalanceLayer<D, Req> {
++pub struct BalanceLayer<D, Req> {
+     rng: SmallRng,
+     _marker: PhantomData<fn(D, Req)>,
+ }
+ 
+-impl<D, Req> MakeBalanceLayer<D, Req> {
+-    /// Build balancers using operating system entropy.
++impl<D, Req> BalanceLayer<D, Req> {
++    /// Builds a balancer using the system entropy.
+     pub fn new() -> Self {
+         Self {
+             rng: SmallRng::from_entropy(),
+@@ -29,7 +19,7 @@ impl<D, Req> MakeBalanceLayer<D, Req> {
+         }
+     }
+ 
+-    /// Build balancers using a seed from the provided random number generator.
++    /// Builds a balancer from the provided RNG.
+     ///
+     /// This may be preferrable when many balancers are initialized.
+     pub fn from_rng<R: Rng>(rng: &mut R) -> Result<Self, rand::Error> {
+@@ -41,17 +31,17 @@ impl<D, Req> MakeBalanceLayer<D, Req> {
+     }
+ }
+ 
+-impl<S, Req> Layer<S> for MakeBalanceLayer<S, Req> {
+-    type Service = MakeBalance<S, Req>;
++impl<S, Req> Layer<S> for BalanceLayer<S, Req> {
++    type Service = BalanceMake<S, Req>;
+ 
+     fn layer(&self, make_discover: S) -> Self::Service {
+-        MakeBalance::from_rng(make_discover, self.rng.clone()).expect("SmallRng is infallible")
++        BalanceMake::new(make_discover, self.rng.clone())
+     }
+ }
+ 
+-impl<D, Req> fmt::Debug for MakeBalanceLayer<D, Req> {
++impl<D, Req> fmt::Debug for BalanceLayer<D, Req> {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+-        f.debug_struct("MakeBalanceLayer")
++        f.debug_struct("BalanceLayer")
+             .field("rng", &self.rng)
+             .finish()
+     }
+diff --git a/tower/src/balance/p2c/make.rs b/tower/src/balance/p2c/make.rs
+index 8712e6e..3f92abf 100644
+--- a/tower/src/balance/p2c/make.rs
++++ b/tower/src/balance/p2c/make.rs
+@@ -2,7 +2,7 @@ use super::Balance;
+ use crate::discover::Discover;
+ use futures_core::ready;
+ use pin_project::pin_project;
+-use rand::{rngs::SmallRng, Rng, SeedableRng};
++use rand::{rngs::SmallRng, SeedableRng};
+ use std::hash::Hash;
+ use std::marker::PhantomData;
+ use std::{
+@@ -12,22 +12,15 @@ use std::{
+ };
+ use tower_service::Service;
+ 
+-/// Constructs load balancers over dynamic service sets produced by a wrapped "inner" service.
+-///
+-/// This is effectively an implementation of [`MakeService`](tower::make_service::MakeService),
+-/// except that it forwards the service descriptors (`Target`) to an inner service (`S`), and
+-/// expects that service to produce a service set in the form of a [`Discover`]. It then wraps the
+-/// service set in a [`Balance`] before returning it as the "made" service.
+-///
+-/// See the [module-level documentation](..) for details on load balancing.
++/// Makes `Balancer`s given an inner service that makes `Discover`s.
+ #[derive(Clone, Debug)]
+-pub struct MakeBalance<S, Req> {
++pub struct BalanceMake<S, Req> {
+     inner: S,
+     rng: SmallRng,
+     _marker: PhantomData<fn(Req)>,
+ }
+ 
+-/// A [`Balance`] in the making.
++/// Makes a balancer instance.
+ #[pin_project]
+ #[derive(Debug)]
+ pub struct MakeFuture<F, Req> {
+@@ -37,30 +30,22 @@ pub struct MakeFuture<F, Req> {
+     _marker: PhantomData<fn(Req)>,
+ }
+ 
+-impl<S, Req> MakeBalance<S, Req> {
+-    /// Build balancers using operating system entropy.
+-    pub fn new(make_discover: S) -> Self {
++impl<S, Req> BalanceMake<S, Req> {
++    pub(crate) fn new(inner: S, rng: SmallRng) -> Self {
+         Self {
+-            inner: make_discover,
+-            rng: SmallRng::from_entropy(),
++            inner,
++            rng,
+             _marker: PhantomData,
+         }
+     }
+ 
+-    /// Build balancers using a seed from the provided random number generator.
+-    ///
+-    /// This may be preferrable when many balancers are initialized.
+-    pub fn from_rng<R: Rng>(inner: S, rng: R) -> Result<Self, rand::Error> {
+-        let rng = SmallRng::from_rng(rng)?;
+-        Ok(Self {
+-            inner,
+-            rng,
+-            _marker: PhantomData,
+-        })
++    /// Initializes a P2C load balancer from the OS's entropy source.
++    pub fn from_entropy(make_discover: S) -> Self {
++        Self::new(make_discover, SmallRng::from_entropy())
+     }
+ }
+ 
+-impl<S, Target, Req> Service<Target> for MakeBalance<S, Req>
++impl<S, Target, Req> Service<Target> for BalanceMake<S, Req>
+ where
+     S: Service<Target>,
+     S::Response: Discover,
+@@ -98,7 +83,7 @@ where
+     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+         let this = self.project();
+         let inner = ready!(this.inner.poll(cx))?;
+-        let svc = Balance::from_rng(inner, this.rng.clone()).expect("SmallRng is infallible");
++        let svc = Balance::new(inner, this.rng.clone());
+         Poll::Ready(Ok(svc))
+     }
+ }
+diff --git a/tower/src/balance/p2c/mod.rs b/tower/src/balance/p2c/mod.rs
+index 870bcef..cf42fd2 100644
+--- a/tower/src/balance/p2c/mod.rs
++++ b/tower/src/balance/p2c/mod.rs
+@@ -1,32 +1,4 @@
+-//! This module implements the "[Power of Two Random Choices]" load balancing algorithm.
+-//!
+-//! It is a simple but robust technique for spreading load across services with only inexact load
+-//! measurements. As its name implies, whenever a request comes in, it samples two ready services
+-//! at random, and issues the request to whichever service is less loaded. How loaded a service is
+-//! is determined by the return value of [`Load`](tower::load::Load).
+-//!
+-//! As described in the [Finagle Guide][finagle]:
+-//!
+-//! > The algorithm randomly picks two services from the set of ready endpoints and
+-//! > selects the least loaded of the two. By repeatedly using this strategy, we can
+-//! > expect a manageable upper bound on the maximum load of any server.
+-//! >
+-//! > The maximum load variance between any two servers is bound by `ln(ln(n))` where
+-//! > `n` is the number of servers in the cluster.
+-//!
+-//! The balance service and layer implementations rely on _service discovery_ to provide the
+-//! underlying set of services to balance requests across. This happens through the
+-//! [`Discover`](tower::discover::Discover) trait, which is essentially a `Stream` that indicates
+-//! when services become available or go away. If you have a fixed set of services, consider using
+-//! [`ServiceList`](tower::discover::ServiceList).
+-//!
+-//! Since the load balancer needs to perform _random_ choices, the constructors in this module
+-//! usually come in two forms: one that uses randomness provided by the operating system, and one
+-//! that lets you specify the random seed to use. Usually the former is what you'll want, though
+-//! the latter may come in handy for reproducability or to reduce reliance on the operating system.
+-//!
+-//! [Power of Two Random Choices]: http://www.eecs.harvard.edu/~michaelm/postscripts/handbook2001.pdf
+-//! [finagle]: https://twitter.github.io/finagle/guide/Clients.html#power-of-two-choices-p2c-least-loaded
++//! A Power-of-Two-Choices Load Balancer
+ 
+ mod layer;
+ mod make;
+@@ -35,6 +7,6 @@ mod service;
+ #[cfg(test)]
+ mod test;
+ 
+-pub use layer::MakeBalanceLayer;
+-pub use make::{MakeBalance, MakeFuture};
++pub use layer::BalanceLayer;
++pub use make::{BalanceMake, MakeFuture};
+ pub use service::Balance;
+diff --git a/tower/src/balance/p2c/service.rs b/tower/src/balance/p2c/service.rs
+index 4943fc3..9676a9b 100644
+--- a/tower/src/balance/p2c/service.rs
++++ b/tower/src/balance/p2c/service.rs
+@@ -5,7 +5,7 @@ use crate::ready_cache::{error::Failed, ReadyCache};
+ use futures_core::ready;
+ use futures_util::future::{self, TryFutureExt};
+ use pin_project::pin_project;
+-use rand::{rngs::SmallRng, Rng, SeedableRng};
++use rand::{rngs::SmallRng, SeedableRng};
+ use std::hash::Hash;
+ use std::marker::PhantomData;
+ use std::{
+@@ -18,15 +18,24 @@ use tokio::sync::oneshot;
+ use tower_service::Service;
+ use tracing::{debug, trace};
+ 
+-/// Efficiently distributes requests across an arbitrary number of services.
++/// Distributes requests across inner services using the [Power of Two Choices][p2c].
+ ///
+-/// See the [module-level documentation](..) for details.
++/// As described in the [Finagle Guide][finagle]:
++///
++/// > The algorithm randomly picks two services from the set of ready endpoints and
++/// > selects the least loaded of the two. By repeatedly using this strategy, we can
++/// > expect a manageable upper bound on the maximum load of any server.
++/// >
++/// > The maximum load variance between any two servers is bound by `ln(ln(n))` where
++/// > `n` is the number of servers in the cluster.
+ ///
+ /// Note that `Balance` requires that the `Discover` you use is `Unpin` in order to implement
+ /// `Service`. This is because it needs to be accessed from `Service::poll_ready`, which takes
+ /// `&mut self`. You can achieve this easily by wrapping your `Discover` in [`Box::pin`] before you
+ /// construct the `Balance` instance. For more details, see [#319].
+ ///
++/// [finagle]: https://twitter.github.io/finagle/guide/Clients.html#power-of-two-choices-p2c-least-loaded
++/// [p2c]: http://www.eecs.harvard.edu/~michaelm/postscripts/handbook2001.pdf
+ /// [`Box::pin`]: https://doc.rust-lang.org/std/boxed/struct.Box.html#method.pin
+ /// [#319]: https://github.com/tower-rs/tower/issues/319
+ pub struct Balance<D, Req>
+@@ -59,10 +68,10 @@ where
+     }
+ }
+ 
++#[pin_project]
+ /// A Future that becomes satisfied when an `S`-typed service is ready.
+ ///
+-/// May fail due to cancelation, i.e., if [`Discover`] removes the service from the service set.
+-#[pin_project]
++/// May fail due to cancelation, i.e. if the service is removed from discovery.
+ #[derive(Debug)]
+ struct UnreadyService<K, S, Req> {
+     key: Option<K>,
+@@ -85,10 +94,10 @@ where
+     D::Service: Service<Req>,
+     <D::Service as Service<Req>>::Error: Into<crate::BoxError>,
+ {
+-    /// Constructs a load balancer that uses operating system entropy.
+-    pub fn new(discover: D) -> Self {
++    /// Initializes a P2C load balancer from the provided randomization source.
++    pub fn new(discover: D, rng: SmallRng) -> Self {
+         Self {
+-            rng: SmallRng::from_entropy(),
++            rng,
+             discover,
+             services: ReadyCache::default(),
+             ready_index: None,
+@@ -97,17 +106,9 @@ where
+         }
+     }
+ 
+-    /// Constructs a load balancer seeded with the provided random number generator.
+-    pub fn from_rng<R: Rng>(discover: D, rng: R) -> Result<Self, rand::Error> {
+-        let rng = SmallRng::from_rng(rng)?;
+-        Ok(Self {
+-            rng,
+-            discover,
+-            services: ReadyCache::default(),
+-            ready_index: None,
+-
+-            _req: PhantomData,
+-        })
++    /// Initializes a P2C load balancer from the OS's entropy source.
++    pub fn from_entropy(discover: D) -> Self {
++        Self::new(discover, SmallRng::from_entropy())
+     }
+ 
+     /// Returns the number of endpoints currently tracked by the balancer.
+diff --git a/tower/src/balance/p2c/test.rs b/tower/src/balance/p2c/test.rs
+index 404e94f..437b912 100644
+--- a/tower/src/balance/p2c/test.rs
++++ b/tower/src/balance/p2c/test.rs
+@@ -11,7 +11,7 @@ use super::*;
+ async fn empty() {
+     let empty: Vec<load::Constant<mock::Mock<(), &'static str>, usize>> = vec![];
+     let disco = ServiceList::new(empty);
+-    let mut svc = mock::Spawn::new(Balance::new(disco));
++    let mut svc = mock::Spawn::new(Balance::from_entropy(disco));
+     assert_pending!(svc.poll_ready());
+ }
+ 
+@@ -20,7 +20,7 @@ async fn single_endpoint() {
+     let (mut svc, mut handle) = mock::spawn_with(|s| {
+         let mock = load::Constant::new(s, 0);
+         let disco = ServiceList::new(vec![mock].into_iter());
+-        Balance::new(disco)
++        Balance::from_entropy(disco)
+     });
+ 
+     handle.allow(0);
+@@ -61,7 +61,7 @@ async fn two_endpoints_with_equal_load() {
+     pin_mut!(handle_b);
+ 
+     let disco = ServiceList::new(vec![mock_a, mock_b].into_iter());
+-    let mut svc = mock::Spawn::new(Balance::new(disco));
++    let mut svc = mock::Spawn::new(Balance::from_entropy(disco));
+ 
+     handle_a.allow(0);
+     handle_b.allow(0);
+diff --git a/tower/src/balance/pool/mod.rs b/tower/src/balance/pool/mod.rs
+index 799aaf8..07df300 100644
+--- a/tower/src/balance/pool/mod.rs
++++ b/tower/src/balance/pool/mod.rs
+@@ -289,7 +289,7 @@ impl Builder {
+         };
+ 
+         Pool {
+-            balance: Balance::new(Box::pin(d)),
++            balance: Balance::from_entropy(Box::pin(d)),
+             options: *self,
+             ewma: self.init,
+         }
+diff --git a/tower/tests/balance/main.rs b/tower/tests/balance/main.rs
+index 8ca3ce9..c23e074 100644
+--- a/tower/tests/balance/main.rs
++++ b/tower/tests/balance/main.rs
+@@ -34,7 +34,7 @@ impl tower::load::Load for Mock {
+ fn stress() {
+     let mut task = task::spawn(());
+     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<_, &'static str>>();
+-    let mut cache = Balance::<_, Req>::new(rx);
++    let mut cache = Balance::<_, Req>::from_entropy(rx);
+ 
+     let mut nready = 0;
+     let mut services = slab::Slab::<(mock::Handle<Req, Req>, bool)>::new();

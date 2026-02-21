@@ -1,0 +1,609 @@
+diff --git a/serde/src/de/impls.rs b/serde/src/de/impls.rs
+index ef3e20e6..c48d02a7 100644
+--- a/serde/src/de/impls.rs
++++ b/serde/src/de/impls.rs
+@@ -869,37 +869,204 @@ map_impl!(
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+ #[cfg(feature = "std")]
+-macro_rules! parse_impl {
+-    ($ty:ty) => {
++macro_rules! parse_ip_impl {
++    ($ty:ty; $size: expr) => {
+         impl<'de> Deserialize<'de> for $ty {
+             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+             where
+                 D: Deserializer<'de>,
+             {
+-                let s = try!(String::deserialize(deserializer));
+-                s.parse().map_err(Error::custom)
++                if deserializer.is_human_readable() {
++                    let s = try!(String::deserialize(deserializer));
++                    s.parse().map_err(Error::custom)
++                } else {
++                    <[u8; $size]>::deserialize(deserializer).map(<$ty>::from)
++                }
++            }
++        }
++    }
++}
++
++macro_rules! variant_identifier {
++    (
++        $name_kind: ident ( $($variant: ident; $bytes: expr; $index: expr),* )
++        $expecting_message: expr,
++        $variants_name: ident
++    ) => {
++        enum $name_kind {
++            $( $variant ),*
++        }
++
++        static $variants_name: &'static [&'static str] = &[ $( stringify!($variant) ),*];
++
++        impl<'de> Deserialize<'de> for $name_kind {
++            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
++            where
++                D: Deserializer<'de>,
++            {
++                struct KindVisitor;
++
++                impl<'de> Visitor<'de> for KindVisitor {
++                    type Value = $name_kind;
++
++                    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
++                        formatter.write_str($expecting_message)
++                    }
++
++                    fn visit_u32<E>(self, value: u32) -> Result<Self::Value, E>
++                    where
++                        E: Error,
++                    {
++                        match value {
++                            $(
++                                $index => Ok($name_kind :: $variant),
++                            )*
++                            _ => Err(Error::invalid_value(Unexpected::Unsigned(value as u64), &self),),
++                        }
++                    }
++
++                    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
++                    where
++                        E: Error,
++                    {
++                        match value {
++                            $(
++                                stringify!($variant) => Ok($name_kind :: $variant),
++                            )*
++                            _ => Err(Error::unknown_variant(value, $variants_name)),
++                        }
++                    }
++
++                    fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
++                    where
++                        E: Error,
++                    {
++                        match value {
++                            $(
++                                $bytes => Ok($name_kind :: $variant),
++                            )*
++                            _ => {
++                                match str::from_utf8(value) {
++                                    Ok(value) => Err(Error::unknown_variant(value, $variants_name)),
++                                    Err(_) => Err(Error::invalid_value(Unexpected::Bytes(value), &self)),
++                                }
++                            }
++                        }
++                    }
++                }
++
++                deserializer.deserialize_identifier(KindVisitor)
++            }
++        }
++    }
++}
++
++macro_rules! deserialize_enum {
++    (
++        $name: ident $name_kind: ident ( $($variant: ident; $bytes: expr; $index: expr),* )
++        $expecting_message: expr,
++        $deserializer: expr
++    ) => {
++        variant_identifier!{
++            $name_kind ( $($variant; $bytes; $index),* )
++            $expecting_message,
++            VARIANTS
++        }
++
++        struct EnumVisitor;
++        impl<'de> Visitor<'de> for EnumVisitor {
++            type Value = $name;
++
++            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
++                formatter.write_str(concat!("a ", stringify!($name)))
++            }
++
++
++            fn visit_enum<A>(self, data: A) -> Result<Self::Value, A::Error>
++            where
++                A: EnumAccess<'de>,
++            {
++                match try!(data.variant()) {
++                    $(
++                        ($name_kind :: $variant, v) => v.newtype_variant().map($name :: $variant),
++                    )*
++                }
++            }
++        }
++        $deserializer.deserialize_enum(stringify!($name), VARIANTS, EnumVisitor)
++    }
++}
++
++#[cfg(feature = "std")]
++impl<'de> Deserialize<'de> for net::IpAddr {
++    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
++    where
++        D: Deserializer<'de>,
++    {
++        if deserializer.is_human_readable() {
++            let s = try!(String::deserialize(deserializer));
++            s.parse().map_err(Error::custom)
++        } else {
++            use lib::net::IpAddr;
++            deserialize_enum!{
++                IpAddr IpAddrKind (V4; b"V4"; 0, V6; b"V6"; 1)
++                "`V4` or `V6`",
++                deserializer
+             }
+         }
+     }
+ }
+ 
+ #[cfg(feature = "std")]
+-parse_impl!(net::IpAddr);
++parse_ip_impl!(net::Ipv4Addr; 4);
+ 
+ #[cfg(feature = "std")]
+-parse_impl!(net::Ipv4Addr);
++parse_ip_impl!(net::Ipv6Addr; 16);
+ 
+ #[cfg(feature = "std")]
+-parse_impl!(net::Ipv6Addr);
++macro_rules! parse_socket_impl {
++    ($ty:ty, $new: expr) => {
++        impl<'de> Deserialize<'de> for $ty {
++            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
++            where
++                D: Deserializer<'de>,
++            {
++                if deserializer.is_human_readable() {
++                    let s = try!(String::deserialize(deserializer));
++                    s.parse().map_err(Error::custom)
++                } else {
++                    <(_, u16)>::deserialize(deserializer).map(|(ip, port)| $new(ip, port))
++                }
++            }
++        }
++    }
++}
+ 
+ #[cfg(feature = "std")]
+-parse_impl!(net::SocketAddr);
++impl<'de> Deserialize<'de> for net::SocketAddr {
++    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
++    where
++        D: Deserializer<'de>,
++    {
++        if deserializer.is_human_readable() {
++            let s = try!(String::deserialize(deserializer));
++            s.parse().map_err(Error::custom)
++        } else {
++            use lib::net::SocketAddr;
++            deserialize_enum!{
++                SocketAddr SocketAddrKind (V4; b"V4"; 0, V6; b"V6"; 1)
++                "`V4` or `V6`",
++                deserializer
++            }
++        }
++    }
++}
+ 
+ #[cfg(feature = "std")]
+-parse_impl!(net::SocketAddrV4);
++parse_socket_impl!(net::SocketAddrV4, net::SocketAddrV4::new);
+ 
+ #[cfg(feature = "std")]
+-parse_impl!(net::SocketAddrV6);
++parse_socket_impl!(net::SocketAddrV6, |ip, port| net::SocketAddrV6::new(ip, port, 0, 0));
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+@@ -984,70 +1151,10 @@ impl<'de> Deserialize<'de> for PathBuf {
+ //    #[derive(Deserialize)]
+ //    #[serde(variant_identifier)]
+ #[cfg(all(feature = "std", any(unix, windows)))]
+-enum OsStringKind {
+-    Unix,
+-    Windows,
+-}
+-
+-#[cfg(all(feature = "std", any(unix, windows)))]
+-static OSSTR_VARIANTS: &'static [&'static str] = &["Unix", "Windows"];
+-
+-#[cfg(all(feature = "std", any(unix, windows)))]
+-impl<'de> Deserialize<'de> for OsStringKind {
+-    fn deserialize<D>(deserializer: D) -> Result<OsStringKind, D::Error>
+-    where
+-        D: Deserializer<'de>,
+-    {
+-        struct KindVisitor;
+-
+-        impl<'de> Visitor<'de> for KindVisitor {
+-            type Value = OsStringKind;
+-
+-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+-                formatter.write_str("`Unix` or `Windows`")
+-            }
+-
+-            fn visit_u32<E>(self, value: u32) -> Result<OsStringKind, E>
+-            where
+-                E: Error,
+-            {
+-                match value {
+-                    0 => Ok(OsStringKind::Unix),
+-                    1 => Ok(OsStringKind::Windows),
+-                    _ => Err(Error::invalid_value(Unexpected::Unsigned(value as u64), &self),),
+-                }
+-            }
+-
+-            fn visit_str<E>(self, value: &str) -> Result<OsStringKind, E>
+-            where
+-                E: Error,
+-            {
+-                match value {
+-                    "Unix" => Ok(OsStringKind::Unix),
+-                    "Windows" => Ok(OsStringKind::Windows),
+-                    _ => Err(Error::unknown_variant(value, OSSTR_VARIANTS)),
+-                }
+-            }
+-
+-            fn visit_bytes<E>(self, value: &[u8]) -> Result<OsStringKind, E>
+-            where
+-                E: Error,
+-            {
+-                match value {
+-                    b"Unix" => Ok(OsStringKind::Unix),
+-                    b"Windows" => Ok(OsStringKind::Windows),
+-                    _ => {
+-                        match str::from_utf8(value) {
+-                            Ok(value) => Err(Error::unknown_variant(value, OSSTR_VARIANTS)),
+-                            Err(_) => Err(Error::invalid_value(Unexpected::Bytes(value), &self)),
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-
+-        deserializer.deserialize_identifier(KindVisitor)
+-    }
++variant_identifier!{
++    OsStringKind (Unix; b"Unix"; 0, Windows; b"Windows"; 1)
++    "`Unix` or `Windows`",
++    OSSTR_VARIANTS
+ }
+ 
+ #[cfg(all(feature = "std", any(unix, windows)))]
+diff --git a/serde/src/de/mod.rs b/serde/src/de/mod.rs
+index e90ced27..71a707ef 100644
+--- a/serde/src/de/mod.rs
++++ b/serde/src/de/mod.rs
+@@ -1011,6 +1011,15 @@ pub trait Deserializer<'de>: Sized {
+     fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+     where
+         V: Visitor<'de>;
++
++    /// Returns whether the serialized data is human readable or not.
++    ///
++    /// Some formats are not intended to be human readable. For these formats
++    /// a type being serialized may opt to serialize into a more compact form.
++    ///
++    /// NOTE: Implementing this method and returning `false` is considered a breaking
++    /// change as it may alter how any given type tries to deserialize itself.
++    fn is_human_readable(&self) -> bool { true }
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+diff --git a/serde/src/ser/impls.rs b/serde/src/ser/impls.rs
+index ea59b78d..3fa2ad9c 100644
+--- a/serde/src/ser/impls.rs
++++ b/serde/src/ser/impls.rs
+@@ -506,9 +506,18 @@ impl Serialize for net::IpAddr {
+     where
+         S: Serializer,
+     {
+-        match *self {
+-            net::IpAddr::V4(ref a) => a.serialize(serializer),
+-            net::IpAddr::V6(ref a) => a.serialize(serializer),
++        if serializer.is_human_readable() {
++            match *self {
++                net::IpAddr::V4(ref a) => a.serialize(serializer),
++                net::IpAddr::V6(ref a) => a.serialize(serializer),
++            }
++        } else {
++            match *self {
++                net::IpAddr::V4(ref a) => 
++                    serializer.serialize_newtype_variant("IpAddr", 0, "V4", a),
++                net::IpAddr::V6(ref a) =>
++                    serializer.serialize_newtype_variant("IpAddr", 1, "V6", a),
++            }
+         }
+     }
+ }
+@@ -519,9 +528,13 @@ impl Serialize for net::Ipv4Addr {
+     where
+         S: Serializer,
+     {
+-        /// "101.102.103.104".len()
+-        const MAX_LEN: usize = 15;
+-        serialize_display_bounded_length!(self, MAX_LEN, serializer)
++        if serializer.is_human_readable() {
++            /// "101.102.103.104".len()
++            const MAX_LEN: usize = 15;
++            serialize_display_bounded_length!(self, MAX_LEN, serializer)
++        } else {
++            self.octets().serialize(serializer)
++        }
+     }
+ }
+ 
+@@ -531,9 +544,13 @@ impl Serialize for net::Ipv6Addr {
+     where
+         S: Serializer,
+     {
+-        /// "1000:1002:1003:1004:1005:1006:1007:1008".len()
+-        const MAX_LEN: usize = 39;
+-        serialize_display_bounded_length!(self, MAX_LEN, serializer)
++        if serializer.is_human_readable() {
++            /// "1000:1002:1003:1004:1005:1006:1007:1008".len()
++            const MAX_LEN: usize = 39;
++            serialize_display_bounded_length!(self, MAX_LEN, serializer)
++        } else {
++            self.octets().serialize(serializer)
++        }
+     }
+ }
+ 
+@@ -543,9 +560,18 @@ impl Serialize for net::SocketAddr {
+     where
+         S: Serializer,
+     {
+-        match *self {
+-            net::SocketAddr::V4(ref addr) => addr.serialize(serializer),
+-            net::SocketAddr::V6(ref addr) => addr.serialize(serializer),
++        if serializer.is_human_readable() {
++            match *self {
++                net::SocketAddr::V4(ref addr) => addr.serialize(serializer),
++                net::SocketAddr::V6(ref addr) => addr.serialize(serializer),
++            }
++        } else {
++            match *self {
++                net::SocketAddr::V4(ref addr) =>
++                    serializer.serialize_newtype_variant("SocketAddr", 0, "V4", addr),
++                net::SocketAddr::V6(ref addr) =>
++                    serializer.serialize_newtype_variant("SocketAddr", 1, "V6", addr),
++            }
+         }
+     }
+ }
+@@ -556,9 +582,13 @@ impl Serialize for net::SocketAddrV4 {
+     where
+         S: Serializer,
+     {
+-        /// "101.102.103.104:65000".len()
+-        const MAX_LEN: usize = 21;
+-        serialize_display_bounded_length!(self, MAX_LEN, serializer)
++        if serializer.is_human_readable() {
++            /// "101.102.103.104:65000".len()
++            const MAX_LEN: usize = 21;
++            serialize_display_bounded_length!(self, MAX_LEN, serializer)
++        } else {
++            (self.ip(), self.port()).serialize(serializer)
++        }
+     }
+ }
+ 
+@@ -568,9 +598,13 @@ impl Serialize for net::SocketAddrV6 {
+     where
+         S: Serializer,
+     {
+-        /// "[1000:1002:1003:1004:1005:1006:1007:1008]:65000".len()
+-        const MAX_LEN: usize = 47;
+-        serialize_display_bounded_length!(self, MAX_LEN, serializer)
++        if serializer.is_human_readable() {
++            /// "[1000:1002:1003:1004:1005:1006:1007:1008]:65000".len()
++            const MAX_LEN: usize = 47;
++            serialize_display_bounded_length!(self, MAX_LEN, serializer)
++        } else {
++            (self.ip(), self.port()).serialize(serializer)
++        }
+     }
+ }
+ 
+diff --git a/serde/src/ser/mod.rs b/serde/src/ser/mod.rs
+index 4356f930..bbcceac7 100644
+--- a/serde/src/ser/mod.rs
++++ b/serde/src/ser/mod.rs
+@@ -1363,6 +1363,15 @@ pub trait Serializer: Sized {
+     fn collect_str<T: ?Sized>(self, value: &T) -> Result<Self::Ok, Self::Error>
+     where
+         T: Display;
++
++    /// Returns wheter the data format is human readable or not.
++    ///
++    /// Some formats are not intended to be human readable. For these formats
++    /// a type being serialized may opt to serialize into a more compact form.
++    ///
++    /// NOTE: Implementing this method and returning `false` is considered a breaking
++    /// change as it may alter how any given type tries to serialize itself.
++    fn is_human_readable(&self) -> bool { true }
+ }
+ 
+ /// Returned from `Serializer::serialize_seq`.
+diff --git a/serde_test/src/assert.rs b/serde_test/src/assert.rs
+index 2af2ebf5..7a4b1d4d 100644
+--- a/serde_test/src/assert.rs
++++ b/serde_test/src/assert.rs
+@@ -47,8 +47,20 @@ pub fn assert_tokens<'de, T>(value: &T, tokens: &'de [Token])
+ where
+     T: Serialize + Deserialize<'de> + PartialEq + Debug,
+ {
+-    assert_ser_tokens(value, tokens);
+-    assert_de_tokens(value, tokens);
++    assert_tokens_readable(value, tokens, true);
++}
++
++// Not public API
++#[doc(hidden)]
++/// Runs both `assert_ser_tokens` and `assert_de_tokens`.
++///
++/// See: `assert_tokens`
++pub fn assert_tokens_readable<'de, T>(value: &T, tokens: &'de [Token], human_readable: bool)
++where
++    T: Serialize + Deserialize<'de> + PartialEq + Debug,
++{
++    assert_ser_tokens_readable(value, tokens, human_readable);
++    assert_de_tokens_readable(value, tokens, human_readable);
+ }
+ 
+ /// Asserts that `value` serializes to the given `tokens`.
+@@ -84,7 +96,19 @@ pub fn assert_ser_tokens<T>(value: &T, tokens: &[Token])
+ where
+     T: Serialize,
+ {
+-    let mut ser = Serializer::new(tokens);
++    assert_ser_tokens_readable(value, tokens, true)
++}
++
++// Not public API
++#[doc(hidden)]
++/// Asserts that `value` serializes to the given `tokens`.
++///
++/// See: `assert_ser_tokens`
++pub fn assert_ser_tokens_readable<T>(value: &T, tokens: &[Token], human_readable: bool)
++where
++    T: Serialize,
++{
++    let mut ser = Serializer::readable(tokens, human_readable);
+     match value.serialize(&mut ser) {
+         Ok(_) => {}
+         Err(err) => panic!("value failed to serialize: {}", err),
+@@ -183,7 +207,16 @@ pub fn assert_de_tokens<'de, T>(value: &T, tokens: &'de [Token])
+ where
+     T: Deserialize<'de> + PartialEq + Debug,
+ {
+-    let mut de = Deserializer::new(tokens);
++    assert_de_tokens_readable(value, tokens, true)
++}
++
++// Not public API
++#[doc(hidden)]
++pub fn assert_de_tokens_readable<'de, T>(value: &T, tokens: &'de [Token], human_readable: bool)
++where
++    T: Deserialize<'de> + PartialEq + Debug,
++{
++    let mut de = Deserializer::readable(tokens, human_readable);
+     match T::deserialize(&mut de) {
+         Ok(v) => assert_eq!(v, *value),
+         Err(e) => panic!("tokens failed to deserialize: {}", e),
+diff --git a/serde_test/src/de.rs b/serde_test/src/de.rs
+index 9e465a73..8a281d9d 100644
+--- a/serde_test/src/de.rs
++++ b/serde_test/src/de.rs
+@@ -16,6 +16,7 @@ use token::Token;
+ #[derive(Debug)]
+ pub struct Deserializer<'de> {
+     tokens: &'de [Token],
++    is_human_readable: bool,
+ }
+ 
+ macro_rules! assert_next_token {
+@@ -48,7 +49,13 @@ macro_rules! end_of_tokens {
+ 
+ impl<'de> Deserializer<'de> {
+     pub fn new(tokens: &'de [Token]) -> Self {
+-        Deserializer { tokens: tokens }
++        Deserializer::readable(tokens, true)
++    }
++
++    // Not public API
++    #[doc(hidden)]
++    pub fn readable(tokens: &'de [Token], is_human_readable: bool) -> Self {
++        Deserializer { tokens: tokens, is_human_readable: is_human_readable }
+     }
+ 
+     fn peek_token_opt(&self) -> Option<Token> {
+@@ -364,6 +371,10 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
+             _ => self.deserialize_any(visitor),
+         }
+     }
++
++    fn is_human_readable(&self) -> bool {
++        self.is_human_readable
++    }
+ }
+ 
+ //////////////////////////////////////////////////////////////////////////
+diff --git a/serde_test/src/lib.rs b/serde_test/src/lib.rs
+index 391837d1..7833d942 100644
+--- a/serde_test/src/lib.rs
++++ b/serde_test/src/lib.rs
+@@ -168,8 +168,12 @@ mod token;
+ mod assert;
+ 
+ pub use token::Token;
+-pub use assert::{assert_tokens, assert_ser_tokens, assert_ser_tokens_error, assert_de_tokens,
+-                 assert_de_tokens_error};
++pub use assert::{assert_tokens, assert_ser_tokens, assert_ser_tokens_error,
++                 assert_de_tokens, assert_de_tokens_error};
++
++// Not public API.
++#[doc(hidden)]
++pub use assert::{assert_tokens_readable, assert_de_tokens_readable, assert_ser_tokens_readable};
+ 
+ // Not public API.
+ #[doc(hidden)]
+diff --git a/serde_test/src/ser.rs b/serde_test/src/ser.rs
+index 31ba72ee..a25ade9a 100644
+--- a/serde_test/src/ser.rs
++++ b/serde_test/src/ser.rs
+@@ -15,12 +15,19 @@ use token::Token;
+ #[derive(Debug)]
+ pub struct Serializer<'a> {
+     tokens: &'a [Token],
++    is_human_readable: bool,
+ }
+ 
+ impl<'a> Serializer<'a> {
+     /// Creates the serializer.
+     pub fn new(tokens: &'a [Token]) -> Self {
+-        Serializer { tokens: tokens }
++        Serializer::readable(tokens, true)
++    }
++
++    // Not public API
++    #[doc(hidden)]
++    pub fn readable(tokens: &'a [Token], is_human_readable: bool) -> Self {
++        Serializer { tokens: tokens, is_human_readable: is_human_readable }
+     }
+ 
+     /// Pulls the next token off of the serializer, ignoring it.
+@@ -282,6 +289,10 @@ impl<'s, 'a> ser::Serializer for &'s mut Serializer<'a> {
+             Ok(Variant { ser: self, end: Token::StructVariantEnd })
+         }
+     }
++
++    fn is_human_readable(&self) -> bool {
++        self.is_human_readable
++    }
+ }
+ 
+ pub struct Variant<'s, 'a: 's> {

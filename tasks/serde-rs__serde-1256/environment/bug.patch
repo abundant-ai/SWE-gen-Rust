@@ -1,0 +1,205 @@
+diff --git a/serde/src/de/impls.rs b/serde/src/de/impls.rs
+index 59f667ed..b13800dc 100644
+--- a/serde/src/de/impls.rs
++++ b/serde/src/de/impls.rs
+@@ -529,14 +529,6 @@ where
+     {
+         T::deserialize(deserializer).map(Some)
+     }
+-
+-    #[doc(hidden)]
+-    fn __private_visit_untagged_option<D>(self, deserializer: D) -> Result<Self::Value, ()>
+-    where
+-        D: Deserializer<'de>,
+-    {
+-        Ok(T::deserialize(deserializer).ok())
+-    }
+ }
+ 
+ impl<'de, T> Deserialize<'de> for Option<T>
+diff --git a/serde/src/de/mod.rs b/serde/src/de/mod.rs
+index fbc24016..826662df 100644
+--- a/serde/src/de/mod.rs
++++ b/serde/src/de/mod.rs
+@@ -1529,15 +1529,6 @@ pub trait Visitor<'de>: Sized {
+         let _ = data;
+         Err(Error::invalid_type(Unexpected::Enum, &self))
+     }
+-
+-    // Used when deserializing a flattened Option field. Not public API.
+-    #[doc(hidden)]
+-    fn __private_visit_untagged_option<D>(self, _: D) -> Result<Self::Value, ()>
+-    where
+-        D: Deserializer<'de>,
+-    {
+-        Err(())
+-    }
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+diff --git a/serde/src/private/de.rs b/serde/src/private/de.rs
+index fab85534..dcf5008f 100644
+--- a/serde/src/private/de.rs
++++ b/serde/src/private/de.rs
+@@ -2645,7 +2645,10 @@ impl<'a, 'de, E> FlatMapDeserializer<'a, 'de, E>
+ where
+     E: Error,
+ {
+-    fn deserialize_other<V>() -> Result<V, E> {
++    fn deserialize_other<V>(self, _: V) -> Result<V::Value, E>
++    where
++        V: Visitor<'de>,
++    {
+         Err(Error::custom("can only flatten structs and maps"))
+     }
+ }
+@@ -2654,11 +2657,11 @@ where
+ macro_rules! forward_to_deserialize_other {
+     ($($func:ident ( $($arg:ty),* ))*) => {
+         $(
+-            fn $func<V>(self, $(_: $arg,)* _visitor: V) -> Result<V::Value, Self::Error>
++            fn $func<V>(self, $(_: $arg,)* visitor: V) -> Result<V::Value, Self::Error>
+             where
+                 V: Visitor<'de>,
+             {
+-                Self::deserialize_other()
++                self.deserialize_other(visitor)
+             }
+         )*
+     }
+@@ -2738,16 +2741,6 @@ where
+         visitor.visit_newtype_struct(self)
+     }
+ 
+-    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+-    where
+-        V: Visitor<'de>,
+-    {
+-        match visitor.__private_visit_untagged_option(self) {
+-            Ok(value) => Ok(value),
+-            Err(()) => Self::deserialize_other(),
+-        }
+-    }
+-
+     forward_to_deserialize_other! {
+         deserialize_bool()
+         deserialize_i8()
+@@ -2765,6 +2758,7 @@ where
+         deserialize_string()
+         deserialize_bytes()
+         deserialize_byte_buf()
++        deserialize_option()
+         deserialize_unit()
+         deserialize_unit_struct(&'static str)
+         deserialize_seq()
+diff --git a/serde/src/private/ser.rs b/serde/src/private/ser.rs
+index c21de163..54bb4ce0 100644
+--- a/serde/src/private/ser.rs
++++ b/serde/src/private/ser.rs
+@@ -1122,14 +1122,14 @@ where
+     }
+ 
+     fn serialize_none(self) -> Result<Self::Ok, Self::Error> {
+-        Ok(())
++        Err(self.bad_type(Unsupported::Optional))
+     }
+ 
+-    fn serialize_some<T: ?Sized>(self, value: &T) -> Result<Self::Ok, Self::Error>
++    fn serialize_some<T: ?Sized>(self, _: &T) -> Result<Self::Ok, Self::Error>
+     where
+         T: Serialize,
+     {
+-        value.serialize(self)
++        Err(self.bad_type(Unsupported::Optional))
+     }
+ 
+     fn serialize_unit(self) -> Result<Self::Ok, Self::Error> {
+diff --git a/test_suite/tests/test_annotations.rs b/test_suite/tests/test_annotations.rs
+index 7aaa97d5..248e4211 100644
+--- a/test_suite/tests/test_annotations.rs
++++ b/test_suite/tests/test_annotations.rs
+@@ -2095,84 +2095,3 @@ fn test_flatten_untagged_enum() {
+         ],
+     );
+ }
+-
+-#[test]
+-fn test_flatten_option() {
+-    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+-    struct Outer {
+-        #[serde(flatten)]
+-        inner1: Option<Inner1>,
+-        #[serde(flatten)]
+-        inner2: Option<Inner2>,
+-    }
+-
+-    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+-    struct Inner1 {
+-        inner1: i32,
+-    }
+-
+-    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+-    struct Inner2 {
+-        inner2: i32,
+-    }
+-
+-    assert_tokens(
+-        &Outer {
+-            inner1: Some(Inner1 {
+-                inner1: 1,
+-            }),
+-            inner2: Some(Inner2 {
+-                inner2: 2,
+-            }),
+-        },
+-        &[
+-            Token::Map { len: None },
+-            Token::Str("inner1"),
+-            Token::I32(1),
+-            Token::Str("inner2"),
+-            Token::I32(2),
+-            Token::MapEnd,
+-        ],
+-    );
+-
+-    assert_tokens(
+-        &Outer {
+-            inner1: Some(Inner1 {
+-                inner1: 1,
+-            }),
+-            inner2: None,
+-        },
+-        &[
+-            Token::Map { len: None },
+-            Token::Str("inner1"),
+-            Token::I32(1),
+-            Token::MapEnd,
+-        ],
+-    );
+-
+-    assert_tokens(
+-        &Outer {
+-            inner1: None,
+-            inner2: Some(Inner2 {
+-                inner2: 2,
+-            }),
+-        },
+-        &[
+-            Token::Map { len: None },
+-            Token::Str("inner2"),
+-            Token::I32(2),
+-            Token::MapEnd,
+-        ],
+-    );
+-
+-    assert_tokens(
+-        &Outer {
+-            inner1: None,
+-            inner2: None,
+-        },
+-        &[
+-            Token::Map { len: None },
+-            Token::MapEnd,
+-        ],
+-    );
+-}

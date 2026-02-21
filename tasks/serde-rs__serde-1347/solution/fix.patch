@@ -1,0 +1,234 @@
+diff --git a/serde/build.rs b/serde/build.rs
+index a187cf85..3e82ddda 100644
+--- a/serde/build.rs
++++ b/serde/build.rs
+@@ -36,6 +36,12 @@ fn main() {
+         println!("cargo:rustc-cfg=integer128");
+     }
+ 
++    // Inclusive ranges methods stabilized in Rust 1.27:
++    // https://github.com/rust-lang/rust/pull/50758
++    if minor >= 27 {
++        println!("cargo:rustc-cfg=range_inclusive");
++    }
++
+     // Non-zero integers stabilized in Rust 1.28:
+     // https://github.com/rust-lang/rust/pull/50808
+     if minor >= 28 {
+diff --git a/serde/src/de/impls.rs b/serde/src/de/impls.rs
+index 3e21b948..39a8cf4e 100644
+--- a/serde/src/de/impls.rs
++++ b/serde/src/de/impls.rs
+@@ -2196,6 +2196,144 @@ where
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+ 
++#[cfg(range_inclusive)]
++impl<'de, Idx> Deserialize<'de> for RangeInclusive<Idx>
++where
++    Idx: Deserialize<'de>,
++{
++    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
++    where
++        D: Deserializer<'de>,
++    {
++        enum Field {
++            Start,
++            End,
++        };
++
++        impl<'de> Deserialize<'de> for Field {
++            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
++            where
++                D: Deserializer<'de>,
++            {
++                struct FieldVisitor;
++
++                impl<'de> Visitor<'de> for FieldVisitor {
++                    type Value = Field;
++
++                    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
++                        formatter.write_str("`start` or `end`")
++                    }
++
++                    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
++                    where
++                        E: Error,
++                    {
++                        match value {
++                            "start" => Ok(Field::Start),
++                            "end" => Ok(Field::End),
++                            _ => Err(Error::unknown_field(value, FIELDS)),
++                        }
++                    }
++
++                    fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
++                    where
++                        E: Error,
++                    {
++                        match value {
++                            b"start" => Ok(Field::Start),
++                            b"end" => Ok(Field::End),
++                            _ => {
++                                let value = ::export::from_utf8_lossy(value);
++                                Err(Error::unknown_field(&value, FIELDS))
++                            }
++                        }
++                    }
++                }
++
++                deserializer.deserialize_identifier(FieldVisitor)
++            }
++        }
++
++        struct RangeInclusiveVisitor<Idx> {
++            phantom: PhantomData<Idx>,
++        }
++
++        impl<'de, Idx> Visitor<'de> for RangeInclusiveVisitor<Idx>
++        where
++            Idx: Deserialize<'de>,
++        {
++            type Value = RangeInclusive<Idx>;
++
++            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
++                formatter.write_str("struct RangeInclusive")
++            }
++
++            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
++            where
++                A: SeqAccess<'de>,
++            {
++                let start: Idx = match try!(seq.next_element()) {
++                    Some(value) => value,
++                    None => {
++                        return Err(Error::invalid_length(0, &self));
++                    }
++                };
++                let end: Idx = match try!(seq.next_element()) {
++                    Some(value) => value,
++                    None => {
++                        return Err(Error::invalid_length(1, &self));
++                    }
++                };
++                Ok(RangeInclusive::new(start, end))
++            }
++
++            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
++            where
++                A: MapAccess<'de>,
++            {
++                let mut start: Option<Idx> = None;
++                let mut end: Option<Idx> = None;
++                while let Some(key) = try!(map.next_key()) {
++                    match key {
++                        Field::Start => {
++                            if start.is_some() {
++                                return Err(<A::Error as Error>::duplicate_field("start"));
++                            }
++                            start = Some(try!(map.next_value()));
++                        }
++                        Field::End => {
++                            if end.is_some() {
++                                return Err(<A::Error as Error>::duplicate_field("end"));
++                            }
++                            end = Some(try!(map.next_value()));
++                        }
++                    }
++                }
++                let start = match start {
++                    Some(start) => start,
++                    None => return Err(<A::Error as Error>::missing_field("start")),
++                };
++                let end = match end {
++                    Some(end) => end,
++                    None => return Err(<A::Error as Error>::missing_field("end")),
++                };
++                Ok(RangeInclusive::new(start, end))
++            }
++        }
++
++        const FIELDS: &'static [&'static str] = &["start", "end"];
++        deserializer.deserialize_struct(
++            "RangeInclusive",
++            FIELDS,
++            RangeInclusiveVisitor {
++                phantom: PhantomData,
++            },
++        )
++    }
++}
++
++////////////////////////////////////////////////////////////////////////////////
++
+ macro_rules! nonzero_integers {
+     ( $( $T: ident, )+ ) => {
+         $(
+diff --git a/serde/src/de/mod.rs b/serde/src/de/mod.rs
+index 84a659a2..0db9367d 100644
+--- a/serde/src/de/mod.rs
++++ b/serde/src/de/mod.rs
+@@ -97,6 +97,7 @@
+ //!    - Path
+ //!    - PathBuf
+ //!    - Range\<T\>
++//!    - RangeInclusive\<T\>
+ //!    - num::NonZero*
+ //!    - `!` *(unstable)*
+ //!  - **Net types**:
+diff --git a/serde/src/lib.rs b/serde/src/lib.rs
+index ff6dbd3c..79fd5b7b 100644
+--- a/serde/src/lib.rs
++++ b/serde/src/lib.rs
+@@ -226,6 +226,9 @@ mod lib {
+ 
+     #[cfg(any(core_duration, feature = "std"))]
+     pub use self::core::time::Duration;
++
++    #[cfg(range_inclusive)]
++    pub use self::core::ops::RangeInclusive;
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+diff --git a/serde/src/ser/impls.rs b/serde/src/ser/impls.rs
+index cb273982..624d07a5 100644
+--- a/serde/src/ser/impls.rs
++++ b/serde/src/ser/impls.rs
+@@ -246,6 +246,25 @@ where
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+ 
++#[cfg(range_inclusive)]
++impl<Idx> Serialize for RangeInclusive<Idx>
++where
++    Idx: Serialize,
++{
++    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
++    where
++        S: Serializer,
++    {
++        use super::SerializeStruct;
++        let mut state = try!(serializer.serialize_struct("RangeInclusive", 2));
++        try!(state.serialize_field("start", &self.start()));
++        try!(state.serialize_field("end", &self.end()));
++        state.end()
++    }
++}
++
++////////////////////////////////////////////////////////////////////////////////
++
+ impl Serialize for () {
+     #[inline]
+     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+diff --git a/serde/src/ser/mod.rs b/serde/src/ser/mod.rs
+index d1d4bd7f..60b9a3e3 100644
+--- a/serde/src/ser/mod.rs
++++ b/serde/src/ser/mod.rs
+@@ -92,6 +92,7 @@
+ //!    - Path
+ //!    - PathBuf
+ //!    - Range\<T\>
++//!    - RangeInclusive\<T\>
+ //!    - num::NonZero*
+ //!    - `!` *(unstable)*
+ //!  - **Net types**:

@@ -1,0 +1,337 @@
+diff --git a/tower/src/buffer/message.rs b/tower/src/buffer/message.rs
+index 6d13aa1..2b2fcde 100644
+--- a/tower/src/buffer/message.rs
++++ b/tower/src/buffer/message.rs
+@@ -1,5 +1,5 @@
+ use super::error::ServiceError;
+-use tokio::sync::oneshot;
++use tokio::sync::{oneshot, OwnedSemaphorePermit};
+ 
+ /// Message sent over buffer
+ #[derive(Debug)]
+@@ -7,6 +7,7 @@ pub(crate) struct Message<Request, Fut> {
+     pub(crate) request: Request,
+     pub(crate) tx: Tx<Fut>,
+     pub(crate) span: tracing::Span,
++    pub(super) _permit: OwnedSemaphorePermit,
+ }
+ 
+ /// Response sender
+diff --git a/tower/src/buffer/service.rs b/tower/src/buffer/service.rs
+index c685984..9b690f0 100644
+--- a/tower/src/buffer/service.rs
++++ b/tower/src/buffer/service.rs
+@@ -4,9 +4,11 @@ use super::{
+     worker::{Handle, Worker},
+ };
+ 
++use futures_core::ready;
++use std::sync::Arc;
+ use std::task::{Context, Poll};
+-use tokio::sync::{mpsc, oneshot};
+-use tokio_util::sync::PollSender;
++use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
++use tokio_util::sync::PollSemaphore;
+ use tower_service::Service;
+ 
+ /// Adds an mpsc buffer in front of an inner service.
+@@ -17,7 +19,23 @@ pub struct Buffer<T, Request>
+ where
+     T: Service<Request>,
+ {
+-    tx: PollSender<Message<Request, T::Future>>,
++    // Note: this actually _is_ bounded, but rather than using Tokio's bounded
++    // channel, we use Tokio's semaphore separately to implement the bound.
++    tx: mpsc::UnboundedSender<Message<Request, T::Future>>,
++    // When the buffer's channel is full, we want to exert backpressure in
++    // `poll_ready`, so that callers such as load balancers could choose to call
++    // another service rather than waiting for buffer capacity.
++    //
++    // Unfortunately, this can't be done easily using Tokio's bounded MPSC
++    // channel, because it doesn't expose a polling-based interface, only an
++    // `async fn ready`, which borrows the sender. Therefore, we implement our
++    // own bounded MPSC on top of the unbounded channel, using a semaphore to
++    // limit how many items are in the channel.
++    semaphore: PollSemaphore,
++    // The current semaphore permit, if one has been acquired.
++    //
++    // This is acquired in `poll_ready` and taken in `call`.
++    permit: Option<OwnedSemaphorePermit>,
+     handle: Handle,
+ }
+ 
+@@ -69,13 +87,15 @@ where
+         T: Send + 'static,
+         T::Error: Send + Sync,
+         Request: Send + 'static,
+-        T::Future: Send + 'static,
+     {
+-        let (tx, rx) = mpsc::channel(bound);
+-        let (handle, worker) = Worker::new(service, rx);
+-        let buffer = Self {
+-            tx: PollSender::new(tx),
++        let (tx, rx) = mpsc::unbounded_channel();
++        let semaphore = Arc::new(Semaphore::new(bound));
++        let (handle, worker) = Worker::new(service, rx, &semaphore);
++        let buffer = Buffer {
++            tx,
+             handle,
++            semaphore: PollSemaphore::new(semaphore),
++            permit: None,
+         };
+         (buffer, worker)
+     }
+@@ -89,8 +109,6 @@ impl<T, Request> Service<Request> for Buffer<T, Request>
+ where
+     T: Service<Request>,
+     T::Error: Into<crate::BoxError>,
+-    T::Future: Send + 'static,
+-    Request: Send + 'static,
+ {
+     type Response = T::Response;
+     type Error = crate::BoxError;
+@@ -103,31 +121,47 @@ where
+             return Poll::Ready(Err(self.get_worker_error()));
+         }
+ 
+-        // Poll the sender to acquire a permit.
+-        self.tx
+-            .poll_reserve(cx)
+-            .map_err(|_| self.get_worker_error())
++        // Then, check if we've already acquired a permit.
++        if self.permit.is_some() {
++            // We've already reserved capacity to send a request. We're ready!
++            return Poll::Ready(Ok(()));
++        }
++
++        // Finally, if we haven't already acquired a permit, poll the semaphore
++        // to acquire one. If we acquire a permit, then there's enough buffer
++        // capacity to send a new request. Otherwise, we need to wait for
++        // capacity.
++        let permit =
++            ready!(self.semaphore.poll_acquire(cx)).ok_or_else(|| self.get_worker_error())?;
++        self.permit = Some(permit);
++
++        Poll::Ready(Ok(()))
+     }
+ 
+     fn call(&mut self, request: Request) -> Self::Future {
+         tracing::trace!("sending request to buffer worker");
++        let _permit = self
++            .permit
++            .take()
++            .expect("buffer full; poll_ready must be called first");
+ 
+         // get the current Span so that we can explicitly propagate it to the worker
+         // if we didn't do this, events on the worker related to this span wouldn't be counted
+         // towards that span since the worker would have no way of entering it.
+         let span = tracing::Span::current();
+ 
+-        // If we've made it here, then a channel permit has already been
++        // If we've made it here, then a semaphore permit has already been
+         // acquired, so we can freely allocate a oneshot.
+         let (tx, rx) = oneshot::channel();
+ 
+-        match self.tx.send_item(Message { request, span, tx }) {
++        match self.tx.send(Message {
++            request,
++            span,
++            tx,
++            _permit,
++        }) {
++            Err(_) => ResponseFuture::failed(self.get_worker_error()),
+             Ok(_) => ResponseFuture::new(rx),
+-            // If the channel is closed, propagate the error from the worker.
+-            Err(_) => {
+-                tracing::trace!("buffer channel closed");
+-                ResponseFuture::failed(self.get_worker_error())
+-            }
+         }
+     }
+ }
+@@ -135,13 +169,15 @@ where
+ impl<T, Request> Clone for Buffer<T, Request>
+ where
+     T: Service<Request>,
+-    Request: Send + 'static,
+-    T::Future: Send + 'static,
+ {
+     fn clone(&self) -> Self {
+         Self {
+-            handle: self.handle.clone(),
+             tx: self.tx.clone(),
++            handle: self.handle.clone(),
++            semaphore: self.semaphore.clone(),
++            // The new clone hasn't acquired a permit yet. It will when it's
++            // next polled ready.
++            permit: None,
+         }
+     }
+ }
+diff --git a/tower/src/buffer/worker.rs b/tower/src/buffer/worker.rs
+index 7f4416d..fe7ea55 100644
+--- a/tower/src/buffer/worker.rs
++++ b/tower/src/buffer/worker.rs
+@@ -3,13 +3,13 @@ use super::{
+     message::Message,
+ };
+ use futures_core::ready;
+-use std::sync::{Arc, Mutex};
++use std::sync::{Arc, Mutex, Weak};
+ use std::{
+     future::Future,
+     pin::Pin,
+     task::{Context, Poll},
+ };
+-use tokio::sync::mpsc;
++use tokio::sync::{mpsc, Semaphore};
+ use tower_service::Service;
+ 
+ pin_project_lite::pin_project! {
+@@ -26,11 +26,19 @@ pin_project_lite::pin_project! {
+         T: Service<Request>,
+     {
+         current_message: Option<Message<Request, T::Future>>,
+-        rx: mpsc::Receiver<Message<Request, T::Future>>,
++        rx: mpsc::UnboundedReceiver<Message<Request, T::Future>>,
+         service: T,
+         finish: bool,
+         failed: Option<ServiceError>,
+         handle: Handle,
++        close: Option<Weak<Semaphore>>,
++    }
++
++    impl<T: Service<Request>, Request> PinnedDrop for Worker<T, Request>
++    {
++        fn drop(mut this: Pin<&mut Self>) {
++            this.as_mut().close_semaphore();
++        }
+     }
+ }
+ 
+@@ -40,6 +48,22 @@ pub(crate) struct Handle {
+     inner: Arc<Mutex<Option<ServiceError>>>,
+ }
+ 
++impl<T, Request> Worker<T, Request>
++where
++    T: Service<Request>,
++{
++    /// Closes the buffer's semaphore if it is still open, waking any pending
++    /// tasks.
++    fn close_semaphore(&mut self) {
++        if let Some(close) = self.close.take().as_ref().and_then(Weak::upgrade) {
++            tracing::debug!("buffer closing; waking pending tasks");
++            close.close();
++        } else {
++            tracing::trace!("buffer already closed");
++        }
++    }
++}
++
+ impl<T, Request> Worker<T, Request>
+ where
+     T: Service<Request>,
+@@ -47,12 +71,14 @@ where
+ {
+     pub(crate) fn new(
+         service: T,
+-        rx: mpsc::Receiver<Message<Request, T::Future>>,
++        rx: mpsc::UnboundedReceiver<Message<Request, T::Future>>,
++        semaphore: &Arc<Semaphore>,
+     ) -> (Handle, Worker<T, Request>) {
+         let handle = Handle {
+             inner: Arc::new(Mutex::new(None)),
+         };
+ 
++        let semaphore = Arc::downgrade(semaphore);
+         let worker = Worker {
+             current_message: None,
+             finish: false,
+@@ -60,6 +86,7 @@ where
+             rx,
+             service,
+             handle: handle.clone(),
++            close: Some(semaphore),
+         };
+ 
+         (handle, worker)
+@@ -194,6 +221,8 @@ where
+                                 .as_ref()
+                                 .expect("Worker::failed did not set self.failed?")
+                                 .clone()));
++                            // Wake any tasks waiting on channel capacity.
++                            self.close_semaphore();
+                         }
+                     }
+                 }
+diff --git a/tower/tests/buffer/main.rs b/tower/tests/buffer/main.rs
+index b65de6b..b5e7c19 100644
+--- a/tower/tests/buffer/main.rs
++++ b/tower/tests/buffer/main.rs
+@@ -159,7 +159,7 @@ async fn waits_for_channel_capacity() {
+ 
+     let (service, mut handle) = mock::pair::<&'static str, &'static str>();
+ 
+-    let (service, worker) = Buffer::pair(service, 2);
++    let (service, worker) = Buffer::pair(service, 3);
+ 
+     let mut service = mock::Spawn::new(service);
+     let mut worker = task::spawn(worker);
+@@ -243,14 +243,6 @@ async fn wakes_pending_waiters_on_close() {
+     assert_pending!(worker.poll());
+     let mut response = task::spawn(service1.call("hello"));
+ 
+-    assert!(worker.is_woken(), "worker task should be woken by request");
+-    assert_pending!(worker.poll());
+-
+-    // fill the channel so all subsequent requests will wait for capacity
+-    let service1 = assert_ready_ok!(task::spawn(service.ready()).poll());
+-    assert_pending!(worker.poll());
+-    let mut response2 = task::spawn(service1.call("world"));
+-
+     let mut service1 = service.clone();
+     let mut ready1 = task::spawn(service1.ready());
+     assert_pending!(worker.poll());
+@@ -271,13 +263,6 @@ async fn wakes_pending_waiters_on_close() {
+         err
+     );
+ 
+-    let err = assert_ready_err!(response2.poll());
+-    assert!(
+-        err.is::<error::Closed>(),
+-        "response should fail with a Closed, got: {:?}",
+-        err
+-    );
+-
+     assert!(
+         ready1.is_woken(),
+         "dropping worker should wake ready task 1"
+@@ -316,14 +301,6 @@ async fn wakes_pending_waiters_on_failure() {
+     assert_pending!(worker.poll());
+     let mut response = task::spawn(service1.call("hello"));
+ 
+-    assert!(worker.is_woken(), "worker task should be woken by request");
+-    assert_pending!(worker.poll());
+-
+-    // fill the channel so all subsequent requests will wait for capacity
+-    let service1 = assert_ready_ok!(task::spawn(service.ready()).poll());
+-    assert_pending!(worker.poll());
+-    let mut response2 = task::spawn(service1.call("world"));
+-
+     let mut service1 = service.clone();
+     let mut ready1 = task::spawn(service1.ready());
+     assert_pending!(worker.poll());
+@@ -345,12 +322,6 @@ async fn wakes_pending_waiters_on_failure() {
+         "response should fail with a ServiceError, got: {:?}",
+         err
+     );
+-    let err = assert_ready_err!(response2.poll());
+-    assert!(
+-        err.is::<error::ServiceError>(),
+-        "response should fail with a ServiceError, got: {:?}",
+-        err
+-    );
+ 
+     assert!(
+         ready1.is_woken(),

@@ -1,0 +1,261 @@
+diff --git a/serde_derive/src/de.rs b/serde_derive/src/de.rs
+index 7d0ce6a0..cadcdc08 100644
+--- a/serde_derive/src/de.rs
++++ b/serde_derive/src/de.rs
+@@ -1145,15 +1145,15 @@ fn deserialize_enum(
+     cattrs: &attr::Container,
+ ) -> Fragment {
+     match *cattrs.tag() {
+-        attr::EnumTag::External => deserialize_externally_tagged_enum(params, variants, cattrs),
+-        attr::EnumTag::Internal { ref tag } => {
++        attr::TagType::External => deserialize_externally_tagged_enum(params, variants, cattrs),
++        attr::TagType::Internal { ref tag } => {
+             deserialize_internally_tagged_enum(params, variants, cattrs, tag)
+         }
+-        attr::EnumTag::Adjacent {
++        attr::TagType::Adjacent {
+             ref tag,
+             ref content,
+         } => deserialize_adjacently_tagged_enum(params, variants, cattrs, tag, content),
+-        attr::EnumTag::None => deserialize_untagged_enum(params, variants, cattrs),
++        attr::TagType::None => deserialize_untagged_enum(params, variants, cattrs),
+     }
+ }
+ 
+diff --git a/serde_derive/src/internals/attr.rs b/serde_derive/src/internals/attr.rs
+index da66ac0f..a7d72e1c 100644
+--- a/serde_derive/src/internals/attr.rs
++++ b/serde_derive/src/internals/attr.rs
+@@ -120,7 +120,7 @@ pub struct Container {
+     rename_all: RenameRule,
+     ser_bound: Option<Vec<syn::WherePredicate>>,
+     de_bound: Option<Vec<syn::WherePredicate>>,
+-    tag: EnumTag,
++    tag: TagType,
+     type_from: Option<syn::Type>,
+     type_into: Option<syn::Type>,
+     remote: Option<syn::Path>,
+@@ -129,7 +129,7 @@ pub struct Container {
+ }
+ 
+ /// Styles of representing an enum.
+-pub enum EnumTag {
++pub enum TagType {
+     /// The default.
+     ///
+     /// ```json
+@@ -361,20 +361,27 @@ impl Container {
+                                 syn::Data::Enum(_) => {
+                                     internal_tag.set(&m.ident, s.value());
+                                 }
+-                                syn::Data::Struct(syn::DataStruct {
+-                                    ref struct_token, ..
+-                                }) => {
+-                                    cx.error_spanned_by(
+-                                        struct_token,
+-                                        "#[serde(tag = \"...\")] can only be used on enums",
+-                                    );
++                                syn::Data::Struct(syn::DataStruct{ref fields, ..}) => {
++                                    match *fields {
++                                        syn::Fields::Named(_) => {
++                                            internal_tag.set(&m.ident, s.value());
++                                        },
++                                        syn::Fields::Unnamed(_) | syn::Fields::Unit => {
++                                            cx.error_spanned_by(
++                                                fields,
++                                                "#[serde(tag = \"...\")] can only be used on enums \
++                                                and structs with named fields",
++                                            );
++                                        }
++                                    }
+                                 }
+                                 syn::Data::Union(syn::DataUnion {
+                                     ref union_token, ..
+                                 }) => {
+                                     cx.error_spanned_by(
+                                         union_token,
+-                                        "#[serde(tag = \"...\")] can only be used on enums",
++                                        "#[serde(tag = \"...\")] can only be used on enums \
++                                        and structs with named fields",
+                                     );
+                                 }
+                             }
+@@ -505,7 +512,7 @@ impl Container {
+         self.de_bound.as_ref().map(|vec| &vec[..])
+     }
+ 
+-    pub fn tag(&self) -> &EnumTag {
++    pub fn tag(&self) -> &TagType {
+         &self.tag
+     }
+ 
+@@ -540,14 +547,14 @@ fn decide_tag(
+     untagged: BoolAttr,
+     internal_tag: Attr<String>,
+     content: Attr<String>,
+-) -> EnumTag {
++) -> TagType {
+     match (
+         untagged.0.get_with_tokens(),
+         internal_tag.get_with_tokens(),
+         content.get_with_tokens(),
+     ) {
+-        (None, None, None) => EnumTag::External,
+-        (Some(_), None, None) => EnumTag::None,
++        (None, None, None) => TagType::External,
++        (Some(_), None, None) => TagType::None,
+         (None, Some((_, tag)), None) => {
+             // Check that there are no tuple variants.
+             if let syn::Data::Enum(ref data) = item.data {
+@@ -567,7 +574,7 @@ fn decide_tag(
+                     }
+                 }
+             }
+-            EnumTag::Internal { tag: tag }
++            TagType::Internal { tag: tag }
+         }
+         (Some((untagged_tokens, _)), Some((tag_tokens, _)), None) => {
+             cx.error_spanned_by(
+@@ -578,14 +585,14 @@ fn decide_tag(
+                 tag_tokens,
+                 "enum cannot be both untagged and internally tagged",
+             );
+-            EnumTag::External // doesn't matter, will error
++            TagType::External // doesn't matter, will error
+         }
+         (None, None, Some((content_tokens, _))) => {
+             cx.error_spanned_by(
+                 content_tokens,
+                 "#[serde(tag = \"...\", content = \"...\")] must be used together",
+             );
+-            EnumTag::External
++            TagType::External
+         }
+         (Some((untagged_tokens, _)), None, Some((content_tokens, _))) => {
+             cx.error_spanned_by(
+@@ -596,9 +603,9 @@ fn decide_tag(
+                 content_tokens,
+                 "untagged enum cannot have #[serde(content = \"...\")]",
+             );
+-            EnumTag::External
++            TagType::External
+         }
+-        (None, Some((_, tag)), Some((_, content))) => EnumTag::Adjacent {
++        (None, Some((_, tag)), Some((_, content))) => TagType::Adjacent {
+             tag: tag,
+             content: content,
+         },
+@@ -615,7 +622,7 @@ fn decide_tag(
+                 content_tokens,
+                 "untagged enum cannot have #[serde(tag = \"...\", content = \"...\")]",
+             );
+-            EnumTag::External
++            TagType::External
+         }
+     }
+ }
+diff --git a/serde_derive/src/internals/check.rs b/serde_derive/src/internals/check.rs
+index 87c2b6c2..6409dfc2 100644
+--- a/serde_derive/src/internals/check.rs
++++ b/serde_derive/src/internals/check.rs
+@@ -1,5 +1,5 @@
+ use internals::ast::{Container, Data, Field, Style};
+-use internals::attr::{EnumTag, Identifier};
++use internals::attr::{TagType, Identifier};
+ use internals::{Ctxt, Derive};
+ use syn::{Member, Type};
+ 
+@@ -127,7 +127,7 @@ fn check_identifier(cx: &Ctxt, cont: &Container) {
+             }
+ 
+             // Variant with `other` attribute cannot appear in untagged enum
+-            (_, Identifier::No, true, &EnumTag::None) => {
++            (_, Identifier::No, true, &TagType::None) => {
+                 cx.error_spanned_by(
+                     variant.original,
+                     "#[serde(other)] cannot appear on untagged enum",
+@@ -276,8 +276,8 @@ fn check_internal_tag_field_name_conflict(cx: &Ctxt, cont: &Container) {
+     };
+ 
+     let tag = match *cont.attrs.tag() {
+-        EnumTag::Internal { ref tag } => tag.as_str(),
+-        EnumTag::External | EnumTag::Adjacent { .. } | EnumTag::None => return,
++        TagType::Internal { ref tag } => tag.as_str(),
++        TagType::External | TagType::Adjacent { .. } | TagType::None => return,
+     };
+ 
+     let diagnose_conflict = || {
+@@ -312,11 +312,11 @@ fn check_internal_tag_field_name_conflict(cx: &Ctxt, cont: &Container) {
+ /// contents tag must differ, for the same reason.
+ fn check_adjacent_tag_conflict(cx: &Ctxt, cont: &Container) {
+     let (type_tag, content_tag) = match *cont.attrs.tag() {
+-        EnumTag::Adjacent {
++        TagType::Adjacent {
+             ref tag,
+             ref content,
+         } => (tag, content),
+-        EnumTag::Internal { .. } | EnumTag::External | EnumTag::None => return,
++        TagType::Internal { .. } | TagType::External | TagType::None => return,
+     };
+ 
+     if type_tag == content_tag {
+diff --git a/serde_derive/src/ser.rs b/serde_derive/src/ser.rs
+index bb6fb316..6bdf58b7 100644
+--- a/serde_derive/src/ser.rs
++++ b/serde_derive/src/ser.rs
+@@ -311,11 +311,23 @@ fn serialize_struct_as_struct(
+     fields: &[Field],
+     cattrs: &attr::Container,
+ ) -> Fragment {
+-    let serialize_fields =
++    let mut serialize_fields =
+         serialize_struct_visitor(fields, params, false, &StructTrait::SerializeStruct);
+ 
+     let type_name = cattrs.name().serialize_name();
+ 
++    let additional_field_count: usize = match cattrs.tag() {
++        &attr::TagType::Internal{ref tag} => {
++            let func = StructTrait::SerializeStruct.serialize_field(Span::call_site());
++            serialize_fields.insert(0, quote! {
++                try!(#func(&mut __serde_state, #tag, #type_name));
++            });
++
++            1
++        }
++        _ => 0
++    };
++
+     let mut serialized_fields = fields
+         .iter()
+         .filter(|&field| !field.attrs.skip_serializing())
+@@ -331,7 +343,7 @@ fn serialize_struct_as_struct(
+                 quote!(if #path(#field_expr) { 0 } else { 1 })
+             }
+         })
+-        .fold(quote!(0), |sum, expr| quote!(#sum + #expr));
++        .fold(quote!(#additional_field_count), |sum, expr| quote!(#sum + #expr));
+ 
+     quote_block! {
+         let #let_mut __serde_state = try!(_serde::Serializer::serialize_struct(__serializer, #type_name, #len));
+@@ -452,17 +464,17 @@ fn serialize_variant(
+         };
+ 
+         let body = Match(match *cattrs.tag() {
+-            attr::EnumTag::External => {
++            attr::TagType::External => {
+                 serialize_externally_tagged_variant(params, variant, variant_index, cattrs)
+             }
+-            attr::EnumTag::Internal { ref tag } => {
++            attr::TagType::Internal { ref tag } => {
+                 serialize_internally_tagged_variant(params, variant, cattrs, tag)
+             }
+-            attr::EnumTag::Adjacent {
++            attr::TagType::Adjacent {
+                 ref tag,
+                 ref content,
+             } => serialize_adjacently_tagged_variant(params, variant, cattrs, tag, content),
+-            attr::EnumTag::None => serialize_untagged_variant(params, variant, cattrs),
++            attr::TagType::None => serialize_untagged_variant(params, variant, cattrs),
+         });
+ 
+         quote! {

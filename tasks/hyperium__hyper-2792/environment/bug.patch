@@ -1,0 +1,523 @@
+diff --git a/src/ext.rs b/src/ext.rs
+index 6c54821e..0e257a61 100644
+--- a/src/ext.rs
++++ b/src/ext.rs
+@@ -11,11 +11,6 @@ use std::collections::HashMap;
+ #[cfg(feature = "http2")]
+ use std::fmt;
+ 
+-#[cfg(any(feature = "http1", feature = "ffi"))]
+-mod h1_reason_phrase;
+-#[cfg(any(feature = "http1", feature = "ffi"))]
+-pub use h1_reason_phrase::ReasonPhrase;
+-
+ #[cfg(feature = "http2")]
+ /// Represents the `:protocol` pseudo-header used by
+ /// the [Extended CONNECT Protocol].
+diff --git a/src/ext/h1_reason_phrase.rs b/src/ext/h1_reason_phrase.rs
+deleted file mode 100644
+index 021b632b..00000000
+--- a/src/ext/h1_reason_phrase.rs
++++ /dev/null
+@@ -1,221 +0,0 @@
+-use std::convert::TryFrom;
+-
+-use bytes::Bytes;
+-
+-/// A reason phrase in an HTTP/1 response.
+-///
+-/// # Clients
+-///
+-/// For clients, a `ReasonPhrase` will be present in the extensions of the `http::Response` returned
+-/// for a request if the reason phrase is different from the canonical reason phrase for the
+-/// response's status code. For example, if a server returns `HTTP/1.1 200 Awesome`, the
+-/// `ReasonPhrase` will be present and contain `Awesome`, but if a server returns `HTTP/1.1 200 OK`,
+-/// the response will not contain a `ReasonPhrase`.
+-///
+-/// ```no_run
+-/// # #[cfg(all(feature = "tcp", feature = "client", feature = "http1"))]
+-/// # async fn fake_fetch() -> hyper::Result<()> {
+-/// use hyper::{Client, Uri};
+-/// use hyper::ext::ReasonPhrase;
+-///
+-/// let res = Client::new().get(Uri::from_static("http://example.com/non_canonical_reason")).await?;
+-///
+-/// // Print out the non-canonical reason phrase, if it has one...
+-/// if let Some(reason) = res.extensions().get::<ReasonPhrase>() {
+-///     println!("non-canonical reason: {}", std::str::from_utf8(reason.as_bytes()).unwrap());
+-/// }
+-/// # Ok(())
+-/// # }
+-/// ```
+-///
+-/// # Servers
+-///
+-/// When a `ReasonPhrase` is present in the extensions of the `http::Response` written by a server,
+-/// its contents will be written in place of the canonical reason phrase when responding via HTTP/1.
+-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+-pub struct ReasonPhrase(Bytes);
+-
+-impl ReasonPhrase {
+-    /// Gets the reason phrase as bytes.
+-    pub fn as_bytes(&self) -> &[u8] {
+-        &self.0
+-    }
+-
+-    /// Converts a static byte slice to a reason phrase.
+-    pub fn from_static(reason: &'static [u8]) -> Self {
+-        // TODO: this can be made const once MSRV is >= 1.57.0
+-        if find_invalid_byte(reason).is_some() {
+-            panic!("invalid byte in static reason phrase");
+-        }
+-        Self(Bytes::from_static(reason))
+-    }
+-
+-    /// Converts a `Bytes` directly into a `ReasonPhrase` without validating.
+-    ///
+-    /// Use with care; invalid bytes in a reason phrase can cause serious security problems if
+-    /// emitted in a response.
+-    pub unsafe fn from_bytes_unchecked(reason: Bytes) -> Self {
+-        Self(reason)
+-    }
+-}
+-
+-impl TryFrom<&[u8]> for ReasonPhrase {
+-    type Error = InvalidReasonPhrase;
+-
+-    fn try_from(reason: &[u8]) -> Result<Self, Self::Error> {
+-        if let Some(bad_byte) = find_invalid_byte(reason) {
+-            Err(InvalidReasonPhrase { bad_byte })
+-        } else {
+-            Ok(Self(Bytes::copy_from_slice(reason)))
+-        }
+-    }
+-}
+-
+-impl TryFrom<Vec<u8>> for ReasonPhrase {
+-    type Error = InvalidReasonPhrase;
+-
+-    fn try_from(reason: Vec<u8>) -> Result<Self, Self::Error> {
+-        if let Some(bad_byte) = find_invalid_byte(&reason) {
+-            Err(InvalidReasonPhrase { bad_byte })
+-        } else {
+-            Ok(Self(Bytes::from(reason)))
+-        }
+-    }
+-}
+-
+-impl TryFrom<String> for ReasonPhrase {
+-    type Error = InvalidReasonPhrase;
+-
+-    fn try_from(reason: String) -> Result<Self, Self::Error> {
+-        if let Some(bad_byte) = find_invalid_byte(reason.as_bytes()) {
+-            Err(InvalidReasonPhrase { bad_byte })
+-        } else {
+-            Ok(Self(Bytes::from(reason)))
+-        }
+-    }
+-}
+-
+-impl TryFrom<Bytes> for ReasonPhrase {
+-    type Error = InvalidReasonPhrase;
+-
+-    fn try_from(reason: Bytes) -> Result<Self, Self::Error> {
+-        if let Some(bad_byte) = find_invalid_byte(&reason) {
+-            Err(InvalidReasonPhrase { bad_byte })
+-        } else {
+-            Ok(Self(reason))
+-        }
+-    }
+-}
+-
+-impl Into<Bytes> for ReasonPhrase {
+-    fn into(self) -> Bytes {
+-        self.0
+-    }
+-}
+-
+-impl AsRef<[u8]> for ReasonPhrase {
+-    fn as_ref(&self) -> &[u8] {
+-        &self.0
+-    }
+-}
+-
+-/// Error indicating an invalid byte when constructing a `ReasonPhrase`.
+-///
+-/// See [the spec][spec] for details on allowed bytes.
+-///
+-/// [spec]: https://httpwg.org/http-core/draft-ietf-httpbis-messaging-latest.html#rfc.section.4.p.7
+-#[derive(Debug)]
+-pub struct InvalidReasonPhrase {
+-    bad_byte: u8,
+-}
+-
+-impl std::fmt::Display for InvalidReasonPhrase {
+-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        write!(f, "Invalid byte in reason phrase: {}", self.bad_byte)
+-    }
+-}
+-
+-impl std::error::Error for InvalidReasonPhrase {}
+-
+-const fn is_valid_byte(b: u8) -> bool {
+-    // See https://www.rfc-editor.org/rfc/rfc5234.html#appendix-B.1
+-    const fn is_vchar(b: u8) -> bool {
+-        0x21 <= b && b <= 0x7E
+-    }
+-
+-    // See https://httpwg.org/http-core/draft-ietf-httpbis-semantics-latest.html#fields.values
+-    //
+-    // The 0xFF comparison is technically redundant, but it matches the text of the spec more
+-    // clearly and will be optimized away.
+-    #[allow(unused_comparisons)]
+-    const fn is_obs_text(b: u8) -> bool {
+-        0x80 <= b && b <= 0xFF
+-    }
+-
+-    // See https://httpwg.org/http-core/draft-ietf-httpbis-messaging-latest.html#rfc.section.4.p.7
+-    b == b'\t' || b == b' ' || is_vchar(b) || is_obs_text(b)
+-}
+-
+-const fn find_invalid_byte(bytes: &[u8]) -> Option<u8> {
+-    let mut i = 0;
+-    while i < bytes.len() {
+-        let b = bytes[i];
+-        if !is_valid_byte(b) {
+-            return Some(b);
+-        }
+-        i += 1;
+-    }
+-    None
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use super::*;
+-
+-    #[test]
+-    fn basic_valid() {
+-        const PHRASE: &'static [u8] = b"OK";
+-        assert_eq!(ReasonPhrase::from_static(PHRASE).as_bytes(), PHRASE);
+-        assert_eq!(ReasonPhrase::try_from(PHRASE).unwrap().as_bytes(), PHRASE);
+-    }
+-
+-    #[test]
+-    fn empty_valid() {
+-        const PHRASE: &'static [u8] = b"";
+-        assert_eq!(ReasonPhrase::from_static(PHRASE).as_bytes(), PHRASE);
+-        assert_eq!(ReasonPhrase::try_from(PHRASE).unwrap().as_bytes(), PHRASE);
+-    }
+-
+-    #[test]
+-    fn obs_text_valid() {
+-        const PHRASE: &'static [u8] = b"hyp\xe9r";
+-        assert_eq!(ReasonPhrase::from_static(PHRASE).as_bytes(), PHRASE);
+-        assert_eq!(ReasonPhrase::try_from(PHRASE).unwrap().as_bytes(), PHRASE);
+-    }
+-
+-    const NEWLINE_PHRASE: &'static [u8] = b"hyp\ner";
+-
+-    #[test]
+-    #[should_panic]
+-    fn newline_invalid_panic() {
+-        ReasonPhrase::from_static(NEWLINE_PHRASE);
+-    }
+-
+-    #[test]
+-    fn newline_invalid_err() {
+-        assert!(ReasonPhrase::try_from(NEWLINE_PHRASE).is_err());
+-    }
+-
+-    const CR_PHRASE: &'static [u8] = b"hyp\rer";
+-
+-    #[test]
+-    #[should_panic]
+-    fn cr_invalid_panic() {
+-        ReasonPhrase::from_static(CR_PHRASE);
+-    }
+-
+-    #[test]
+-    fn cr_invalid_err() {
+-        assert!(ReasonPhrase::try_from(CR_PHRASE).is_err());
+-    }
+-}
+diff --git a/src/ffi/http_types.rs b/src/ffi/http_types.rs
+index ea10f139..868d58e7 100644
+--- a/src/ffi/http_types.rs
++++ b/src/ffi/http_types.rs
+@@ -6,7 +6,7 @@ use super::body::{hyper_body, hyper_buf};
+ use super::error::hyper_code;
+ use super::task::{hyper_task_return_type, AsTaskType};
+ use super::{UserDataPointer, HYPER_ITER_CONTINUE};
+-use crate::ext::{HeaderCaseMap, OriginalHeaderOrder, ReasonPhrase};
++use crate::ext::{HeaderCaseMap, OriginalHeaderOrder};
+ use crate::header::{HeaderName, HeaderValue};
+ use crate::{Body, HeaderMap, Method, Request, Response, Uri};
+ 
+@@ -25,6 +25,9 @@ pub struct hyper_headers {
+     orig_order: OriginalHeaderOrder,
+ }
+ 
++#[derive(Debug)]
++pub(crate) struct ReasonPhrase(pub(crate) Bytes);
++
+ pub(crate) struct RawHeaders(pub(crate) hyper_buf);
+ 
+ pub(crate) struct OnInformational {
+@@ -362,7 +365,7 @@ impl hyper_response {
+ 
+     fn reason_phrase(&self) -> &[u8] {
+         if let Some(reason) = self.0.extensions().get::<ReasonPhrase>() {
+-            return reason.as_bytes();
++            return &reason.0;
+         }
+ 
+         if let Some(reason) = self.0.status().canonical_reason() {
+diff --git a/src/proto/h1/role.rs b/src/proto/h1/role.rs
+index d6272eea..76fc16d1 100644
+--- a/src/proto/h1/role.rs
++++ b/src/proto/h1/role.rs
+@@ -1,6 +1,7 @@
+ use std::fmt::{self, Write};
+ use std::mem::MaybeUninit;
+ 
++#[cfg(any(test, feature = "server", feature = "ffi"))]
+ use bytes::Bytes;
+ use bytes::BytesMut;
+ #[cfg(feature = "server")]
+@@ -376,13 +377,7 @@ impl Http1Transaction for Server {
+ 
+         let init_cap = 30 + msg.head.headers.len() * AVERAGE_HEADER_SIZE;
+         dst.reserve(init_cap);
+-
+-        let custom_reason_phrase = msg.head.extensions.get::<crate::ext::ReasonPhrase>();
+-
+-        if msg.head.version == Version::HTTP_11
+-            && msg.head.subject == StatusCode::OK
+-            && custom_reason_phrase.is_none()
+-        {
++        if msg.head.version == Version::HTTP_11 && msg.head.subject == StatusCode::OK {
+             extend(dst, b"HTTP/1.1 200 OK\r\n");
+         } else {
+             match msg.head.version {
+@@ -397,21 +392,15 @@ impl Http1Transaction for Server {
+ 
+             extend(dst, msg.head.subject.as_str().as_bytes());
+             extend(dst, b" ");
+-
+-            if let Some(reason) = custom_reason_phrase {
+-                extend(dst, reason.as_bytes());
+-            } else {
+-                // a reason MUST be written, as many parsers will expect it.
+-                extend(
+-                    dst,
+-                    msg.head
+-                        .subject
+-                        .canonical_reason()
+-                        .unwrap_or("<none>")
+-                        .as_bytes(),
+-                );
+-            }
+-
++            // a reason MUST be written, as many parsers will expect it.
++            extend(
++                dst,
++                msg.head
++                    .subject
++                    .canonical_reason()
++                    .unwrap_or("<none>")
++                    .as_bytes(),
++            );
+             extend(dst, b"\r\n");
+         }
+ 
+@@ -955,6 +944,9 @@ impl Http1Transaction for Client {
+                         trace!("Response.parse Complete({})", len);
+                         let status = StatusCode::from_u16(res.code.unwrap())?;
+ 
++                        #[cfg(not(feature = "ffi"))]
++                        let reason = ();
++                        #[cfg(feature = "ffi")]
+                         let reason = {
+                             let reason = res.reason.unwrap();
+                             // Only save the reason phrase if it isn't the canonical reason
+@@ -978,7 +970,12 @@ impl Http1Transaction for Client {
+                     Err(httparse::Error::Version) if ctx.h09_responses => {
+                         trace!("Response.parse accepted HTTP/0.9 response");
+ 
+-                        (0, StatusCode::OK, None, Version::HTTP_09, 0)
++                        #[cfg(not(feature = "ffi"))]
++                        let reason = ();
++                        #[cfg(feature = "ffi")]
++                        let reason = None;
++
++                        (0, StatusCode::OK, reason, Version::HTTP_09, 0)
+                     }
+                     Err(e) => return Err(e.into()),
+                 }
+@@ -1061,12 +1058,12 @@ impl Http1Transaction for Client {
+                 extensions.insert(header_order);
+             }
+ 
++            #[cfg(feature = "ffi")]
+             if let Some(reason) = reason {
+-                // Safety: httparse ensures that only valid reason phrase bytes are present in this
+-                // field.
+-                let reason = unsafe { crate::ext::ReasonPhrase::from_bytes_unchecked(reason) };
+-                extensions.insert(reason);
++                extensions.insert(crate::ffi::ReasonPhrase(reason));
+             }
++            #[cfg(not(feature = "ffi"))]
++            drop(reason);
+ 
+             #[cfg(feature = "ffi")]
+             if ctx.raw_headers {
+diff --git a/tests/client.rs b/tests/client.rs
+index 88b3ee0d..417e9bf2 100644
+--- a/tests/client.rs
++++ b/tests/client.rs
+@@ -2271,62 +2271,6 @@ mod conn {
+         future::join(server, client).await;
+     }
+ 
+-    #[tokio::test]
+-    async fn get_custom_reason_phrase() {
+-        let _ = ::pretty_env_logger::try_init();
+-        let listener = TkTcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+-            .await
+-            .unwrap();
+-        let addr = listener.local_addr().unwrap();
+-
+-        let server = async move {
+-            let mut sock = listener.accept().await.unwrap().0;
+-            let mut buf = [0; 4096];
+-            let n = sock.read(&mut buf).await.expect("read 1");
+-
+-            // Notably:
+-            // - Just a path, since just a path was set
+-            // - No host, since no host was set
+-            let expected = "GET /a HTTP/1.1\r\n\r\n";
+-            assert_eq!(s(&buf[..n]), expected);
+-
+-            sock.write_all(b"HTTP/1.1 200 Alright\r\nContent-Length: 0\r\n\r\n")
+-                .await
+-                .unwrap();
+-        };
+-
+-        let client = async move {
+-            let tcp = tcp_connect(&addr).await.expect("connect");
+-            let (mut client, conn) = conn::handshake(tcp).await.expect("handshake");
+-
+-            tokio::task::spawn(async move {
+-                conn.await.expect("http conn");
+-            });
+-
+-            let req = Request::builder()
+-                .uri("/a")
+-                .body(Default::default())
+-                .unwrap();
+-            let mut res = client.send_request(req).await.expect("send_request");
+-            assert_eq!(res.status(), hyper::StatusCode::OK);
+-            assert_eq!(
+-                res.extensions()
+-                    .get::<hyper::ext::ReasonPhrase>()
+-                    .expect("custom reason phrase is present")
+-                    .as_bytes(),
+-                &b"Alright"[..]
+-            );
+-            assert_eq!(res.headers().len(), 1);
+-            assert_eq!(
+-                res.headers().get(http::header::CONTENT_LENGTH).unwrap(),
+-                "0"
+-            );
+-            assert!(res.body_mut().next().await.is_none());
+-        };
+-
+-        future::join(server, client).await;
+-    }
+-
+     #[test]
+     fn incoming_content_length() {
+         use hyper::body::HttpBody;
+diff --git a/tests/server.rs b/tests/server.rs
+index af5b5e99..3362b518 100644
+--- a/tests/server.rs
++++ b/tests/server.rs
+@@ -1,7 +1,6 @@
+ #![deny(warnings)]
+ #![deny(rust_2018_idioms)]
+ 
+-use std::convert::TryInto;
+ use std::future::Future;
+ use std::io::{self, Read, Write};
+ use std::net::TcpListener as StdTcpListener;
+@@ -384,33 +383,6 @@ mod response_body_lengths {
+     }
+ }
+ 
+-#[test]
+-fn get_response_custom_reason_phrase() {
+-    let _ = pretty_env_logger::try_init();
+-    let server = serve();
+-    server.reply().reason_phrase("Cool");
+-    let mut req = connect(server.addr());
+-    req.write_all(
+-        b"\
+-        GET / HTTP/1.1\r\n\
+-        Host: example.domain\r\n\
+-        Connection: close\r\n\
+-        \r\n\
+-    ",
+-    )
+-    .unwrap();
+-
+-    let mut response = String::new();
+-    req.read_to_string(&mut response).unwrap();
+-
+-    let mut lines = response.lines();
+-    assert_eq!(lines.next(), Some("HTTP/1.1 200 Cool"));
+-
+-    let mut lines = lines.skip_while(|line| !line.is_empty());
+-    assert_eq!(lines.next(), Some(""));
+-    assert_eq!(lines.next(), None);
+-}
+-
+ #[test]
+ fn get_chunked_response_with_ka() {
+     let foo_bar = b"foo bar baz";
+@@ -2699,17 +2671,6 @@ impl<'a> ReplyBuilder<'a> {
+         self
+     }
+ 
+-    fn reason_phrase(self, reason: &str) -> Self {
+-        self.tx
+-            .lock()
+-            .unwrap()
+-            .send(Reply::ReasonPhrase(
+-                reason.as_bytes().try_into().expect("reason phrase"),
+-            ))
+-            .unwrap();
+-        self
+-    }
+-
+     fn version(self, version: hyper::Version) -> Self {
+         self.tx
+             .lock()
+@@ -2783,7 +2744,6 @@ struct TestService {
+ #[derive(Debug)]
+ enum Reply {
+     Status(hyper::StatusCode),
+-    ReasonPhrase(hyper::ext::ReasonPhrase),
+     Version(hyper::Version),
+     Header(HeaderName, HeaderValue),
+     Body(hyper::Body),
+@@ -2839,9 +2799,6 @@ impl TestService {
+                 Reply::Status(s) => {
+                     *res.status_mut() = s;
+                 }
+-                Reply::ReasonPhrase(reason) => {
+-                    res.extensions_mut().insert(reason);
+-                }
+                 Reply::Version(v) => {
+                     *res.version_mut() = v;
+                 }

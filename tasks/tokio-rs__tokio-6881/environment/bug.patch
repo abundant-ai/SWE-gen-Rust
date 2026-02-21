@@ -1,0 +1,772 @@
+diff --git a/tokio-util/Cargo.toml b/tokio-util/Cargo.toml
+index 12f70be8..a73eec87 100644
+--- a/tokio-util/Cargo.toml
++++ b/tokio-util/Cargo.toml
+@@ -42,7 +42,7 @@ futures-io = { version = "0.3.0", optional = true }
+ futures-util = { version = "0.3.0", optional = true }
+ pin-project-lite = "0.2.11"
+ slab = { version = "0.4.4", optional = true } # Backs `DelayQueue`
+-tracing = { version = "0.1.29", default-features = false, features = ["std"], optional = true }
++tracing = { version = "0.1.25", default-features = false, features = ["std"], optional = true }
+ 
+ [target.'cfg(tokio_unstable)'.dependencies]
+ hashbrown = { version = "0.14.0", default-features = false, optional = true }
+diff --git a/tokio/Cargo.toml b/tokio/Cargo.toml
+index b07f5015..4c5f7d46 100644
+--- a/tokio/Cargo.toml
++++ b/tokio/Cargo.toml
+@@ -101,7 +101,7 @@ socket2 = { version = "0.5.5", optional = true, features = [ "all" ] }
+ # Currently unstable. The API exposed by these features may be broken at any time.
+ # Requires `--cfg tokio_unstable` to enable.
+ [target.'cfg(tokio_unstable)'.dependencies]
+-tracing = { version = "0.1.29", default-features = false, features = ["std"], optional = true } # Not in full
++tracing = { version = "0.1.25", default-features = false, features = ["std"], optional = true } # Not in full
+ 
+ # Currently unstable. The API exposed by these features may be broken at any time.
+ # Requires `--cfg tokio_unstable` to enable.
+diff --git a/tokio/src/runtime/blocking/pool.rs b/tokio/src/runtime/blocking/pool.rs
+index 7eec91d2..f8466a19 100644
+--- a/tokio/src/runtime/blocking/pool.rs
++++ b/tokio/src/runtime/blocking/pool.rs
+@@ -8,7 +8,6 @@ use crate::runtime::builder::ThreadNameFn;
+ use crate::runtime::task::{self, JoinHandle};
+ use crate::runtime::{Builder, Callback, Handle, BOX_FUTURE_THRESHOLD};
+ use crate::util::metric_atomics::MetricAtomicUsize;
+-use crate::util::trace::{blocking_task, SpawnMeta};
+ 
+ use std::collections::{HashMap, VecDeque};
+ use std::fmt;
+@@ -300,21 +299,10 @@ impl Spawner {
+         F: FnOnce() -> R + Send + 'static,
+         R: Send + 'static,
+     {
+-        let fn_size = std::mem::size_of::<F>();
+-        let (join_handle, spawn_result) = if fn_size > BOX_FUTURE_THRESHOLD {
+-            self.spawn_blocking_inner(
+-                Box::new(func),
+-                Mandatory::NonMandatory,
+-                SpawnMeta::new_unnamed(fn_size),
+-                rt,
+-            )
++        let (join_handle, spawn_result) = if std::mem::size_of::<F>() > BOX_FUTURE_THRESHOLD {
++            self.spawn_blocking_inner(Box::new(func), Mandatory::NonMandatory, None, rt)
+         } else {
+-            self.spawn_blocking_inner(
+-                func,
+-                Mandatory::NonMandatory,
+-                SpawnMeta::new_unnamed(fn_size),
+-                rt,
+-            )
++            self.spawn_blocking_inner(func, Mandatory::NonMandatory, None, rt)
+         };
+ 
+         match spawn_result {
+@@ -338,19 +326,18 @@ impl Spawner {
+             F: FnOnce() -> R + Send + 'static,
+             R: Send + 'static,
+         {
+-            let fn_size = std::mem::size_of::<F>();
+-            let (join_handle, spawn_result) = if fn_size > BOX_FUTURE_THRESHOLD {
++            let (join_handle, spawn_result) = if std::mem::size_of::<F>() > BOX_FUTURE_THRESHOLD {
+                 self.spawn_blocking_inner(
+                     Box::new(func),
+                     Mandatory::Mandatory,
+-                    SpawnMeta::new_unnamed(fn_size),
++                    None,
+                     rt,
+                 )
+             } else {
+                 self.spawn_blocking_inner(
+                     func,
+                     Mandatory::Mandatory,
+-                    SpawnMeta::new_unnamed(fn_size),
++                    None,
+                     rt,
+                 )
+             };
+@@ -368,16 +355,35 @@ impl Spawner {
+         &self,
+         func: F,
+         is_mandatory: Mandatory,
+-        spawn_meta: SpawnMeta<'_>,
++        name: Option<&str>,
+         rt: &Handle,
+     ) -> (JoinHandle<R>, Result<(), SpawnError>)
+     where
+         F: FnOnce() -> R + Send + 'static,
+         R: Send + 'static,
+     {
++        let fut = BlockingTask::new(func);
+         let id = task::Id::next();
+-        let fut =
+-            blocking_task::<F, BlockingTask<F>>(BlockingTask::new(func), spawn_meta, id.as_u64());
++        #[cfg(all(tokio_unstable, feature = "tracing"))]
++        let fut = {
++            use tracing::Instrument;
++            let location = std::panic::Location::caller();
++            let span = tracing::trace_span!(
++                target: "tokio::task::blocking",
++                "runtime.spawn",
++                kind = %"blocking",
++                task.name = %name.unwrap_or_default(),
++                task.id = id.as_u64(),
++                "fn" = %std::any::type_name::<F>(),
++                loc.file = location.file(),
++                loc.line = location.line(),
++                loc.col = location.column(),
++            );
++            fut.instrument(span)
++        };
++
++        #[cfg(not(all(tokio_unstable, feature = "tracing")))]
++        let _ = name;
+ 
+         let (task, handle) = task::unowned(fut, BlockingSchedule::new(rt), id);
+ 
+diff --git a/tokio/src/runtime/handle.rs b/tokio/src/runtime/handle.rs
+index 9026e877..7e3cd150 100644
+--- a/tokio/src/runtime/handle.rs
++++ b/tokio/src/runtime/handle.rs
+@@ -18,11 +18,10 @@ pub struct Handle {
+ use crate::runtime::task::JoinHandle;
+ use crate::runtime::BOX_FUTURE_THRESHOLD;
+ use crate::util::error::{CONTEXT_MISSING_ERROR, THREAD_LOCAL_DESTROYED_ERROR};
+-use crate::util::trace::SpawnMeta;
+ 
+ use std::future::Future;
+ use std::marker::PhantomData;
+-use std::{error, fmt, mem};
++use std::{error, fmt};
+ 
+ /// Runtime context guard.
+ ///
+@@ -190,11 +189,10 @@ impl Handle {
+         F: Future + Send + 'static,
+         F::Output: Send + 'static,
+     {
+-        let fut_size = mem::size_of::<F>();
+-        if fut_size > BOX_FUTURE_THRESHOLD {
+-            self.spawn_named(Box::pin(future), SpawnMeta::new_unnamed(fut_size))
++        if std::mem::size_of::<F>() > BOX_FUTURE_THRESHOLD {
++            self.spawn_named(Box::pin(future), None)
+         } else {
+-            self.spawn_named(future, SpawnMeta::new_unnamed(fut_size))
++            self.spawn_named(future, None)
+         }
+     }
+ 
+@@ -298,16 +296,15 @@ impl Handle {
+     /// [`tokio::time`]: crate::time
+     #[track_caller]
+     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+-        let fut_size = mem::size_of::<F>();
+-        if fut_size > BOX_FUTURE_THRESHOLD {
+-            self.block_on_inner(Box::pin(future), SpawnMeta::new_unnamed(fut_size))
++        if std::mem::size_of::<F>() > BOX_FUTURE_THRESHOLD {
++            self.block_on_inner(Box::pin(future))
+         } else {
+-            self.block_on_inner(future, SpawnMeta::new_unnamed(fut_size))
++            self.block_on_inner(future)
+         }
+     }
+ 
+     #[track_caller]
+-    fn block_on_inner<F: Future>(&self, future: F, _meta: SpawnMeta<'_>) -> F::Output {
++    fn block_on_inner<F: Future>(&self, future: F) -> F::Output {
+         #[cfg(all(
+             tokio_unstable,
+             tokio_taskdump,
+@@ -319,7 +316,7 @@ impl Handle {
+ 
+         #[cfg(all(tokio_unstable, feature = "tracing"))]
+         let future =
+-            crate::util::trace::task(future, "block_on", _meta, super::task::Id::next().as_u64());
++            crate::util::trace::task(future, "block_on", None, super::task::Id::next().as_u64());
+ 
+         // Enter the runtime context. This sets the current driver handles and
+         // prevents blocking an existing runtime.
+@@ -329,7 +326,7 @@ impl Handle {
+     }
+ 
+     #[track_caller]
+-    pub(crate) fn spawn_named<F>(&self, future: F, _meta: SpawnMeta<'_>) -> JoinHandle<F::Output>
++    pub(crate) fn spawn_named<F>(&self, future: F, _name: Option<&str>) -> JoinHandle<F::Output>
+     where
+         F: Future + Send + 'static,
+         F::Output: Send + 'static,
+@@ -344,7 +341,7 @@ impl Handle {
+         ))]
+         let future = super::task::trace::Trace::root(future);
+         #[cfg(all(tokio_unstable, feature = "tracing"))]
+-        let future = crate::util::trace::task(future, "task", _meta, id.as_u64());
++        let future = crate::util::trace::task(future, "task", _name, id.as_u64());
+         self.inner.spawn(future, id)
+     }
+ 
+diff --git a/tokio/src/runtime/runtime.rs b/tokio/src/runtime/runtime.rs
+index 4b22ae97..74061d24 100644
+--- a/tokio/src/runtime/runtime.rs
++++ b/tokio/src/runtime/runtime.rs
+@@ -3,10 +3,8 @@ use crate::runtime::blocking::BlockingPool;
+ use crate::runtime::scheduler::CurrentThread;
+ use crate::runtime::{context, EnterGuard, Handle};
+ use crate::task::JoinHandle;
+-use crate::util::trace::SpawnMeta;
+ 
+ use std::future::Future;
+-use std::mem;
+ use std::time::Duration;
+ 
+ cfg_rt_multi_thread! {
+@@ -243,13 +241,10 @@ impl Runtime {
+         F: Future + Send + 'static,
+         F::Output: Send + 'static,
+     {
+-        let fut_size = mem::size_of::<F>();
+-        if fut_size > BOX_FUTURE_THRESHOLD {
+-            self.handle
+-                .spawn_named(Box::pin(future), SpawnMeta::new_unnamed(fut_size))
++        if std::mem::size_of::<F>() > BOX_FUTURE_THRESHOLD {
++            self.handle.spawn_named(Box::pin(future), None)
+         } else {
+-            self.handle
+-                .spawn_named(future, SpawnMeta::new_unnamed(fut_size))
++            self.handle.spawn_named(future, None)
+         }
+     }
+ 
+@@ -334,16 +329,15 @@ impl Runtime {
+     /// [handle]: fn@Handle::block_on
+     #[track_caller]
+     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+-        let fut_size = mem::size_of::<F>();
+-        if fut_size > BOX_FUTURE_THRESHOLD {
+-            self.block_on_inner(Box::pin(future), SpawnMeta::new_unnamed(fut_size))
++        if std::mem::size_of::<F>() > BOX_FUTURE_THRESHOLD {
++            self.block_on_inner(Box::pin(future))
+         } else {
+-            self.block_on_inner(future, SpawnMeta::new_unnamed(fut_size))
++            self.block_on_inner(future)
+         }
+     }
+ 
+     #[track_caller]
+-    fn block_on_inner<F: Future>(&self, future: F, _meta: SpawnMeta<'_>) -> F::Output {
++    fn block_on_inner<F: Future>(&self, future: F) -> F::Output {
+         #[cfg(all(
+             tokio_unstable,
+             tokio_taskdump,
+@@ -357,7 +351,7 @@ impl Runtime {
+         let future = crate::util::trace::task(
+             future,
+             "block_on",
+-            _meta,
++            None,
+             crate::runtime::task::Id::next().as_u64(),
+         );
+ 
+diff --git a/tokio/src/task/builder.rs b/tokio/src/task/builder.rs
+index 6053352a..c98849b2 100644
+--- a/tokio/src/task/builder.rs
++++ b/tokio/src/task/builder.rs
+@@ -2,9 +2,8 @@
+ use crate::{
+     runtime::{Handle, BOX_FUTURE_THRESHOLD},
+     task::{JoinHandle, LocalSet},
+-    util::trace::SpawnMeta,
+ };
+-use std::{future::Future, io, mem};
++use std::{future::Future, io};
+ 
+ /// Factory which is used to configure the properties of a new task.
+ ///
+@@ -89,11 +88,10 @@ impl<'a> Builder<'a> {
+         Fut: Future + Send + 'static,
+         Fut::Output: Send + 'static,
+     {
+-        let fut_size = mem::size_of::<Fut>();
+-        Ok(if fut_size > BOX_FUTURE_THRESHOLD {
+-            super::spawn::spawn_inner(Box::pin(future), SpawnMeta::new(self.name, fut_size))
++        Ok(if std::mem::size_of::<Fut>() > BOX_FUTURE_THRESHOLD {
++            super::spawn::spawn_inner(Box::pin(future), self.name)
+         } else {
+-            super::spawn::spawn_inner(future, SpawnMeta::new(self.name, fut_size))
++            super::spawn::spawn_inner(future, self.name)
+         })
+     }
+ 
+@@ -110,11 +108,10 @@ impl<'a> Builder<'a> {
+         Fut: Future + Send + 'static,
+         Fut::Output: Send + 'static,
+     {
+-        let fut_size = mem::size_of::<Fut>();
+-        Ok(if fut_size > BOX_FUTURE_THRESHOLD {
+-            handle.spawn_named(Box::pin(future), SpawnMeta::new(self.name, fut_size))
++        Ok(if std::mem::size_of::<Fut>() > BOX_FUTURE_THRESHOLD {
++            handle.spawn_named(Box::pin(future), self.name)
+         } else {
+-            handle.spawn_named(future, SpawnMeta::new(self.name, fut_size))
++            handle.spawn_named(future, self.name)
+         })
+     }
+ 
+@@ -138,11 +135,10 @@ impl<'a> Builder<'a> {
+         Fut: Future + 'static,
+         Fut::Output: 'static,
+     {
+-        let fut_size = mem::size_of::<Fut>();
+-        Ok(if fut_size > BOX_FUTURE_THRESHOLD {
+-            super::local::spawn_local_inner(Box::pin(future), SpawnMeta::new(self.name, fut_size))
++        Ok(if std::mem::size_of::<Fut>() > BOX_FUTURE_THRESHOLD {
++            super::local::spawn_local_inner(Box::pin(future), self.name)
+         } else {
+-            super::local::spawn_local_inner(future, SpawnMeta::new(self.name, fut_size))
++            super::local::spawn_local_inner(future, self.name)
+         })
+     }
+ 
+@@ -163,12 +159,7 @@ impl<'a> Builder<'a> {
+         Fut: Future + 'static,
+         Fut::Output: 'static,
+     {
+-        let fut_size = mem::size_of::<Fut>();
+-        Ok(if fut_size > BOX_FUTURE_THRESHOLD {
+-            local_set.spawn_named(Box::pin(future), SpawnMeta::new(self.name, fut_size))
+-        } else {
+-            local_set.spawn_named(future, SpawnMeta::new(self.name, fut_size))
+-        })
++        Ok(local_set.spawn_named(future, self.name))
+     }
+ 
+     /// Spawns blocking code on the blocking threadpool.
+@@ -209,19 +200,19 @@ impl<'a> Builder<'a> {
+         Output: Send + 'static,
+     {
+         use crate::runtime::Mandatory;
+-        let fn_size = mem::size_of::<Function>();
+-        let (join_handle, spawn_result) = if fn_size > BOX_FUTURE_THRESHOLD {
++        let (join_handle, spawn_result) = if std::mem::size_of::<Function>() > BOX_FUTURE_THRESHOLD
++        {
+             handle.inner.blocking_spawner().spawn_blocking_inner(
+                 Box::new(function),
+                 Mandatory::NonMandatory,
+-                SpawnMeta::new(self.name, fn_size),
++                self.name,
+                 handle,
+             )
+         } else {
+             handle.inner.blocking_spawner().spawn_blocking_inner(
+                 function,
+                 Mandatory::NonMandatory,
+-                SpawnMeta::new(self.name, fn_size),
++                self.name,
+                 handle,
+             )
+         };
+diff --git a/tokio/src/task/local.rs b/tokio/src/task/local.rs
+index d5341937..90d4d361 100644
+--- a/tokio/src/task/local.rs
++++ b/tokio/src/task/local.rs
+@@ -6,7 +6,6 @@ use crate::runtime;
+ use crate::runtime::task::{self, JoinHandle, LocalOwnedTasks, Task, TaskHarnessScheduleHooks};
+ use crate::runtime::{context, ThreadId, BOX_FUTURE_THRESHOLD};
+ use crate::sync::AtomicWaker;
+-use crate::util::trace::SpawnMeta;
+ use crate::util::RcCell;
+ 
+ use std::cell::Cell;
+@@ -14,7 +13,6 @@ use std::collections::VecDeque;
+ use std::fmt;
+ use std::future::Future;
+ use std::marker::PhantomData;
+-use std::mem;
+ use std::pin::Pin;
+ use std::rc::Rc;
+ use std::task::Poll;
+@@ -369,23 +367,22 @@ cfg_rt! {
+         F: Future + 'static,
+         F::Output: 'static,
+     {
+-        let fut_size = std::mem::size_of::<F>();
+-        if fut_size > BOX_FUTURE_THRESHOLD {
+-            spawn_local_inner(Box::pin(future), SpawnMeta::new_unnamed(fut_size))
++        if std::mem::size_of::<F>() > BOX_FUTURE_THRESHOLD {
++            spawn_local_inner(Box::pin(future), None)
+         } else {
+-            spawn_local_inner(future, SpawnMeta::new_unnamed(fut_size))
++            spawn_local_inner(future, None)
+         }
+     }
+ 
+ 
+     #[track_caller]
+-    pub(super) fn spawn_local_inner<F>(future: F, meta: SpawnMeta<'_>) -> JoinHandle<F::Output>
++    pub(super) fn spawn_local_inner<F>(future: F, name: Option<&str>) -> JoinHandle<F::Output>
+     where F: Future + 'static,
+           F::Output: 'static
+     {
+         match CURRENT.with(|LocalData { ctx, .. }| ctx.get()) {
+             None => panic!("`spawn_local` called from outside of a `task::LocalSet`"),
+-            Some(cx) => cx.spawn(future, meta)
++            Some(cx) => cx.spawn(future, name)
+        }
+     }
+ }
+@@ -524,12 +521,7 @@ impl LocalSet {
+         F: Future + 'static,
+         F::Output: 'static,
+     {
+-        let fut_size = mem::size_of::<F>();
+-        if fut_size > BOX_FUTURE_THRESHOLD {
+-            self.spawn_named(Box::pin(future), SpawnMeta::new_unnamed(fut_size))
+-        } else {
+-            self.spawn_named(future, SpawnMeta::new_unnamed(fut_size))
+-        }
++        self.spawn_named(future, None)
+     }
+ 
+     /// Runs a future to completion on the provided runtime, driving any local
+@@ -651,22 +643,26 @@ impl LocalSet {
+     pub(in crate::task) fn spawn_named<F>(
+         &self,
+         future: F,
+-        meta: SpawnMeta<'_>,
++        name: Option<&str>,
+     ) -> JoinHandle<F::Output>
+     where
+         F: Future + 'static,
+         F::Output: 'static,
+     {
+-        self.spawn_named_inner(future, meta)
++        if std::mem::size_of::<F>() > BOX_FUTURE_THRESHOLD {
++            self.spawn_named_inner(Box::pin(future), name)
++        } else {
++            self.spawn_named_inner(future, name)
++        }
+     }
+ 
+     #[track_caller]
+-    fn spawn_named_inner<F>(&self, future: F, meta: SpawnMeta<'_>) -> JoinHandle<F::Output>
++    fn spawn_named_inner<F>(&self, future: F, name: Option<&str>) -> JoinHandle<F::Output>
+     where
+         F: Future + 'static,
+         F::Output: 'static,
+     {
+-        let handle = self.context.spawn(future, meta);
++        let handle = self.context.spawn(future, name);
+ 
+         // Because a task was spawned from *outside* the `LocalSet`, wake the
+         // `LocalSet` future to execute the new task, if it hasn't been woken.
+@@ -953,13 +949,13 @@ impl Drop for LocalSet {
+ 
+ impl Context {
+     #[track_caller]
+-    fn spawn<F>(&self, future: F, meta: SpawnMeta<'_>) -> JoinHandle<F::Output>
++    fn spawn<F>(&self, future: F, name: Option<&str>) -> JoinHandle<F::Output>
+     where
+         F: Future + 'static,
+         F::Output: 'static,
+     {
+         let id = crate::runtime::task::Id::next();
+-        let future = crate::util::trace::task(future, "local", meta, id.as_u64());
++        let future = crate::util::trace::task(future, "local", name, id.as_u64());
+ 
+         // Safety: called from the thread that owns the `LocalSet`
+         let (handle, notified) = {
+diff --git a/tokio/src/task/spawn.rs b/tokio/src/task/spawn.rs
+index 7c748226..4208ac6e 100644
+--- a/tokio/src/task/spawn.rs
++++ b/tokio/src/task/spawn.rs
+@@ -1,6 +1,5 @@
+ use crate::runtime::BOX_FUTURE_THRESHOLD;
+ use crate::task::JoinHandle;
+-use crate::util::trace::SpawnMeta;
+ 
+ use std::future::Future;
+ 
+@@ -168,16 +167,17 @@ cfg_rt! {
+         F: Future + Send + 'static,
+         F::Output: Send + 'static,
+     {
+-        let fut_size = std::mem::size_of::<F>();
+-        if fut_size > BOX_FUTURE_THRESHOLD {
+-            spawn_inner(Box::pin(future), SpawnMeta::new_unnamed(fut_size))
++        // preventing stack overflows on debug mode, by quickly sending the
++        // task to the heap.
++        if std::mem::size_of::<F>() > BOX_FUTURE_THRESHOLD {
++            spawn_inner(Box::pin(future), None)
+         } else {
+-            spawn_inner(future, SpawnMeta::new_unnamed(fut_size))
++            spawn_inner(future, None)
+         }
+     }
+ 
+     #[track_caller]
+-    pub(super) fn spawn_inner<T>(future: T, meta: SpawnMeta<'_>) -> JoinHandle<T::Output>
++    pub(super) fn spawn_inner<T>(future: T, name: Option<&str>) -> JoinHandle<T::Output>
+     where
+         T: Future + Send + 'static,
+         T::Output: Send + 'static,
+@@ -197,7 +197,7 @@ cfg_rt! {
+         ))]
+         let future = task::trace::Trace::root(future);
+         let id = task::Id::next();
+-        let task = crate::util::trace::task(future, "task", meta, id.as_u64());
++        let task = crate::util::trace::task(future, "task", name, id.as_u64());
+ 
+         match context::with_current(|handle| handle.spawn(task, id)) {
+             Ok(join_handle) => join_handle,
+diff --git a/tokio/src/util/trace.rs b/tokio/src/util/trace.rs
+index 97006df4..e1827686 100644
+--- a/tokio/src/util/trace.rs
++++ b/tokio/src/util/trace.rs
+@@ -1,110 +1,34 @@
+-cfg_rt! {
+-    use std::marker::PhantomData;
+-
+-    pub(crate) struct SpawnMeta<'a> {
+-        /// The name of the task
+-        #[cfg(all(tokio_unstable, feature = "tracing"))]
+-        pub(crate) name: Option<&'a str>,
+-        /// The original size of the future or function being spawned
+-        #[cfg(all(tokio_unstable, feature = "tracing"))]
+-        pub(crate) original_size: usize,
+-        _pd: PhantomData<&'a ()>,
+-    }
+-
+-    impl<'a> SpawnMeta<'a> {
+-        /// Create new spawn meta with a name and original size (before possible auto-boxing)
+-        #[cfg(all(tokio_unstable, feature = "tracing"))]
+-        pub(crate) fn new(name: Option<&'a str>, original_size: usize) -> Self {
+-            Self {
+-                name,
+-                original_size,
+-                _pd: PhantomData,
+-            }
+-        }
+-
+-        /// Create a new unnamed spawn meta with the original size (before possible auto-boxing)
+-        pub(crate) fn new_unnamed(original_size: usize) -> Self {
+-            #[cfg(not(all(tokio_unstable, feature = "tracing")))]
+-            let _original_size = original_size;
+-
+-            Self {
+-                #[cfg(all(tokio_unstable, feature = "tracing"))]
+-                name: None,
+-                #[cfg(all(tokio_unstable, feature = "tracing"))]
+-                original_size,
+-                _pd: PhantomData,
+-            }
+-        }
+-    }
+-
+-    cfg_trace! {
++cfg_trace! {
++    cfg_rt! {
+         use core::{
+             pin::Pin,
+             task::{Context, Poll},
+         };
+         use pin_project_lite::pin_project;
+-        use std::mem;
+         use std::future::Future;
+-        use tracing::instrument::Instrument;
+         pub(crate) use tracing::instrument::Instrumented;
+ 
+         #[inline]
+         #[track_caller]
+-        pub(crate) fn task<F>(task: F, kind: &'static str, meta: SpawnMeta<'_>, id: u64) -> Instrumented<F> {
++        pub(crate) fn task<F>(task: F, kind: &'static str, name: Option<&str>, id: u64) -> Instrumented<F> {
+             #[track_caller]
+-            fn get_span(kind: &'static str, spawn_meta: SpawnMeta<'_>, id: u64, task_size: usize) -> tracing::Span {
++            fn get_span(kind: &'static str, name: Option<&str>, id: u64) -> tracing::Span {
+                 let location = std::panic::Location::caller();
+-                let original_size = if spawn_meta.original_size != task_size {
+-                    Some(spawn_meta.original_size)
+-                } else {
+-                    None
+-                };
+                 tracing::trace_span!(
+                     target: "tokio::task",
+                     parent: None,
+                     "runtime.spawn",
+                     %kind,
+-                    task.name = %spawn_meta.name.unwrap_or_default(),
++                    task.name = %name.unwrap_or_default(),
+                     task.id = id,
+-                    original_size.bytes = original_size,
+-                    size.bytes = task_size,
+                     loc.file = location.file(),
+                     loc.line = location.line(),
+                     loc.col = location.column(),
+                 )
+             }
+             use tracing::instrument::Instrument;
+-            let span = get_span(kind, meta, id, mem::size_of::<F>());
+-            task.instrument(span)
+-        }
+-
+-        #[inline]
+-        #[track_caller]
+-        pub(crate) fn blocking_task<Fn, Fut>(task: Fut, spawn_meta: SpawnMeta<'_>, id: u64) -> Instrumented<Fut> {
+-            let location = std::panic::Location::caller();
+-
+-            let fn_size = mem::size_of::<Fn>();
+-            let original_size = if spawn_meta.original_size != fn_size {
+-                Some(spawn_meta.original_size)
+-            } else {
+-                None
+-            };
+-
+-            let span = tracing::trace_span!(
+-                target: "tokio::task::blocking",
+-                "runtime.spawn",
+-                kind = %"blocking",
+-                task.name = %spawn_meta.name.unwrap_or_default(),
+-                task.id = id,
+-                "fn" = %std::any::type_name::<Fn>(),
+-                original_size.bytes = original_size,
+-                size.bytes = fn_size,
+-                loc.file = location.file(),
+-                loc.line = location.line(),
+-                loc.col = location.column(),
+-            );
++            let span = get_span(kind, name, id);
+             task.instrument(span)
+-
+         }
+ 
+         pub(crate) fn async_op<P,F>(inner: P, resource_span: tracing::Span, source: &str, poll_op_name: &'static str, inherits_child_attrs: bool) -> InstrumentedAsyncOp<F>
+@@ -159,23 +83,7 @@ cfg_rt! {
+             }
+         }
+     }
+-
+-    cfg_not_trace! {
+-        #[inline]
+-        pub(crate) fn task<F>(task: F, _kind: &'static str, _meta: SpawnMeta<'_>, _id: u64) -> F {
+-            // nop
+-            task
+-        }
+-
+-        #[inline]
+-        pub(crate) fn blocking_task<Fn, Fut>(task: Fut, _spawn_meta: SpawnMeta<'_>, _id: u64) -> Fut {
+-            let _ = PhantomData::<&Fn>;
+-            // nop
+-            task
+-        }
+-    }
+ }
+-
+ cfg_time! {
+     #[track_caller]
+     pub(crate) fn caller_location() -> Option<&'static std::panic::Location<'static>> {
+@@ -185,3 +93,13 @@ cfg_time! {
+         None
+     }
+ }
++
++cfg_not_trace! {
++    cfg_rt! {
++        #[inline]
++        pub(crate) fn task<F>(task: F, _: &'static str, _name: Option<&str>, _: u64) -> F {
++            // nop
++            task
++        }
++    }
++}
+diff --git a/tokio/tests/tracing-instrumentation/tests/task.rs b/tokio/tests/tracing-instrumentation/tests/task.rs
+index fb215ca7..7bdb078e 100644
+--- a/tokio/tests/tracing-instrumentation/tests/task.rs
++++ b/tokio/tests/tracing-instrumentation/tests/task.rs
+@@ -3,8 +3,6 @@
+ //! These tests ensure that the instrumentation for task spawning and task
+ //! lifecycles is correct.
+ 
+-use std::{mem, time::Duration};
+-
+ use tokio::task;
+ use tracing_mock::{expect, span::NewSpan, subscriber};
+ 
+@@ -95,81 +93,6 @@ async fn task_builder_loc_file_recorded() {
+     handle.assert_finished();
+ }
+ 
+-#[tokio::test]
+-async fn task_spawn_sizes_recorded() {
+-    let future = futures::future::ready(());
+-    let size = mem::size_of_val(&future) as u64;
+-
+-    let task_span = expect::span()
+-        .named("runtime.spawn")
+-        .with_target("tokio::task")
+-        // TODO(hds): check that original_size.bytes is NOT recorded when this can be done in
+-        // tracing-mock without listing every other field.
+-        .with_field(expect::field("size.bytes").with_value(&size));
+-
+-    let (subscriber, handle) = subscriber::mock().new_span(task_span).run_with_handle();
+-
+-    {
+-        let _guard = tracing::subscriber::set_default(subscriber);
+-
+-        task::Builder::new()
+-            .spawn(future)
+-            .unwrap()
+-            .await
+-            .expect("failed to await join handle");
+-    }
+-
+-    handle.assert_finished();
+-}
+-
+-#[tokio::test]
+-async fn task_big_spawn_sizes_recorded() {
+-    let future = {
+-        async fn big<const N: usize>() {
+-            let mut a = [0_u8; N];
+-            for (idx, item) in a.iter_mut().enumerate() {
+-                *item = (idx % 256) as u8;
+-            }
+-            tokio::time::sleep(Duration::from_millis(10)).await;
+-            for (idx, item) in a.iter_mut().enumerate() {
+-                assert_eq!(*item, (idx % 256) as u8);
+-            }
+-        }
+-
+-        // This is larger than the release auto-boxing threshold
+-        big::<20_000>()
+-    };
+-
+-    fn boxed_size<T>(_: &T) -> usize {
+-        mem::size_of::<Box<T>>()
+-    }
+-    let size = mem::size_of_val(&future) as u64;
+-    let boxed_size = boxed_size(&future);
+-
+-    let task_span = expect::span()
+-        .named("runtime.spawn")
+-        .with_target("tokio::task")
+-        .with_field(
+-            expect::field("size.bytes")
+-                .with_value(&boxed_size)
+-                .and(expect::field("original_size.bytes").with_value(&size)),
+-        );
+-
+-    let (subscriber, handle) = subscriber::mock().new_span(task_span).run_with_handle();
+-
+-    {
+-        let _guard = tracing::subscriber::set_default(subscriber);
+-
+-        task::Builder::new()
+-            .spawn(future)
+-            .unwrap()
+-            .await
+-            .expect("failed to await join handle");
+-    }
+-
+-    handle.assert_finished();
+-}
+-
+ /// Expect a task with name
+ ///
+ /// This is a convenience function to create the expectation for a new task

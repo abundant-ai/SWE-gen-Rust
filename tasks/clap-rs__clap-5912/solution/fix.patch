@@ -1,0 +1,163 @@
+diff --git a/clap_builder/src/builder/action.rs b/clap_builder/src/builder/action.rs
+index 2e8221d8..0d2ca7be 100644
+--- a/clap_builder/src/builder/action.rs
++++ b/clap_builder/src/builder/action.rs
+@@ -1,6 +1,8 @@
+ #[cfg(debug_assertions)]
+ use crate::util::AnyValueId;
+ 
++use crate::builder::ValueRange;
++
+ /// Behavior of arguments when they are encountered while parsing
+ ///
+ /// # Examples
+@@ -369,6 +371,35 @@ impl ArgAction {
+         }
+     }
+ 
++    #[cfg(debug_assertions)]
++    pub(crate) fn max_num_args(&self) -> ValueRange {
++        match self {
++            Self::Set => ValueRange::FULL,
++            Self::Append => ValueRange::FULL,
++            Self::SetTrue => ValueRange::OPTIONAL,
++            Self::SetFalse => ValueRange::OPTIONAL,
++            Self::Count => ValueRange::EMPTY,
++            Self::Help => ValueRange::EMPTY,
++            Self::HelpShort => ValueRange::EMPTY,
++            Self::HelpLong => ValueRange::EMPTY,
++            Self::Version => ValueRange::EMPTY,
++        }
++    }
++
++    pub(crate) fn default_num_args(&self) -> ValueRange {
++        match self {
++            Self::Set => ValueRange::SINGLE,
++            Self::Append => ValueRange::SINGLE,
++            Self::SetTrue => ValueRange::EMPTY,
++            Self::SetFalse => ValueRange::EMPTY,
++            Self::Count => ValueRange::EMPTY,
++            Self::Help => ValueRange::EMPTY,
++            Self::HelpShort => ValueRange::EMPTY,
++            Self::HelpLong => ValueRange::EMPTY,
++            Self::Version => ValueRange::EMPTY,
++        }
++    }
++
+     pub(crate) fn default_value(&self) -> Option<&'static std::ffi::OsStr> {
+         match self {
+             Self::Set => None,
+diff --git a/clap_builder/src/builder/arg.rs b/clap_builder/src/builder/arg.rs
+index 79181497..9ed75ece 100644
+--- a/clap_builder/src/builder/arg.rs
++++ b/clap_builder/src/builder/arg.rs
+@@ -4546,11 +4546,7 @@ impl Arg {
+         if val_names_len > 1 {
+             self.num_vals.get_or_insert(val_names_len.into());
+         } else {
+-            let nargs = if self.get_action().takes_values() {
+-                ValueRange::SINGLE
+-            } else {
+-                ValueRange::EMPTY
+-            };
++            let nargs = self.get_action().default_num_args();
+             self.num_vals.get_or_insert(nargs);
+         }
+     }
+diff --git a/clap_builder/src/builder/debug_asserts.rs b/clap_builder/src/builder/debug_asserts.rs
+index 001ef8a1..28ef70eb 100644
+--- a/clap_builder/src/builder/debug_asserts.rs
++++ b/clap_builder/src/builder/debug_asserts.rs
+@@ -690,14 +690,14 @@ fn assert_arg(arg: &Arg) {
+         arg.get_id(),
+     );
+ 
+-    if arg.is_takes_value_set() {
+-        assert!(
+-            arg.get_action().takes_values(),
+-            "Argument `{}`'s selected action {:?} contradicts `takes_value`",
+-            arg.get_id(),
+-            arg.get_action()
+-        );
+-    }
++    assert!(
++        arg.get_num_args().unwrap_or(1.into()).max_values()
++            <= arg.get_action().max_num_args().max_values(),
++        "Argument `{}`'s action {:?} is incompatible with `num_args({:?})`",
++        arg.get_id(),
++        arg.get_action(),
++        arg.get_num_args().unwrap_or(1.into())
++    );
+     if let Some(action_type_id) = arg.get_action().value_type_id() {
+         assert_eq!(
+             action_type_id,
+diff --git a/clap_builder/src/builder/range.rs b/clap_builder/src/builder/range.rs
+index 1676ed32..be5695de 100644
+--- a/clap_builder/src/builder/range.rs
++++ b/clap_builder/src/builder/range.rs
+@@ -18,6 +18,17 @@ impl ValueRange {
+         end_inclusive: 1,
+     };
+ 
++    #[cfg(debug_assertions)]
++    pub(crate) const OPTIONAL: Self = Self {
++        start_inclusive: 0,
++        end_inclusive: 1,
++    };
++
++    pub(crate) const FULL: Self = Self {
++        start_inclusive: 0,
++        end_inclusive: usize::MAX,
++    };
++
+     /// Create a range
+     ///
+     /// # Panics
+@@ -135,9 +146,7 @@ impl From<std::ops::Range<usize>> for ValueRange {
+ 
+ impl From<std::ops::RangeFull> for ValueRange {
+     fn from(_: std::ops::RangeFull) -> Self {
+-        let start_inclusive = 0;
+-        let end_inclusive = usize::MAX;
+-        Self::raw(start_inclusive, end_inclusive)
++        Self::FULL
+     }
+ }
+ 
+@@ -176,7 +185,10 @@ impl From<std::ops::RangeToInclusive<usize>> for ValueRange {
+ impl std::fmt::Display for ValueRange {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         ok!(self.start_inclusive.fmt(f));
+-        if !self.is_fixed() {
++        if self.is_fixed() {
++        } else if self.end_inclusive == usize::MAX {
++            ok!("..".fmt(f));
++        } else {
+             ok!("..=".fmt(f));
+             ok!(self.end_inclusive.fmt(f));
+         }
+diff --git a/clap_complete/src/engine/complete.rs b/clap_complete/src/engine/complete.rs
+index 99077499..7b01f55e 100644
+--- a/clap_complete/src/engine/complete.rs
++++ b/clap_complete/src/engine/complete.rs
+@@ -81,7 +81,7 @@ pub fn complete(
+                 });
+ 
+                 if let Some(opt) = opt {
+-                    if opt.get_action().takes_values() && value.is_none() {
++                    if opt.get_num_args().expect("built").takes_values() && value.is_none() {
+                         next_state = ParseState::Opt((opt, 1));
+                     };
+                 } else if pos_allows_hyphen(current_cmd, pos_index) {
+@@ -581,7 +581,10 @@ fn parse_shortflags<'c, 's>(
+                     });
+                     is_find.unwrap_or(false)
+                 });
+-                if opt.map(|o| o.get_action().takes_values()).unwrap_or(false) {
++                if opt
++                    .map(|o| o.get_num_args().expect("built").takes_values())
++                    .unwrap_or(false)
++                {
+                     takes_value_opt = opt;
+                     break;
+                 }

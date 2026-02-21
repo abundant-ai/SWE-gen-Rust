@@ -1,0 +1,202 @@
+diff --git a/serde_derive/src/de.rs b/serde_derive/src/de.rs
+index d4238f13..0b86cde6 100644
+--- a/serde_derive/src/de.rs
++++ b/serde_derive/src/de.rs
+@@ -1165,6 +1165,32 @@ fn deserialize_enum(
+     params: &Parameters,
+     variants: &[Variant],
+     cattrs: &attr::Container,
++) -> Fragment {
++    // The variants have already been checked (in ast.rs) that all untagged variants appear at the end
++    match variants
++        .iter()
++        .enumerate()
++        .find(|(_, var)| var.attrs.untagged())
++    {
++        Some((variant_idx, _)) => {
++            let (tagged, untagged) = variants.split_at(variant_idx);
++            let tagged_frag = Expr(deserialize_homogeneous_enum(params, tagged, cattrs));
++            let tagged_frag = |deserializer| {
++                Some(Expr(quote_block! {
++                    let __deserializer = #deserializer;
++                    #tagged_frag
++                }))
++            };
++            deserialize_untagged_enum_after(params, untagged, cattrs, tagged_frag)
++        }
++        None => deserialize_homogeneous_enum(params, variants, cattrs),
++    }
++}
++
++fn deserialize_homogeneous_enum(
++    params: &Parameters,
++    variants: &[Variant],
++    cattrs: &attr::Container,
+ ) -> Fragment {
+     match cattrs.tag() {
+         attr::TagType::External => deserialize_externally_tagged_enum(params, variants, cattrs),
+@@ -1661,6 +1687,17 @@ fn deserialize_untagged_enum(
+     variants: &[Variant],
+     cattrs: &attr::Container,
+ ) -> Fragment {
++    deserialize_untagged_enum_after(params, variants, cattrs, |_| None)
++}
++
++fn deserialize_untagged_enum_after(
++    params: &Parameters,
++    variants: &[Variant],
++    cattrs: &attr::Container,
++    first_attempt: impl FnOnce(TokenStream) -> Option<Expr>,
++) -> Fragment {
++    let deserializer =
++        quote!(_serde::__private::de::ContentRefDeserializer::<__D::Error>::new(&__content));
+     let attempts = variants
+         .iter()
+         .filter(|variant| !variant.attrs.skip_deserializing())
+@@ -1669,12 +1706,12 @@ fn deserialize_untagged_enum(
+                 params,
+                 variant,
+                 cattrs,
+-                quote!(
+-                    _serde::__private::de::ContentRefDeserializer::<__D::Error>::new(&__content)
+-                ),
++                deserializer.clone(),
+             ))
+         });
+-
++    let attempts = first_attempt(deserializer.clone())
++        .into_iter()
++        .chain(attempts);
+     // TODO this message could be better by saving the errors from the failed
+     // attempts. The heuristic used by TOML was to count the number of fields
+     // processed before an error, and use the error that happened after the
+diff --git a/serde_derive/src/internals/ast.rs b/serde_derive/src/internals/ast.rs
+index 2a6950b2..ca3dd33a 100644
+--- a/serde_derive/src/internals/ast.rs
++++ b/serde_derive/src/internals/ast.rs
+@@ -140,6 +140,7 @@ fn enum_from_ast<'a>(
+     variants: &'a Punctuated<syn::Variant, Token![,]>,
+     container_default: &attr::Default,
+ ) -> Vec<Variant<'a>> {
++    let mut seen_untagged = false;
+     variants
+         .iter()
+         .map(|variant| {
+@@ -153,8 +154,12 @@ fn enum_from_ast<'a>(
+                 fields,
+                 original: variant,
+             }
+-        })
+-        .collect()
++        }).inspect(|variant| {
++            if !variant.attrs.untagged() && seen_untagged {
++                cx.error_spanned_by(&variant.ident, "all variants with the #[serde(untagged)] attribute must be placed at the end of the enum")
++            }
++            seen_untagged = variant.attrs.untagged()
++        }).collect()
+ }
+ 
+ fn struct_from_ast<'a>(
+diff --git a/serde_derive/src/internals/attr.rs b/serde_derive/src/internals/attr.rs
+index 9875b660..f0192259 100644
+--- a/serde_derive/src/internals/attr.rs
++++ b/serde_derive/src/internals/attr.rs
+@@ -734,6 +734,7 @@ pub struct Variant {
+     serialize_with: Option<syn::ExprPath>,
+     deserialize_with: Option<syn::ExprPath>,
+     borrow: Option<BorrowAttribute>,
++    untagged: bool,
+ }
+ 
+ struct BorrowAttribute {
+@@ -756,6 +757,7 @@ impl Variant {
+         let mut serialize_with = Attr::none(cx, SERIALIZE_WITH);
+         let mut deserialize_with = Attr::none(cx, DESERIALIZE_WITH);
+         let mut borrow = Attr::none(cx, BORROW);
++        let mut untagged = BoolAttr::none(cx, UNTAGGED);
+ 
+         for attr in &variant.attrs {
+             if attr.path() != SERDE {
+@@ -867,6 +869,8 @@ impl Variant {
+                             cx.error_spanned_by(variant, msg);
+                         }
+                     }
++                } else if meta.path == UNTAGGED {
++                    untagged.set_true(&meta.path);
+                 } else {
+                     let path = meta.path.to_token_stream().to_string().replace(' ', "");
+                     return Err(
+@@ -893,6 +897,7 @@ impl Variant {
+             serialize_with: serialize_with.get(),
+             deserialize_with: deserialize_with.get(),
+             borrow: borrow.get(),
++            untagged: untagged.get(),
+         }
+     }
+ 
+@@ -944,6 +949,10 @@ impl Variant {
+     pub fn deserialize_with(&self) -> Option<&syn::ExprPath> {
+         self.deserialize_with.as_ref()
+     }
++
++    pub fn untagged(&self) -> bool {
++        self.untagged
++    }
+ }
+ 
+ /// Represents field attribute information
+diff --git a/serde_derive/src/ser.rs b/serde_derive/src/ser.rs
+index 43695dd0..3b49b86c 100644
+--- a/serde_derive/src/ser.rs
++++ b/serde_derive/src/ser.rs
+@@ -477,17 +477,17 @@ fn serialize_variant(
+             }
+         };
+ 
+-        let body = Match(match cattrs.tag() {
+-            attr::TagType::External => {
++        let body = Match(match (cattrs.tag(), variant.attrs.untagged()) {
++            (attr::TagType::External, false) => {
+                 serialize_externally_tagged_variant(params, variant, variant_index, cattrs)
+             }
+-            attr::TagType::Internal { tag } => {
++            (attr::TagType::Internal { tag }, false) => {
+                 serialize_internally_tagged_variant(params, variant, cattrs, tag)
+             }
+-            attr::TagType::Adjacent { tag, content } => {
++            (attr::TagType::Adjacent { tag, content }, false) => {
+                 serialize_adjacently_tagged_variant(params, variant, cattrs, tag, content)
+             }
+-            attr::TagType::None => serialize_untagged_variant(params, variant, cattrs),
++            (attr::TagType::None, _) | (_, true) => serialize_untagged_variant(params, variant, cattrs),
+         });
+ 
+         quote! {
+diff --git a/test_suite/tests/ui/enum-representation/partially_tagged_wrong_order.rs b/test_suite/tests/ui/enum-representation/partially_tagged_wrong_order.rs
+diff --git a/test_suite/tests/ui/enum-representation/partially_tagged_wrong_order.rs b/test_suite/tests/ui/enum-representation/partially_tagged_wrong_order.rs
+new file mode 100644
+index 00000000..a33398ca
+--- /dev/null
++++ b/test_suite/tests/ui/enum-representation/partially_tagged_wrong_order.rs
+@@ -0,0 +1,10 @@
++use serde_derive::Serialize;
++
++#[derive(Serialize)]
++enum E {
++    #[serde(untagged)]
++    A(u8),
++    B(String),
++}
++
++fn main() {}
+diff --git a/test_suite/tests/ui/enum-representation/partially_tagged_wrong_order.stderr b/test_suite/tests/ui/enum-representation/partially_tagged_wrong_order.stderr
+new file mode 100644
+index 00000000..17d3c3f9
+--- /dev/null
++++ b/test_suite/tests/ui/enum-representation/partially_tagged_wrong_order.stderr
+@@ -0,0 +1,5 @@
++error: all variants with the #[serde(untagged)] attribute must be placed at the end of the enum
++ --> tests/ui/enum-representation/partially_tagged_wrong_order.rs:7:5
++  |
++7 |     B(String),
++  |     ^

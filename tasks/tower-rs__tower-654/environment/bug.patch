@@ -1,0 +1,158 @@
+diff --git a/tower/src/buffer/layer.rs b/tower/src/buffer/layer.rs
+index 8ef9167..aadc938 100644
+--- a/tower/src/buffer/layer.rs
++++ b/tower/src/buffer/layer.rs
+@@ -48,7 +48,7 @@ where
+     S::Error: Into<crate::BoxError> + Send + Sync,
+     Request: Send + 'static,
+ {
+-    type Service = Buffer<Request, S::Future>;
++    type Service = Buffer<S, Request>;
+ 
+     fn layer(&self, service: S) -> Self::Service {
+         Buffer::new(service, self.bound)
+diff --git a/tower/src/buffer/service.rs b/tower/src/buffer/service.rs
+index 9493f10..c685984 100644
+--- a/tower/src/buffer/service.rs
++++ b/tower/src/buffer/service.rs
+@@ -4,10 +4,7 @@ use super::{
+     worker::{Handle, Worker},
+ };
+ 
+-use std::{
+-    future::Future,
+-    task::{Context, Poll},
+-};
++use std::task::{Context, Poll};
+ use tokio::sync::{mpsc, oneshot};
+ use tokio_util::sync::PollSender;
+ use tower_service::Service;
+@@ -16,14 +13,18 @@ use tower_service::Service;
+ ///
+ /// See the module documentation for more details.
+ #[derive(Debug)]
+-pub struct Buffer<Req, F> {
+-    tx: PollSender<Message<Req, F>>,
++pub struct Buffer<T, Request>
++where
++    T: Service<Request>,
++{
++    tx: PollSender<Message<Request, T::Future>>,
+     handle: Handle,
+ }
+ 
+-impl<Req, F> Buffer<Req, F>
++impl<T, Request> Buffer<T, Request>
+ where
+-    F: 'static,
++    T: Service<Request>,
++    T::Error: Into<crate::BoxError>,
+ {
+     /// Creates a new [`Buffer`] wrapping `service`.
+     ///
+@@ -46,12 +47,12 @@ where
+     /// [`Poll::Ready`]: std::task::Poll::Ready
+     /// [`call`]: crate::Service::call
+     /// [`poll_ready`]: crate::Service::poll_ready
+-    pub fn new<S>(service: S, bound: usize) -> Self
++    pub fn new(service: T, bound: usize) -> Self
+     where
+-        S: Service<Req, Future = F> + Send + 'static,
+-        F: Send,
+-        S::Error: Into<crate::BoxError> + Send + Sync,
+-        Req: Send + 'static,
++        T: Send + 'static,
++        T::Future: Send,
++        T::Error: Send + Sync,
++        Request: Send + 'static,
+     {
+         let (service, worker) = Self::pair(service, bound);
+         tokio::spawn(worker);
+@@ -63,12 +64,12 @@ where
+     /// This is useful if you do not want to spawn directly onto the tokio runtime
+     /// but instead want to use your own executor. This will return the [`Buffer`] and
+     /// the background `Worker` that you can then spawn.
+-    pub fn pair<S>(service: S, bound: usize) -> (Self, Worker<S, Req>)
++    pub fn pair(service: T, bound: usize) -> (Buffer<T, Request>, Worker<T, Request>)
+     where
+-        S: Service<Req, Future = F> + Send + 'static,
+-        F: Send,
+-        S::Error: Into<crate::BoxError> + Send + Sync,
+-        Req: Send + 'static,
++        T: Send + 'static,
++        T::Error: Send + Sync,
++        Request: Send + 'static,
++        T::Future: Send + 'static,
+     {
+         let (tx, rx) = mpsc::channel(bound);
+         let (handle, worker) = Worker::new(service, rx);
+@@ -84,15 +85,16 @@ where
+     }
+ }
+ 
+-impl<Req, Rsp, F, E> Service<Req> for Buffer<Req, F>
++impl<T, Request> Service<Request> for Buffer<T, Request>
+ where
+-    F: Future<Output = Result<Rsp, E>> + Send + 'static,
+-    E: Into<crate::BoxError>,
+-    Req: Send + 'static,
++    T: Service<Request>,
++    T::Error: Into<crate::BoxError>,
++    T::Future: Send + 'static,
++    Request: Send + 'static,
+ {
+-    type Response = Rsp;
++    type Response = T::Response;
+     type Error = crate::BoxError;
+-    type Future = ResponseFuture<F>;
++    type Future = ResponseFuture<T::Future>;
+ 
+     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+         // First, check if the worker is still alive.
+@@ -107,7 +109,7 @@ where
+             .map_err(|_| self.get_worker_error())
+     }
+ 
+-    fn call(&mut self, request: Req) -> Self::Future {
++    fn call(&mut self, request: Request) -> Self::Future {
+         tracing::trace!("sending request to buffer worker");
+ 
+         // get the current Span so that we can explicitly propagate it to the worker
+@@ -130,10 +132,11 @@ where
+     }
+ }
+ 
+-impl<Req, F> Clone for Buffer<Req, F>
++impl<T, Request> Clone for Buffer<T, Request>
+ where
+-    Req: Send + 'static,
+-    F: Send + 'static,
++    T: Service<Request>,
++    Request: Send + 'static,
++    T::Future: Send + 'static,
+ {
+     fn clone(&self) -> Self {
+         Self {
+diff --git a/tower/tests/buffer/main.rs b/tower/tests/buffer/main.rs
+index ee238f1..b65de6b 100644
+--- a/tower/tests/buffer/main.rs
++++ b/tower/tests/buffer/main.rs
+@@ -437,15 +437,15 @@ async fn doesnt_leak_permits() {
+     assert_ready_ok!(ready3.poll());
+ }
+ 
++type Mock = mock::Mock<&'static str, &'static str>;
+ type Handle = mock::Handle<&'static str, &'static str>;
+-type MockBuffer = Buffer<&'static str, mock::future::ResponseFuture<&'static str>>;
+ 
+-fn new_service() -> (mock::Spawn<MockBuffer>, Handle) {
++fn new_service() -> (mock::Spawn<Buffer<Mock, &'static str>>, Handle) {
+     // bound is >0 here because clears_canceled_requests needs multiple outstanding requests
+     new_service_with_bound(10)
+ }
+ 
+-fn new_service_with_bound(bound: usize) -> (mock::Spawn<MockBuffer>, Handle) {
++fn new_service_with_bound(bound: usize) -> (mock::Spawn<Buffer<Mock, &'static str>>, Handle) {
+     mock::spawn_with(|s| {
+         let (svc, worker) = Buffer::pair(s, bound);
+ 

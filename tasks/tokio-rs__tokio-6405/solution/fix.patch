@@ -1,0 +1,178 @@
+diff --git a/tokio/src/sync/mpsc/bounded.rs b/tokio/src/sync/mpsc/bounded.rs
+index 3cdba3dc..b7b1ce7f 100644
+--- a/tokio/src/sync/mpsc/bounded.rs
++++ b/tokio/src/sync/mpsc/bounded.rs
+@@ -1409,6 +1409,16 @@ impl<T> Sender<T> {
+     pub fn max_capacity(&self) -> usize {
+         self.chan.semaphore().bound
+     }
++
++    /// Returns the number of [`Sender`] handles.
++    pub fn strong_count(&self) -> usize {
++        self.chan.strong_count()
++    }
++
++    /// Returns the number of [`WeakSender`] handles.
++    pub fn weak_count(&self) -> usize {
++        self.chan.weak_count()
++    }
+ }
+ 
+ impl<T> Clone for Sender<T> {
+@@ -1429,12 +1439,20 @@ impl<T> fmt::Debug for Sender<T> {
+ 
+ impl<T> Clone for WeakSender<T> {
+     fn clone(&self) -> Self {
++        self.chan.increment_weak_count();
++
+         WeakSender {
+             chan: self.chan.clone(),
+         }
+     }
+ }
+ 
++impl<T> Drop for WeakSender<T> {
++    fn drop(&mut self) {
++        self.chan.decrement_weak_count();
++    }
++}
++
+ impl<T> WeakSender<T> {
+     /// Tries to convert a `WeakSender` into a [`Sender`]. This will return `Some`
+     /// if there are other `Sender` instances alive and the channel wasn't
+@@ -1442,6 +1460,16 @@ impl<T> WeakSender<T> {
+     pub fn upgrade(&self) -> Option<Sender<T>> {
+         chan::Tx::upgrade(self.chan.clone()).map(Sender::new)
+     }
++
++    /// Returns the number of [`Sender`] handles.
++    pub fn strong_count(&self) -> usize {
++        self.chan.strong_count()
++    }
++
++    /// Returns the number of [`WeakSender`] handles.
++    pub fn weak_count(&self) -> usize {
++        self.chan.weak_count()
++    }
+ }
+ 
+ impl<T> fmt::Debug for WeakSender<T> {
+diff --git a/tokio/src/sync/mpsc/chan.rs b/tokio/src/sync/mpsc/chan.rs
+index c05a4abb..179a69f5 100644
+--- a/tokio/src/sync/mpsc/chan.rs
++++ b/tokio/src/sync/mpsc/chan.rs
+@@ -66,6 +66,9 @@ pub(super) struct Chan<T, S> {
+     /// When this drops to zero, the send half of the channel is closed.
+     tx_count: AtomicUsize,
+ 
++    /// Tracks the number of outstanding weak sender handles.
++    tx_weak_count: AtomicUsize,
++
+     /// Only accessed by `Rx` handle.
+     rx_fields: UnsafeCell<RxFields<T>>,
+ }
+@@ -115,6 +118,7 @@ pub(crate) fn channel<T, S: Semaphore>(semaphore: S) -> (Tx<T, S>, Rx<T, S>) {
+         semaphore,
+         rx_waker: CachePadded::new(AtomicWaker::new()),
+         tx_count: AtomicUsize::new(1),
++        tx_weak_count: AtomicUsize::new(0),
+         rx_fields: UnsafeCell::new(RxFields {
+             list: rx,
+             rx_closed: false,
+@@ -131,7 +135,17 @@ impl<T, S> Tx<T, S> {
+         Tx { inner: chan }
+     }
+ 
++    pub(super) fn strong_count(&self) -> usize {
++        self.inner.tx_count.load(Acquire)
++    }
++
++    pub(super) fn weak_count(&self) -> usize {
++        self.inner.tx_weak_count.load(Relaxed)
++    }
++
+     pub(super) fn downgrade(&self) -> Arc<Chan<T, S>> {
++        self.inner.increment_weak_count();
++
+         self.inner.clone()
+     }
+ 
+@@ -452,6 +466,22 @@ impl<T, S> Chan<T, S> {
+         // Notify the rx task
+         self.rx_waker.wake();
+     }
++
++    pub(super) fn decrement_weak_count(&self) {
++        self.tx_weak_count.fetch_sub(1, Relaxed);
++    }
++
++    pub(super) fn increment_weak_count(&self) {
++        self.tx_weak_count.fetch_add(1, Relaxed);
++    }
++
++    pub(super) fn strong_count(&self) -> usize {
++        self.tx_count.load(Acquire)
++    }
++
++    pub(super) fn weak_count(&self) -> usize {
++        self.tx_weak_count.load(Relaxed)
++    }
+ }
+ 
+ impl<T, S> Drop for Chan<T, S> {
+diff --git a/tokio/src/sync/mpsc/unbounded.rs b/tokio/src/sync/mpsc/unbounded.rs
+index b87b07ba..e5ef0ade 100644
+--- a/tokio/src/sync/mpsc/unbounded.rs
++++ b/tokio/src/sync/mpsc/unbounded.rs
+@@ -578,16 +578,34 @@ impl<T> UnboundedSender<T> {
+             chan: self.chan.downgrade(),
+         }
+     }
++
++    /// Returns the number of [`UnboundedSender`] handles.
++    pub fn strong_count(&self) -> usize {
++        self.chan.strong_count()
++    }
++
++    /// Returns the number of [`WeakUnboundedSender`] handles.
++    pub fn weak_count(&self) -> usize {
++        self.chan.weak_count()
++    }
+ }
+ 
+ impl<T> Clone for WeakUnboundedSender<T> {
+     fn clone(&self) -> Self {
++        self.chan.increment_weak_count();
++
+         WeakUnboundedSender {
+             chan: self.chan.clone(),
+         }
+     }
+ }
+ 
++impl<T> Drop for WeakUnboundedSender<T> {
++    fn drop(&mut self) {
++        self.chan.decrement_weak_count();
++    }
++}
++
+ impl<T> WeakUnboundedSender<T> {
+     /// Tries to convert a `WeakUnboundedSender` into an [`UnboundedSender`].
+     /// This will return `Some` if there are other `Sender` instances alive and
+@@ -595,6 +613,16 @@ impl<T> WeakUnboundedSender<T> {
+     pub fn upgrade(&self) -> Option<UnboundedSender<T>> {
+         chan::Tx::upgrade(self.chan.clone()).map(UnboundedSender::new)
+     }
++
++    /// Returns the number of [`UnboundedSender`] handles.
++    pub fn strong_count(&self) -> usize {
++        self.chan.strong_count()
++    }
++
++    /// Returns the number of [`WeakUnboundedSender`] handles.
++    pub fn weak_count(&self) -> usize {
++        self.chan.weak_count()
++    }
+ }
+ 
+ impl<T> fmt::Debug for WeakUnboundedSender<T> {

@@ -1,0 +1,307 @@
+diff --git a/tower/Cargo.toml b/tower/Cargo.toml
+index 2c9c9e5..6eec939 100644
+--- a/tower/Cargo.toml
++++ b/tower/Cargo.toml
+@@ -67,3 +67,10 @@ tower-test = { version = "0.3", path = "../tower-test" }
+ tracing-subscriber = "0.1.1"
+ # env_logger = { version = "0.5.3", default-features = false }
+ # log = "0.4.1"
++
++[package.metadata.docs.rs]
++all-features = true
++rustdoc-args = ["--cfg", "docsrs"]
++
++[package.metadata.playground]
++features = ["full"]
+\ No newline at end of file
+diff --git a/tower/src/builder/mod.rs b/tower/src/builder/mod.rs
+index ca72409..2061443 100644
+--- a/tower/src/builder/mod.rs
++++ b/tower/src/builder/mod.rs
+@@ -190,6 +190,27 @@ impl<L> ServiceBuilder<L> {
+         self.layer(crate::timeout::TimeoutLayer::new(timeout))
+     }
+ 
++    /// Map one request type to another.
++    #[cfg(feature = "util")]
++    pub fn map_request<F, R1, R2>(
++        self,
++        f: F,
++    ) -> ServiceBuilder<Stack<crate::util::MapRequestLayer<F>, L>>
++    where
++        F: Fn(R1) -> R2,
++    {
++        self.layer(crate::util::MapRequestLayer::new(f))
++    }
++
++    /// Map one response type to another.
++    #[cfg(feature = "util")]
++    pub fn map_response<F>(
++        self,
++        f: F,
++    ) -> ServiceBuilder<Stack<crate::util::MapResponseLayer<F>, L>> {
++        self.layer(crate::util::MapResponseLayer::new(f))
++    }
++
+     /// Obtains the underlying `Layer` implementation.
+     pub fn into_inner(self) -> L {
+         self.layer
+diff --git a/tower/src/lib.rs b/tower/src/lib.rs
+index 7931645..2be5211 100644
+--- a/tower/src/lib.rs
++++ b/tower/src/lib.rs
+@@ -48,8 +48,11 @@ pub mod timeout;
+ pub mod util;
+ 
+ pub mod builder;
++pub mod layer;
+ 
+ #[cfg(feature = "util")]
+ pub use self::util::{service_fn, ServiceExt};
++
+ pub use crate::builder::ServiceBuilder;
++pub use tower_layer::Layer;
+ pub use tower_service::Service;
+diff --git a/tower/src/reconnect/mod.rs b/tower/src/reconnect/mod.rs
+index 2464ee4..47b9a3b 100644
+--- a/tower/src/reconnect/mod.rs
++++ b/tower/src/reconnect/mod.rs
+@@ -1,3 +1,5 @@
++#![allow(missing_docs)]
++
+ pub mod future;
+ 
+ use self::future::ResponseFuture;
+diff --git a/tower/src/util/map/mod.rs b/tower/src/util/map/mod.rs
+new file mode 100644
+index 0000000..2c526d3
+--- /dev/null
++++ b/tower/src/util/map/mod.rs
+@@ -0,0 +1,7 @@
++mod request;
++mod response;
++
++#[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
++pub use request::{MapRequest, MapRequestLayer};
++#[allow(unreachable_pub)] // https://github.com/rust-lang/rust/issues/57411
++pub use response::{MapResponse, MapResponseLayer};
+diff --git a/tower/src/util/map/request.rs b/tower/src/util/map/request.rs
+new file mode 100644
+index 0000000..55562b7
+--- /dev/null
++++ b/tower/src/util/map/request.rs
+@@ -0,0 +1,70 @@
++use std::task::{Context, Poll};
++use tower_layer::Layer;
++use tower_service::Service;
++
++/// A [`tower::Service`] which maps from one request type to another.
++///
++/// [`tower::Service`]: ../trait.Service.html
++#[derive(Debug, Clone)]
++pub struct MapRequest<S, F> {
++    inner: S,
++    f: F,
++}
++
++impl<S, F> MapRequest<S, F> {
++    /// Create a new `Map` service.
++    pub fn new(inner: S, f: F) -> Self {
++        MapRequest { inner, f }
++    }
++}
++
++impl<S, F, R1, R2> Service<R1> for MapRequest<S, F>
++where
++    S: Service<R2>,
++    F: FnMut(R1) -> R2,
++{
++    type Response = S::Response;
++    type Error = S::Error;
++    type Future = S::Future;
++
++    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
++        self.inner.poll_ready(cx)
++    }
++
++    fn call(&mut self, req: R1) -> Self::Future {
++        let req = (self.f)(req);
++        self.inner.call(req)
++    }
++}
++
++/// A [`tower::Layer`] that accepts an [`FnMut`] and applies it
++/// to each inner service. Note that [`FnMut`] will implement
++/// [`Clone`] _if_ all the captured values implement either [`Copy`]
++/// or [`Clone`].
++///
++/// [`tower::Layer`]: ../trait.Layer.html
++/// [`FnMut`]: https://doc.rust-lang.org/std/ops/trait.FnMut.html
++/// [`Clone`]: https://doc.rust-lang.org/std/clone/trait.Clone.html
++/// [`Copy`]: https://doc.rust-lang.org/std/marker/trait.Copy.html
++#[derive(Debug, Clone)]
++pub struct MapRequestLayer<F> {
++    f: F,
++}
++
++impl<F> MapRequestLayer<F> {
++    /// Create a `MapLayer` from some `Fn`.
++    pub fn new(f: F) -> Self {
++        MapRequestLayer { f }
++    }
++}
++
++impl<F, S> Layer<S> for MapRequestLayer<F>
++where
++    F: Clone,
++{
++    type Service = MapRequest<S, F>;
++
++    fn layer(&self, inner: S) -> Self::Service {
++        MapRequest::new(inner, self.f.clone())
++    }
++}
+diff --git a/tower/src/util/map/response.rs b/tower/src/util/map/response.rs
+new file mode 100644
+index 0000000..fbe69d0
+--- /dev/null
++++ b/tower/src/util/map/response.rs
+@@ -0,0 +1,118 @@
++use pin_project::pin_project;
++use std::{
++    future::Future,
++    marker::PhantomData,
++    pin::Pin,
++    sync::Arc,
++    task::{Context, Poll},
++};
++use tower_layer::Layer;
++use tower_service::Service;
++
++/// A [`tower::Service`] which maps from one response type to another.
++///
++/// [`tower::Service`]: ../trait.Service.html
++#[derive(Debug)]
++pub struct MapResponse<S, F> {
++    inner: S,
++    f: Arc<F>,
++}
++
++impl<S, F> MapResponse<S, F> {
++    /// Create a new `MapResponse`.
++    pub fn new(inner: S, f: F) -> Self {
++        let f = Arc::new(f);
++        MapResponse { inner, f }
++    }
++}
++
++impl<S, F, Request, R1, R2> Service<Request> for MapResponse<S, F>
++where
++    S: Service<Request, Response = R1>,
++    F: Fn(R1) -> R2,
++{
++    type Response = R2;
++    type Error = S::Error;
++    type Future = MapResponseFuture<F, S::Future, R1, R2, S::Error>;
++
++    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
++        self.inner.poll_ready(cx)
++    }
++
++    fn call(&mut self, req: Request) -> Self::Future {
++        let f = self.f.clone();
++        let fut = self.inner.call(req);
++
++        MapResponseFuture {
++            f,
++            fut,
++            _pd: PhantomData,
++        }
++    }
++}
++
++impl<S: Clone, F> Clone for MapResponse<S, F> {
++    fn clone(&self) -> Self {
++        MapResponse {
++            inner: self.inner.clone(),
++            f: self.f.clone(),
++        }
++    }
++}
++
++/// A [`tower::Layer`] that accepts a [`Clone`]able [`Fn`] and applies it
++/// to each inner service.
++///
++/// [`tower::Layer`]: ../trait.Layer.html
++/// [`Clone`]: https://doc.rust-lang.org/std/clone/trait.Clone.html
++/// [`Fn`]: https://doc.rust-lang.org/std/ops/trait.Fn.html
++#[derive(Debug, Clone)]
++pub struct MapResponseLayer<F> {
++    f: F,
++}
++
++impl<F> MapResponseLayer<F> {
++    /// Create a new `MapResponseLayer`.
++    pub fn new(f: F) -> Self {
++        MapResponseLayer { f }
++    }
++}
++
++impl<S, F> Layer<S> for MapResponseLayer<F>
++where
++    F: Clone,
++{
++    type Service = MapResponse<S, F>;
++
++    fn layer(&self, inner: S) -> Self::Service {
++        MapResponse::new(inner, self.f.clone())
++    }
++}
++
++#[pin_project]
++#[derive(Debug)]
++pub struct MapResponseFuture<F, Fut, R1, R2, E> {
++    f: Arc<F>,
++    #[pin]
++    fut: Fut,
++    _pd: PhantomData<fn(R1, R2, E)>,
++}
++
++impl<F, Fut, R1, R2, E> Future for MapResponseFuture<F, Fut, R1, R2, E>
++where
++    F: Fn(R1) -> R2,
++    Fut: Future<Output = Result<R1, E>>,
++{
++    type Output = Result<R2, E>;
++
++    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        let me = self.project();
++
++        let res = match futures_core::ready!(me.fut.poll(cx)) {
++            Ok(r) => Ok((&me.f)(r)),
++            Err(e) => Err(e),
++        };
++
++        Poll::Ready(res)
++    }
++}
+diff --git a/tower/src/util/mod.rs b/tower/src/util/mod.rs
+index 7c642a7..a7b90e7 100644
+--- a/tower/src/util/mod.rs
++++ b/tower/src/util/mod.rs
+@@ -3,6 +3,7 @@
+ mod boxed;
+ mod call_all;
+ mod either;
++mod map;
+ mod oneshot;
+ mod optional;
+ mod ready;
+@@ -11,6 +12,7 @@ mod service_fn;
+ pub use self::{
+     boxed::{BoxService, UnsyncBoxService},
+     either::Either,
++    map::{MapRequest, MapRequestLayer, MapResponse, MapResponseLayer},
+     oneshot::Oneshot,
+     optional::Optional,
+     ready::{Ready, ReadyAnd, ReadyOneshot},

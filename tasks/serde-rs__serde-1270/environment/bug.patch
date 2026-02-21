@@ -1,0 +1,542 @@
+diff --git a/serde_derive/src/de.rs b/serde_derive/src/de.rs
+index ad105398..875c941a 100644
+--- a/serde_derive/src/de.rs
++++ b/serde_derive/src/de.rs
+@@ -15,7 +15,7 @@ use syn::{self, Ident, Index, Member};
+ use bound;
+ use fragment::{Expr, Fragment, Match, Stmts};
+ use internals::ast::{Container, Data, Field, Style, Variant};
+-use internals::{attr, Ctxt, Derive};
++use internals::{attr, Ctxt};
+ use pretend;
+ use try;
+ 
+@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
+ 
+ pub fn expand_derive_deserialize(input: &syn::DeriveInput) -> Result<TokenStream, String> {
+     let ctxt = Ctxt::new();
+-    let cont = Container::from_ast(&ctxt, input, Derive::Deserialize);
++    let cont = Container::from_ast(&ctxt, input);
+     precondition(&ctxt, &cont);
+     try!(ctxt.check());
+ 
+@@ -269,9 +269,7 @@ fn borrowed_lifetimes(cont: &Container) -> BorrowedLifetimes {
+ }
+ 
+ fn deserialize_body(cont: &Container, params: &Parameters) -> Fragment {
+-    if cont.attrs.transparent() {
+-        deserialize_transparent(cont, params)
+-    } else if let Some(type_from) = cont.attrs.type_from() {
++    if let Some(type_from) = cont.attrs.type_from() {
+         deserialize_from(type_from)
+     } else if let attr::Identifier::No = cont.attrs.identifier() {
+         match cont.data {
+@@ -300,9 +298,7 @@ fn deserialize_in_place_body(cont: &Container, params: &Parameters) -> Option<St
+     // deserialize_in_place for remote derives.
+     assert!(!params.has_getter);
+ 
+-    if cont.attrs.transparent()
+-        || cont.attrs.type_from().is_some()
+-        || cont.attrs.identifier().is_some()
++    if cont.attrs.type_from().is_some() || cont.attrs.identifier().is_some()
+         || cont
+             .data
+             .all_fields()
+@@ -348,41 +344,6 @@ fn deserialize_in_place_body(_cont: &Container, _params: &Parameters) -> Option<
+     None
+ }
+ 
+-fn deserialize_transparent(cont: &Container, params: &Parameters) -> Fragment {
+-    let fields = match cont.data {
+-        Data::Struct(_, ref fields) => fields,
+-        Data::Enum(_) => unreachable!(),
+-    };
+-
+-    let this = &params.this;
+-    let transparent_field = fields.iter().find(|f| f.attrs.transparent()).unwrap();
+-
+-    let path = match transparent_field.attrs.deserialize_with() {
+-        Some(path) => quote!(#path),
+-        None => quote!(_serde::Deserialize::deserialize),
+-    };
+-
+-    let assign = fields.iter().map(|field| {
+-        let member = &field.member;
+-        if field as *const Field == transparent_field as *const Field {
+-            quote!(#member: __transparent)
+-        } else {
+-            let value = match *field.attrs.default() {
+-                attr::Default::Default => quote!(_serde::export::Default::default()),
+-                attr::Default::Path(ref path) => quote!(#path()),
+-                attr::Default::None => quote!(_serde::export::PhantomData),
+-            };
+-            quote!(#member: #value)
+-        }
+-    });
+-
+-    quote_block! {
+-        _serde::export::Result::map(
+-            #path(__deserializer),
+-            |__transparent| #this { #(#assign),* })
+-    }
+-}
+-
+ fn deserialize_from(type_from: &syn::Type) -> Fragment {
+     quote_block! {
+         _serde::export::Result::map(
+diff --git a/serde_derive/src/internals/ast.rs b/serde_derive/src/internals/ast.rs
+index ce1d3197..093910d7 100644
+--- a/serde_derive/src/internals/ast.rs
++++ b/serde_derive/src/internals/ast.rs
+@@ -8,7 +8,7 @@
+ 
+ use internals::attr;
+ use internals::check;
+-use internals::{Ctxt, Derive};
++use internals::Ctxt;
+ use syn;
+ use syn::punctuated::Punctuated;
+ 
+@@ -47,7 +47,7 @@ pub enum Style {
+ }
+ 
+ impl<'a> Container<'a> {
+-    pub fn from_ast(cx: &Ctxt, item: &'a syn::DeriveInput, derive: Derive) -> Container<'a> {
++    pub fn from_ast(cx: &Ctxt, item: &'a syn::DeriveInput) -> Container<'a> {
+         let mut attrs = attr::Container::from_ast(cx, item);
+ 
+         let mut data = match item.data {
+@@ -86,13 +86,13 @@ impl<'a> Container<'a> {
+             attrs.mark_has_flatten();
+         }
+ 
+-        let mut item = Container {
++        let item = Container {
+             ident: item.ident.clone(),
+             attrs: attrs,
+             data: data,
+             generics: &item.generics,
+         };
+-        check::check(cx, &mut item, derive);
++        check::check(cx, &item);
+         item
+     }
+ }
+diff --git a/serde_derive/src/internals/attr.rs b/serde_derive/src/internals/attr.rs
+index abfb005b..43c689a0 100644
+--- a/serde_derive/src/internals/attr.rs
++++ b/serde_derive/src/internals/attr.rs
+@@ -105,7 +105,6 @@ impl Name {
+ /// Represents container (e.g. struct) attribute information
+ pub struct Container {
+     name: Name,
+-    transparent: bool,
+     deny_unknown_fields: bool,
+     default: Default,
+     rename_all: RenameRule,
+@@ -182,7 +181,6 @@ impl Container {
+     pub fn from_ast(cx: &Ctxt, item: &syn::DeriveInput) -> Self {
+         let mut ser_name = Attr::none(cx, "rename");
+         let mut de_name = Attr::none(cx, "rename");
+-        let mut transparent = BoolAttr::none(cx, "transparent");
+         let mut deny_unknown_fields = BoolAttr::none(cx, "deny_unknown_fields");
+         let mut default = Attr::none(cx, "default");
+         let mut rename_all = Attr::none(cx, "rename_all");
+@@ -230,11 +228,6 @@ impl Container {
+                         }
+                     }
+ 
+-                    // Parse `#[serde(transparent)]`
+-                    Meta(Word(ref word)) if word == "transparent" => {
+-                        transparent.set_true();
+-                    }
+-
+                     // Parse `#[serde(deny_unknown_fields)]`
+                     Meta(Word(ref word)) if word == "deny_unknown_fields" => {
+                         deny_unknown_fields.set_true();
+@@ -383,7 +376,6 @@ impl Container {
+                 serialize: ser_name.get().unwrap_or_else(|| item.ident.to_string()),
+                 deserialize: de_name.get().unwrap_or_else(|| item.ident.to_string()),
+             },
+-            transparent: transparent.get(),
+             deny_unknown_fields: deny_unknown_fields.get(),
+             default: default.get().unwrap_or(Default::None),
+             rename_all: rename_all.get().unwrap_or(RenameRule::None),
+@@ -406,10 +398,6 @@ impl Container {
+         &self.rename_all
+     }
+ 
+-    pub fn transparent(&self) -> bool {
+-        self.transparent
+-    }
+-
+     pub fn deny_unknown_fields(&self) -> bool {
+         self.deny_unknown_fields
+     }
+@@ -776,7 +764,6 @@ pub struct Field {
+     borrowed_lifetimes: BTreeSet<syn::Lifetime>,
+     getter: Option<syn::ExprPath>,
+     flatten: bool,
+-    transparent: bool,
+ }
+ 
+ /// Represents the default to use for a field when deserializing.
+@@ -790,6 +777,7 @@ pub enum Default {
+ }
+ 
+ impl Default {
++    #[cfg(feature = "deserialize_in_place")]
+     pub fn is_none(&self) -> bool {
+         match *self {
+             Default::None => true,
+@@ -1078,7 +1066,6 @@ impl Field {
+             borrowed_lifetimes: borrowed_lifetimes,
+             getter: getter.get(),
+             flatten: flatten.get(),
+-            transparent: false,
+         }
+     }
+ 
+@@ -1138,14 +1125,6 @@ impl Field {
+     pub fn flatten(&self) -> bool {
+         self.flatten
+     }
+-
+-    pub fn transparent(&self) -> bool {
+-        self.transparent
+-    }
+-
+-    pub fn mark_transparent(&mut self) {
+-        self.transparent = true;
+-    }
+ }
+ 
+ type SerAndDe<T> = (Option<T>, Option<T>);
+diff --git a/serde_derive/src/internals/check.rs b/serde_derive/src/internals/check.rs
+index 0caa4b50..eac1c229 100644
+--- a/serde_derive/src/internals/check.rs
++++ b/serde_derive/src/internals/check.rs
+@@ -8,19 +8,18 @@
+ 
+ use internals::ast::{Container, Data, Field, Style};
+ use internals::attr::{EnumTag, Identifier};
+-use internals::{Ctxt, Derive};
+-use syn::{Member, Type};
++use internals::Ctxt;
++use syn::Member;
+ 
+ /// Cross-cutting checks that require looking at more than a single attrs
+ /// object. Simpler checks should happen when parsing and building the attrs.
+-pub fn check(cx: &Ctxt, cont: &mut Container, derive: Derive) {
++pub fn check(cx: &Ctxt, cont: &Container) {
+     check_getter(cx, cont);
+     check_flatten(cx, cont);
+     check_identifier(cx, cont);
+     check_variant_skip_attrs(cx, cont);
+     check_internal_tag_field_name_conflict(cx, cont);
+     check_adjacent_tag_conflict(cx, cont);
+-    check_transparent(cx, cont, derive);
+ }
+ 
+ /// Getters are only allowed inside structs (not enums) with the `remote`
+@@ -279,75 +278,9 @@ fn check_adjacent_tag_conflict(cx: &Ctxt, cont: &Container) {
+     }
+ }
+ 
+-/// Enums and unit structs cannot be transparent.
+-fn check_transparent(cx: &Ctxt, cont: &mut Container, derive: Derive) {
+-    if !cont.attrs.transparent() {
+-        return;
+-    }
+-
+-    if cont.attrs.type_from().is_some() {
+-        cx.error("#[serde(transparent)] is not allowed with #[serde(from = \"...\")]");
+-    }
+-
+-    if cont.attrs.type_into().is_some() {
+-        cx.error("#[serde(transparent)] is not allowed with #[serde(into = \"...\")]");
+-    }
+-
+-    let fields = match cont.data {
+-        Data::Enum(_) => {
+-            cx.error("#[serde(transparent)] is not allowed on an enum");
+-            return;
+-        }
+-        Data::Struct(Style::Unit, _) => {
+-            cx.error("#[serde(transparent)] is not allowed on a unit struct");
+-            return;
+-        }
+-        Data::Struct(_, ref mut fields) => fields,
+-    };
+-
+-    let mut transparent_field = None;
+-
+-    for field in fields {
+-        if allow_transparent(field, derive) {
+-            if transparent_field.is_some() {
+-                cx.error("#[serde(transparent)] requires struct to have at most one transparent field");
+-                return;
+-            }
+-            transparent_field = Some(field);
+-        }
+-    }
+-
+-    match transparent_field {
+-        Some(transparent_field) => transparent_field.attrs.mark_transparent(),
+-        None => match derive {
+-            Derive::Serialize => {
+-                cx.error("#[serde(transparent)] requires at least one field that is not skipped");
+-            }
+-            Derive::Deserialize => {
+-                cx.error("#[serde(transparent)] requires at least one field that is neither skipped nor has a default");
+-            }
+-        }
+-    }
+-}
+-
+ fn member_message(member: &Member) -> String {
+     match *member {
+         Member::Named(ref ident) => format!("`{}`", ident),
+         Member::Unnamed(ref i) => i.index.to_string(),
+     }
+ }
+-
+-fn allow_transparent(field: &Field, derive: Derive) -> bool {
+-    if let Type::Path(ref ty) = *field.ty {
+-        if let Some(seg) = ty.path.segments.last() {
+-            if seg.into_value().ident == "PhantomData" {
+-                return false;
+-            }
+-        }
+-    }
+-
+-    match derive {
+-        Derive::Serialize => !field.attrs.skip_serializing(),
+-        Derive::Deserialize => !field.attrs.skip_deserializing() && field.attrs.default().is_none(),
+-    }
+-}
+diff --git a/serde_derive/src/internals/mod.rs b/serde_derive/src/internals/mod.rs
+index 7a39688d..f68462c9 100644
+--- a/serde_derive/src/internals/mod.rs
++++ b/serde_derive/src/internals/mod.rs
+@@ -14,9 +14,3 @@ pub use self::ctxt::Ctxt;
+ 
+ mod case;
+ mod check;
+-
+-#[derive(Copy, Clone)]
+-pub enum Derive {
+-    Serialize,
+-    Deserialize,
+-}
+diff --git a/serde_derive/src/ser.rs b/serde_derive/src/ser.rs
+index c78237bf..11e5b483 100644
+--- a/serde_derive/src/ser.rs
++++ b/serde_derive/src/ser.rs
+@@ -13,13 +13,13 @@ use syn::{self, Ident, Index, Member};
+ use bound;
+ use fragment::{Fragment, Match, Stmts};
+ use internals::ast::{Container, Data, Field, Style, Variant};
+-use internals::{attr, Ctxt, Derive};
++use internals::{attr, Ctxt};
+ use pretend;
+ use try;
+ 
+ pub fn expand_derive_serialize(input: &syn::DeriveInput) -> Result<TokenStream, String> {
+     let ctxt = Ctxt::new();
+-    let cont = Container::from_ast(&ctxt, input, Derive::Serialize);
++    let cont = Container::from_ast(&ctxt, input);
+     precondition(&ctxt, &cont);
+     try!(ctxt.check());
+ 
+@@ -166,9 +166,7 @@ fn needs_serialize_bound(field: &attr::Field, variant: Option<&attr::Variant>) -
+ }
+ 
+ fn serialize_body(cont: &Container, params: &Parameters) -> Fragment {
+-    if cont.attrs.transparent() {
+-        serialize_transparent(cont, params)
+-    } else if let Some(type_into) = cont.attrs.type_into() {
++    if let Some(type_into) = cont.attrs.type_into() {
+         serialize_into(params, type_into)
+     } else {
+         match cont.data {
+@@ -187,26 +185,6 @@ fn serialize_body(cont: &Container, params: &Parameters) -> Fragment {
+     }
+ }
+ 
+-fn serialize_transparent(cont: &Container, params: &Parameters) -> Fragment {
+-    let fields = match cont.data {
+-        Data::Struct(_, ref fields) => fields,
+-        Data::Enum(_) => unreachable!(),
+-    };
+-
+-    let self_var = &params.self_var;
+-    let transparent_field = fields.iter().find(|f| f.attrs.transparent()).unwrap();
+-    let member = &transparent_field.member;
+-
+-    let path = match transparent_field.attrs.serialize_with() {
+-        Some(path) => quote!(#path),
+-        None => quote!(_serde::Serialize::serialize),
+-    };
+-
+-    quote_block! {
+-        #path(&#self_var.#member, __serializer)
+-    }
+-}
+-
+ fn serialize_into(params: &Parameters, type_into: &syn::Type) -> Fragment {
+     let self_var = &params.self_var;
+     quote_block! {
+diff --git a/test_suite/tests/compile-fail/transparent/at_most_one.rs b/test_suite/tests/compile-fail/transparent/at_most_one.rs
+deleted file mode 100644
+index d5b7dae8..00000000
+--- a/test_suite/tests/compile-fail/transparent/at_most_one.rs
++++ /dev/null
+@@ -1,20 +0,0 @@
+-// Copyright 2018 Serde Developers
+-//
+-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+-// option. This file may not be copied, modified, or distributed
+-// except according to those terms.
+-
+-#[macro_use]
+-extern crate serde_derive;
+-
+-#[derive(Serialize)] //~ ERROR: proc-macro derive panicked
+-#[serde(transparent)]
+-struct S {
+-    //~^^^ HELP: #[serde(transparent)] requires struct to have at most one transparent field
+-    a: u8,
+-    b: u8,
+-}
+-
+-fn main() {}
+diff --git a/test_suite/tests/compile-fail/transparent/de_at_least_one.rs b/test_suite/tests/compile-fail/transparent/de_at_least_one.rs
+deleted file mode 100644
+index a1abe474..00000000
+--- a/test_suite/tests/compile-fail/transparent/de_at_least_one.rs
++++ /dev/null
+@@ -1,22 +0,0 @@
+-// Copyright 2018 Serde Developers
+-//
+-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+-// option. This file may not be copied, modified, or distributed
+-// except according to those terms.
+-
+-#[macro_use]
+-extern crate serde_derive;
+-
+-#[derive(Deserialize)] //~ ERROR: proc-macro derive panicked
+-#[serde(transparent)]
+-struct S {
+-    //~^^^ HELP: #[serde(transparent)] requires at least one field that is neither skipped nor has a default
+-    #[serde(skip)]
+-    a: u8,
+-    #[serde(default)]
+-    b: u8,
+-}
+-
+-fn main() {}
+diff --git a/test_suite/tests/compile-fail/transparent/ser_at_least_one.rs b/test_suite/tests/compile-fail/transparent/ser_at_least_one.rs
+deleted file mode 100644
+index 19dd59c1..00000000
+--- a/test_suite/tests/compile-fail/transparent/ser_at_least_one.rs
++++ /dev/null
+@@ -1,20 +0,0 @@
+-// Copyright 2018 Serde Developers
+-//
+-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+-// option. This file may not be copied, modified, or distributed
+-// except according to those terms.
+-
+-#[macro_use]
+-extern crate serde_derive;
+-
+-#[derive(Serialize)] //~ ERROR: proc-macro derive panicked
+-#[serde(transparent)]
+-struct S {
+-    //~^^^ HELP: #[serde(transparent)] requires at least one field that is not skipped
+-    #[serde(skip)]
+-    a: u8,
+-}
+-
+-fn main() {}
+diff --git a/test_suite/tests/test_annotations.rs b/test_suite/tests/test_annotations.rs
+index aea692cb..5b82ad88 100644
+--- a/test_suite/tests/test_annotations.rs
++++ b/test_suite/tests/test_annotations.rs
+@@ -15,7 +15,6 @@ extern crate serde;
+ use self::serde::de::{self, Unexpected};
+ use self::serde::{Deserialize, Deserializer, Serialize, Serializer};
+ use std::collections::HashMap;
+-use std::marker::PhantomData;
+ 
+ extern crate serde_test;
+ use self::serde_test::{
+@@ -2162,41 +2161,3 @@ fn test_flatten_option() {
+         &[Token::Map { len: None }, Token::MapEnd],
+     );
+ }
+-
+-#[test]
+-fn test_transparent_struct() {
+-    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+-    #[serde(transparent)]
+-    struct Transparent {
+-        #[serde(skip)]
+-        a: bool,
+-        b: u32,
+-        #[serde(skip)]
+-        c: bool,
+-        d: PhantomData<()>,
+-    }
+-
+-    assert_tokens(
+-        &Transparent {
+-            a: false,
+-            b: 1,
+-            c: false,
+-            d: PhantomData,
+-        },
+-        &[Token::U32(1)],
+-    );
+-}
+-
+-#[test]
+-fn test_transparent_tuple_struct() {
+-    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+-    #[serde(transparent)]
+-    struct Transparent(
+-        #[serde(skip)] bool,
+-        u32,
+-        #[serde(skip)] bool,
+-        PhantomData<()>,
+-    );
+-
+-    assert_tokens(&Transparent(false, 1, false, PhantomData), &[Token::U32(1)]);
+-}
+diff --git a/test_suite/tests/test_gen.rs b/test_suite/tests/test_gen.rs
+index ef301b59..ffb73210 100644
+--- a/test_suite/tests/test_gen.rs
++++ b/test_suite/tests/test_gen.rs
+@@ -653,14 +653,6 @@ fn test_gen() {
+             X,
+         ),
+     }
+-
+-    #[derive(Serialize, Deserialize)]
+-    #[serde(transparent)]
+-    struct TransparentWith {
+-        #[serde(serialize_with = "ser_x")]
+-        #[serde(deserialize_with = "de_x")]
+-        x: X,
+-    }
+ }
+ 
+ //////////////////////////////////////////////////////////////////////////

@@ -1,0 +1,255 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 99d1105..91e9f2c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -10,7 +10,7 @@ members = [
+   "tower-layer",
+   # "tower-limit",
+   "tower-load",
+-  "tower-load-shed",
++  # "tower-load-shed",
+   # "tower-reconnect",
+   # "tower-retry",
+   "tower-service",
+diff --git a/tower-load-shed/CHANGELOG.md b/tower-load-shed/CHANGELOG.md
+index 0730e7b..24a6a34 100644
+--- a/tower-load-shed/CHANGELOG.md
++++ b/tower-load-shed/CHANGELOG.md
+@@ -1,7 +1,3 @@
+-# 0.3.0-alpha.1
+-
+-- Move to `std::future`
+-
+ # 0.1.0 (April 26, 2019)
+ 
+ - Initial release
+diff --git a/tower-load-shed/Cargo.toml b/tower-load-shed/Cargo.toml
+index dcf3099..7bcf87d 100644
+--- a/tower-load-shed/Cargo.toml
++++ b/tower-load-shed/Cargo.toml
+@@ -8,13 +8,13 @@ name = "tower-load-shed"
+ #   - README.md
+ # - Update CHANGELOG.md.
+ # - Create "v0.1.x" git tag.
+-version = "0.3.0-alpha.1"
++version = "0.1.0"
+ authors = ["Tower Maintainers <team@tower-rs.com>"]
+ license = "MIT"
+ readme = "README.md"
+ repository = "https://github.com/tower-rs/tower"
+ homepage = "https://github.com/tower-rs/tower"
+-documentation = "https://docs.rs/tower-load-shed/0.3.0-alpha.1"
++documentation = "https://docs.rs/tower-load-shed/0.1.0"
+ description = """
+ Immediately reject requests if the inner service is not ready. This is also
+ known as load-shedding.
+@@ -23,12 +23,10 @@ categories = ["asynchronous", "network-programming"]
+ edition = "2018"
+ 
+ [dependencies]
+-tower-service = "0.3.0-alpha.1"
+-tower-layer = { version = "0.3.0-alpha.1", path = "../tower-layer" }
+-pin-project = { version = "0.4.0-alpha.10", features = ["project_attr"] }
+-futures-core-preview = "0.3.0-alpha.18"
++futures = "0.1.25"
++tower-service = "0.2.0"
++tower-layer = "0.1.0"
+ 
+ [dev-dependencies]
+-tokio-test = "0.2.0-alpha.4"
+-tower-test = { version = "0.3.0-alpha.1", path = "../tower-test" }
+-futures-util-preview = "0.3.0-alpha.18"
++tokio-mock-task = "0.1.1"
++tower-test = { version = "0.1.0", path = "../tower-test" }
+diff --git a/tower-load-shed/src/future.rs b/tower-load-shed/src/future.rs
+index ee14d65..dd8e8b2 100644
+--- a/tower-load-shed/src/future.rs
++++ b/tower-load-shed/src/future.rs
+@@ -1,57 +1,38 @@
+ //! Future types
+ 
+ use std::fmt;
+-use std::future::Future;
+-use std::pin::Pin;
+-use std::task::{Context, Poll};
+ 
+-use futures_core::ready;
+-use pin_project::{pin_project, project};
++use futures::{Future, Poll};
+ 
+ use crate::error::{Error, Overloaded};
+ 
+ /// Future for the `LoadShed` service.
+-#[pin_project]
+ pub struct ResponseFuture<F> {
+-    #[pin]
+-    state: ResponseState<F>,
+-}
+-
+-#[pin_project]
+-enum ResponseState<F> {
+-    Called(#[pin] F),
+-    Overloaded,
++    state: Result<F, ()>,
+ }
+ 
+ impl<F> ResponseFuture<F> {
+     pub(crate) fn called(fut: F) -> Self {
+-        ResponseFuture {
+-            state: ResponseState::Called(fut),
+-        }
++        ResponseFuture { state: Ok(fut) }
+     }
+ 
+     pub(crate) fn overloaded() -> Self {
+-        ResponseFuture {
+-            state: ResponseState::Overloaded,
+-        }
++        ResponseFuture { state: Err(()) }
+     }
+ }
+ 
+-impl<F, T, E> Future for ResponseFuture<F>
++impl<F> Future for ResponseFuture<F>
+ where
+-    F: Future<Output = Result<T, E>>,
+-    E: Into<Error>,
++    F: Future,
++    F::Error: Into<Error>,
+ {
+-    type Output = Result<T, Error>;
+-
+-    #[project]
+-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+-        let mut this = self.project();
++    type Item = F::Item;
++    type Error = Error;
+ 
+-        #[project]
+-        match this.state.project() {
+-            ResponseState::Called(fut) => Poll::Ready(ready!(fut.poll(cx)).map_err(Into::into)),
+-            ResponseState::Overloaded => Poll::Ready(Err(Overloaded::new().into())),
++    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
++        match self.state {
++            Ok(ref mut fut) => fut.poll().map_err(Into::into),
++            Err(()) => Err(Overloaded::new().into()),
+         }
+     }
+ }
+diff --git a/tower-load-shed/src/lib.rs b/tower-load-shed/src/lib.rs
+index 38e7da4..9f94271 100644
+--- a/tower-load-shed/src/lib.rs
++++ b/tower-load-shed/src/lib.rs
+@@ -1,11 +1,11 @@
+-#![doc(html_root_url = "https://docs.rs/tower-load-shed/0.3.0-alpha.1")]
++#![doc(html_root_url = "https://docs.rs/tower-load-shed/0.1.0")]
+ #![cfg_attr(test, deny(warnings))]
+ #![deny(missing_debug_implementations, missing_docs, rust_2018_idioms)]
+ #![allow(elided_lifetimes_in_paths)]
+ 
+ //! Tower middleware for shedding load when inner services aren't ready.
+ 
+-use std::task::{Context, Poll};
++use futures::Poll;
+ use tower_service::Service;
+ 
+ pub mod error;
+@@ -44,17 +44,14 @@ where
+     type Error = Error;
+     type Future = ResponseFuture<S::Future>;
+ 
+-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
++    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+         // We check for readiness here, so that we can know in `call` if
+         // the inner service is overloaded or not.
+-        self.is_ready = match self.inner.poll_ready(cx) {
+-            Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+-            r => r.is_ready(),
+-        };
++        self.is_ready = self.inner.poll_ready().map_err(Into::into)?.is_ready();
+ 
+         // But we always report Ready, so that layers above don't wait until
+         // the inner service is ready (the entire point of this layer!)
+-        Poll::Ready(Ok(()))
++        Ok(().into())
+     }
+ 
+     fn call(&mut self, req: Req) -> Self::Future {
+diff --git a/tower-load-shed/tests/load-shed.rs b/tower-load-shed/tests/load-shed.rs
+index 3090332..a7ae11d 100644
+--- a/tower-load-shed/tests/load-shed.rs
++++ b/tower-load-shed/tests/load-shed.rs
+@@ -1,42 +1,42 @@
+-use futures_util::pin_mut;
+-use std::future::Future;
+-use tokio_test::{assert_ready_err, assert_ready_ok, task::mock};
++use futures::Future;
+ use tower_load_shed::{self, LoadShed};
+ use tower_service::Service;
+ use tower_test::{assert_request_eq, mock};
+ 
+ #[test]
+ fn when_ready() {
+-    mock(|cx| {
+-        let (mut service, handle) = new_service();
+-        pin_mut!(handle);
++    let (mut service, mut handle) = new_service();
+ 
+-        assert_ready_ok!(service.poll_ready(cx), "overload always reports ready");
++    with_task(|| {
++        assert!(
++            service.poll_ready().unwrap().is_ready(),
++            "overload always reports ready",
++        );
++    });
+ 
+-        let response = service.call("hello");
+-        pin_mut!(response);
++    let response = service.call("hello");
+ 
+-        assert_request_eq!(handle, "hello").send_response("world");
+-        assert_eq!(assert_ready_ok!(response.poll(cx)), "world");
+-    });
++    assert_request_eq!(handle, "hello").send_response("world");
++    assert_eq!(response.wait().unwrap(), "world");
+ }
+ 
+ #[test]
+ fn when_not_ready() {
+-    mock(|cx| {
+-        let (mut service, handle) = new_service();
+-        pin_mut!(handle);
++    let (mut service, mut handle) = new_service();
+ 
+-        handle.allow(0);
++    handle.allow(0);
+ 
+-        assert_ready_ok!(service.poll_ready(cx), "overload always reports ready");
++    with_task(|| {
++        assert!(
++            service.poll_ready().unwrap().is_ready(),
++            "overload always reports ready",
++        );
++    });
+ 
+-        let fut = service.call("hello");
+-        pin_mut!(fut);
++    let fut = service.call("hello");
+ 
+-        let err = assert_ready_err!(fut.poll(cx));
+-        assert!(err.is::<tower_load_shed::error::Overloaded>());
+-    });
++    let err = fut.wait().unwrap_err();
++    assert!(err.is::<tower_load_shed::error::Overloaded>());
+ }
+ 
+ type Mock = mock::Mock<&'static str, &'static str>;
+@@ -47,3 +47,8 @@ fn new_service() -> (LoadShed<Mock>, Handle) {
+     let service = LoadShed::new(service);
+     (service, handle)
+ }
++
++fn with_task<F: FnOnce() -> U, U>(f: F) -> U {
++    use futures::future::lazy;
++    lazy(|| Ok::<_, ()>(f())).wait().unwrap()
++}

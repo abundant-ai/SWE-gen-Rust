@@ -1,0 +1,437 @@
+diff --git a/tokio-util/Cargo.toml b/tokio-util/Cargo.toml
+index 084d123f..e8e004c0 100644
+--- a/tokio-util/Cargo.toml
++++ b/tokio-util/Cargo.toml
+@@ -24,9 +24,9 @@ default = []
+ full = ["codec", "compat", "io-util", "time", "net", "rt"]
+ 
+ net = ["tokio/net"]
+-compat = ["futures-io",]
++compat = ["futures-io"]
+ codec = []
+-time = ["tokio/time","slab"]
++time = ["tokio/time", "slab"]
+ io = []
+ io-util = ["io", "tokio/rt", "tokio/io-util"]
+ rt = ["tokio/rt", "tokio/sync", "futures-util", "hashbrown"]
+diff --git a/tokio-util/src/future.rs b/tokio-util/src/future.rs
+new file mode 100644
+index 00000000..ba477990
+--- /dev/null
++++ b/tokio-util/src/future.rs
+@@ -0,0 +1,138 @@
++//! An extension trait for Futures that provides a variety of convenient adapters.
++
++mod with_cancellation_token;
++use with_cancellation_token::{WithCancellationTokenFuture, WithCancellationTokenFutureOwned};
++
++use std::future::Future;
++
++use crate::sync::CancellationToken;
++
++/// A trait which contains a variety of convenient adapters and utilities for `Future`s.
++pub trait FutureExt: Future {
++    cfg_time! {
++        /// A wrapper around [`tokio::time::timeout`], with the advantage that it is easier to write
++        /// fluent call chains.
++        ///
++        /// # Examples
++        ///
++        /// ```rust
++        /// use tokio::{sync::oneshot, time::Duration};
++        /// use tokio_util::future::FutureExt;
++        ///
++        /// # async fn dox() {
++        /// let (_tx, rx) = oneshot::channel::<()>();
++        ///
++        /// let res = rx.timeout(Duration::from_millis(10)).await;
++        /// assert!(res.is_err());
++        /// # }
++        /// ```
++        fn timeout(self, timeout: std::time::Duration) -> tokio::time::Timeout<Self>
++        where
++            Self: Sized,
++        {
++            tokio::time::timeout(timeout, self)
++        }
++
++        /// A wrapper around [`tokio::time::timeout_at`], with the advantage that it is easier to write
++        /// fluent call chains.
++        ///
++        /// # Examples
++        ///
++        /// ```rust
++        /// use tokio::{sync::oneshot, time::{Duration, Instant}};
++        /// use tokio_util::future::FutureExt;
++        ///
++        /// # async fn dox() {
++        /// let (_tx, rx) = oneshot::channel::<()>();
++        /// let deadline = Instant::now() + Duration::from_millis(10);
++        ///
++        /// let res = rx.timeout_at(deadline).await;
++        /// assert!(res.is_err());
++        /// # }
++        /// ```
++        fn timeout_at(self, deadline: tokio::time::Instant) -> tokio::time::Timeout<Self>
++        where
++            Self: Sized,
++        {
++            tokio::time::timeout_at(deadline, self)
++        }
++    }
++
++    /// Similar to [`CancellationToken::run_until_cancelled`],
++    /// but with the advantage that it is easier to write fluent call chains,
++    /// and biased towards waiting for [`CancellationToken`] to complete.
++    ///
++    /// # Fairness
++    ///
++    /// Calling this on an already-cancelled token directly returns `None`.
++    /// For all subsequent polls, in case of concurrent completion and
++    /// cancellation, this is biased towards the future completion.
++    ///
++    /// # Examples
++    ///
++    /// ```rust
++    /// use tokio::sync::oneshot;
++    /// use tokio_util::future::FutureExt;
++    /// use tokio_util::sync::CancellationToken;
++    ///
++    /// # async fn dox() {
++    /// let (_tx, rx) = oneshot::channel::<()>();
++    /// let token = CancellationToken::new();
++    /// let token_clone = token.clone();
++    /// tokio::spawn(async move {
++    ///     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
++    ///     token.cancel();
++    /// });
++    /// assert!(rx.with_cancellation_token(&token_clone).await.is_none())
++    /// # }
++    /// ```
++    fn with_cancellation_token(
++        self,
++        cancellation_token: &CancellationToken,
++    ) -> WithCancellationTokenFuture<'_, Self>
++    where
++        Self: Sized,
++    {
++        WithCancellationTokenFuture::new(cancellation_token, self)
++    }
++
++    /// Similar to [`CancellationToken::run_until_cancelled_owned`],
++    /// but with the advantage that it is easier to write fluent call chains,
++    /// and biased towards waiting for [`CancellationToken`] to complete.
++    ///
++    /// # Fairness
++    ///
++    /// Calling this on an already-cancelled token directly returns `None`.
++    /// For all subsequent polls, in case of concurrent completion and
++    /// cancellation, this is biased towards the future completion.
++    ///
++    /// # Examples
++    ///
++    /// ```rust
++    /// use tokio::sync::oneshot;
++    /// use tokio_util::future::FutureExt;
++    /// use tokio_util::sync::CancellationToken;
++    ///
++    /// # async fn dox() {
++    /// let (_tx, rx) = oneshot::channel::<()>();
++    /// let token = CancellationToken::new();
++    /// let token_clone = token.clone();
++    /// tokio::spawn(async move {
++    ///     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
++    ///     token.cancel();
++    /// });
++    /// assert!(rx.with_cancellation_token_owned(token_clone).await.is_none())
++    /// # }
++    /// ```
++    fn with_cancellation_token_owned(
++        self,
++        cancellation_token: CancellationToken,
++    ) -> WithCancellationTokenFutureOwned<Self>
++    where
++        Self: Sized,
++    {
++        WithCancellationTokenFutureOwned::new(cancellation_token, self)
++    }
++}
++
++impl<T: Future + ?Sized> FutureExt for T {}
+diff --git a/tokio-util/src/future/with_cancellation_token.rs b/tokio-util/src/future/with_cancellation_token.rs
+new file mode 100644
+index 00000000..7b1d0f0b
+--- /dev/null
++++ b/tokio-util/src/future/with_cancellation_token.rs
+@@ -0,0 +1,79 @@
++use std::{
++    future::Future,
++    pin::Pin,
++    task::{Context, Poll},
++};
++
++use pin_project_lite::pin_project;
++
++use crate::sync::{CancellationToken, RunUntilCancelledFuture, RunUntilCancelledFutureOwned};
++
++pin_project! {
++    /// A [`Future`] that is resolved once the corresponding [`CancellationToken`]
++    /// is cancelled or a given [`Future`] gets resolved.
++    ///
++    /// This future is immediately resolved if the corresponding [`CancellationToken`]
++    /// is already cancelled, otherwise, in case of concurrent completion and
++    /// cancellation, this is biased towards the future completion.
++    #[must_use = "futures do nothing unless polled"]
++    pub struct WithCancellationTokenFuture<'a, F: Future> {
++        #[pin]
++        run_until_cancelled: Option<RunUntilCancelledFuture<'a, F>>
++    }
++}
++
++impl<'a, F: Future> WithCancellationTokenFuture<'a, F> {
++    pub(crate) fn new(cancellation_token: &'a CancellationToken, future: F) -> Self {
++        Self {
++            run_until_cancelled: (!cancellation_token.is_cancelled())
++                .then(|| RunUntilCancelledFuture::new(cancellation_token, future)),
++        }
++    }
++}
++
++impl<'a, F: Future> Future for WithCancellationTokenFuture<'a, F> {
++    type Output = Option<F::Output>;
++
++    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        let this = self.project();
++        match this.run_until_cancelled.as_pin_mut() {
++            Some(fut) => fut.poll(cx),
++            None => Poll::Ready(None),
++        }
++    }
++}
++
++pin_project! {
++    /// A [`Future`] that is resolved once the corresponding [`CancellationToken`]
++    /// is cancelled or a given [`Future`] gets resolved.
++    ///
++    /// This future is immediately resolved if the corresponding [`CancellationToken`]
++    /// is already cancelled, otherwise, in case of concurrent completion and
++    /// cancellation, this is biased towards the future completion.
++    #[must_use = "futures do nothing unless polled"]
++    pub struct WithCancellationTokenFutureOwned<F: Future> {
++        #[pin]
++        run_until_cancelled: Option<RunUntilCancelledFutureOwned<F>>
++    }
++}
++
++impl<F: Future> WithCancellationTokenFutureOwned<F> {
++    pub(crate) fn new(cancellation_token: CancellationToken, future: F) -> Self {
++        Self {
++            run_until_cancelled: (!cancellation_token.is_cancelled())
++                .then(|| RunUntilCancelledFutureOwned::new(cancellation_token, future)),
++        }
++    }
++}
++
++impl<F: Future> Future for WithCancellationTokenFutureOwned<F> {
++    type Output = Option<F::Output>;
++
++    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        let this = self.project();
++        match this.run_until_cancelled.as_pin_mut() {
++            Some(fut) => fut.poll(cx),
++            None => Poll::Ready(None),
++        }
++    }
++}
+diff --git a/tokio-util/src/lib.rs b/tokio-util/src/lib.rs
+index a68a6ba3..677027d6 100644
+--- a/tokio-util/src/lib.rs
++++ b/tokio-util/src/lib.rs
+@@ -59,3 +59,5 @@ pub mod either;
+ pub use bytes;
+ 
+ mod util;
++
++pub mod future;
+diff --git a/tokio-util/src/sync/cancellation_token.rs b/tokio-util/src/sync/cancellation_token.rs
+index d785ed42..1b397c2b 100644
+--- a/tokio-util/src/sync/cancellation_token.rs
++++ b/tokio-util/src/sync/cancellation_token.rs
+@@ -281,34 +281,6 @@ impl CancellationToken {
+     where
+         F: Future,
+     {
+-        pin_project! {
+-            /// A Future that is resolved once the corresponding [`CancellationToken`]
+-            /// is cancelled or a given Future gets resolved. It is biased towards the
+-            /// Future completion.
+-            #[must_use = "futures do nothing unless polled"]
+-            struct RunUntilCancelledFuture<'a, F: Future> {
+-                #[pin]
+-                cancellation: WaitForCancellationFuture<'a>,
+-                #[pin]
+-                future: F,
+-            }
+-        }
+-
+-        impl<'a, F: Future> Future for RunUntilCancelledFuture<'a, F> {
+-            type Output = Option<F::Output>;
+-
+-            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+-                let this = self.project();
+-                if let Poll::Ready(res) = this.future.poll(cx) {
+-                    Poll::Ready(Some(res))
+-                } else if this.cancellation.poll(cx).is_ready() {
+-                    Poll::Ready(None)
+-                } else {
+-                    Poll::Pending
+-                }
+-            }
+-        }
+-
+         if self.is_cancelled() {
+             None
+         } else {
+@@ -439,3 +411,77 @@ impl Future for WaitForCancellationFutureOwned {
+         }
+     }
+ }
++
++pin_project! {
++    /// A Future that is resolved once the corresponding [`CancellationToken`]
++    /// is cancelled or a given Future gets resolved. It is biased towards the
++    /// Future completion.
++    #[must_use = "futures do nothing unless polled"]
++    pub(crate) struct RunUntilCancelledFuture<'a, F: Future> {
++        #[pin]
++        cancellation: WaitForCancellationFuture<'a>,
++        #[pin]
++        future: F,
++    }
++}
++
++impl<'a, F: Future> RunUntilCancelledFuture<'a, F> {
++    pub(crate) fn new(cancellation_token: &'a CancellationToken, future: F) -> Self {
++        Self {
++            cancellation: cancellation_token.cancelled(),
++            future,
++        }
++    }
++}
++
++impl<'a, F: Future> Future for RunUntilCancelledFuture<'a, F> {
++    type Output = Option<F::Output>;
++
++    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        let this = self.project();
++        if let Poll::Ready(res) = this.future.poll(cx) {
++            Poll::Ready(Some(res))
++        } else if this.cancellation.poll(cx).is_ready() {
++            Poll::Ready(None)
++        } else {
++            Poll::Pending
++        }
++    }
++}
++
++pin_project! {
++    /// A Future that is resolved once the corresponding [`CancellationToken`]
++    /// is cancelled or a given Future gets resolved. It is biased towards the
++    /// Future completion.
++    #[must_use = "futures do nothing unless polled"]
++    pub(crate) struct RunUntilCancelledFutureOwned<F: Future> {
++        #[pin]
++        cancellation: WaitForCancellationFutureOwned,
++        #[pin]
++        future: F,
++    }
++}
++
++impl<F: Future> Future for RunUntilCancelledFutureOwned<F> {
++    type Output = Option<F::Output>;
++
++    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
++        let this = self.project();
++        if let Poll::Ready(res) = this.future.poll(cx) {
++            Poll::Ready(Some(res))
++        } else if this.cancellation.poll(cx).is_ready() {
++            Poll::Ready(None)
++        } else {
++            Poll::Pending
++        }
++    }
++}
++
++impl<F: Future> RunUntilCancelledFutureOwned<F> {
++    pub(crate) fn new(cancellation_token: CancellationToken, future: F) -> Self {
++        Self {
++            cancellation: cancellation_token.cancelled_owned(),
++            future,
++        }
++    }
++}
+diff --git a/tokio-util/src/sync/mod.rs b/tokio-util/src/sync/mod.rs
+index 28f2fbd2..c6c97471 100644
+--- a/tokio-util/src/sync/mod.rs
++++ b/tokio-util/src/sync/mod.rs
+@@ -5,6 +5,7 @@ pub use cancellation_token::{
+     guard::DropGuard, guard_ref::DropGuardRef, CancellationToken, WaitForCancellationFuture,
+     WaitForCancellationFutureOwned,
+ };
++pub(crate) use cancellation_token::{RunUntilCancelledFuture, RunUntilCancelledFutureOwned};
+ 
+ mod mpsc;
+ pub use mpsc::{PollSendError, PollSender};
+diff --git a/tokio-util/src/time/mod.rs b/tokio-util/src/time/mod.rs
+index b4c5a772..076f4832 100644
+--- a/tokio-util/src/time/mod.rs
++++ b/tokio-util/src/time/mod.rs
+@@ -8,44 +8,18 @@
+ //!
+ //! This type must be used from within the context of the `Runtime`.
+ 
+-use std::future::Future;
+ use std::time::Duration;
+-use tokio::time::Timeout;
+ 
+ mod wheel;
+ 
+ pub mod delay_queue;
+ 
++// re-export `FutureExt` to avoid breaking change
+ #[doc(inline)]
+-pub use delay_queue::DelayQueue;
+-
+-/// A trait which contains a variety of convenient adapters and utilities for `Future`s.
+-pub trait FutureExt: Future {
+-    /// A wrapper around [`tokio::time::timeout`], with the advantage that it is easier to write
+-    /// fluent call chains.
+-    ///
+-    /// # Examples
+-    ///
+-    /// ```rust
+-    /// use tokio::{sync::oneshot, time::Duration};
+-    /// use tokio_util::time::FutureExt;
+-    ///
+-    /// # async fn dox() {
+-    /// let (tx, rx) = oneshot::channel::<()>();
+-    ///
+-    /// let res = rx.timeout(Duration::from_millis(10)).await;
+-    /// assert!(res.is_err());
+-    /// # }
+-    /// ```
+-    fn timeout(self, timeout: Duration) -> Timeout<Self>
+-    where
+-        Self: Sized,
+-    {
+-        tokio::time::timeout(timeout, self)
+-    }
+-}
++pub use crate::future::FutureExt;
+ 
+-impl<T: Future + ?Sized> FutureExt for T {}
++#[doc(inline)]
++pub use delay_queue::DelayQueue;
+ 
+ // ===== Internal utils =====
+ 

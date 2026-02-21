@@ -1,0 +1,20 @@
+#!/bin/bash
+
+cd /app/src
+
+export RUST_BACKTRACE=1
+
+# Copy HEAD test files from /tests (overwrites BASE state)
+cp "/tests/client.rs" "tests/client.rs"
+cp "/tests/support_mod.rs" "tests/support/mod.rs"
+
+# Run the client test file
+cargo test --test client --features full -- --nocapture
+test_status=$?
+
+if [ $test_status -eq 0 ]; then
+  echo 1 > /logs/verifier/reward.txt
+else
+  echo 0 > /logs/verifier/reward.txt
+fi
+exit "$test_status"

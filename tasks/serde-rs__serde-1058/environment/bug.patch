@@ -1,0 +1,329 @@
+diff --git a/serde/src/private/de.rs b/serde/src/private/de.rs
+index 3d8a2ec3..a79b5a1f 100644
+--- a/serde/src/private/de.rs
++++ b/serde/src/private/de.rs
+@@ -834,43 +834,26 @@ mod content {
+         type Value = TaggedContent<'de, T>;
+ 
+         fn expecting(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+-            fmt.write_str("internally tagged enum")
+-        }
+-
+-        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+-        where
+-            S: SeqAccess<'de>,
+-        {
+-            let tag = match try!(seq.next_element()) {
+-                Some(tag) => tag,
+-                None => {
+-                    return Err(de::Error::missing_field(self.tag_name));
+-                }
+-            };
+-            let rest = de::value::SeqAccessDeserializer::new(seq);
+-            Ok(TaggedContent {
+-                tag: tag,
+-                content: try!(Content::deserialize(rest)),
+-            })
++            fmt.write_str("any value")
+         }
+ 
+-        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
++        fn visit_map<V>(self, mut visitor: V) -> Result<Self::Value, V::Error>
+         where
+-            M: MapAccess<'de>,
++            V: MapAccess<'de>,
+         {
+             let mut tag = None;
+-            let mut vec = Vec::with_capacity(size_hint::cautious(map.size_hint()));
++            let mut vec = Vec::with_capacity(size_hint::cautious(visitor.size_hint()));
+             while let Some(k) =
+-                try!(map.next_key_seed(TagOrContentVisitor::new(self.tag_name))) {
++                try!(visitor.next_key_seed(TagOrContentVisitor::new(self.tag_name))) {
+                 match k {
+                     TagOrContent::Tag => {
+                         if tag.is_some() {
+                             return Err(de::Error::duplicate_field(self.tag_name));
+                         }
+-                        tag = Some(try!(map.next_value()));
++                        tag = Some(try!(visitor.next_value()));
+                     }
+                     TagOrContent::Content(k) => {
+-                        let v = try!(map.next_value());
++                        let v = try!(visitor.next_value());
+                         vec.push((k, v));
+                     }
+                 }
+@@ -1819,16 +1802,9 @@ mod content {
+             write!(formatter, "unit variant {}::{}", self.type_name, self.variant_name)
+         }
+ 
+-        fn visit_seq<S>(self, _: S) -> Result<(), S::Error>
+-        where
+-            S: SeqAccess<'de>,
+-        {
+-            Ok(())
+-        }
+-
+-        fn visit_map<M>(self, _: M) -> Result<(), M::Error>
++        fn visit_map<V>(self, _: V) -> Result<(), V::Error>
+         where
+-            M: MapAccess<'de>,
++            V: MapAccess<'de>,
+         {
+             Ok(())
+         }
+diff --git a/serde_derive/src/de.rs b/serde_derive/src/de.rs
+index 44ed7fa0..fe064dd5 100644
+--- a/serde_derive/src/de.rs
++++ b/serde_derive/src/de.rs
+@@ -222,7 +222,7 @@ fn deserialize_body(cont: &Container, params: &Parameters) -> Fragment {
+                 if fields.iter().any(|field| field.ident.is_none()) {
+                     panic!("struct has unnamed fields");
+                 }
+-                deserialize_struct(None, params, fields, &cont.attrs, None, Untagged::No)
++                deserialize_struct(None, params, fields, &cont.attrs, None)
+             }
+             Body::Struct(Style::Tuple, ref fields) |
+             Body::Struct(Style::Newtype, ref fields) => {
+@@ -488,20 +488,15 @@ fn deserialize_newtype_struct(type_path: &Tokens, params: &Parameters, field: &F
+     }
+ }
+ 
+-enum Untagged {
+-    Yes,
+-    No,
+-}
+-
+ fn deserialize_struct(
+     variant_ident: Option<&syn::Ident>,
+     params: &Parameters,
+     fields: &[Field],
+     cattrs: &attr::Container,
+     deserializer: Option<Tokens>,
+-    untagged: Untagged,
+ ) -> Fragment {
+     let is_enum = variant_ident.is_some();
++    let is_untagged = deserializer.is_some();
+ 
+     let this = &params.this;
+     let (de_impl_generics, de_ty_generics, ty_generics, where_clause) = split_with_de_lifetime(params,);
+@@ -564,19 +559,18 @@ fn deserialize_struct(
+         quote!(mut __seq)
+     };
+ 
+-    // untagged struct variants do not get a visit_seq method
+-    let visit_seq = match untagged {
+-        Untagged::Yes => None,
+-        Untagged::No => {
+-            Some(quote! {
+-                #[inline]
+-                fn visit_seq<__A>(self, #visitor_var: __A) -> _serde::export::Result<Self::Value, __A::Error>
+-                    where __A: _serde::de::SeqAccess<#delife>
+-                {
+-                    #visit_seq
+-                }
+-            })
+-        }
++    let visit_seq = if is_untagged {
++        // untagged struct variants do not get a visit_seq method
++        None
++    } else {
++        Some(quote! {
++            #[inline]
++            fn visit_seq<__A>(self, #visitor_var: __A) -> _serde::export::Result<Self::Value, __A::Error>
++                where __A: _serde::de::SeqAccess<#delife>
++            {
++                #visit_seq
++            }
++        })
+     };
+ 
+     quote_block! {
+@@ -1154,7 +1148,7 @@ fn deserialize_externally_tagged_variant(
+             deserialize_tuple(Some(variant_ident), params, &variant.fields, cattrs, None)
+         }
+         Style::Struct => {
+-            deserialize_struct(Some(variant_ident), params, &variant.fields, cattrs, None, Untagged::No)
++            deserialize_struct(Some(variant_ident), params, &variant.fields, cattrs, None)
+         }
+     }
+ }
+@@ -1181,23 +1175,8 @@ fn deserialize_internally_tagged_variant(
+                 _serde::export::Ok(#this::#variant_ident)
+             }
+         }
+-        Style::Newtype => {
+-            deserialize_untagged_newtype_variant(
+-                variant_ident,
+-                params,
+-                &variant.fields[0],
+-                deserializer,
+-            )
+-        }
+-        Style::Struct => {
+-            deserialize_struct(
+-                Some(variant_ident),
+-                params,
+-                &variant.fields,
+-                cattrs,
+-                Some(deserializer),
+-                Untagged::No,
+-            )
++        Style::Newtype | Style::Struct => {
++            deserialize_untagged_variant(params, variant, cattrs, deserializer)
+         }
+         Style::Tuple => unreachable!("checked in serde_derive_internals"),
+     }
+@@ -1259,7 +1238,6 @@ fn deserialize_untagged_variant(
+                 &variant.fields,
+                 cattrs,
+                 Some(deserializer),
+-                Untagged::Yes,
+             )
+         }
+     }
+diff --git a/test_suite/tests/test_macros.rs b/test_suite/tests/test_macros.rs
+index 0ea2578a..66e72f23 100644
+--- a/test_suite/tests/test_macros.rs
++++ b/test_suite/tests/test_macros.rs
+@@ -591,10 +591,11 @@ fn test_internally_tagged_enum() {
+     #[serde(tag = "type")]
+     enum InternallyTagged {
+         A { a: u8 },
+-        B,
+-        C(BTreeMap<String, String>),
+-        D(Newtype),
+-        E(Struct),
++        B { b: u8 },
++        C,
++        D(BTreeMap<String, String>),
++        E(Newtype),
++        F(Struct),
+     }
+ 
+     assert_tokens(
+@@ -612,79 +613,64 @@ fn test_internally_tagged_enum() {
+         ],
+     );
+ 
+-    assert_de_tokens(
+-        &InternallyTagged::A { a: 1 },
+-        &[
+-            Token::Seq { len: Some(2) },
+-            Token::Str("A"),
+-            Token::U8(1),
+-            Token::SeqEnd,
+-        ],
+-    );
+-
+     assert_tokens(
+-        &InternallyTagged::B,
++        &InternallyTagged::B { b: 2 },
+         &[
+-            Token::Struct { name: "InternallyTagged", len: 1 },
++            Token::Struct { name: "InternallyTagged", len: 2 },
+ 
+             Token::Str("type"),
+             Token::Str("B"),
+ 
+-            Token::StructEnd,
+-        ],
+-    );
++            Token::Str("b"),
++            Token::U8(2),
+ 
+-    assert_de_tokens(
+-        &InternallyTagged::B,
+-        &[
+-            Token::Seq { len: Some(1) },
+-            Token::Str("B"),
+-            Token::SeqEnd,
++            Token::StructEnd,
+         ],
+     );
+ 
+     assert_tokens(
+-        &InternallyTagged::C(BTreeMap::new()),
++        &InternallyTagged::C,
+         &[
+-            Token::Map { len: Some(1) },
++            Token::Struct { name: "InternallyTagged", len: 1 },
+ 
+             Token::Str("type"),
+             Token::Str("C"),
+ 
+-            Token::MapEnd,
++            Token::StructEnd,
+         ],
+     );
+ 
+-    assert_de_tokens_error::<InternallyTagged>(
++    assert_tokens(
++        &InternallyTagged::D(BTreeMap::new()),
+         &[
+-            Token::Seq { len: Some(2) },
+-            Token::Str("C"),
+-            Token::Map { len: Some(0) },
++            Token::Map { len: Some(1) },
++
++            Token::Str("type"),
++            Token::Str("D"),
++
+             Token::MapEnd,
+-            Token::SeqEnd,
+         ],
+-        "invalid type: sequence, expected a map",
+     );
+ 
+     assert_tokens(
+-        &InternallyTagged::D(Newtype(BTreeMap::new())),
++        &InternallyTagged::E(Newtype(BTreeMap::new())),
+         &[
+             Token::Map { len: Some(1) },
+ 
+             Token::Str("type"),
+-            Token::Str("D"),
++            Token::Str("E"),
+ 
+             Token::MapEnd,
+         ],
+     );
+ 
+     assert_tokens(
+-        &InternallyTagged::E(Struct { f: 6 }),
++        &InternallyTagged::F(Struct { f: 6 }),
+         &[
+             Token::Struct { name: "Struct", len: 2 },
+ 
+             Token::Str("type"),
+-            Token::Str("E"),
++            Token::Str("F"),
+ 
+             Token::Str("f"),
+             Token::U8(6),
+@@ -693,16 +679,6 @@ fn test_internally_tagged_enum() {
+         ],
+     );
+ 
+-    assert_de_tokens(
+-        &InternallyTagged::E(Struct { f: 6 }),
+-        &[
+-            Token::Seq { len: Some(2) },
+-            Token::Str("E"),
+-            Token::U8(6),
+-            Token::SeqEnd,
+-        ],
+-    );
+-
+     assert_de_tokens_error::<InternallyTagged>(
+         &[Token::Map { len: Some(0) }, Token::MapEnd],
+         "missing field `type`",
+@@ -717,7 +693,7 @@ fn test_internally_tagged_enum() {
+ 
+             Token::MapEnd,
+         ],
+-        "unknown variant `Z`, expected one of `A`, `B`, `C`, `D`, `E`",
++        "unknown variant `Z`, expected one of `A`, `B`, `C`, `D`, `E`, `F`",
+     );
+ }
+ 

@@ -1,0 +1,230 @@
+diff --git a/tokio/src/net/tcp/stream.rs b/tokio/src/net/tcp/stream.rs
+index f64a526b..b0e3ec27 100644
+--- a/tokio/src/net/tcp/stream.rs
++++ b/tokio/src/net/tcp/stream.rs
+@@ -1112,16 +1112,8 @@ impl TcpStream {
+     /// This function will cause all pending and future I/O on the specified
+     /// portions to return immediately with an appropriate value (see the
+     /// documentation of `Shutdown`).
+-    ///
+-    /// Remark: this function transforms `Err(std::io::ErrorKind::NotConnected)` to `Ok(())`.
+-    /// It does this to abstract away OS specific logic and to prevent a race condition between
+-    /// this function call and the OS closing this socket because of external events (e.g. TCP reset).
+-    /// See <https://github.com/tokio-rs/tokio/issues/4665> for more information.
+     pub(super) fn shutdown_std(&self, how: Shutdown) -> io::Result<()> {
+-        match self.io.shutdown(how) {
+-            Err(err) if err.kind() == std::io::ErrorKind::NotConnected => Ok(()),
+-            result => result,
+-        }
++        self.io.shutdown(how)
+     }
+ 
+     /// Gets the value of the `TCP_NODELAY` option on this socket.
+diff --git a/tokio/src/runtime/builder.rs b/tokio/src/runtime/builder.rs
+index 93c67c5b..47ba18c9 100644
+--- a/tokio/src/runtime/builder.rs
++++ b/tokio/src/runtime/builder.rs
+@@ -770,7 +770,6 @@ impl Builder {
+     /// # }
+     /// ```
+     #[cfg(tokio_unstable)]
+-    #[cfg_attr(docsrs, doc(cfg(tokio_unstable)))]
+     pub fn on_before_task_poll<F>(&mut self, f: F) -> &mut Self
+     where
+         F: Fn(&TaskMeta<'_>) + Send + Sync + 'static,
+@@ -814,7 +813,6 @@ impl Builder {
+     /// # }
+     /// ```
+     #[cfg(tokio_unstable)]
+-    #[cfg_attr(docsrs, doc(cfg(tokio_unstable)))]
+     pub fn on_after_task_poll<F>(&mut self, f: F) -> &mut Self
+     where
+         F: Fn(&TaskMeta<'_>) + Send + Sync + 'static,
+diff --git a/tokio/src/runtime/metrics/batch.rs b/tokio/src/runtime/metrics/batch.rs
+index fe2f4a9d..00f9c989 100644
+--- a/tokio/src/runtime/metrics/batch.rs
++++ b/tokio/src/runtime/metrics/batch.rs
+@@ -12,7 +12,7 @@ pub(crate) struct MetricsBatch {
+     busy_duration_total: u64,
+ 
+     /// Instant at which work last resumed (continued after park).
+-    processing_scheduled_tasks_started_at: Option<Instant>,
++    processing_scheduled_tasks_started_at: Instant,
+ 
+     /// Number of times the worker parked.
+     park_count: u64,
+@@ -67,17 +67,17 @@ cfg_unstable_metrics! {
+ 
+ impl MetricsBatch {
+     pub(crate) fn new(worker_metrics: &WorkerMetrics) -> MetricsBatch {
+-        let maybe_now = now();
+-        Self::new_unstable(worker_metrics, maybe_now)
++        let now = Instant::now();
++        Self::new_unstable(worker_metrics, now)
+     }
+ 
+     cfg_metrics_variant! {
+         stable: {
+             #[inline(always)]
+-            fn new_unstable(_worker_metrics: &WorkerMetrics, maybe_now: Option<Instant>) -> MetricsBatch {
++            fn new_unstable(_worker_metrics: &WorkerMetrics, now: Instant) -> MetricsBatch {
+                 MetricsBatch {
+                     busy_duration_total: 0,
+-                    processing_scheduled_tasks_started_at: maybe_now,
++                    processing_scheduled_tasks_started_at: now,
+                     park_count: 0,
+                     park_unpark_count: 0,
+                 }
+@@ -85,16 +85,7 @@ impl MetricsBatch {
+         },
+         unstable: {
+             #[inline(always)]
+-            fn new_unstable(worker_metrics: &WorkerMetrics, maybe_now: Option<Instant>) -> MetricsBatch {
+-                let poll_timer = maybe_now.and_then(|now| {
+-                    worker_metrics
+-                        .poll_count_histogram
+-                        .as_ref()
+-                        .map(|worker_poll_counts| PollTimer {
+-                            poll_counts: HistogramBatch::from_histogram(worker_poll_counts),
+-                            poll_started_at: now,
+-                        })
+-                });
++            fn new_unstable(worker_metrics: &WorkerMetrics, now: Instant) -> MetricsBatch {
+                 MetricsBatch {
+                     park_count: 0,
+                     park_unpark_count: 0,
+@@ -106,8 +97,13 @@ impl MetricsBatch {
+                     local_schedule_count: 0,
+                     overflow_count: 0,
+                     busy_duration_total: 0,
+-                    processing_scheduled_tasks_started_at: maybe_now,
+-                    poll_timer,
++                    processing_scheduled_tasks_started_at: now,
++                    poll_timer: worker_metrics.poll_count_histogram.as_ref().map(
++                        |worker_poll_counts| PollTimer {
++                            poll_counts: HistogramBatch::from_histogram(worker_poll_counts),
++                            poll_started_at: now,
++                        },
++                    ),
+                 }
+             }
+         }
+@@ -190,17 +186,13 @@ impl MetricsBatch {
+ 
+     /// Start processing a batch of tasks
+     pub(crate) fn start_processing_scheduled_tasks(&mut self) {
+-        self.processing_scheduled_tasks_started_at = now();
++        self.processing_scheduled_tasks_started_at = Instant::now();
+     }
+ 
+     /// Stop processing a batch of tasks
+     pub(crate) fn end_processing_scheduled_tasks(&mut self) {
+-        if let Some(processing_scheduled_tasks_started_at) =
+-            self.processing_scheduled_tasks_started_at
+-        {
+-            let busy_duration = processing_scheduled_tasks_started_at.elapsed();
+-            self.busy_duration_total += duration_as_u64(busy_duration);
+-        }
++        let busy_duration = self.processing_scheduled_tasks_started_at.elapsed();
++        self.busy_duration_total += duration_as_u64(busy_duration);
+     }
+ 
+     cfg_metrics_variant! {
+@@ -287,17 +279,3 @@ cfg_rt_multi_thread! {
+ pub(crate) fn duration_as_u64(dur: Duration) -> u64 {
+     u64::try_from(dur.as_nanos()).unwrap_or(u64::MAX)
+ }
+-
+-/// Gate unsupported time metrics for `wasm32-unknown-unknown`
+-/// <https://github.com/tokio-rs/tokio/issues/7319>
+-fn now() -> Option<Instant> {
+-    if cfg!(all(
+-        target_arch = "wasm32",
+-        target_os = "unknown",
+-        target_vendor = "unknown"
+-    )) {
+-        None
+-    } else {
+-        Some(Instant::now())
+-    }
+-}
+diff --git a/tokio/tests/tcp_shutdown.rs b/tokio/tests/tcp_shutdown.rs
+index 837e6123..2497c1a4 100644
+--- a/tokio/tests/tcp_shutdown.rs
++++ b/tokio/tests/tcp_shutdown.rs
+@@ -2,10 +2,8 @@
+ #![cfg(all(feature = "full", not(target_os = "wasi"), not(miri)))] // Wasi doesn't support bind
+                                                                    // No `socket` on miri.
+ 
+-use std::time::Duration;
+ use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+ use tokio::net::{TcpListener, TcpStream};
+-use tokio::sync::oneshot::channel;
+ use tokio_test::assert_ok;
+ 
+ #[tokio::test]
+@@ -13,7 +11,7 @@ async fn shutdown() {
+     let srv = assert_ok!(TcpListener::bind("127.0.0.1:0").await);
+     let addr = assert_ok!(srv.local_addr());
+ 
+-    let handle = tokio::spawn(async move {
++    tokio::spawn(async move {
+         let mut stream = assert_ok!(TcpStream::connect(&addr).await);
+ 
+         assert_ok!(AsyncWriteExt::shutdown(&mut stream).await);
+@@ -28,55 +26,4 @@ async fn shutdown() {
+ 
+     let n = assert_ok!(io::copy(&mut rd, &mut wr).await);
+     assert_eq!(n, 0);
+-    assert_ok!(AsyncWriteExt::shutdown(&mut stream).await);
+-    handle.await.unwrap()
+-}
+-
+-#[tokio::test]
+-async fn shutdown_after_tcp_reset() {
+-    let srv = assert_ok!(TcpListener::bind("127.0.0.1:0").await);
+-    let addr = assert_ok!(srv.local_addr());
+-
+-    let (connected_tx, connected_rx) = channel();
+-    let (dropped_tx, dropped_rx) = channel();
+-
+-    let handle = tokio::spawn(async move {
+-        let mut stream = assert_ok!(TcpStream::connect(&addr).await);
+-        connected_tx.send(()).unwrap();
+-
+-        dropped_rx.await.unwrap();
+-        assert_ok!(AsyncWriteExt::shutdown(&mut stream).await);
+-    });
+-
+-    let (stream, _) = assert_ok!(srv.accept().await);
+-    // By setting linger to 0 we will trigger a TCP reset
+-    stream.set_linger(Some(Duration::new(0, 0))).unwrap();
+-    connected_rx.await.unwrap();
+-
+-    drop(stream);
+-    dropped_tx.send(()).unwrap();
+-
+-    handle.await.unwrap();
+-}
+-
+-#[tokio::test]
+-async fn shutdown_multiple_calls() {
+-    let srv = assert_ok!(TcpListener::bind("127.0.0.1:0").await);
+-    let addr = assert_ok!(srv.local_addr());
+-
+-    let (connected_tx, connected_rx) = channel();
+-
+-    let handle = tokio::spawn(async move {
+-        let mut stream = assert_ok!(TcpStream::connect(&addr).await);
+-        connected_tx.send(()).unwrap();
+-        assert_ok!(AsyncWriteExt::shutdown(&mut stream).await);
+-        assert_ok!(AsyncWriteExt::shutdown(&mut stream).await);
+-        assert_ok!(AsyncWriteExt::shutdown(&mut stream).await);
+-    });
+-
+-    let (mut stream, _) = assert_ok!(srv.accept().await);
+-    connected_rx.await.unwrap();
+-
+-    assert_ok!(AsyncWriteExt::shutdown(&mut stream).await);
+-    handle.await.unwrap();
+ }

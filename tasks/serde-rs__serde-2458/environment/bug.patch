@@ -1,0 +1,486 @@
+diff --git a/serde_derive/src/de.rs b/serde_derive/src/de.rs
+index d01a5128..f3226f1c 100644
+--- a/serde_derive/src/de.rs
++++ b/serde_derive/src/de.rs
+@@ -2153,7 +2153,7 @@ fn deserialize_custom_identifier(
+         })
+         .collect();
+ 
+-    let names = names_idents.iter().flat_map(|(_, _, aliases)| aliases);
++    let names = names_idents.iter().map(|(name, _, _)| name);
+ 
+     let names_const = if fallthrough.is_some() {
+         None
+@@ -2216,17 +2216,25 @@ fn deserialize_identifier(
+     collect_other_fields: bool,
+     expecting: Option<&str>,
+ ) -> Fragment {
+-    let str_mapping = fields.iter().map(|(_, ident, aliases)| {
+-        // `aliases` also contains a main name
+-        quote!(#(#aliases)|* => _serde::__private::Ok(#this_value::#ident))
+-    });
+-    let bytes_mapping = fields.iter().map(|(_, ident, aliases)| {
+-        // `aliases` also contains a main name
+-        let aliases = aliases
+-            .iter()
+-            .map(|alias| Literal::byte_string(alias.as_bytes()));
+-        quote!(#(#aliases)|* => _serde::__private::Ok(#this_value::#ident))
+-    });
++    let mut flat_fields = Vec::new();
++    for (_, ident, aliases) in fields {
++        flat_fields.extend(aliases.iter().map(|alias| (alias, ident)));
++    }
++
++    let field_strs: &Vec<_> = &flat_fields.iter().map(|(name, _)| name).collect();
++    let field_bytes: &Vec<_> = &flat_fields
++        .iter()
++        .map(|(name, _)| Literal::byte_string(name.as_bytes()))
++        .collect();
++
++    let constructors: &Vec<_> = &flat_fields
++        .iter()
++        .map(|(_, ident)| quote!(#this_value::#ident))
++        .collect();
++    let main_constructors: &Vec<_> = &fields
++        .iter()
++        .map(|(_, ident, _)| quote!(#this_value::#ident))
++        .collect();
+ 
+     let expecting = expecting.unwrap_or(if is_variant {
+         "variant identifier"
+@@ -2234,6 +2242,8 @@ fn deserialize_identifier(
+         "field identifier"
+     });
+ 
++    let index_expecting = if is_variant { "variant" } else { "field" };
++
+     let bytes_to_str = if fallthrough.is_some() || collect_other_fields {
+         None
+     } else {
+@@ -2281,6 +2291,21 @@ fn deserialize_identifier(
+         &fallthrough_arm_tokens
+     };
+ 
++    let u64_fallthrough_arm_tokens;
++    let u64_fallthrough_arm = if let Some(fallthrough) = &fallthrough {
++        fallthrough
++    } else {
++        let fallthrough_msg = format!("{} index 0 <= i < {}", index_expecting, fields.len());
++        u64_fallthrough_arm_tokens = quote! {
++            _serde::__private::Err(_serde::de::Error::invalid_value(
++                _serde::de::Unexpected::Unsigned(__value),
++                &#fallthrough_msg,
++            ))
++        };
++        &u64_fallthrough_arm_tokens
++    };
++
++    let variant_indices = 0_u64..;
+     let visit_other = if collect_other_fields {
+         quote! {
+             fn visit_bool<__E>(self, __value: bool) -> _serde::__private::Result<Self::Value, __E>
+@@ -2375,33 +2400,15 @@ fn deserialize_identifier(
+             }
+         }
+     } else {
+-        let u64_mapping = fields.iter().enumerate().map(|(i, (_, ident, _))| {
+-            let i = i as u64;
+-            quote!(#i => _serde::__private::Ok(#this_value::#ident))
+-        });
+-
+-        let u64_fallthrough_arm_tokens;
+-        let u64_fallthrough_arm = if let Some(fallthrough) = &fallthrough {
+-            fallthrough
+-        } else {
+-            let index_expecting = if is_variant { "variant" } else { "field" };
+-            let fallthrough_msg = format!("{} index 0 <= i < {}", index_expecting, fields.len());
+-            u64_fallthrough_arm_tokens = quote! {
+-                _serde::__private::Err(_serde::de::Error::invalid_value(
+-                    _serde::de::Unexpected::Unsigned(__value),
+-                    &#fallthrough_msg,
+-                ))
+-            };
+-            &u64_fallthrough_arm_tokens
+-        };
+-
+         quote! {
+             fn visit_u64<__E>(self, __value: u64) -> _serde::__private::Result<Self::Value, __E>
+             where
+                 __E: _serde::de::Error,
+             {
+                 match __value {
+-                    #(#u64_mapping,)*
++                    #(
++                        #variant_indices => _serde::__private::Ok(#main_constructors),
++                    )*
+                     _ => #u64_fallthrough_arm,
+                 }
+             }
+@@ -2409,8 +2416,6 @@ fn deserialize_identifier(
+     };
+ 
+     let visit_borrowed = if fallthrough_borrowed.is_some() || collect_other_fields {
+-        let str_mapping = str_mapping.clone();
+-        let bytes_mapping = bytes_mapping.clone();
+         let fallthrough_borrowed_arm = fallthrough_borrowed.as_ref().unwrap_or(fallthrough_arm);
+         Some(quote! {
+             fn visit_borrowed_str<__E>(self, __value: &'de str) -> _serde::__private::Result<Self::Value, __E>
+@@ -2418,7 +2423,9 @@ fn deserialize_identifier(
+                 __E: _serde::de::Error,
+             {
+                 match __value {
+-                    #(#str_mapping,)*
++                    #(
++                        #field_strs => _serde::__private::Ok(#constructors),
++                    )*
+                     _ => {
+                         #value_as_borrowed_str_content
+                         #fallthrough_borrowed_arm
+@@ -2431,7 +2438,9 @@ fn deserialize_identifier(
+                 __E: _serde::de::Error,
+             {
+                 match __value {
+-                    #(#bytes_mapping,)*
++                    #(
++                        #field_bytes => _serde::__private::Ok(#constructors),
++                    )*
+                     _ => {
+                         #bytes_to_str
+                         #value_as_borrowed_bytes_content
+@@ -2456,7 +2465,9 @@ fn deserialize_identifier(
+             __E: _serde::de::Error,
+         {
+             match __value {
+-                #(#str_mapping,)*
++                #(
++                    #field_strs => _serde::__private::Ok(#constructors),
++                )*
+                 _ => {
+                     #value_as_str_content
+                     #fallthrough_arm
+@@ -2469,7 +2480,9 @@ fn deserialize_identifier(
+             __E: _serde::de::Error,
+         {
+             match __value {
+-                #(#bytes_mapping,)*
++                #(
++                    #field_bytes => _serde::__private::Ok(#constructors),
++                )*
+                 _ => {
+                     #bytes_to_str
+                     #value_as_bytes_content
+diff --git a/serde_derive/src/internals/attr.rs b/serde_derive/src/internals/attr.rs
+index 1a8bd9d4..42212a64 100644
+--- a/serde_derive/src/internals/attr.rs
++++ b/serde_derive/src/internals/attr.rs
+@@ -184,20 +184,12 @@ impl Name {
+     }
+ 
+     fn deserialize_aliases(&self) -> Vec<String> {
+-        self.deserialize_aliases.clone()
+-    }
+-
+-    fn correct_aliases(&mut self) {
+-        // `deserialize_aliases` got from a BTreeSet, so it sorted and does not
+-        // contain duplicates.
+-        // We cannot insert main name in `new` because rename_all rules not yet
+-        // applied there.
+-        match self.deserialize_aliases.binary_search(&self.deserialize) {
+-            Ok(_) => {} // element already here
+-            Err(pos) => self
+-                .deserialize_aliases
+-                .insert(pos, self.deserialize.clone()),
++        let mut aliases = self.deserialize_aliases.clone();
++        let main_name = self.deserialize_name();
++        if !aliases.contains(&main_name) {
++            aliases.push(main_name);
+         }
++        aliases
+     }
+ }
+ 
+@@ -936,7 +928,6 @@ impl Variant {
+         if !self.name.deserialize_renamed {
+             self.name.deserialize = rules.deserialize.apply_to_variant(&self.name.deserialize);
+         }
+-        self.name.correct_aliases();
+     }
+ 
+     pub fn rename_all_rules(&self) -> &RenameAllRules {
+@@ -1276,7 +1267,6 @@ impl Field {
+         if !self.name.deserialize_renamed {
+             self.name.deserialize = rules.deserialize.apply_to_field(&self.name.deserialize);
+         }
+-        self.name.correct_aliases();
+     }
+ 
+     pub fn skip_serializing(&self) -> bool {
+diff --git a/test_suite/tests/test_annotations.rs b/test_suite/tests/test_annotations.rs
+index 41cad2f3..354f82c9 100644
+--- a/test_suite/tests/test_annotations.rs
++++ b/test_suite/tests/test_annotations.rs
+@@ -643,7 +643,7 @@ fn test_unknown_field_rename_struct() {
+             Token::Str("a4"),
+             Token::I32(3),
+         ],
+-        "unknown field `a4`, expected one of `a1`, `a2`, `a3`, `a5`, `a6`",
++        "unknown field `a4`, expected one of `a1`, `a3`, `a2`, `a5`, `a6`",
+     );
+ }
+ 
+@@ -837,7 +837,7 @@ fn test_unknown_field_rename_enum() {
+             Token::Str("d"),
+             Token::I8(2),
+         ],
+-        "unknown field `d`, expected one of `a`, `b`, `c`, `e`, `f`",
++        "unknown field `d`, expected one of `a`, `c`, `b`, `e`, `f`",
+     );
+ }
+ 
+diff --git a/test_suite/tests/test_identifier.rs b/test_suite/tests/test_identifier.rs
+index 4e141414..6edb316c 100644
+--- a/test_suite/tests/test_identifier.rs
++++ b/test_suite/tests/test_identifier.rs
+@@ -3,186 +3,86 @@
+ #![allow(clippy::derive_partial_eq_without_eq)]
+ 
+ use serde_derive::Deserialize;
+-use serde_test::{assert_de_tokens, assert_de_tokens_error, Token};
+-
+-mod variant_identifier {
+-    use super::*;
++use serde_test::{assert_de_tokens, Token};
+ 
++#[test]
++fn test_variant_identifier() {
+     #[derive(Deserialize, Debug, PartialEq)]
+     #[serde(variant_identifier)]
+     enum V {
+         Aaa,
+-        #[serde(alias = "Ccc", alias = "Ddd")]
+         Bbb,
+     }
+ 
+-    #[test]
+-    fn variant1() {
+-        assert_de_tokens(&V::Aaa, &[Token::U8(0)]);
+-        assert_de_tokens(&V::Aaa, &[Token::U16(0)]);
+-        assert_de_tokens(&V::Aaa, &[Token::U32(0)]);
+-        assert_de_tokens(&V::Aaa, &[Token::U64(0)]);
+-        assert_de_tokens(&V::Aaa, &[Token::Str("Aaa")]);
+-        assert_de_tokens(&V::Aaa, &[Token::Bytes(b"Aaa")]);
+-    }
+-
+-    #[test]
+-    fn aliases() {
+-        assert_de_tokens(&V::Bbb, &[Token::U8(1)]);
+-        assert_de_tokens(&V::Bbb, &[Token::U16(1)]);
+-        assert_de_tokens(&V::Bbb, &[Token::U32(1)]);
+-        assert_de_tokens(&V::Bbb, &[Token::U64(1)]);
+-
+-        assert_de_tokens(&V::Bbb, &[Token::Str("Bbb")]);
+-        assert_de_tokens(&V::Bbb, &[Token::Bytes(b"Bbb")]);
+-
+-        assert_de_tokens(&V::Bbb, &[Token::Str("Ccc")]);
+-        assert_de_tokens(&V::Bbb, &[Token::Bytes(b"Ccc")]);
+-
+-        assert_de_tokens(&V::Bbb, &[Token::Str("Ddd")]);
+-        assert_de_tokens(&V::Bbb, &[Token::Bytes(b"Ddd")]);
+-    }
+-
+-    #[test]
+-    fn unknown() {
+-        assert_de_tokens_error::<V>(
+-            &[Token::U8(42)],
+-            "invalid value: integer `42`, expected variant index 0 <= i < 2",
+-        );
+-        assert_de_tokens_error::<V>(
+-            &[Token::U16(42)],
+-            "invalid value: integer `42`, expected variant index 0 <= i < 2",
+-        );
+-        assert_de_tokens_error::<V>(
+-            &[Token::U32(42)],
+-            "invalid value: integer `42`, expected variant index 0 <= i < 2",
+-        );
+-        assert_de_tokens_error::<V>(
+-            &[Token::U64(42)],
+-            "invalid value: integer `42`, expected variant index 0 <= i < 2",
+-        );
+-        assert_de_tokens_error::<V>(
+-            &[Token::Str("Unknown")],
+-            "unknown variant `Unknown`, expected one of `Aaa`, `Bbb`, `Ccc`, `Ddd`",
+-        );
+-        assert_de_tokens_error::<V>(
+-            &[Token::Bytes(b"Unknown")],
+-            "unknown variant `Unknown`, expected one of `Aaa`, `Bbb`, `Ccc`, `Ddd`",
+-        );
+-    }
++    assert_de_tokens(&V::Aaa, &[Token::U8(0)]);
++    assert_de_tokens(&V::Aaa, &[Token::U16(0)]);
++    assert_de_tokens(&V::Aaa, &[Token::U32(0)]);
++    assert_de_tokens(&V::Aaa, &[Token::U64(0)]);
++    assert_de_tokens(&V::Aaa, &[Token::Str("Aaa")]);
++    assert_de_tokens(&V::Aaa, &[Token::Bytes(b"Aaa")]);
+ }
+ 
+-mod field_identifier {
+-    use super::*;
+-
++#[test]
++fn test_field_identifier() {
+     #[derive(Deserialize, Debug, PartialEq)]
+     #[serde(field_identifier, rename_all = "snake_case")]
+     enum F {
+         Aaa,
+-        #[serde(alias = "ccc", alias = "ddd")]
+         Bbb,
+     }
+ 
+-    #[test]
+-    fn field1() {
+-        assert_de_tokens(&F::Aaa, &[Token::U8(0)]);
+-        assert_de_tokens(&F::Aaa, &[Token::U16(0)]);
+-        assert_de_tokens(&F::Aaa, &[Token::U32(0)]);
+-        assert_de_tokens(&F::Aaa, &[Token::U64(0)]);
+-        assert_de_tokens(&F::Aaa, &[Token::Str("aaa")]);
+-        assert_de_tokens(&F::Aaa, &[Token::Bytes(b"aaa")]);
+-    }
+-
+-    #[test]
+-    fn aliases() {
+-        assert_de_tokens(&F::Bbb, &[Token::U8(1)]);
+-        assert_de_tokens(&F::Bbb, &[Token::U16(1)]);
+-        assert_de_tokens(&F::Bbb, &[Token::U32(1)]);
+-        assert_de_tokens(&F::Bbb, &[Token::U64(1)]);
+-
+-        assert_de_tokens(&F::Bbb, &[Token::Str("bbb")]);
+-        assert_de_tokens(&F::Bbb, &[Token::Bytes(b"bbb")]);
+-
+-        assert_de_tokens(&F::Bbb, &[Token::Str("ccc")]);
+-        assert_de_tokens(&F::Bbb, &[Token::Bytes(b"ccc")]);
+-
+-        assert_de_tokens(&F::Bbb, &[Token::Str("ddd")]);
+-        assert_de_tokens(&F::Bbb, &[Token::Bytes(b"ddd")]);
+-    }
++    assert_de_tokens(&F::Aaa, &[Token::U8(0)]);
++    assert_de_tokens(&F::Aaa, &[Token::U16(0)]);
++    assert_de_tokens(&F::Aaa, &[Token::U32(0)]);
++    assert_de_tokens(&F::Aaa, &[Token::U64(0)]);
++    assert_de_tokens(&F::Aaa, &[Token::Str("aaa")]);
++    assert_de_tokens(&F::Aaa, &[Token::Bytes(b"aaa")]);
++}
+ 
+-    #[test]
+-    fn unknown() {
+-        assert_de_tokens_error::<F>(
+-            &[Token::U8(42)],
+-            "invalid value: integer `42`, expected field index 0 <= i < 2",
+-        );
+-        assert_de_tokens_error::<F>(
+-            &[Token::U16(42)],
+-            "invalid value: integer `42`, expected field index 0 <= i < 2",
+-        );
+-        assert_de_tokens_error::<F>(
+-            &[Token::U32(42)],
+-            "invalid value: integer `42`, expected field index 0 <= i < 2",
+-        );
+-        assert_de_tokens_error::<F>(
+-            &[Token::U64(42)],
+-            "invalid value: integer `42`, expected field index 0 <= i < 2",
+-        );
+-        assert_de_tokens_error::<F>(
+-            &[Token::Str("unknown")],
+-            "unknown field `unknown`, expected one of `aaa`, `bbb`, `ccc`, `ddd`",
+-        );
+-        assert_de_tokens_error::<F>(
+-            &[Token::Bytes(b"unknown")],
+-            "unknown field `unknown`, expected one of `aaa`, `bbb`, `ccc`, `ddd`",
+-        );
++#[test]
++fn test_unit_fallthrough() {
++    #[derive(Deserialize, Debug, PartialEq)]
++    #[serde(field_identifier, rename_all = "snake_case")]
++    enum F {
++        Aaa,
++        Bbb,
++        #[serde(other)]
++        Other,
+     }
+ 
+-    #[test]
+-    fn unit_fallthrough() {
+-        #[derive(Deserialize, Debug, PartialEq)]
+-        #[serde(field_identifier, rename_all = "snake_case")]
+-        enum F {
+-            Aaa,
+-            Bbb,
+-            #[serde(other)]
+-            Other,
+-        }
++    assert_de_tokens(&F::Other, &[Token::U8(42)]);
++    assert_de_tokens(&F::Other, &[Token::U16(42)]);
++    assert_de_tokens(&F::Other, &[Token::U32(42)]);
++    assert_de_tokens(&F::Other, &[Token::U64(42)]);
++    assert_de_tokens(&F::Other, &[Token::Str("x")]);
++}
+ 
+-        assert_de_tokens(&F::Other, &[Token::U8(42)]);
+-        assert_de_tokens(&F::Other, &[Token::U16(42)]);
+-        assert_de_tokens(&F::Other, &[Token::U32(42)]);
+-        assert_de_tokens(&F::Other, &[Token::U64(42)]);
+-        assert_de_tokens(&F::Other, &[Token::Str("x")]);
++#[test]
++fn test_newtype_fallthrough() {
++    #[derive(Deserialize, Debug, PartialEq)]
++    #[serde(field_identifier, rename_all = "snake_case")]
++    enum F {
++        Aaa,
++        Bbb,
++        Other(String),
+     }
+ 
+-    #[test]
+-    fn newtype_fallthrough() {
+-        #[derive(Deserialize, Debug, PartialEq)]
+-        #[serde(field_identifier, rename_all = "snake_case")]
+-        enum F {
+-            Aaa,
+-            Bbb,
+-            Other(String),
+-        }
++    assert_de_tokens(&F::Other("x".to_owned()), &[Token::Str("x")]);
++}
+ 
+-        assert_de_tokens(&F::Other("x".to_owned()), &[Token::Str("x")]);
++#[test]
++fn test_newtype_fallthrough_generic() {
++    #[derive(Deserialize, Debug, PartialEq)]
++    #[serde(field_identifier, rename_all = "snake_case")]
++    enum F<T> {
++        Aaa,
++        Bbb,
++        Other(T),
+     }
+ 
+-    #[test]
+-    fn newtype_fallthrough_generic() {
+-        #[derive(Deserialize, Debug, PartialEq)]
+-        #[serde(field_identifier, rename_all = "snake_case")]
+-        enum F<T> {
+-            Aaa,
+-            Bbb,
+-            Other(T),
+-        }
+-
+-        assert_de_tokens(&F::Other(42u8), &[Token::U8(42)]);
+-        assert_de_tokens(&F::Other(42u16), &[Token::U16(42)]);
+-        assert_de_tokens(&F::Other(42u32), &[Token::U32(42)]);
+-        assert_de_tokens(&F::Other(42u64), &[Token::U64(42)]);
+-        assert_de_tokens(&F::Other("x".to_owned()), &[Token::Str("x")]);
+-    }
++    assert_de_tokens(&F::Other(42u8), &[Token::U8(42)]);
++    assert_de_tokens(&F::Other(42u16), &[Token::U16(42)]);
++    assert_de_tokens(&F::Other(42u32), &[Token::U32(42)]);
++    assert_de_tokens(&F::Other(42u64), &[Token::U64(42)]);
++    assert_de_tokens(&F::Other("x".to_owned()), &[Token::Str("x")]);
+ }

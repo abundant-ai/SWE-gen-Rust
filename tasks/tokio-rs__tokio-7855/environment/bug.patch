@@ -1,0 +1,176 @@
+diff --git a/tokio-util/src/task/abort_on_drop.rs b/tokio-util/src/task/abort_on_drop.rs
+index d06ebd5f..191731cb 100644
+--- a/tokio-util/src/task/abort_on_drop.rs
++++ b/tokio-util/src/task/abort_on_drop.rs
+@@ -1,8 +1,5 @@
+ //! An [`AbortOnDropHandle`] is like a [`JoinHandle`], except that it
+ //! will abort the task as soon as it is dropped.
+-//!
+-//! Correspondingly, an [`AbortOnDrop`] is like a [`AbortHandle`] that will abort
+-//! the task as soon as it is dropped.
+ 
+ use tokio::task::{AbortHandle, JoinError, JoinHandle};
+ 
+@@ -22,7 +19,7 @@ pub struct AbortOnDropHandle<T>(JoinHandle<T>);
+ 
+ impl<T> Drop for AbortOnDropHandle<T> {
+     fn drop(&mut self) {
+-        self.abort()
++        self.0.abort()
+     }
+ }
+ 
+@@ -34,14 +31,12 @@ impl<T> AbortOnDropHandle<T> {
+ 
+     /// Abort the task associated with this handle,
+     /// equivalent to [`JoinHandle::abort`].
+-    #[inline]
+     pub fn abort(&self) {
+         self.0.abort()
+     }
+ 
+     /// Checks if the task associated with this handle is finished,
+     /// equivalent to [`JoinHandle::is_finished`].
+-    #[inline]
+     pub fn is_finished(&self) -> bool {
+         self.0.is_finished()
+     }
+@@ -84,62 +79,6 @@ impl<T> AsRef<JoinHandle<T>> for AbortOnDropHandle<T> {
+     }
+ }
+ 
+-/// A wrapper around a [`tokio::task::AbortHandle`],
+-/// which [aborts] the task when it is dropped.
+-///
+-/// Unlike [`AbortOnDropHandle`], [`AbortOnDrop`] cannot be `.await`ed for a result.
+-///
+-/// It has no generic parameter, making it suitable when you only need to keep
+-/// a task handle in a struct and do not care about the output.
+-///
+-/// [aborts]: tokio::task::AbortHandle::abort
+-#[must_use = "Dropping the handle aborts the task immediately"]
+-pub struct AbortOnDrop(AbortHandle);
+-
+-impl Drop for AbortOnDrop {
+-    fn drop(&mut self) {
+-        self.abort()
+-    }
+-}
+-
+-impl AbortOnDrop {
+-    /// Create an [`AbortOnDrop`] from a [`AbortHandle`].
+-    pub fn new(handle: AbortHandle) -> Self {
+-        Self(handle)
+-    }
+-
+-    /// Abort the task associated with this handle,
+-    /// equivalent to [`AbortHandle::abort`].
+-    #[inline]
+-    pub fn abort(&self) {
+-        self.0.abort()
+-    }
+-
+-    /// Checks if the task associated with this handle is finished,
+-    /// equivalent to [`AbortHandle::is_finished`].
+-    #[inline]
+-    pub fn is_finished(&self) -> bool {
+-        self.0.is_finished()
+-    }
+-
+-    /// Cancels aborting on drop and returns the original [`AbortHandle`].
+-    pub fn detach(self) -> AbortHandle {
+-        // Avoid invoking `AbortOnDrop`'s `Drop` impl
+-        let this = ManuallyDrop::new(self);
+-        // SAFETY: `&this.0` is a reference, so it is certainly initialized, and
+-        // it won't be double-dropped because it's in a `ManuallyDrop`
+-        unsafe { std::ptr::read(&this.0) }
+-    }
+-}
+-
+-impl std::fmt::Debug for AbortOnDrop {
+-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        f.debug_struct("AbortOnDrop")
+-            .field("id", &self.0.id())
+-            .finish()
+-    }
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -151,7 +90,6 @@ mod tests {
+ 
+     #[test]
+     fn assert_debug() {
+-        is_debug::<AbortOnDrop>();
+         is_debug::<AbortOnDropHandle<NotDebug>>();
+     }
+ }
+diff --git a/tokio-util/src/task/mod.rs b/tokio-util/src/task/mod.rs
+index 87870e21..3c35ebff 100644
+--- a/tokio-util/src/task/mod.rs
++++ b/tokio-util/src/task/mod.rs
+@@ -12,7 +12,7 @@ cfg_rt! {
+     pub use task_tracker::TaskTracker;
+ 
+     mod abort_on_drop;
+-    pub use abort_on_drop::{AbortOnDrop, AbortOnDropHandle};
++    pub use abort_on_drop::AbortOnDropHandle;
+ 
+     mod join_queue;
+     pub use join_queue::JoinQueue;
+diff --git a/tokio-util/tests/abort_on_drop.rs b/tokio-util/tests/abort_on_drop.rs
+index 2f97ab4b..20634e88 100644
+--- a/tokio-util/tests/abort_on_drop.rs
++++ b/tokio-util/tests/abort_on_drop.rs
+@@ -1,5 +1,5 @@
+ use tokio::{sync::oneshot, task::yield_now};
+-use tokio_util::task::{AbortOnDrop, AbortOnDropHandle};
++use tokio_util::task::AbortOnDropHandle;
+ 
+ #[tokio::test]
+ async fn aborts_task_on_drop() {
+@@ -35,42 +35,5 @@ async fn does_not_abort_after_detach() {
+     let handle = AbortOnDropHandle::new(handle);
+     handle.detach(); // returns and drops the original join handle
+     yield_now().await;
+-    assert!(!tx.is_closed()); // the task is still alive
+-}
+-
+-#[tokio::test]
+-async fn handle_aborts_task_on_drop() {
+-    let (mut tx, rx) = oneshot::channel::<bool>();
+-    let handle = tokio::spawn(async move {
+-        let _ = rx.await;
+-    });
+-    let handle = AbortOnDrop::new(handle.abort_handle());
+-    drop(handle);
+-    tx.closed().await;
+-    assert!(tx.is_closed());
+-}
+-
+-#[tokio::test]
+-async fn handle_aborts_task_directly() {
+-    let (mut tx, rx) = oneshot::channel::<bool>();
+-    let handle = tokio::spawn(async move {
+-        let _ = rx.await;
+-    });
+-    let handle = AbortOnDrop::new(handle.abort_handle());
+-    handle.abort();
+-    tx.closed().await;
+-    assert!(tx.is_closed());
+-    assert!(handle.is_finished());
+-}
+-
+-#[tokio::test]
+-async fn handle_does_not_abort_after_detach() {
+-    let (tx, rx) = oneshot::channel::<bool>();
+-    let handle = tokio::spawn(async move {
+-        let _ = rx.await;
+-    });
+-    let handle = AbortOnDrop::new(handle.abort_handle());
+-    handle.detach(); // returns and drops the original abort handle
+-    yield_now().await;
+-    assert!(!tx.is_closed()); // the task is still alive
++    assert!(!tx.is_closed()); // task is still live
+ }

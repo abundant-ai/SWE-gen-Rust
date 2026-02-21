@@ -1,0 +1,214 @@
+diff --git a/serde_derive/src/de.rs b/serde_derive/src/de.rs
+index ee159986..6fc0cfd2 100644
+--- a/serde_derive/src/de.rs
++++ b/serde_derive/src/de.rs
+@@ -723,19 +723,11 @@ fn deserialize_seq(
+                     })
+                 }
+             };
+-            let value_if_none = match field.attrs.default() {
+-                attr::Default::Default => quote!(_serde::__private::Default::default()),
+-                attr::Default::Path(path) => quote!(#path()),
+-                attr::Default::None => quote!(
+-                    return _serde::__private::Err(_serde::de::Error::invalid_length(#index_in_seq, &#expecting));
+-                ),
+-            };
++            let value_if_none = expr_is_missing_seq(None, index_in_seq, field, cattrs, expecting);
+             let assign = quote! {
+                 let #var = match #visit {
+                     _serde::__private::Some(__value) => __value,
+-                    _serde::__private::None => {
+-                        #value_if_none
+-                    }
++                    _serde::__private::None => #value_if_none,
+                 };
+             };
+             index_in_seq += 1;
+@@ -811,24 +803,14 @@ fn deserialize_seq_in_place(
+                 self.place.#member = #default;
+             }
+         } else {
+-            let value_if_none = match field.attrs.default() {
+-                attr::Default::Default => quote!(
+-                    self.place.#member = _serde::__private::Default::default();
+-                ),
+-                attr::Default::Path(path) => quote!(
+-                    self.place.#member = #path();
+-                ),
+-                attr::Default::None => quote!(
+-                    return _serde::__private::Err(_serde::de::Error::invalid_length(#index_in_seq, &#expecting));
+-                ),
+-            };
++            let value_if_none = expr_is_missing_seq(Some(quote!(self.place.#member = )), index_in_seq, field, cattrs, expecting);
+             let write = match field.attrs.deserialize_with() {
+                 None => {
+                     quote! {
+                         if let _serde::__private::None = _serde::de::SeqAccess::next_element_seed(&mut __seq,
+                             _serde::__private::de::InPlaceSeed(&mut self.place.#member))?
+                         {
+-                            #value_if_none
++                            #value_if_none;
+                         }
+                     }
+                 }
+@@ -841,7 +823,7 @@ fn deserialize_seq_in_place(
+                                 self.place.#member = __wrap.value;
+                             }
+                             _serde::__private::None => {
+-                                #value_if_none
++                                #value_if_none;
+                             }
+                         }
+                     })
+@@ -2993,6 +2975,35 @@ fn expr_is_missing(field: &Field, cattrs: &attr::Container) -> Fragment {
+     }
+ }
+ 
++fn expr_is_missing_seq(
++    assign_to: Option<TokenStream>,
++    index: usize,
++    field: &Field,
++    cattrs: &attr::Container,
++    expecting: &str,
++) -> TokenStream {
++    match field.attrs.default() {
++        attr::Default::Default => {
++            let span = field.original.span();
++            return quote_spanned!(span=> #assign_to _serde::__private::Default::default());
++        }
++        attr::Default::Path(path) => {
++            return quote_spanned!(path.span()=> #assign_to #path());
++        }
++        attr::Default::None => { /* below */ }
++    }
++
++    match *cattrs.default() {
++        attr::Default::Default | attr::Default::Path(_) => {
++            let member = &field.member;
++            return quote!(#assign_to __default.#member);
++        }
++        attr::Default::None => quote!(
++            return _serde::__private::Err(_serde::de::Error::invalid_length(#index, &#expecting))
++        ),
++    }
++}
++
+ fn effective_style(variant: &Variant) -> Style {
+     match variant.style {
+         Style::Newtype if variant.fields[0].attrs.skip_deserializing() => Style::Unit,
+diff --git a/serde_derive/src/internals/attr.rs b/serde_derive/src/internals/attr.rs
+index d1e5280b..d0c4467d 100644
+--- a/serde_derive/src/internals/attr.rs
++++ b/serde_derive/src/internals/attr.rs
+@@ -405,20 +405,20 @@ impl Container {
+                         if let Some(path) = parse_lit_into_expr_path(cx, DEFAULT, &meta)? {
+                             match &item.data {
+                                 syn::Data::Struct(syn::DataStruct { fields, .. }) => match fields {
+-                                    syn::Fields::Named(_) => {
++                                    syn::Fields::Named(_) | syn::Fields::Unnamed(_) => {
+                                         default.set(&meta.path, Default::Path(path));
+                                     }
+-                                    syn::Fields::Unnamed(_) | syn::Fields::Unit => {
+-                                        let msg = "#[serde(default = \"...\")] can only be used on structs with named fields";
++                                    syn::Fields::Unit => {
++                                        let msg = "#[serde(default = \"...\")] can only be used on structs with fields";
+                                         cx.syn_error(meta.error(msg));
+                                     }
+                                 },
+                                 syn::Data::Enum(_) => {
+-                                    let msg = "#[serde(default = \"...\")] can only be used on structs with named fields";
++                                    let msg = "#[serde(default = \"...\")] can only be used on structs with fields";
+                                     cx.syn_error(meta.error(msg));
+                                 }
+                                 syn::Data::Union(_) => {
+-                                    let msg = "#[serde(default = \"...\")] can only be used on structs with named fields";
++                                    let msg = "#[serde(default = \"...\")] can only be used on structs with fields";
+                                     cx.syn_error(meta.error(msg));
+                                 }
+                             }
+@@ -427,20 +427,20 @@ impl Container {
+                         // #[serde(default)]
+                         match &item.data {
+                             syn::Data::Struct(syn::DataStruct { fields, .. }) => match fields {
+-                                syn::Fields::Named(_) => {
++                                syn::Fields::Named(_) | syn::Fields::Unnamed(_) => {
+                                     default.set(meta.path, Default::Default);
+                                 }
+-                                syn::Fields::Unnamed(_) | syn::Fields::Unit => {
+-                                    let msg = "#[serde(default)] can only be used on structs with named fields";
++                                syn::Fields::Unit => {
++                                    let msg = "#[serde(default)] can only be used on structs with fields";
+                                     cx.error_spanned_by(fields, msg);
+                                 }
+                             },
+                             syn::Data::Enum(_) => {
+-                                let msg = "#[serde(default)] can only be used on structs with named fields";
++                                let msg = "#[serde(default)] can only be used on structs with fields";
+                                 cx.syn_error(meta.error(msg));
+                             }
+                             syn::Data::Union(_) => {
+-                                let msg = "#[serde(default)] can only be used on structs with named fields";
++                                let msg = "#[serde(default)] can only be used on structs with fields";
+                                 cx.syn_error(meta.error(msg));
+                             }
+                         }
+diff --git a/serde_derive/src/internals/check.rs b/serde_derive/src/internals/check.rs
+index bad16d00..ea70e630 100644
+--- a/serde_derive/src/internals/check.rs
++++ b/serde_derive/src/internals/check.rs
+@@ -1,11 +1,12 @@
+ use crate::internals::ast::{Container, Data, Field, Style};
+-use crate::internals::attr::{Identifier, TagType};
++use crate::internals::attr::{Default, Identifier, TagType};
+ use crate::internals::{ungroup, Ctxt, Derive};
+ use syn::{Member, Type};
+ 
+ // Cross-cutting checks that require looking at more than a single attrs object.
+ // Simpler checks should happen when parsing and building the attrs.
+ pub fn check(cx: &Ctxt, cont: &mut Container, derive: Derive) {
++    check_default_on_tuple(cx, cont);
+     check_remote_generic(cx, cont);
+     check_getter(cx, cont);
+     check_flatten(cx, cont);
+@@ -17,6 +18,41 @@ pub fn check(cx: &Ctxt, cont: &mut Container, derive: Derive) {
+     check_from_and_try_from(cx, cont);
+ }
+ 
++/// If some field of tuple is marked as `#[serde(default)]` then all subsequent
++/// fields also should be marked with that attribute or the struct itself should
++/// have this attribute. This is because using default value for a field is
++/// possible only if the sequence is exhausted that means that all subsequent
++/// fields will fail to deserialize and should provide a default value if we want
++/// the successful deserialization.
++fn check_default_on_tuple(cx: &Ctxt, cont: &Container) {
++    if let Default::None = cont.attrs.default() {
++        if let Data::Struct(Style::Tuple, fields) = &cont.data {
++            let mut first_default_index = None;
++            for (i, field) in fields.iter().enumerate() {
++                // Skipped fields automatically get the #[serde(default)] attribute
++                // We interested only on non-skipped fields here
++                if field.attrs.skip_deserializing() {
++                    continue;
++                }
++                if let Default::None = field.attrs.default() {
++                    if let Some(first) = first_default_index {
++                        cx.error_spanned_by(
++                            field.ty,
++                            format!("struct or field must have #[serde(default)] because previous field {} have #[serde(default)]", first),
++                        );
++                    }
++                    continue;
++                }
++                if let None = first_default_index {
++                    first_default_index = Some(i);
++                }
++            }
++        }
++    }
++    // TODO: Warn if container has default and all fields also marked with default
++    // when warnings in proc-macro become available
++}
++
+ // Remote derive definition type must have either all of the generics of the
+ // remote type:
+ //

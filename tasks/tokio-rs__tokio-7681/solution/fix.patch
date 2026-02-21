@@ -1,0 +1,229 @@
+diff --git a/README.md b/README.md
+index a0609dd7..7f5e0d4a 100644
+--- a/README.md
++++ b/README.md
+@@ -56,7 +56,7 @@ Make sure you activated the full features of the tokio crate on Cargo.toml:
+ 
+ ```toml
+ [dependencies]
+-tokio = { version = "1.47.1", features = ["full"] }
++tokio = { version = "1.47.2", features = ["full"] }
+ ```
+ Then, on your main.rs:
+ 
+diff --git a/tokio/CHANGELOG.md b/tokio/CHANGELOG.md
+index 6d4124f2..1994e169 100644
+--- a/tokio/CHANGELOG.md
++++ b/tokio/CHANGELOG.md
+@@ -1,3 +1,17 @@
++# 1.47.2 (October 14th, 2025)
++
++### Fixed
++
++- runtime: use release ordering in `wake_by_ref()` even if already woken ([#7622])
++- sync: close the `broadcast::Sender` in `broadcast::Sender::new()` ([#7629])
++- macros: fix hygiene issue in `join!` and `try_join!` ([#7638])
++- process: fix error when runtime is shut down on nightly-2025-10-12 ([#7672])
++
++[#7622]: https://github.com/tokio-rs/tokio/pull/7622
++[#7629]: https://github.com/tokio-rs/tokio/pull/7629
++[#7638]: https://github.com/tokio-rs/tokio/pull/7638
++[#7672]: https://github.com/tokio-rs/tokio/pull/7672
++
+ # 1.47.1 (August 1st, 2025)
+ 
+ ### Fixed
+diff --git a/tokio/Cargo.toml b/tokio/Cargo.toml
+index 8512cc57..51fda3a1 100644
+--- a/tokio/Cargo.toml
++++ b/tokio/Cargo.toml
+@@ -6,7 +6,7 @@ name = "tokio"
+ #   - README.md
+ # - Update CHANGELOG.md.
+ # - Create "v1.x.y" git tag.
+-version = "1.47.1"
++version = "1.47.2"
+ edition = "2021"
+ rust-version = "1.70"
+ authors = ["Tokio Contributors <team@tokio.rs>"]
+diff --git a/tokio/README.md b/tokio/README.md
+index a0609dd7..7f5e0d4a 100644
+--- a/tokio/README.md
++++ b/tokio/README.md
+@@ -56,7 +56,7 @@ Make sure you activated the full features of the tokio crate on Cargo.toml:
+ 
+ ```toml
+ [dependencies]
+-tokio = { version = "1.47.1", features = ["full"] }
++tokio = { version = "1.47.2", features = ["full"] }
+ ```
+ Then, on your main.rs:
+ 
+diff --git a/tokio/src/macros/join.rs b/tokio/src/macros/join.rs
+index cd89da1c..8c6ad545 100644
+--- a/tokio/src/macros/join.rs
++++ b/tokio/src/macros/join.rs
+@@ -113,7 +113,7 @@ doc! {macro_rules! join {
+     (@ {
+         // Type of rotator that controls which inner future to start with
+         // when polling our output future.
+-        rotator=$rotator:ty;
++        rotator_select=$rotator_select:ty;
+ 
+         // One `_` for each branch in the `join!` macro. This is not used once
+         // normalization is complete.
+@@ -126,7 +126,7 @@ doc! {macro_rules! join {
+         $( ( $($skip:tt)* ) $e:expr, )*
+ 
+     }) => {{
+-        use $crate::macros::support::{maybe_done, poll_fn, Future, Pin};
++        use $crate::macros::support::{maybe_done, poll_fn, Future, Pin, RotatorSelect};
+         use $crate::macros::support::Poll::{Ready, Pending};
+ 
+         // Safety: nothing must be moved out of `futures`. This is to satisfy
+@@ -143,14 +143,14 @@ doc! {macro_rules! join {
+         // <https://internals.rust-lang.org/t/surprising-soundness-trouble-around-pollfn/17484>
+         let mut futures = &mut futures;
+ 
+-        const COUNT: u32 = $($total)*;
+-
+         // Each time the future created by poll_fn is polled, if not using biased mode,
+         // a different future is polled first to ensure every future passed to join!
+         // can make progress even if one of the futures consumes the whole budget.
+-        let mut rotator = <$rotator>::default();
++        let mut rotator = <$rotator_select as RotatorSelect>::Rotator::<{$($total)*}>::default();
+ 
+         poll_fn(move |cx| {
++            const COUNT: u32 = $($total)*;
++
+             let mut is_pending = false;
+             let mut to_run = COUNT;
+ 
+@@ -205,17 +205,17 @@ doc! {macro_rules! join {
+ 
+     // ===== Normalize =====
+ 
+-    (@ { rotator=$rotator:ty; ( $($s:tt)* ) ( $($n:tt)* ) $($t:tt)* } $e:expr, $($r:tt)* ) => {
+-        $crate::join!(@{ rotator=$rotator; ($($s)* _) ($($n)* + 1) $($t)* ($($s)*) $e, } $($r)*)
++    (@ { rotator_select=$rotator_select:ty; ( $($s:tt)* ) ( $($n:tt)* ) $($t:tt)* } $e:expr, $($r:tt)* ) => {
++        $crate::join!(@{ rotator_select=$rotator_select; ($($s)* _) ($($n)* + 1) $($t)* ($($s)*) $e, } $($r)*)
+     };
+ 
+     // ===== Entry point =====
+     ( biased; $($e:expr),+ $(,)?) => {
+-        $crate::join!(@{ rotator=$crate::macros::support::BiasedRotator; () (0) } $($e,)*)
++        $crate::join!(@{ rotator_select=$crate::macros::support::SelectBiased; () (0) } $($e,)*)
+     };
+ 
+     ( $($e:expr),+ $(,)?) => {
+-        $crate::join!(@{ rotator=$crate::macros::support::Rotator<COUNT>; () (0) } $($e,)*)
++        $crate::join!(@{ rotator_select=$crate::macros::support::SelectNormal; () (0) } $($e,)*)
+     };
+ 
+     (biased;) => { async {}.await };
+@@ -223,6 +223,30 @@ doc! {macro_rules! join {
+     () => { async {}.await }
+ }}
+ 
++/// Helper trait to select which type of `Rotator` to use.
++// We need this to allow specifying a const generic without
++// colliding with caller const names due to macro hygiene.
++pub trait RotatorSelect {
++    type Rotator<const COUNT: u32>: Default;
++}
++
++/// Marker type indicating that the starting branch should
++/// rotate each poll.
++#[derive(Debug)]
++pub struct SelectNormal;
++/// Marker type indicating that the starting branch should
++/// be the first declared branch each poll.
++#[derive(Debug)]
++pub struct SelectBiased;
++
++impl RotatorSelect for SelectNormal {
++    type Rotator<const COUNT: u32> = Rotator<COUNT>;
++}
++
++impl RotatorSelect for SelectBiased {
++    type Rotator<const COUNT: u32> = BiasedRotator;
++}
++
+ /// Rotates by one each [`Self::num_skip`] call up to COUNT - 1.
+ #[derive(Default, Debug)]
+ pub struct Rotator<const COUNT: u32> {
+diff --git a/tokio/src/macros/support.rs b/tokio/src/macros/support.rs
+index 213d85cd..0231354e 100644
+--- a/tokio/src/macros/support.rs
++++ b/tokio/src/macros/support.rs
+@@ -3,7 +3,7 @@ cfg_macros! {
+ 
+     pub use std::future::poll_fn;
+ 
+-    pub use crate::macros::join::{BiasedRotator, Rotator};
++    pub use crate::macros::join::{BiasedRotator, Rotator, RotatorSelect, SelectNormal, SelectBiased};
+ 
+     #[doc(hidden)]
+     pub fn thread_rng_n(n: u32) -> u32 {
+diff --git a/tokio/src/macros/try_join.rs b/tokio/src/macros/try_join.rs
+index 471b5ebb..c3185429 100644
+--- a/tokio/src/macros/try_join.rs
++++ b/tokio/src/macros/try_join.rs
+@@ -166,7 +166,7 @@ doc! {macro_rules! try_join {
+     (@ {
+         // Type of rotator that controls which inner future to start with
+         // when polling our output future.
+-        rotator=$rotator:ty;
++        rotator_select=$rotator_select:ty;
+ 
+         // One `_` for each branch in the `try_join!` macro. This is not used once
+         // normalization is complete.
+@@ -179,7 +179,7 @@ doc! {macro_rules! try_join {
+         $( ( $($skip:tt)* ) $e:expr, )*
+ 
+     }) => {{
+-        use $crate::macros::support::{maybe_done, poll_fn, Future, Pin};
++        use $crate::macros::support::{maybe_done, poll_fn, Future, Pin, RotatorSelect};
+         use $crate::macros::support::Poll::{Ready, Pending};
+ 
+         // Safety: nothing must be moved out of `futures`. This is to satisfy
+@@ -196,14 +196,14 @@ doc! {macro_rules! try_join {
+         // <https://internals.rust-lang.org/t/surprising-soundness-trouble-around-pollfn/17484>
+         let mut futures = &mut futures;
+ 
+-        const COUNT: u32 = $($total)*;
+-
+         // Each time the future created by poll_fn is polled, if not using biased mode,
+         // a different future is polled first to ensure every future passed to try_join!
+         // can make progress even if one of the futures consumes the whole budget.
+-        let mut rotator = <$rotator>::default();
++        let mut rotator = <$rotator_select as RotatorSelect>::Rotator::<{$($total)*}>::default();
+ 
+         poll_fn(move |cx| {
++            const COUNT: u32 = $($total)*;
++
+             let mut is_pending = false;
+             let mut to_run = COUNT;
+ 
+@@ -264,17 +264,17 @@ doc! {macro_rules! try_join {
+ 
+     // ===== Normalize =====
+ 
+-    (@ { rotator=$rotator:ty;  ( $($s:tt)* ) ( $($n:tt)* ) $($t:tt)* } $e:expr, $($r:tt)* ) => {
+-      $crate::try_join!(@{ rotator=$rotator; ($($s)* _) ($($n)* + 1) $($t)* ($($s)*) $e, } $($r)*)
++    (@ { rotator_select=$rotator_select:ty;  ( $($s:tt)* ) ( $($n:tt)* ) $($t:tt)* } $e:expr, $($r:tt)* ) => {
++      $crate::try_join!(@{ rotator_select=$rotator_select; ($($s)* _) ($($n)* + 1) $($t)* ($($s)*) $e, } $($r)*)
+     };
+ 
+     // ===== Entry point =====
+     ( biased; $($e:expr),+ $(,)?) => {
+-        $crate::try_join!(@{ rotator=$crate::macros::support::BiasedRotator;  () (0) } $($e,)*)
++        $crate::try_join!(@{ rotator_select=$crate::macros::support::SelectBiased;  () (0) } $($e,)*)
+     };
+ 
+     ( $($e:expr),+ $(,)?) => {
+-        $crate::try_join!(@{ rotator=$crate::macros::support::Rotator<COUNT>; () (0) } $($e,)*)
++        $crate::try_join!(@{ rotator_select=$crate::macros::support::SelectNormal; () (0) } $($e,)*)
+     };
+ 
+     (biased;) => { async { Ok(()) }.await };

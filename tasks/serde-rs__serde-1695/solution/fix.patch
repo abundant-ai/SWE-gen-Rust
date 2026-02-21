@@ -1,0 +1,218 @@
+diff --git a/serde_derive/src/internals/ast.rs b/serde_derive/src/internals/ast.rs
+index 8bcb0ecd..75b28c96 100644
+--- a/serde_derive/src/internals/ast.rs
++++ b/serde_derive/src/internals/ast.rs
+@@ -88,9 +88,12 @@ impl<'a> Container<'a> {
+                         if field.attrs.flatten() {
+                             has_flatten = true;
+                         }
+-                        field
+-                            .attrs
+-                            .rename_by_rules(variant.attrs.rename_all_rules());
++                        field.attrs.rename_by_rules(
++                            variant
++                                .attrs
++                                .rename_all_rules()
++                                .or(attrs.rename_all_fields_rules()),
++                        );
+                     }
+                 }
+             }
+diff --git a/serde_derive/src/internals/attr.rs b/serde_derive/src/internals/attr.rs
+index 42212a64..13329956 100644
+--- a/serde_derive/src/internals/attr.rs
++++ b/serde_derive/src/internals/attr.rs
+@@ -193,11 +193,23 @@ impl Name {
+     }
+ }
+ 
++#[derive(Copy, Clone)]
+ pub struct RenameAllRules {
+     serialize: RenameRule,
+     deserialize: RenameRule,
+ }
+ 
++impl RenameAllRules {
++    /// Returns a new `RenameAllRules` with the individual rules of `self` and
++    /// `other_rules` joined by `RenameRules::or`.
++    pub fn or(self, other_rules: Self) -> Self {
++        Self {
++            serialize: self.serialize.or(other_rules.serialize),
++            deserialize: self.deserialize.or(other_rules.deserialize),
++        }
++    }
++}
++
+ /// Represents struct or enum attribute information.
+ pub struct Container {
+     name: Name,
+@@ -205,6 +217,7 @@ pub struct Container {
+     deny_unknown_fields: bool,
+     default: Default,
+     rename_all_rules: RenameAllRules,
++    rename_all_fields_rules: RenameAllRules,
+     ser_bound: Option<Vec<syn::WherePredicate>>,
+     de_bound: Option<Vec<syn::WherePredicate>>,
+     tag: TagType,
+@@ -288,6 +301,8 @@ impl Container {
+         let mut default = Attr::none(cx, DEFAULT);
+         let mut rename_all_ser_rule = Attr::none(cx, RENAME_ALL);
+         let mut rename_all_de_rule = Attr::none(cx, RENAME_ALL);
++        let mut rename_all_fields_ser_rule = Attr::none(cx, RENAME_ALL_FIELDS);
++        let mut rename_all_fields_de_rule = Attr::none(cx, RENAME_ALL_FIELDS);
+         let mut ser_bound = Attr::none(cx, BOUND);
+         let mut de_bound = Attr::none(cx, BOUND);
+         let mut untagged = BoolAttr::none(cx, UNTAGGED);
+@@ -341,6 +356,44 @@ impl Container {
+                             }
+                         }
+                     }
++                } else if meta.path == RENAME_ALL_FIELDS {
++                    // #[serde(rename_all_fields = "foo")]
++                    // #[serde(rename_all_fields(serialize = "foo", deserialize = "bar"))]
++                    let one_name = meta.input.peek(Token![=]);
++                    let (ser, de) = get_renames(cx, RENAME_ALL_FIELDS, &meta)?;
++
++                    match item.data {
++                        syn::Data::Enum(_) => {
++                            if let Some(ser) = ser {
++                                match RenameRule::from_str(&ser.value()) {
++                                    Ok(rename_rule) => {
++                                        rename_all_fields_ser_rule.set(&meta.path, rename_rule);
++                                    }
++                                    Err(err) => cx.error_spanned_by(ser, err),
++                                }
++                            }
++                            if let Some(de) = de {
++                                match RenameRule::from_str(&de.value()) {
++                                    Ok(rename_rule) => {
++                                        rename_all_fields_de_rule.set(&meta.path, rename_rule);
++                                    }
++                                    Err(err) => {
++                                        if !one_name {
++                                            cx.error_spanned_by(de, err);
++                                        }
++                                    }
++                                }
++                            }
++                        }
++                        syn::Data::Struct(_) => {
++                            let msg = "#[serde(rename_all_fields)] can only be used on enums";
++                            cx.error_spanned_by(&meta.path, msg);
++                        }
++                        syn::Data::Union(_) => {
++                            let msg = "#[serde(rename_all_fields)] can only be used on enums";
++                            cx.error_spanned_by(&meta.path, msg);
++                        }
++                    }
+                 } else if meta.path == TRANSPARENT {
+                     // #[serde(transparent)]
+                     transparent.set_true(meta.path);
+@@ -528,6 +581,10 @@ impl Container {
+                 serialize: rename_all_ser_rule.get().unwrap_or(RenameRule::None),
+                 deserialize: rename_all_de_rule.get().unwrap_or(RenameRule::None),
+             },
++            rename_all_fields_rules: RenameAllRules {
++                serialize: rename_all_fields_ser_rule.get().unwrap_or(RenameRule::None),
++                deserialize: rename_all_fields_de_rule.get().unwrap_or(RenameRule::None),
++            },
+             ser_bound: ser_bound.get(),
+             de_bound: de_bound.get(),
+             tag: decide_tag(cx, item, untagged, internal_tag, content),
+@@ -547,8 +604,12 @@ impl Container {
+         &self.name
+     }
+ 
+-    pub fn rename_all_rules(&self) -> &RenameAllRules {
+-        &self.rename_all_rules
++    pub fn rename_all_rules(&self) -> RenameAllRules {
++        self.rename_all_rules
++    }
++
++    pub fn rename_all_fields_rules(&self) -> RenameAllRules {
++        self.rename_all_fields_rules
+     }
+ 
+     pub fn transparent(&self) -> bool {
+@@ -921,7 +982,7 @@ impl Variant {
+         self.name.deserialize_aliases()
+     }
+ 
+-    pub fn rename_by_rules(&mut self, rules: &RenameAllRules) {
++    pub fn rename_by_rules(&mut self, rules: RenameAllRules) {
+         if !self.name.serialize_renamed {
+             self.name.serialize = rules.serialize.apply_to_variant(&self.name.serialize);
+         }
+@@ -930,8 +991,8 @@ impl Variant {
+         }
+     }
+ 
+-    pub fn rename_all_rules(&self) -> &RenameAllRules {
+-        &self.rename_all_rules
++    pub fn rename_all_rules(&self) -> RenameAllRules {
++        self.rename_all_rules
+     }
+ 
+     pub fn ser_bound(&self) -> Option<&[syn::WherePredicate]> {
+@@ -1260,7 +1321,7 @@ impl Field {
+         self.name.deserialize_aliases()
+     }
+ 
+-    pub fn rename_by_rules(&mut self, rules: &RenameAllRules) {
++    pub fn rename_by_rules(&mut self, rules: RenameAllRules) {
+         if !self.name.serialize_renamed {
+             self.name.serialize = rules.serialize.apply_to_field(&self.name.serialize);
+         }
+diff --git a/serde_derive/src/internals/case.rs b/serde_derive/src/internals/case.rs
+index 55450516..e769462c 100644
+--- a/serde_derive/src/internals/case.rs
++++ b/serde_derive/src/internals/case.rs
+@@ -59,8 +59,8 @@ impl RenameRule {
+     }
+ 
+     /// Apply a renaming rule to an enum variant, returning the version expected in the source.
+-    pub fn apply_to_variant(&self, variant: &str) -> String {
+-        match *self {
++    pub fn apply_to_variant(self, variant: &str) -> String {
++        match self {
+             None | PascalCase => variant.to_owned(),
+             LowerCase => variant.to_ascii_lowercase(),
+             UpperCase => variant.to_ascii_uppercase(),
+@@ -84,8 +84,8 @@ impl RenameRule {
+     }
+ 
+     /// Apply a renaming rule to a struct field, returning the version expected in the source.
+-    pub fn apply_to_field(&self, field: &str) -> String {
+-        match *self {
++    pub fn apply_to_field(self, field: &str) -> String {
++        match self {
+             None | LowerCase | SnakeCase => field.to_owned(),
+             UpperCase => field.to_ascii_uppercase(),
+             PascalCase => {
+@@ -112,6 +112,14 @@ impl RenameRule {
+             ScreamingKebabCase => ScreamingSnakeCase.apply_to_field(field).replace('_', "-"),
+         }
+     }
++
++    /// Returns the `RenameRule` if it is not `None`, `rule_b` otherwise.
++    pub fn or(self, rule_b: Self) -> Self {
++        match self {
++            None => rule_b,
++            _ => self,
++        }
++    }
+ }
+ 
+ pub struct ParseError<'a> {
+diff --git a/serde_derive/src/internals/symbol.rs b/serde_derive/src/internals/symbol.rs
+index 9606edb5..68091fb8 100644
+--- a/serde_derive/src/internals/symbol.rs
++++ b/serde_derive/src/internals/symbol.rs
+@@ -23,6 +23,7 @@ pub const OTHER: Symbol = Symbol("other");
+ pub const REMOTE: Symbol = Symbol("remote");
+ pub const RENAME: Symbol = Symbol("rename");
+ pub const RENAME_ALL: Symbol = Symbol("rename_all");
++pub const RENAME_ALL_FIELDS: Symbol = Symbol("rename_all_fields");
+ pub const REPR: Symbol = Symbol("repr");
+ pub const SERDE: Symbol = Symbol("serde");
+ pub const SERIALIZE: Symbol = Symbol("serialize");

@@ -1,0 +1,98 @@
+diff --git a/tokio/src/macros/select.rs b/tokio/src/macros/select.rs
+index 10a71aa7..18cc44b9 100644
+--- a/tokio/src/macros/select.rs
++++ b/tokio/src/macros/select.rs
+@@ -660,6 +660,10 @@ doc! {macro_rules! select {
+             let mut futures = &mut futures;
+ 
+             $crate::macros::support::poll_fn(|cx| {
++                // Return `Pending` when the task budget is depleted since budget-aware futures
++                // are going to yield anyway and other futures will not cooperate.
++                ::std::task::ready!($crate::macros::support::poll_budget_available(cx));
++
+                 // Track if any branch returns pending. If no branch completes
+                 // **or** returns pending, this implies that all branches are
+                 // disabled.
+diff --git a/tokio/src/macros/support.rs b/tokio/src/macros/support.rs
+index 8588f75c..ff3ccb40 100644
+--- a/tokio/src/macros/support.rs
++++ b/tokio/src/macros/support.rs
+@@ -7,8 +7,24 @@ cfg_macros! {
+     pub fn thread_rng_n(n: u32) -> u32 {
+         crate::runtime::context::thread_rng_n(n)
+     }
++
++    cfg_coop! {
++        #[doc(hidden)]
++        #[inline]
++        pub fn poll_budget_available(cx: &mut Context<'_>) -> Poll<()> {
++            crate::task::coop::poll_budget_available(cx)
++        }
++    }
++
++    cfg_not_coop! {
++        #[doc(hidden)]
++        #[inline]
++        pub fn poll_budget_available(_: &mut Context<'_>) -> Poll<()> {
++            Poll::Ready(())
++        }
++    }
+ }
+ 
+ pub use std::future::{Future, IntoFuture};
+ pub use std::pin::Pin;
+-pub use std::task::Poll;
++pub use std::task::{Context, Poll};
+diff --git a/tokio/src/task/coop/mod.rs b/tokio/src/task/coop/mod.rs
+index f05f0205..58f0c848 100644
+--- a/tokio/src/task/coop/mod.rs
++++ b/tokio/src/task/coop/mod.rs
+@@ -305,12 +305,27 @@ cfg_coop! {
+ 
+                 Poll::Ready(restore)
+             } else {
+-                defer(cx);
++                register_waker(cx);
+                 Poll::Pending
+             }
+         }).unwrap_or(Poll::Ready(RestoreOnPending(Cell::new(Budget::unconstrained()))))
+     }
+ 
++    /// Returns `Poll::Ready` if the current task has budget to consume, and `Poll::Pending` otherwise.
++    ///
++    /// Note that in contrast to `poll_proceed`, this method does not consume any budget and is used when
++    /// polling for budget availability.
++    #[inline]
++    pub(crate) fn poll_budget_available(cx: &mut Context<'_>) -> Poll<()> {
++        if has_budget_remaining() {
++            Poll::Ready(())
++        } else {
++            register_waker(cx);
++
++            Poll::Pending
++        }
++    }
++
+     cfg_rt! {
+         cfg_unstable_metrics! {
+             #[inline(always)]
+@@ -326,7 +341,7 @@ cfg_coop! {
+             fn inc_budget_forced_yield_count() {}
+         }
+ 
+-        fn defer(cx: &mut Context<'_>) {
++        fn register_waker(cx: &mut Context<'_>) {
+             context::defer(cx.waker());
+         }
+     }
+@@ -335,8 +350,8 @@ cfg_coop! {
+         #[inline(always)]
+         fn inc_budget_forced_yield_count() {}
+ 
+-        fn defer(cx: &mut Context<'_>) {
+-            cx.waker().wake_by_ref();
++        fn register_waker(cx: &mut Context<'_>) {
++            cx.waker().wake_by_ref()
+         }
+     }
+ 

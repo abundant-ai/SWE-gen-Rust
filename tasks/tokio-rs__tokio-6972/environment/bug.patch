@@ -1,0 +1,229 @@
+diff --git a/tokio/src/runtime/dump.rs b/tokio/src/runtime/dump.rs
+index 0a6adf97..d262f398 100644
+--- a/tokio/src/runtime/dump.rs
++++ b/tokio/src/runtime/dump.rs
+@@ -3,9 +3,7 @@
+ //! See [`Handle::dump`][crate::runtime::Handle::dump].
+ 
+ use crate::task::Id;
+-use std::{fmt, future::Future, path::Path};
+-
+-pub use crate::runtime::task::trace::Root;
++use std::{fmt, path::Path};
+ 
+ /// A snapshot of a runtime's state.
+ ///
+@@ -216,72 +214,6 @@ impl Trace {
+             })
+             .collect()
+     }
+-
+-    /// Runs the function `f` in tracing mode, and returns its result along with the resulting [`Trace`].
+-    ///
+-    /// This is normally called with `f` being the poll function of a future, and will give you a backtrace
+-    /// that tells you what that one future is doing.
+-    ///
+-    /// Use [`Handle::dump`] instead if you want to know what *all the tasks* in your program are doing.
+-    /// Also see [`Handle::dump`] for more documentation about dumps, but unlike [`Handle::dump`], this function
+-    /// should not be much slower than calling `f` directly.
+-    ///
+-    /// Due to the way tracing is implemented, Tokio leaf futures will usually, instead of doing their
+-    /// actual work, do the equivalent of a `yield_now` (returning a `Poll::Pending` and scheduling the
+-    /// current context for execution), which means forward progress will probably not happen unless
+-    /// you eventually call your future outside of `capture`.
+-    ///
+-    /// [`Handle::dump`]: crate::runtime::Handle::dump
+-    ///
+-    /// Example usage:
+-    /// ```
+-    /// use std::future::Future;
+-    /// use std::task::Poll;
+-    /// use tokio::runtime::dump::Trace;
+-    ///
+-    /// # async fn test_fn() {
+-    /// // some future
+-    /// let mut test_future = std::pin::pin!(async move { tokio::task::yield_now().await; 0 });
+-    ///
+-    /// // trace it once, see what it's doing
+-    /// let (trace, res) = Trace::root(std::future::poll_fn(|cx| {
+-    ///     let (res, trace) = Trace::capture(|| test_future.as_mut().poll(cx));
+-    ///     Poll::Ready((trace, res))
+-    /// })).await;
+-    ///
+-    /// // await it to let it finish, outside of a `capture`
+-    /// let output = match res {
+-    ///    Poll::Ready(output) => output,
+-    ///    Poll::Pending => test_future.await,
+-    /// };
+-    ///
+-    /// println!("{trace}");
+-    /// # }
+-    /// ```
+-    ///
+-    /// ### Nested calls
+-    ///
+-    /// Nested calls to `capture` might return partial traces, but will not do any other undesirable behavior (for
+-    /// example, they will not panic).
+-    pub fn capture<F, R>(f: F) -> (R, Trace)
+-    where
+-        F: FnOnce() -> R,
+-    {
+-        let (res, trace) = super::task::trace::Trace::capture(f);
+-        (res, Trace { inner: trace })
+-    }
+-
+-    /// Create a root for stack traces captured using [`Trace::capture`]. Stack frames above
+-    /// the root will not be captured.
+-    ///
+-    /// Nesting multiple [`Root`] futures is fine. Captures will stop at the first root. Not having
+-    /// a [`Root`] is fine as well, but there is no guarantee on where the capture will stop.
+-    pub fn root<F>(f: F) -> Root<F>
+-    where
+-        F: Future,
+-    {
+-        crate::runtime::task::trace::Trace::root(f)
+-    }
+ }
+ 
+ impl Dump {
+diff --git a/tokio/src/runtime/handle.rs b/tokio/src/runtime/handle.rs
+index 91f13d6c..752640d7 100644
+--- a/tokio/src/runtime/handle.rs
++++ b/tokio/src/runtime/handle.rs
+@@ -447,9 +447,6 @@ cfg_taskdump! {
+     impl Handle {
+         /// Captures a snapshot of the runtime's state.
+         ///
+-        /// If you only want to capture a snapshot of a single future's state, you can use
+-        /// [`Trace::capture`][crate::runtime::dump::Trace].
+-        ///
+         /// This functionality is experimental, and comes with a number of
+         /// requirements and limitations.
+         ///
+diff --git a/tokio/src/runtime/task/trace/mod.rs b/tokio/src/runtime/task/trace/mod.rs
+index 71aa3b22..16cb3477 100644
+--- a/tokio/src/runtime/task/trace/mod.rs
++++ b/tokio/src/runtime/task/trace/mod.rs
+@@ -56,8 +56,7 @@ pub(crate) struct Trace {
+ pin_project_lite::pin_project! {
+     #[derive(Debug, Clone)]
+     #[must_use = "futures do nothing unless you `.await` or poll them"]
+-    /// A future wrapper that roots traces (captured with [`Trace::capture`]).
+-    pub struct Root<T> {
++    pub(crate) struct Root<T> {
+         #[pin]
+         future: T,
+     }
+diff --git a/tokio/tests/task_trace_self.rs b/tokio/tests/task_trace_self.rs
+deleted file mode 100644
+index a4dc1f37..00000000
+--- a/tokio/tests/task_trace_self.rs
++++ /dev/null
+@@ -1,107 +0,0 @@
+-#![allow(unknown_lints, unexpected_cfgs)]
+-#![cfg(all(
+-    tokio_unstable,
+-    tokio_taskdump,
+-    target_os = "linux",
+-    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+-))]
+-
+-use std::future::Future;
+-use std::pin::Pin;
+-use std::sync::{Arc, Mutex};
+-use std::task::{Context, Poll};
+-use std::time::{Duration, Instant};
+-
+-use tokio::runtime::dump::{Root, Trace};
+-
+-pin_project_lite::pin_project! {
+-    pub struct PrettyFuture<F: Future> {
+-        #[pin]
+-        f: Root<F>,
+-        t_last: State,
+-        logs: Arc<Mutex<Vec<Trace>>>,
+-    }
+-}
+-
+-enum State {
+-    NotStarted,
+-    Running { since: Instant },
+-    Alerted,
+-}
+-
+-impl<F: Future> PrettyFuture<F> {
+-    pub fn pretty(f: F, logs: Arc<Mutex<Vec<Trace>>>) -> Self {
+-        PrettyFuture {
+-            f: Trace::root(f),
+-            t_last: State::NotStarted,
+-            logs,
+-        }
+-    }
+-}
+-
+-impl<F: Future> Future for PrettyFuture<F> {
+-    type Output = F::Output;
+-
+-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+-        let mut this = self.project();
+-        let now = Instant::now();
+-        let t_last = match this.t_last {
+-            State::Running { since } => Some(*since),
+-            State::NotStarted => {
+-                *this.t_last = State::Running { since: now };
+-                None
+-            }
+-            State::Alerted => {
+-                // don't double-alert for the same future
+-                None
+-            }
+-        };
+-        if t_last.is_some_and(|t_last| now.duration_since(t_last) > Duration::from_millis(500)) {
+-            let (res, trace) = tokio::runtime::dump::Trace::capture(|| this.f.as_mut().poll(cx));
+-            this.logs.lock().unwrap().push(trace);
+-            *this.t_last = State::Alerted;
+-            return res;
+-        }
+-        this.f.poll(cx)
+-    }
+-}
+-
+-#[tokio::test]
+-async fn task_trace_self() {
+-    let log = Arc::new(Mutex::new(vec![]));
+-    let log2 = Arc::new(Mutex::new(vec![]));
+-    let mut good_line = vec![];
+-    let mut bad_line = vec![];
+-    PrettyFuture::pretty(
+-        PrettyFuture::pretty(
+-            async {
+-                bad_line.push(line!() + 1);
+-                tokio::task::yield_now().await;
+-                bad_line.push(line!() + 1);
+-                tokio::time::sleep(Duration::from_millis(1)).await;
+-                for _ in 0..100 {
+-                    good_line.push(line!() + 1);
+-                    tokio::time::sleep(Duration::from_millis(10)).await;
+-                }
+-            },
+-            log.clone(),
+-        ),
+-        log2.clone(),
+-    )
+-    .await;
+-    for line in good_line {
+-        let s = format!("{}:{}:", file!(), line);
+-        assert!(log.lock().unwrap().iter().any(|x| {
+-            eprintln!("{}", x);
+-            format!("{}", x).contains(&s)
+-        }));
+-    }
+-    for line in bad_line {
+-        let s = format!("{}:{}:", file!(), line);
+-        assert!(!log
+-            .lock()
+-            .unwrap()
+-            .iter()
+-            .any(|x| format!("{}", x).contains(&s)));
+-    }
+-}

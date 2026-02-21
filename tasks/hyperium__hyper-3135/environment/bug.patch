@@ -1,0 +1,259 @@
+diff --git a/benches/end_to_end.rs b/benches/end_to_end.rs
+index 89c3caf4..34d0e2e6 100644
+--- a/benches/end_to_end.rs
++++ b/benches/end_to_end.rs
+@@ -316,10 +316,11 @@ impl Opts {
+         let mut client = rt.block_on(async {
+             if self.http2 {
+                 let io = tokio::net::TcpStream::connect(&addr).await.unwrap();
+-                let (tx, conn) = hyper::client::conn::http2::Builder::new(support::TokioExecutor)
++                let (tx, conn) = hyper::client::conn::http2::Builder::new()
+                     .initial_stream_window_size(self.http2_stream_window)
+                     .initial_connection_window_size(self.http2_conn_window)
+                     .adaptive_window(self.http2_adaptive_window)
++                    .executor(support::TokioExecutor)
+                     .handshake(io)
+                     .await
+                     .unwrap();
+diff --git a/src/client/conn/http2.rs b/src/client/conn/http2.rs
+index f54b7a90..5b9e0547 100644
+--- a/src/client/conn/http2.rs
++++ b/src/client/conn/http2.rs
+@@ -57,18 +57,16 @@ pub struct Builder {
+ ///
+ /// This is a shortcut for `Builder::new().handshake(io)`.
+ /// See [`client::conn`](crate::client::conn) for more.
+-pub async fn handshake<E, T, B>(
+-    exec: E,
++pub async fn handshake<T, B>(
+     io: T,
+ ) -> crate::Result<(SendRequest<B>, Connection<T, B>)>
+ where
+-    E: Executor<BoxSendFuture> + Send + Sync + 'static,
+     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+     B: Body + 'static,
+     B::Data: Send,
+     B::Error: Into<Box<dyn StdError + Send + Sync>>,
+ {
+-    Builder::new(exec).handshake(io).await
++    Builder::new().handshake(io).await
+ }
+ 
+ // ===== impl SendRequest
+@@ -246,17 +244,23 @@ where
+ impl Builder {
+     /// Creates a new connection builder.
+     #[inline]
+-    pub fn new<E>(exec: E) -> Builder 
+-    where
+-        E: Executor<BoxSendFuture> + Send + Sync + 'static,
+-    {
++    pub fn new() -> Builder {
+         Builder {
+-            exec: Exec::new(exec),
++            exec: Exec::Default,
+             timer: Time::Empty,
+             h2_builder: Default::default(),
+         }
+     }
+ 
++    /// Provide an executor to execute background HTTP2 tasks.
++    pub fn executor<E>(&mut self, exec: E) -> &mut Builder
++    where
++        E: Executor<BoxSendFuture> + Send + Sync + 'static,
++    {
++        self.exec = Exec::Executor(Arc::new(exec));
++        self
++    }
++
+     /// Provide a timer to execute background HTTP2 tasks.
+     pub fn timer<M>(&mut self, timer: M) -> &mut Builder
+     where
+diff --git a/src/common/exec.rs b/src/common/exec.rs
+index ebe87e82..b7e3e9d7 100644
+--- a/src/common/exec.rs
++++ b/src/common/exec.rs
+@@ -16,25 +16,30 @@ pub trait ConnStreamExec<F, B: Body>: Clone {
+ 
+ pub(crate) type BoxSendFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+ 
+-// Executor must be provided by the user
++// Either the user provides an executor for background tasks, or we panic.
++// TODO: with the `runtime`feature, `Exec::Default` used `tokio::spawn`. With the
++// removal of the opt-in default runtime, this should be refactored.
+ #[derive(Clone)]
+-pub(crate) struct Exec(Arc<dyn Executor<BoxSendFuture> + Send + Sync>);
++pub(crate) enum Exec {
++    Default,
++    Executor(Arc<dyn Executor<BoxSendFuture> + Send + Sync>),
++}
+ 
+ // ===== impl Exec =====
+ 
+ impl Exec {
+-    pub(crate) fn new<E>(exec: E) -> Self
+-    where
+-        E: Executor<BoxSendFuture> + Send + Sync + 'static,
+-    {
+-        Self(Arc::new(exec))
+-    }
+-
+     pub(crate) fn execute<F>(&self, fut: F)
+     where
+         F: Future<Output = ()> + Send + 'static,
+     {
+-        self.0.execute(Box::pin(fut))
++        match *self {
++            Exec::Default => {
++                panic!("executor must be set");
++            }
++            Exec::Executor(ref e) => {
++                e.execute(Box::pin(fut));
++            }
++        }
+     }
+ }
+ 
+diff --git a/src/ffi/client.rs b/src/ffi/client.rs
+index a300076d..d5cbd065 100644
+--- a/src/ffi/client.rs
++++ b/src/ffi/client.rs
+@@ -55,7 +55,8 @@ ffi_fn! {
+             #[cfg(feature = "http2")]
+             {
+             if options.http2 {
+-                return conn::http2::Builder::new(options.exec.clone())
++                return conn::http2::Builder::new()
++                    .executor(options.exec.clone())
+                     .handshake::<_, crate::body::Incoming>(io)
+                     .await
+                     .map(|(tx, conn)| {
+diff --git a/tests/client.rs b/tests/client.rs
+index 739f223b..aa889172 100644
+--- a/tests/client.rs
++++ b/tests/client.rs
+@@ -1922,7 +1922,8 @@ mod conn {
+         });
+ 
+         let io = tcp_connect(&addr).await.expect("tcp connect");
+-        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
++        let (mut client, conn) = conn::http2::Builder::new()
++            .executor(TokioExecutor)
+             .handshake(io)
+             .await
+             .expect("http handshake");
+@@ -1978,7 +1979,8 @@ mod conn {
+         });
+ 
+         let io = tcp_connect(&addr).await.expect("tcp connect");
+-        let (_client, conn) = conn::http2::Builder::new(TokioExecutor)
++        let (_client, conn) = conn::http2::Builder::new()
++            .executor(TokioExecutor)
+             .timer(TokioTimer)
+             .keep_alive_interval(Duration::from_secs(1))
+             .keep_alive_timeout(Duration::from_secs(1))
+@@ -2006,7 +2008,8 @@ mod conn {
+         });
+ 
+         let io = tcp_connect(&addr).await.expect("tcp connect");
+-        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
++        let (mut client, conn) = conn::http2::Builder::new()
++            .executor(TokioExecutor)
+             .timer(TokioTimer)
+             .keep_alive_interval(Duration::from_secs(1))
+             .keep_alive_timeout(Duration::from_secs(1))
+@@ -2037,7 +2040,8 @@ mod conn {
+         });
+ 
+         let io = tcp_connect(&addr).await.expect("tcp connect");
+-        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
++        let (mut client, conn) = conn::http2::Builder::new()
++            .executor(TokioExecutor)
+             .timer(TokioTimer)
+             .keep_alive_interval(Duration::from_secs(1))
+             .keep_alive_timeout(Duration::from_secs(1))
+@@ -2096,7 +2100,8 @@ mod conn {
+         });
+ 
+         let io = tcp_connect(&addr).await.expect("tcp connect");
+-        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
++        let (mut client, conn) = conn::http2::Builder::new()
++            .executor(TokioExecutor)
+             .timer(TokioTimer)
+             .keep_alive_interval(Duration::from_secs(1))
+             .keep_alive_timeout(Duration::from_secs(1))
+@@ -2151,7 +2156,8 @@ mod conn {
+         });
+ 
+         let io = tcp_connect(&addr).await.expect("tcp connect");
+-        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
++        let (mut client, conn) = conn::http2::Builder::new()
++            .executor(TokioExecutor)
+             .handshake(io)
+             .await
+             .expect("http handshake");
+@@ -2201,7 +2207,8 @@ mod conn {
+         });
+ 
+         let io = tcp_connect(&addr).await.expect("tcp connect");
+-        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
++        let (mut client, conn) = conn::http2::Builder::new()
++            .executor(TokioExecutor)
+             .handshake::<_, Empty<Bytes>>(io)
+             .await
+             .expect("http handshake");
+diff --git a/tests/server.rs b/tests/server.rs
+index 68c53ce5..5fe08848 100644
+--- a/tests/server.rs
++++ b/tests/server.rs
+@@ -2389,7 +2389,8 @@ async fn http2_keep_alive_with_responsive_client() {
+     });
+ 
+     let tcp = connect_async(addr).await;
+-    let (mut client, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor)
++    let (mut client, conn) = hyper::client::conn::http2::Builder::new()
++        .executor(TokioExecutor)
+         .handshake(tcp)
+         .await
+         .expect("http handshake");
+@@ -3016,7 +3017,8 @@ impl TestClient {
+             .unwrap();
+ 
+         if self.http2_only {
+-            let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor)
++            let (mut sender, conn) = hyper::client::conn::http2::Builder::new()
++                .executor(TokioExecutor)
+                 .handshake(stream)
+                 .await
+                 .unwrap();
+diff --git a/tests/support/mod.rs b/tests/support/mod.rs
+index e7e1e8c6..a8eb37dc 100644
+--- a/tests/support/mod.rs
++++ b/tests/support/mod.rs
+@@ -427,7 +427,8 @@ async fn async_test(cfg: __TestConfig) {
+             let stream = TcpStream::connect(addr).await.unwrap();
+ 
+             let res = if http2_only {
+-                let (mut sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor)
++                let (mut sender, conn) = hyper::client::conn::http2::Builder::new()
++                    .executor(TokioExecutor)
+                     .handshake(stream)
+                     .await
+                     .unwrap();
+@@ -525,11 +526,11 @@ async fn naive_proxy(cfg: ProxyConfig) -> (SocketAddr, impl Future<Output = ()>)
+                             .unwrap();
+ 
+                         let resp = if http2_only {
+-                            let (mut sender, conn) =
+-                                hyper::client::conn::http2::Builder::new(TokioExecutor)
+-                                    .handshake(stream)
+-                                    .await
+-                                    .unwrap();
++                            let (mut sender, conn) = hyper::client::conn::http2::Builder::new()
++                                .executor(TokioExecutor)
++                                .handshake(stream)
++                                .await
++                                .unwrap();
+ 
+                             tokio::task::spawn(async move {
+                                 if let Err(err) = conn.await {

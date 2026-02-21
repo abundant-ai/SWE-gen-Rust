@@ -1,0 +1,23 @@
+#!/bin/bash
+
+cd /app/src
+
+export RUST_BACKTRACE=1
+export RUSTFLAGS='--cfg hyper_unstable_tracing'
+
+# Copy HEAD test files from /tests (overwrites BASE state)
+cp "/tests/client.rs" "tests/client.rs"
+cp "/tests/server.rs" "tests/server.rs"
+cp "/tests/support/mod.rs" "tests/support/mod.rs"
+cp "/tests/support/trailers.rs" "tests/support/trailers.rs"
+
+# Run the client and server test files
+cargo test --test client --test server --features full,tracing -- --nocapture
+test_status=$?
+
+if [ $test_status -eq 0 ]; then
+  echo 1 > /logs/verifier/reward.txt
+else
+  echo 0 > /logs/verifier/reward.txt
+fi
+exit "$test_status"

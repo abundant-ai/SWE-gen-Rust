@@ -1,0 +1,223 @@
+diff --git a/serde/src/lib.rs b/serde/src/lib.rs
+index c622cf6a..97e02684 100644
+--- a/serde/src/lib.rs
++++ b/serde/src/lib.rs
+@@ -157,7 +157,7 @@ mod lib {
+         pub use std::*;
+     }
+ 
+-    pub use self::core::{cmp, iter, num, slice, str};
++    pub use self::core::{cmp, iter, num, ptr, slice, str};
+     pub use self::core::{f32, f64};
+     pub use self::core::{i16, i32, i64, i8, isize};
+     pub use self::core::{u16, u32, u64, u8, usize};
+diff --git a/serde/src/private/mod.rs b/serde/src/private/mod.rs
+index 24ea84b3..71e82a89 100644
+--- a/serde/src/private/mod.rs
++++ b/serde/src/private/mod.rs
+@@ -14,6 +14,7 @@ pub use lib::default::Default;
+ pub use lib::fmt::{self, Formatter};
+ pub use lib::marker::PhantomData;
+ pub use lib::option::Option::{self, None, Some};
++pub use lib::ptr;
+ pub use lib::result::Result::{self, Err, Ok};
+ 
+ pub use self::string::from_utf8_lossy;
+diff --git a/serde_derive/build.rs b/serde_derive/build.rs
+index 6e1b7b6d..d0c827a6 100644
+--- a/serde_derive/build.rs
++++ b/serde_derive/build.rs
+@@ -16,6 +16,12 @@ fn main() {
+     if minor >= 37 {
+         println!("cargo:rustc-cfg=underscore_consts");
+     }
++
++    // The ptr::addr_of! macro stabilized in Rust 1.51:
++    // https://blog.rust-lang.org/2021/03/25/Rust-1.51.0.html#stabilized-apis
++    if minor >= 51 {
++        println!("cargo:rustc-cfg=ptr_addr_of");
++    }
+ }
+ 
+ fn rustc_minor_version() -> Option<u32> {
+diff --git a/serde_derive/src/pretend.rs b/serde_derive/src/pretend.rs
+index 7ec89444..c4e58745 100644
+--- a/serde_derive/src/pretend.rs
++++ b/serde_derive/src/pretend.rs
+@@ -1,7 +1,7 @@
+-use proc_macro2::{Span, TokenStream};
+-use syn::Ident;
++use proc_macro2::TokenStream;
++use quote::format_ident;
+ 
+-use internals::ast::{Container, Data, Field, Style};
++use internals::ast::{Container, Data, Field, Style, Variant};
+ 
+ // Suppress dead_code warnings that would otherwise appear when using a remote
+ // derive. Other than this pretend code, a struct annotated with remote derive
+@@ -32,49 +32,115 @@ pub fn pretend_used(cont: &Container, is_packed: bool) -> TokenStream {
+ 
+ // For structs with named fields, expands to:
+ //
++//     match None::<&T> {
++//         Some(T { a: __v0, b: __v1 }) => {}
++//         _ => {}
++//     }
++//
++// For packed structs on sufficiently new rustc, expands to:
++//
++//     match None::<&T> {
++//         Some(__v @ T { a: _, b: _ }) => {
++//             let _ = addr_of!(__v.a);
++//             let _ = addr_of!(__v.b);
++//         }
++//         _ => {}
++//     }
++//
++// For packed structs on older rustc, we assume Sized and !Drop, and expand to:
++//
+ //     match None::<T> {
+-//         Some(T { a: ref __v0, b: ref __v1 }) => {}
++//         Some(T { a: __v0, b: __v1 }) => {}
+ //         _ => {}
+ //     }
+ //
+ // For enums, expands to the following but only including struct variants:
+ //
+-//     match None::<T> {
+-//         Some(T::A { a: ref __v0 }) => {}
+-//         Some(T::B { b: ref __v0 }) => {}
++//     match None::<&T> {
++//         Some(T::A { a: __v0 }) => {}
++//         Some(T::B { b: __v0 }) => {}
+ //         _ => {}
+ //     }
+ //
+-// The `ref` is important in case the user has written a Drop impl on their
+-// type. Rust does not allow destructuring a struct or enum that has a Drop
+-// impl.
+ fn pretend_fields_used(cont: &Container, is_packed: bool) -> TokenStream {
++    match &cont.data {
++        Data::Enum(variants) => pretend_fields_used_enum(cont, variants),
++        Data::Struct(Style::Struct, fields) => if is_packed {
++            pretend_fields_used_struct_packed(cont, fields)
++        } else {
++            pretend_fields_used_struct(cont, fields)
++        },
++        Data::Struct(_, _) => quote!(),
++    }
++}
++
++fn pretend_fields_used_struct(cont: &Container, fields: &[Field]) -> TokenStream {
+     let type_ident = &cont.ident;
+     let (_, ty_generics, _) = cont.generics.split_for_impl();
+ 
+-    let patterns = match &cont.data {
+-        Data::Enum(variants) => variants
+-            .iter()
+-            .filter_map(|variant| match variant.style {
+-                Style::Struct => {
+-                    let variant_ident = &variant.ident;
+-                    let pat = struct_pattern(&variant.fields, is_packed);
+-                    Some(quote!(#type_ident::#variant_ident #pat))
++    let members = fields.iter().map(|field| &field.member);
++    let placeholders = (0usize..).map(|i| format_ident!("__v{}", i));
++
++    quote! {
++        match _serde::__private::None::<&#type_ident #ty_generics> {
++            _serde::__private::Some(#type_ident { #(#members: #placeholders),* }) => {}
++            _ => {}
++        }
++    }
++}
++
++fn pretend_fields_used_struct_packed(cont: &Container, fields: &[Field]) -> TokenStream {
++    let type_ident = &cont.ident;
++    let (_, ty_generics, _) = cont.generics.split_for_impl();
++
++    let members = fields.iter().map(|field| &field.member).collect::<Vec<_>>();
++
++    #[cfg(ptr_addr_of)]
++    {
++        quote! {
++            match _serde::__private::None::<&#type_ident #ty_generics> {
++                _serde::__private::Some(__v @ #type_ident { #(#members: _),* }) => {
++                    #(
++                        let _ = _serde::__private::ptr::addr_of!(__v.#members);
++                    )*
+                 }
+-                _ => None,
+-            })
+-            .collect::<Vec<_>>(),
+-        Data::Struct(Style::Struct, fields) => {
+-            let pat = struct_pattern(fields, is_packed);
+-            vec![quote!(#type_ident #pat)]
++                _ => {}
++            }
+         }
+-        Data::Struct(_, _) => {
+-            return quote!();
++    }
++
++    #[cfg(not(ptr_addr_of))]
++    {
++        let placeholders = (0usize..).map(|i| format_ident!("__v{}", i));
++
++        quote! {
++            match _serde::__private::None::<#type_ident #ty_generics> {
++                _serde::__private::Some(#type_ident { #(#members: #placeholders),* }) => {}
++                _ => {}
++            }
+         }
+-    };
++    }
++}
++
++fn pretend_fields_used_enum(cont: &Container, variants: &[Variant]) -> TokenStream {
++    let type_ident = &cont.ident;
++    let (_, ty_generics, _) = cont.generics.split_for_impl();
++
++    let patterns = variants
++        .iter()
++        .filter_map(|variant| match variant.style {
++            Style::Struct => {
++                let variant_ident = &variant.ident;
++                let members = variant.fields.iter().map(|field| &field.member);
++                let placeholders = (0usize..).map(|i| format_ident!("__v{}", i));
++                Some(quote!(#type_ident::#variant_ident { #(#members: #placeholders),* }))
++            }
++            _ => None,
++        })
++        .collect::<Vec<_>>();
+ 
+     quote! {
+-        match _serde::__private::None::<#type_ident #ty_generics> {
++        match _serde::__private::None::<&#type_ident #ty_generics> {
+             #(
+                 _serde::__private::Some(#patterns) => {}
+             )*
+@@ -107,7 +173,7 @@ fn pretend_variants_used(cont: &Container) -> TokenStream {
+     let cases = variants.iter().map(|variant| {
+         let variant_ident = &variant.ident;
+         let placeholders = &(0..variant.fields.len())
+-            .map(|i| Ident::new(&format!("__v{}", i), Span::call_site()))
++            .map(|i| format_ident!("__v{}", i))
+             .collect::<Vec<_>>();
+ 
+         let pat = match variant.style {
+@@ -131,15 +197,3 @@ fn pretend_variants_used(cont: &Container) -> TokenStream {
+ 
+     quote!(#(#cases)*)
+ }
+-
+-fn struct_pattern(fields: &[Field], is_packed: bool) -> TokenStream {
+-    let members = fields.iter().map(|field| &field.member);
+-    let placeholders =
+-        (0..fields.len()).map(|i| Ident::new(&format!("__v{}", i), Span::call_site()));
+-    let take_reference = if is_packed {
+-        None
+-    } else {
+-        Some(quote!(ref))
+-    };
+-    quote!({ #(#members: #take_reference #placeholders),* })
+-}

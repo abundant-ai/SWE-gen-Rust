@@ -1,0 +1,332 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 086acb6..a745bcd 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -5,7 +5,7 @@ members = [
+   # "tower-balance",
+   "tower-buffer",
+   "tower-discover",
+-  "tower-filter",
++  # "tower-filter",
+   # "tower-hedge",
+   "tower-layer",
+   "tower-limit",
+diff --git a/tower-filter/CHANGELOG.md b/tower-filter/CHANGELOG.md
+index 483fd9e..cae251b 100644
+--- a/tower-filter/CHANGELOG.md
++++ b/tower-filter/CHANGELOG.md
+@@ -1,7 +1,3 @@
+-# 0.3.0-alpha.1
+-
+-- Move to `std::future`
+-
+ # 0.1.0 (unreleased)
+ 
+ - Initial release
+diff --git a/tower-filter/Cargo.toml b/tower-filter/Cargo.toml
+index 90bc049..804afa5 100644
+--- a/tower-filter/Cargo.toml
++++ b/tower-filter/Cargo.toml
+@@ -8,13 +8,13 @@ name = "tower-filter"
+ #   - README.md
+ # - Update CHANGELOG.md.
+ # - Create "v0.1.x" git tag.
+-version = "0.3.0-alpha.1"
++version = "0.1.0"
+ authors = ["Tower Maintainers <team@tower-rs.com>"]
+ license = "MIT"
+ readme = "README.md"
+ repository = "https://github.com/tower-rs/tower"
+ homepage = "https://github.com/tower-rs/tower"
+-documentation = "https://docs.rs/tower-filter/0.3.0-alpha.1"
++documentation = "https://docs.rs/tower-filter/0.1.0"
+ description = """
+ Conditionally allow requests to be dispatched to a service based on the result
+ of a predicate.
+@@ -24,13 +24,9 @@ edition = "2018"
+ publish = false
+ 
+ [dependencies]
+-tower-service = "0.3.0-alpha.1"
+-tower-layer = { version = "0.3.0-alpha.1", path = "../tower-layer" }
+-pin-project = { version = "0.4.0-alpha.10", features = ["project_attr"] }
+-futures-core-preview = "0.3.0-alpha.18"
++futures = "0.1.26"
++tower-service = "0.2.0"
++tower-layer = "0.1.0"
+ 
+ [dev-dependencies]
+-tower-test = { version = "0.3.0-alpha.1", path = "../tower-test" }
+-tokio-test = "0.2.0-alpha.4"
+-tokio = "0.2.0-alpha.4"
+-futures-util-preview = "0.3.0-alpha.18"
++tower-test = { version = "0.1", path = "../tower-test" }
+diff --git a/tower-filter/src/future.rs b/tower-filter/src/future.rs
+index cbaa2c0..baa90ff 100644
+--- a/tower-filter/src/future.rs
++++ b/tower-filter/src/future.rs
+@@ -1,27 +1,18 @@
+ //! Future types
+ 
+ use crate::error::{self, Error};
+-use futures_core::ready;
+-use pin_project::{pin_project, project};
+-use std::{
+-    future::Future,
+-    pin::Pin,
+-    task::{Context, Poll},
+-};
++use futures::{Async, Future, Poll};
+ use tower_service::Service;
+ 
+ /// Filtered response future
+-#[pin_project]
+ #[derive(Debug)]
+ pub struct ResponseFuture<T, S, Request>
+ where
+     S: Service<Request>,
+ {
+-    #[pin]
+     /// Response future state
+     state: State<Request, S::Future>,
+ 
+-    #[pin]
+     /// Predicate future
+     check: T,
+ 
+@@ -29,62 +20,65 @@ where
+     service: S,
+ }
+ 
+-#[pin_project]
+ #[derive(Debug)]
+ enum State<Request, U> {
+-    Check(Option<Request>),
+-    WaitResponse(#[pin] U),
++    Check(Request),
++    WaitResponse(U),
++    Invalid,
+ }
+ 
+-impl<F, T, S, Request> ResponseFuture<F, S, Request>
++impl<T, S, Request> ResponseFuture<T, S, Request>
+ where
+-    F: Future<Output = Result<T, Error>>,
++    T: Future<Error = Error>,
+     S: Service<Request>,
+     S::Error: Into<error::Source>,
+ {
+-    pub(crate) fn new(request: Request, check: F, service: S) -> Self {
++    pub(crate) fn new(request: Request, check: T, service: S) -> Self {
+         ResponseFuture {
+-            state: State::Check(Some(request)),
++            state: State::Check(request),
+             check,
+             service,
+         }
+     }
+ }
+ 
+-impl<F, T, S, Request> Future for ResponseFuture<F, S, Request>
++impl<T, S, Request> Future for ResponseFuture<T, S, Request>
+ where
+-    F: Future<Output = Result<T, Error>>,
++    T: Future<Error = Error>,
+     S: Service<Request>,
+     S::Error: Into<error::Source>,
+ {
+-    type Output = Result<S::Response, Error>;
++    type Item = S::Response;
++    type Error = Error;
+ 
+-    #[project]
+-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+-        let mut this = self.project();
++    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
++        use self::State::*;
++        use std::mem;
+ 
+         loop {
+-            #[project]
+-            match this.state.project() {
+-                State::Check(request) => {
+-                    let request = request
+-                        .take()
+-                        .expect("we either give it back or leave State::Check once we take");
+-
++            match mem::replace(&mut self.state, Invalid) {
++                Check(request) => {
+                     // Poll predicate
+-                    match this.check.as_mut().poll(cx)? {
+-                        Poll::Ready(_) => {
+-                            let response = this.service.call(request);
+-                            this.state.set(State::WaitResponse(response));
++                    match self.check.poll()? {
++                        Async::Ready(_) => {
++                            let response = self.service.call(request);
++                            self.state = WaitResponse(response);
+                         }
+-                        Poll::Pending => {
+-                            this.state.set(State::Check(Some(request)));
+-                            return Poll::Pending;
++                        Async::NotReady => {
++                            self.state = Check(request);
++                            return Ok(Async::NotReady);
+                         }
+                     }
+                 }
+-                State::WaitResponse(response) => {
+-                    return Poll::Ready(ready!(response.poll(cx)).map_err(Error::inner));
++                WaitResponse(mut response) => {
++                    let ret = response.poll().map_err(Error::inner);
++
++                    self.state = WaitResponse(response);
++
++                    return ret;
++                }
++                Invalid => {
++                    panic!("invalid state");
+                 }
+             }
+         }
+diff --git a/tower-filter/src/lib.rs b/tower-filter/src/lib.rs
+index 307248a..5aad80f 100644
+--- a/tower-filter/src/lib.rs
++++ b/tower-filter/src/lib.rs
+@@ -1,4 +1,4 @@
+-#![doc(html_root_url = "https://docs.rs/tower-filter/0.3.0-alpha.1")]
++#![doc(html_root_url = "https://docs.rs/tower-filter/0.1.0")]
+ #![deny(rust_2018_idioms)]
+ #![allow(elided_lifetimes_in_paths)]
+ 
+@@ -13,8 +13,7 @@ mod predicate;
+ pub use crate::{layer::FilterLayer, predicate::Predicate};
+ 
+ use crate::{error::Error, future::ResponseFuture};
+-use futures_core::ready;
+-use std::task::{Context, Poll};
++use futures::Poll;
+ use tower_service::Service;
+ 
+ #[derive(Clone, Debug)]
+@@ -39,8 +38,8 @@ where
+     type Error = Error;
+     type Future = ResponseFuture<U::Future, T, Request>;
+ 
+-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+-        Poll::Ready(ready!(self.inner.poll_ready(cx)).map_err(error::Error::inner))
++    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
++        self.inner.poll_ready().map_err(error::Error::inner)
+     }
+ 
+     fn call(&mut self, request: Request) -> Self::Future {
+diff --git a/tower-filter/src/predicate.rs b/tower-filter/src/predicate.rs
+index 6f842d1..970bee5 100644
+--- a/tower-filter/src/predicate.rs
++++ b/tower-filter/src/predicate.rs
+@@ -1,9 +1,9 @@
+ use crate::error::Error;
+-use std::future::Future;
++use futures::{Future, IntoFuture};
+ 
+ /// Checks a request
+ pub trait Predicate<Request> {
+-    type Future: Future<Output = Result<(), Error>>;
++    type Future: Future<Item = (), Error = Error>;
+ 
+     fn check(&mut self, request: &Request) -> Self::Future;
+ }
+@@ -11,11 +11,11 @@ pub trait Predicate<Request> {
+ impl<F, T, U> Predicate<T> for F
+ where
+     F: Fn(&T) -> U,
+-    U: Future<Output = Result<(), Error>>,
++    U: IntoFuture<Item = (), Error = Error>,
+ {
+-    type Future = U;
++    type Future = U::Future;
+ 
+     fn check(&mut self, request: &T) -> Self::Future {
+-        self(request)
++        self(request).into_future()
+     }
+ }
+diff --git a/tower-filter/tests/filter.rs b/tower-filter/tests/filter.rs
+index d6bf15b..5cc9569 100644
+--- a/tower-filter/tests/filter.rs
++++ b/tower-filter/tests/filter.rs
+@@ -1,17 +1,15 @@
+-use futures_util::{future::poll_fn, pin_mut};
+-use std::{future::Future, thread};
+-use tokio_test::{assert_ready, assert_ready_err, task};
++use futures::*;
++use std::thread;
+ use tower_filter::{error::Error, Filter};
+ use tower_service::Service;
+ use tower_test::{assert_request_eq, mock};
+ 
+-#[tokio::test]
+-async fn passthrough_sync() {
+-    let (mut service, handle) = new_service(|_| async { Ok(()) });
++#[test]
++fn passthrough_sync() {
++    let (mut service, mut handle) = new_service(|_| Ok(()));
+ 
+     let th = thread::spawn(move || {
+         // Receive the requests and respond
+-        pin_mut!(handle);
+         for i in 0..10 {
+             assert_request_eq!(handle, format!("ping-{}", i)).send_response(format!("pong-{}", i));
+         }
+@@ -19,32 +17,29 @@ async fn passthrough_sync() {
+ 
+     let mut responses = vec![];
+ 
+-    for i in 0usize..10 {
++    for i in 0..10 {
+         let request = format!("ping-{}", i);
+-        poll_fn(|cx| service.poll_ready(cx)).await.unwrap();
+-        let exchange = service.call(request);
+-        let exchange = async move {
+-            let response = exchange.await.unwrap();
++        assert!(service.poll_ready().unwrap().is_ready());
++        let exchange = service.call(request).and_then(move |response| {
+             let expect = format!("pong-{}", i);
+             assert_eq!(response.as_str(), expect.as_str());
+-        };
++
++            Ok(())
++        });
+ 
+         responses.push(exchange);
+     }
+ 
+-    futures_util::future::join_all(responses).await;
++    future::join_all(responses).wait().unwrap();
+     th.join().unwrap();
+ }
+ 
+ #[test]
+ fn rejected_sync() {
+-    task::mock(|cx| {
+-        let (mut service, _handle) = new_service(|_| async { Err(Error::rejected()) });
++    let (mut service, _handle) = new_service(|_| Err(Error::rejected()));
+ 
+-        let fut = service.call("hello".into());
+-        pin_mut!(fut);
+-        assert_ready_err!(fut.poll(cx));
+-    });
++    let response = service.call("hello".into()).wait();
++    assert!(response.is_err());
+ }
+ 
+ type Mock = mock::Mock<String, String>;
+@@ -53,7 +48,7 @@ type Handle = mock::Handle<String, String>;
+ fn new_service<F, U>(f: F) -> (Filter<Mock, F>, Handle)
+ where
+     F: Fn(&String) -> U,
+-    U: Future<Output = Result<(), Error>>,
++    U: IntoFuture<Item = (), Error = Error>,
+ {
+     let (service, handle) = mock::pair();
+     let service = Filter::new(service, f);

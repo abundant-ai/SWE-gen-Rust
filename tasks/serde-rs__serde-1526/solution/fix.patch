@@ -1,0 +1,140 @@
+diff --git a/serde/src/export.rs b/serde/src/export.rs
+index 805f45ab..cfbcf8c5 100644
+--- a/serde/src/export.rs
++++ b/serde/src/export.rs
+@@ -1,5 +1,5 @@
+ pub use lib::clone::Clone;
+-pub use lib::convert::{From, Into};
++pub use lib::convert::{From, Into, TryFrom};
+ pub use lib::default::Default;
+ pub use lib::fmt::{self, Formatter};
+ pub use lib::marker::PhantomData;
+diff --git a/serde_derive/src/de.rs b/serde_derive/src/de.rs
+index 4c788845..2b469555 100644
+--- a/serde_derive/src/de.rs
++++ b/serde_derive/src/de.rs
+@@ -269,6 +269,8 @@ fn deserialize_body(cont: &Container, params: &Parameters) -> Fragment {
+         deserialize_transparent(cont, params)
+     } else if let Some(type_from) = cont.attrs.type_from() {
+         deserialize_from(type_from)
++    } else if let Some(type_try_from) = cont.attrs.type_try_from() {
++        deserialize_try_from(type_try_from)
+     } else if let attr::Identifier::No = cont.attrs.identifier() {
+         match cont.data {
+             Data::Enum(ref variants) => deserialize_enum(params, variants, &cont.attrs),
+@@ -298,6 +300,7 @@ fn deserialize_in_place_body(cont: &Container, params: &Parameters) -> Option<St
+ 
+     if cont.attrs.transparent()
+         || cont.attrs.type_from().is_some()
++        || cont.attrs.type_try_from().is_some()
+         || cont.attrs.identifier().is_some()
+         || cont
+             .data
+@@ -390,6 +393,14 @@ fn deserialize_from(type_from: &syn::Type) -> Fragment {
+     }
+ }
+ 
++fn deserialize_try_from(type_try_from: &syn::Type) -> Fragment {
++    quote_block! {
++        _serde::export::Result::and_then(
++            <#type_try_from as _serde::Deserialize>::deserialize(__deserializer),
++            |v| _serde::export::TryFrom::try_from(v).map_err(_serde::de::Error::custom))
++    }
++}
++
+ fn deserialize_unit_struct(params: &Parameters, cattrs: &attr::Container) -> Fragment {
+     let this = &params.this;
+     let type_name = cattrs.name().deserialize_name();
+diff --git a/serde_derive/src/internals/attr.rs b/serde_derive/src/internals/attr.rs
+index 2bf7dc3f..cbdc28e9 100644
+--- a/serde_derive/src/internals/attr.rs
++++ b/serde_derive/src/internals/attr.rs
+@@ -215,6 +215,7 @@ pub struct Container {
+     de_bound: Option<Vec<syn::WherePredicate>>,
+     tag: TagType,
+     type_from: Option<syn::Type>,
++    type_try_from: Option<syn::Type>,
+     type_into: Option<syn::Type>,
+     remote: Option<syn::Path>,
+     identifier: Identifier,
+@@ -296,6 +297,7 @@ impl Container {
+         let mut internal_tag = Attr::none(cx, "tag");
+         let mut content = Attr::none(cx, "content");
+         let mut type_from = Attr::none(cx, "from");
++        let mut type_try_from = Attr::none(cx, "try_from");
+         let mut type_into = Attr::none(cx, "into");
+         let mut remote = Attr::none(cx, "remote");
+         let mut field_identifier = BoolAttr::none(cx, "field_identifier");
+@@ -557,6 +559,13 @@ impl Container {
+                         }
+                     }
+ 
++                    // Parse `#[serde(try_from = "Type")]
++                    Meta(NameValue(ref m)) if m.ident == "try_from" => {
++                        if let Ok(try_from_ty) = parse_lit_into_ty(cx, &m.ident, &m.lit) {
++                            type_try_from.set_opt(&m.ident, Some(try_from_ty));
++                        }
++                    }
++
+                     // Parse `#[serde(into = "Type")]
+                     Meta(NameValue(ref m)) if m.ident == "into" => {
+                         if let Ok(into_ty) = parse_lit_into_ty(cx, &m.ident, &m.lit) {
+@@ -619,6 +628,7 @@ impl Container {
+             de_bound: de_bound.get(),
+             tag: decide_tag(cx, item, untagged, internal_tag, content),
+             type_from: type_from.get(),
++            type_try_from: type_try_from.get(),
+             type_into: type_into.get(),
+             remote: remote.get(),
+             identifier: decide_identifier(cx, item, field_identifier, variant_identifier),
+@@ -663,6 +673,10 @@ impl Container {
+         self.type_from.as_ref()
+     }
+ 
++    pub fn type_try_from(&self) -> Option<&syn::Type> {
++        self.type_try_from.as_ref()
++    }
++
+     pub fn type_into(&self) -> Option<&syn::Type> {
+         self.type_into.as_ref()
+     }
+diff --git a/serde_derive/src/internals/check.rs b/serde_derive/src/internals/check.rs
+index 19d8dd87..870a1327 100644
+--- a/serde_derive/src/internals/check.rs
++++ b/serde_derive/src/internals/check.rs
+@@ -13,6 +13,7 @@ pub fn check(cx: &Ctxt, cont: &mut Container, derive: Derive) {
+     check_internal_tag_field_name_conflict(cx, cont);
+     check_adjacent_tag_conflict(cx, cont);
+     check_transparent(cx, cont, derive);
++    check_from_and_try_from(cx, cont);
+ }
+ 
+ /// Getters are only allowed inside structs (not enums) with the `remote`
+@@ -330,6 +331,13 @@ fn check_transparent(cx: &Ctxt, cont: &mut Container, derive: Derive) {
+         );
+     }
+ 
++    if cont.attrs.type_try_from().is_some() {
++        cx.error_spanned_by(
++            cont.original,
++            "#[serde(transparent)] is not allowed with #[serde(try_from = \"...\")]",
++        );
++    }
++
+     if cont.attrs.type_into().is_some() {
+         cx.error_spanned_by(
+             cont.original,
+@@ -410,3 +418,12 @@ fn allow_transparent(field: &Field, derive: Derive) -> bool {
+         Derive::Deserialize => !field.attrs.skip_deserializing() && field.attrs.default().is_none(),
+     }
+ }
++
++fn check_from_and_try_from(cx: &Ctxt, cont: &mut Container) {
++    if cont.attrs.type_from().is_some() && cont.attrs.type_try_from().is_some() {
++        cx.error_spanned_by(
++            cont.original,
++            "#[serde(from = \"...\")] and #[serde(try_from = \"...\")] conflict with each other",
++        );
++    }
++}
+\ No newline at end of file

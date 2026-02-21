@@ -1,0 +1,135 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index e35c633d..a8b2550c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -62,7 +62,7 @@ tokio = { version = "1", features = [
+ ] }
+ tokio-test = "0.4"
+ tokio-util = { version = "0.7", features = ["codec"] }
+-tower = { version = "0.4", default-features = false, features = ["make", "util"] }
++tower = { version = "0.4", features = ["make", "util"] }
+ url = "2.2"
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
+diff --git a/src/body/body.rs b/src/body/body.rs
+index 111867a5..699398b8 100644
+--- a/src/body/body.rs
++++ b/src/body/body.rs
+@@ -602,16 +602,17 @@ impl Sender {
+     }
+ 
+     /// Aborts the body in an abnormal fashion.
+-    pub fn abort(mut self) {
+-        self.send_error(crate::Error::new_body_write_aborted());
+-    }
+-
+-    pub(crate) fn send_error(&mut self, err: crate::Error) {
++    pub fn abort(self) {
+         let _ = self
+             .data_tx
+             // clone so the send works even if buffer is full
+             .clone()
+-            .try_send(Err(err));
++            .try_send(Err(crate::Error::new_body_write_aborted()));
++    }
++
++    #[cfg(feature = "http1")]
++    pub(crate) fn send_error(&mut self, err: crate::Error) {
++        let _ = self.data_tx.try_send(Err(err));
+     }
+ }
+ 
+diff --git a/src/proto/h1/dispatch.rs b/src/proto/h1/dispatch.rs
+index fddf639d..677131bf 100644
+--- a/src/proto/h1/dispatch.rs
++++ b/src/proto/h1/dispatch.rs
+@@ -118,10 +118,6 @@ where
+         should_shutdown: bool,
+     ) -> Poll<crate::Result<Dispatched>> {
+         Poll::Ready(ready!(self.poll_inner(cx, should_shutdown)).or_else(|e| {
+-            // Be sure to alert a streaming body of the failure.
+-            if let Some(mut body) = self.body_tx.take() {
+-                body.send_error(crate::Error::new_body("connection error"));
+-            }
+             // An error means we're shutting down either way.
+             // We just try to give the error to the user,
+             // and close the connection with an Ok. If we
+@@ -371,12 +367,7 @@ where
+                         self.conn.end_body()?;
+                     }
+                 } else {
+-                    // If there's no body_rx, end the body
+-                    if self.conn.can_write_body() {
+-                        self.conn.end_body()?;
+-                    } else {
+-                        return Poll::Pending;
+-                    }
++                    return Poll::Pending;
+                 }
+             }
+         }
+diff --git a/tests/server.rs b/tests/server.rs
+index 786bb4b4..191554da 100644
+--- a/tests/server.rs
++++ b/tests/server.rs
+@@ -93,7 +93,6 @@ mod response_body_lengths {
+     }
+ 
+     fn run_test(case: TestCase) {
+-        let _ = pretty_env_logger::try_init();
+         assert!(
+             case.version == 0 || case.version == 1,
+             "TestCase.version must 0 or 1"
+@@ -158,22 +157,18 @@ mod response_body_lengths {
+         let n = body.find("\r\n\r\n").unwrap() + 4;
+ 
+         if case.expects_chunked {
+-            if body_str.len() > 0 {
+-                let len = body.len();
+-                assert_eq!(
+-                    &body[n + 1..n + 3],
+-                    "\r\n",
+-                    "expected body chunk size header"
+-                );
+-                assert_eq!(&body[n + 3..len - 7], body_str, "expected body");
+-                assert_eq!(
+-                    &body[len - 7..],
+-                    "\r\n0\r\n\r\n",
+-                    "expected body final chunk size header"
+-                );
+-            } else {
+-                assert_eq!(&body[n..], "0\r\n\r\n");
+-            }
++            let len = body.len();
++            assert_eq!(
++                &body[n + 1..n + 3],
++                "\r\n",
++                "expected body chunk size header"
++            );
++            assert_eq!(&body[n + 3..len - 7], body_str, "expected body");
++            assert_eq!(
++                &body[len - 7..],
++                "\r\n0\r\n\r\n",
++                "expected body final chunk size header"
++            );
+         } else {
+             assert_eq!(&body[n..], body_str, "expected body");
+         }
+@@ -224,17 +219,6 @@ mod response_body_lengths {
+         });
+     }
+ 
+-    #[test]
+-    fn chunked_response_known_empty() {
+-        run_test(TestCase {
+-            version: 1,
+-            headers: &[("transfer-encoding", "chunked")],
+-            body: Bd::Known(""),
+-            expects_chunked: true, // should still send chunked, and 0\r\n\r\n
+-            expects_con_len: false,
+-        });
+-    }
+-
+     #[test]
+     fn chunked_response_unknown() {
+         run_test(TestCase {

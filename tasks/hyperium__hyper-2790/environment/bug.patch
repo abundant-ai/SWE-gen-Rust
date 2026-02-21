@@ -1,0 +1,199 @@
+diff --git a/src/client/dispatch.rs b/src/client/dispatch.rs
+index 0d70dbcc..1d2b87eb 100644
+--- a/src/client/dispatch.rs
++++ b/src/client/dispatch.rs
+@@ -86,7 +86,7 @@ impl<T, U> Sender<T, U> {
+         }
+         let (tx, rx) = oneshot::channel();
+         self.inner
+-            .send(Envelope(Some((val, Callback::Retry(Some(tx))))))
++            .send(Envelope(Some((val, Callback::Retry(tx)))))
+             .map(move |_| rx)
+             .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+     }
+@@ -97,7 +97,7 @@ impl<T, U> Sender<T, U> {
+         }
+         let (tx, rx) = oneshot::channel();
+         self.inner
+-            .send(Envelope(Some((val, Callback::NoRetry(Some(tx))))))
++            .send(Envelope(Some((val, Callback::NoRetry(tx)))))
+             .map(move |_| rx)
+             .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+     }
+@@ -124,7 +124,7 @@ impl<T, U> UnboundedSender<T, U> {
+     pub(crate) fn try_send(&mut self, val: T) -> Result<RetryPromise<T, U>, T> {
+         let (tx, rx) = oneshot::channel();
+         self.inner
+-            .send(Envelope(Some((val, Callback::Retry(Some(tx))))))
++            .send(Envelope(Some((val, Callback::Retry(tx)))))
+             .map(move |_| rx)
+             .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
+     }
+@@ -198,59 +198,33 @@ impl<T, U> Drop for Envelope<T, U> {
+ }
+ 
+ pub(crate) enum Callback<T, U> {
+-    Retry(Option<oneshot::Sender<Result<U, (crate::Error, Option<T>)>>>),
+-    NoRetry(Option<oneshot::Sender<Result<U, crate::Error>>>),
+-}
+-
+-impl<T, U> Drop for Callback<T, U> {
+-    fn drop(&mut self) {
+-        // FIXME(nox): What errors do we want here?
+-        let error = crate::Error::new_user_dispatch_gone().with(if std::thread::panicking() {
+-            "user code panicked"
+-        } else {
+-            "runtime dropped the dispatch task"
+-        });
+-
+-        match self {
+-            Callback::Retry(tx) => {
+-                if let Some(tx) = tx.take() {
+-                    let _ = tx.send(Err((error, None)));
+-                }
+-            }
+-            Callback::NoRetry(tx) => {
+-                if let Some(tx) = tx.take() {
+-                    let _ = tx.send(Err(error));
+-                }
+-            }
+-        }
+-    }
++    Retry(oneshot::Sender<Result<U, (crate::Error, Option<T>)>>),
++    NoRetry(oneshot::Sender<Result<U, crate::Error>>),
+ }
+ 
+ impl<T, U> Callback<T, U> {
+     #[cfg(feature = "http2")]
+     pub(crate) fn is_canceled(&self) -> bool {
+         match *self {
+-            Callback::Retry(Some(ref tx)) => tx.is_closed(),
+-            Callback::NoRetry(Some(ref tx)) => tx.is_closed(),
+-            _ => unreachable!(),
++            Callback::Retry(ref tx) => tx.is_closed(),
++            Callback::NoRetry(ref tx) => tx.is_closed(),
+         }
+     }
+ 
+     pub(crate) fn poll_canceled(&mut self, cx: &mut task::Context<'_>) -> Poll<()> {
+         match *self {
+-            Callback::Retry(Some(ref mut tx)) => tx.poll_closed(cx),
+-            Callback::NoRetry(Some(ref mut tx)) => tx.poll_closed(cx),
+-            _ => unreachable!(),
++            Callback::Retry(ref mut tx) => tx.poll_closed(cx),
++            Callback::NoRetry(ref mut tx) => tx.poll_closed(cx),
+         }
+     }
+ 
+-    pub(crate) fn send(mut self, val: Result<U, (crate::Error, Option<T>)>) {
++    pub(crate) fn send(self, val: Result<U, (crate::Error, Option<T>)>) {
+         match self {
+-            Callback::Retry(ref mut tx) => {
+-                let _ = tx.take().unwrap().send(val);
++            Callback::Retry(tx) => {
++                let _ = tx.send(val);
+             }
+-            Callback::NoRetry(ref mut tx) => {
+-                let _ = tx.take().unwrap().send(val.map_err(|e| e.0));
++            Callback::NoRetry(tx) => {
++                let _ = tx.send(val.map_err(|e| e.0));
+             }
+         }
+     }
+diff --git a/src/error.rs b/src/error.rs
+index 468f24cb..20acf3a7 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -137,10 +137,6 @@ pub(super) enum User {
+     #[cfg(feature = "server")]
+     WithoutShutdownNonHttp1,
+ 
+-    /// The dispatch task is gone.
+-    #[cfg(feature = "client")]
+-    DispatchGone,
+-
+     /// User aborted in an FFI callback.
+     #[cfg(feature = "ffi")]
+     AbortedByCallback,
+@@ -391,11 +387,6 @@ impl Error {
+         Error::new_user(User::AbortedByCallback)
+     }
+ 
+-    #[cfg(feature = "client")]
+-    pub(super) fn new_user_dispatch_gone() -> Error {
+-        Error::new(Kind::User(User::DispatchGone))
+-    }
+-
+     #[cfg(feature = "http2")]
+     pub(super) fn new_h2(cause: ::h2::Error) -> Error {
+         if cause.is_io() {
+@@ -492,8 +483,6 @@ impl Error {
+             Kind::User(User::WithoutShutdownNonHttp1) => {
+                 "without_shutdown() called on a non-HTTP/1 connection"
+             }
+-            #[cfg(feature = "client")]
+-            Kind::User(User::DispatchGone) => "dispatch task is gone",
+             #[cfg(feature = "ffi")]
+             Kind::User(User::AbortedByCallback) => "operation aborted by an application callback",
+         }
+diff --git a/src/ext.rs b/src/ext.rs
+index 224206dd..6c54821e 100644
+--- a/src/ext.rs
++++ b/src/ext.rs
+@@ -40,7 +40,6 @@ impl Protocol {
+         self.inner.as_str()
+     }
+ 
+-    #[cfg(feature = "server")]
+     pub(crate) fn from_inner(inner: h2::ext::Protocol) -> Self {
+         Self { inner }
+     }
+diff --git a/tests/client.rs b/tests/client.rs
+index 2d3737f6..88b3ee0d 100644
+--- a/tests/client.rs
++++ b/tests/client.rs
+@@ -3114,44 +3114,6 @@ mod conn {
+         done_tx.send(()).unwrap();
+     }
+ 
+-    #[tokio::test]
+-    async fn test_body_panics() {
+-        use hyper::body::HttpBody;
+-
+-        let _ = pretty_env_logger::try_init();
+-
+-        let listener = TkTcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+-            .await
+-            .unwrap();
+-        let addr = listener.local_addr().unwrap();
+-
+-        // spawn a server that reads but doesn't write
+-        tokio::spawn(async move {
+-            let sock = listener.accept().await.unwrap().0;
+-            drain_til_eof(sock).await.expect("server read");
+-        });
+-
+-        let io = tcp_connect(&addr).await.expect("tcp connect");
+-
+-        let (mut client, conn) = conn::Builder::new().handshake(io).await.expect("handshake");
+-
+-        tokio::spawn(async move {
+-            conn.await.expect("client conn shouldn't error");
+-        });
+-
+-        let req = Request::post("/a")
+-            .body(Body::from("baguette").map_data::<_, &[u8]>(|_| panic!("oopsie")))
+-            .unwrap();
+-
+-        let error = client.send_request(req).await.unwrap_err();
+-
+-        assert!(error.is_user());
+-        assert_eq!(
+-            error.to_string(),
+-            "dispatch task is gone: user code panicked"
+-        );
+-    }
+-
+     async fn drain_til_eof<T: AsyncRead + Unpin>(mut sock: T) -> io::Result<()> {
+         let mut buf = [0u8; 1024];
+         loop {
