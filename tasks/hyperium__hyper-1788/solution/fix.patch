@@ -1,0 +1,163 @@
+diff --git a/src/error.rs b/src/error.rs
+index 5bb75a34..24d0d657 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -5,6 +5,7 @@ use std::io;
+ 
+ use httparse;
+ use http;
++use h2;
+ 
+ /// Result type often returned from methods that can have hyper `Error`s.
+ pub type Result<T> = ::std::result::Result<T, Error>;
+@@ -137,10 +138,8 @@ impl Error {
+         self.inner.kind == Kind::Connect
+     }
+ 
+-    /// Returns the error's cause.
+-    ///
+-    /// This is identical to `Error::cause` except that it provides extra
+-    /// bounds required to be able to downcast the error.
++    #[doc(hidden)]
++    #[cfg_attr(error_source, deprecated(note = "use Error::source instead"))]
+     pub fn cause2(&self) -> Option<&(StdError + 'static + Sync + Send)> {
+         self.inner.cause.as_ref().map(|e| &**e)
+     }
+@@ -163,6 +162,45 @@ impl Error {
+         &self.inner.kind
+     }
+ 
++    #[cfg(not(error_source))]
++    pub(crate) fn h2_reason(&self) -> h2::Reason {
++        // Since we don't have access to `Error::source`, we can only
++        // look so far...
++        let mut cause = self.cause2();
++        while let Some(err) = cause {
++            if let Some(h2_err) = err.downcast_ref::<h2::Error>() {
++                return h2_err
++                    .reason()
++                    .unwrap_or(h2::Reason::INTERNAL_ERROR);
++            }
++
++            cause = err
++                .downcast_ref::<Error>()
++                .and_then(Error::cause2);
++        }
++
++        // else
++        h2::Reason::INTERNAL_ERROR
++    }
++
++    #[cfg(error_source)]
++    pub(crate) fn h2_reason(&self) -> h2::Reason {
++        // Find an h2::Reason somewhere in the cause stack, if it exists,
++        // otherwise assume an INTERNAL_ERROR.
++        let mut cause = self.source();
++        while let Some(err) = cause {
++            if let Some(h2_err) = err.downcast_ref::<h2::Error>() {
++                return h2_err
++                    .reason()
++                    .unwrap_or(h2::Reason::INTERNAL_ERROR);
++            }
++            cause = err.source();
++        }
++
++        // else
++        h2::Reason::INTERNAL_ERROR
++    }
++
+     pub(crate) fn new_canceled<E: Into<Cause>>(cause: Option<E>) -> Error {
+         Error::new(Kind::Canceled, cause.map(Into::into))
+     }
+@@ -400,4 +438,25 @@ impl AssertSendSync for Error {}
+ 
+ #[cfg(test)]
+ mod tests {
++    use super::*;
++
++    #[test]
++    fn h2_reason_unknown() {
++        let closed = Error::new_closed();
++        assert_eq!(closed.h2_reason(), h2::Reason::INTERNAL_ERROR);
++    }
++
++    #[test]
++    fn h2_reason_one_level() {
++        let body_err = Error::new_user_body(h2::Error::from(h2::Reason::ENHANCE_YOUR_CALM));
++        assert_eq!(body_err.h2_reason(), h2::Reason::ENHANCE_YOUR_CALM);
++    }
++
++    #[test]
++    fn h2_reason_nested() {
++        let recvd = Error::new_h2(h2::Error::from(h2::Reason::HTTP_1_1_REQUIRED));
++        // Suppose a user were proxying the received error
++        let svc_err = Error::new_user_service(recvd);
++        assert_eq!(svc_err.h2_reason(), h2::Reason::HTTP_1_1_REQUIRED);
++    }
+ }
+diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
+index 072799d8..ff702561 100644
+--- a/src/proto/h2/mod.rs
++++ b/src/proto/h2/mod.rs
+@@ -1,6 +1,6 @@
+ use bytes::Buf;
+ use futures::{Async, Future, Poll};
+-use h2::{Reason, SendStream};
++use h2::{SendStream};
+ use http::header::{
+     HeaderName, CONNECTION, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER,
+     TRANSFER_ENCODING, UPGRADE,
+@@ -91,10 +91,10 @@ where
+         }
+     }
+ 
+-    fn on_err(&mut self, err: S::Error) -> ::Error {
++    fn on_user_err(&mut self, err: S::Error) -> ::Error {
+         let err = ::Error::new_user_body(err);
+-        trace!("send body user stream error: {}", err);
+-        self.body_tx.send_reset(Reason::INTERNAL_ERROR);
++        debug!("send body user stream error: {}", err);
++        self.body_tx.send_reset(err.h2_reason());
+         err
+     }
+ 
+@@ -138,7 +138,7 @@ where
+                     }
+                 }
+ 
+-                match try_ready!(self.stream.poll_data().map_err(|e| self.on_err(e))) {
++                match try_ready!(self.stream.poll_data().map_err(|e| self.on_user_err(e))) {
+                     Some(chunk) => {
+                         let is_eos = self.stream.is_end_stream();
+                         trace!(
+@@ -175,7 +175,7 @@ where
+                     return Err(::Error::new_body_write(::h2::Error::from(reason)));
+                 }
+ 
+-                match try_ready!(self.stream.poll_trailers().map_err(|e| self.on_err(e))) {
++                match try_ready!(self.stream.poll_trailers().map_err(|e| self.on_user_err(e))) {
+                     Some(trailers) => {
+                         self.body_tx
+                             .send_trailers(trailers)
+diff --git a/src/proto/h2/server.rs b/src/proto/h2/server.rs
+index ac170944..16b91661 100644
+--- a/src/proto/h2/server.rs
++++ b/src/proto/h2/server.rs
+@@ -211,7 +211,7 @@ where
+                         Err(e) => {
+                             let err = ::Error::new_user_service(e);
+                             warn!("http2 service errored: {}", err);
+-                            self.reply.send_reset(Reason::INTERNAL_ERROR);
++                            self.reply.send_reset(err.h2_reason());
+                             return Err(err);
+                         },
+                     };
+@@ -232,7 +232,7 @@ where
+                             match self.reply.send_response(res, $eos) {
+                                 Ok(tx) => tx,
+                                 Err(e) => {
+-                                    trace!("send response error: {}", e);
++                                    debug!("send response error: {}", e);
+                                     self.reply.send_reset(Reason::INTERNAL_ERROR);
+                                     return Err(::Error::new_h2(e));
+                                 }

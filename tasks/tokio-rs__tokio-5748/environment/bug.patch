@@ -1,0 +1,273 @@
+diff --git a/tokio/src/runtime/scheduler/current_thread.rs b/tokio/src/runtime/scheduler/current_thread.rs
+index ac859de6..2cbe2973 100644
+--- a/tokio/src/runtime/scheduler/current_thread.rs
++++ b/tokio/src/runtime/scheduler/current_thread.rs
+@@ -2,8 +2,8 @@ use crate::future::poll_fn;
+ use crate::loom::sync::atomic::AtomicBool;
+ use crate::loom::sync::Arc;
+ use crate::runtime::driver::{self, Driver};
+-use crate::runtime::scheduler::{self, Defer, Inject};
+-use crate::runtime::task::{self, JoinHandle, OwnedTasks, Schedule, Task};
++use crate::runtime::scheduler::{self, Defer};
++use crate::runtime::task::{self, Inject, JoinHandle, OwnedTasks, Schedule, Task};
+ use crate::runtime::{blocking, context, Config, MetricsBatch, SchedulerMetrics, WorkerMetrics};
+ use crate::sync::notify::Notify;
+ use crate::util::atomic_cell::AtomicCell;
+diff --git a/tokio/src/runtime/scheduler/mod.rs b/tokio/src/runtime/scheduler/mod.rs
+index 93390453..118e555d 100644
+--- a/tokio/src/runtime/scheduler/mod.rs
++++ b/tokio/src/runtime/scheduler/mod.rs
+@@ -4,9 +4,6 @@ cfg_rt! {
+ 
+     mod defer;
+     use defer::Defer;
+-
+-    mod inject;
+-    pub(crate) use inject::Inject;
+ }
+ 
+ cfg_rt_multi_thread! {
+diff --git a/tokio/src/runtime/scheduler/multi_thread/queue.rs b/tokio/src/runtime/scheduler/multi_thread/queue.rs
+index c61c4de6..2a0ae833 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/queue.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/queue.rs
+@@ -3,8 +3,7 @@
+ use crate::loom::cell::UnsafeCell;
+ use crate::loom::sync::Arc;
+ use crate::runtime::scheduler::multi_thread::Stats;
+-use crate::runtime::scheduler::Inject;
+-use crate::runtime::task;
++use crate::runtime::task::{self, Inject};
+ 
+ use std::mem::{self, MaybeUninit};
+ use std::ptr;
+diff --git a/tokio/src/runtime/scheduler/multi_thread/worker.rs b/tokio/src/runtime/scheduler/multi_thread/worker.rs
+index 7b5b09f7..7b87a9c0 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/worker.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/worker.rs
+@@ -62,8 +62,8 @@ use crate::runtime::context;
+ use crate::runtime::scheduler::multi_thread::{
+     idle, queue, Counters, Handle, Idle, Parker, Stats, Unparker,
+ };
+-use crate::runtime::scheduler::{Defer, Inject};
+-use crate::runtime::task::OwnedTasks;
++use crate::runtime::scheduler::Defer;
++use crate::runtime::task::{Inject, OwnedTasks};
+ use crate::runtime::{
+     blocking, coop, driver, scheduler, task, Config, SchedulerMetrics, WorkerMetrics,
+ };
+diff --git a/tokio/src/runtime/scheduler/inject.rs b/tokio/src/runtime/task/inject.rs
+similarity index 94%
+rename from tokio/src/runtime/scheduler/inject.rs
+rename to tokio/src/runtime/task/inject.rs
+index 4b65449e..6b7eee07 100644
+--- a/tokio/src/runtime/scheduler/inject.rs
++++ b/tokio/src/runtime/task/inject.rs
+@@ -5,6 +5,7 @@ use crate::loom::sync::{Mutex, MutexGuard};
+ use crate::runtime::task;
+ 
+ use std::marker::PhantomData;
++use std::ptr::NonNull;
+ use std::sync::atomic::Ordering::{Acquire, Release};
+ 
+ /// Growable, MPMC queue used to inject new tasks into the scheduler and as an
+@@ -25,10 +26,10 @@ struct Pointers {
+     is_closed: bool,
+ 
+     /// Linked-list head.
+-    head: Option<task::RawTask>,
++    head: Option<NonNull<task::Header>>,
+ 
+     /// Linked-list tail.
+-    tail: Option<task::RawTask>,
++    tail: Option<NonNull<task::Header>>,
+ }
+ 
+ pub(crate) struct Pop<'a, T: 'static> {
+@@ -189,8 +190,8 @@ cfg_rt_multi_thread! {
+         #[inline]
+         fn push_batch_inner(
+             &self,
+-            batch_head: task::RawTask,
+-            batch_tail: task::RawTask,
++            batch_head: NonNull<task::Header>,
++            batch_tail: NonNull<task::Header>,
+             num: usize,
+         ) {
+             debug_assert!(get_next(batch_tail).is_none());
+@@ -281,12 +282,12 @@ impl Pointers {
+     }
+ }
+ 
+-fn get_next(task: task::RawTask) -> Option<task::RawTask> {
+-    unsafe { task.get_queue_next() }
++fn get_next(header: NonNull<task::Header>) -> Option<NonNull<task::Header>> {
++    unsafe { header.as_ref().queue_next.with(|ptr| *ptr) }
+ }
+ 
+-fn set_next(task: task::RawTask, val: Option<task::RawTask>) {
++fn set_next(header: NonNull<task::Header>, val: Option<NonNull<task::Header>>) {
+     unsafe {
+-        task.set_queue_next(val);
++        header.as_ref().set_next(val);
+     }
+ }
+diff --git a/tokio/src/runtime/task/mod.rs b/tokio/src/runtime/task/mod.rs
+index 932552fb..8da59cb0 100644
+--- a/tokio/src/runtime/task/mod.rs
++++ b/tokio/src/runtime/task/mod.rs
+@@ -182,6 +182,9 @@ mod id;
+ #[cfg_attr(not(tokio_unstable), allow(unreachable_pub))]
+ pub use id::{id, try_id, Id};
+ 
++mod inject;
++pub(super) use self::inject::Inject;
++
+ #[cfg(feature = "rt")]
+ mod abort;
+ mod join;
+@@ -195,7 +198,7 @@ mod list;
+ pub(crate) use self::list::{LocalOwnedTasks, OwnedTasks};
+ 
+ mod raw;
+-pub(crate) use self::raw::RawTask;
++use self::raw::RawTask;
+ 
+ mod state;
+ use self::state::State;
+@@ -332,17 +335,13 @@ cfg_rt! {
+ }
+ 
+ impl<S: 'static> Task<S> {
+-    unsafe fn new(raw: RawTask) -> Task<S> {
++    unsafe fn from_raw(ptr: NonNull<Header>) -> Task<S> {
+         Task {
+-            raw,
++            raw: RawTask::from_raw(ptr),
+             _p: PhantomData,
+         }
+     }
+ 
+-    unsafe fn from_raw(ptr: NonNull<Header>) -> Task<S> {
+-        Task::new(RawTask::from_raw(ptr))
+-    }
+-
+     #[cfg(all(
+         tokio_unstable,
+         tokio_taskdump,
+@@ -370,16 +369,22 @@ impl<S: 'static> Notified<S> {
+ }
+ 
+ impl<S: 'static> Notified<S> {
+-    pub(crate) unsafe fn from_raw(ptr: RawTask) -> Notified<S> {
+-        Notified(Task::new(ptr))
++    unsafe fn from_raw(ptr: NonNull<Header>) -> Notified<S> {
++        Notified(Task::from_raw(ptr))
+     }
+ }
+ 
+-impl<S: 'static> Notified<S> {
+-    pub(crate) fn into_raw(self) -> RawTask {
+-        let raw = self.0.raw;
++impl<S: 'static> Task<S> {
++    fn into_raw(self) -> NonNull<Header> {
++        let ret = self.raw.header_ptr();
+         mem::forget(self);
+-        raw
++        ret
++    }
++}
++
++impl<S: 'static> Notified<S> {
++    fn into_raw(self) -> NonNull<Header> {
++        self.0.into_raw()
+     }
+ }
+ 
+diff --git a/tokio/src/runtime/task/raw.rs b/tokio/src/runtime/task/raw.rs
+index 80788592..72bfa3f4 100644
+--- a/tokio/src/runtime/task/raw.rs
++++ b/tokio/src/runtime/task/raw.rs
+@@ -6,7 +6,7 @@ use std::ptr::NonNull;
+ use std::task::{Poll, Waker};
+ 
+ /// Raw task handle
+-pub(crate) struct RawTask {
++pub(in crate::runtime) struct RawTask {
+     ptr: NonNull<Header>,
+ }
+ 
+@@ -240,27 +240,6 @@ impl RawTask {
+     pub(super) fn ref_inc(self) {
+         self.header().state.ref_inc();
+     }
+-
+-    /// Get the queue-next pointer
+-    ///
+-    /// This is for usage by the injection queue
+-    ///
+-    /// Safety: make sure only one queue uses this and access is synchronized.
+-    pub(crate) unsafe fn get_queue_next(self) -> Option<RawTask> {
+-        self.header()
+-            .queue_next
+-            .with(|ptr| *ptr)
+-            .map(|p| RawTask::from_raw(p))
+-    }
+-
+-    /// Sets the queue-next pointer
+-    ///
+-    /// This is for usage by the injection queue
+-    ///
+-    /// Safety: make sure only one queue uses this and access is synchronized.
+-    pub(crate) unsafe fn set_queue_next(self, val: Option<RawTask>) {
+-        self.header().set_next(val.map(|task| task.ptr));
+-    }
+ }
+ 
+ impl Clone for RawTask {
+diff --git a/tokio/src/runtime/task/trace/mod.rs b/tokio/src/runtime/task/trace/mod.rs
+index 6299d75d..99abc754 100644
+--- a/tokio/src/runtime/task/trace/mod.rs
++++ b/tokio/src/runtime/task/trace/mod.rs
+@@ -1,6 +1,7 @@
+ use crate::loom::sync::Arc;
+ use crate::runtime::context;
+-use crate::runtime::scheduler::{self, current_thread, Inject};
++use crate::runtime::scheduler::{self, current_thread};
++use crate::runtime::task::Inject;
+ 
+ use backtrace::BacktraceFrame;
+ use std::cell::Cell;
+diff --git a/tokio/src/runtime/tests/inject.rs b/tokio/src/runtime/tests/inject.rs
+index 149654d1..92431855 100644
+--- a/tokio/src/runtime/tests/inject.rs
++++ b/tokio/src/runtime/tests/inject.rs
+@@ -1,4 +1,4 @@
+-use crate::runtime::scheduler::Inject;
++use crate::runtime::task::Inject;
+ 
+ #[test]
+ fn push_and_pop() {
+diff --git a/tokio/src/runtime/tests/loom_queue.rs b/tokio/src/runtime/tests/loom_queue.rs
+index 756f7b84..eb85807a 100644
+--- a/tokio/src/runtime/tests/loom_queue.rs
++++ b/tokio/src/runtime/tests/loom_queue.rs
+@@ -1,5 +1,5 @@
+ use crate::runtime::scheduler::multi_thread::{queue, Stats};
+-use crate::runtime::scheduler::Inject;
++use crate::runtime::task::Inject;
+ use crate::runtime::tests::NoopSchedule;
+ 
+ use loom::thread;
+diff --git a/tokio/src/runtime/tests/queue.rs b/tokio/src/runtime/tests/queue.rs
+index 5642d29d..2e42f1bb 100644
+--- a/tokio/src/runtime/tests/queue.rs
++++ b/tokio/src/runtime/tests/queue.rs
+@@ -1,6 +1,5 @@
+ use crate::runtime::scheduler::multi_thread::{queue, Stats};
+-use crate::runtime::scheduler::Inject;
+-use crate::runtime::task::{self, Schedule, Task};
++use crate::runtime::task::{self, Inject, Schedule, Task};
+ 
+ use std::thread;
+ use std::time::Duration;

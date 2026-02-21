@@ -1,0 +1,231 @@
+diff --git a/tower-buffer/src/layer.rs b/tower-buffer/src/layer.rs
+index 900f739..8b82145 100644
+--- a/tower-buffer/src/layer.rs
++++ b/tower-buffer/src/layer.rs
+@@ -41,10 +41,6 @@ where
+     type Service = Buffer<S, Request>;
+ 
+     fn layer(&self, service: S) -> Result<Self::Service, Self::LayerError> {
+-        Ok(Buffer::with_executor(
+-            service,
+-            self.bound,
+-            &mut self.executor.clone(),
+-        ))
++        Buffer::with_executor(service, self.bound, &mut self.executor.clone())
+     }
+ }
+diff --git a/tower-buffer/src/service.rs b/tower-buffer/src/service.rs
+index 337a95b..82f804a 100644
+--- a/tower-buffer/src/service.rs
++++ b/tower-buffer/src/service.rs
+@@ -1,5 +1,5 @@
+ use crate::{
+-    error::{Error, SpawnError},
++    error::Error,
+     future::ResponseFuture,
+     message::Message,
+     worker::{Handle, Worker, WorkerExecutor},
+@@ -18,7 +18,7 @@ where
+     T: Service<Request>,
+ {
+     tx: mpsc::Sender<Message<Request, T::Future>>,
+-    worker: Option<Handle>,
++    worker: Handle,
+ }
+ 
+ impl<T, Request> Buffer<T, Request>
+@@ -33,7 +33,7 @@ where
+     ///
+     /// The default Tokio executor is used to run the given service, which means that this method
+     /// must be called while on the Tokio runtime.
+-    pub fn new(service: T, bound: usize) -> Self
++    pub fn new(service: T, bound: usize) -> Result<Self, Error>
+     where
+         T: Send + 'static,
+         T::Future: Send,
+@@ -51,24 +51,13 @@ where
+     ///
+     /// `bound` gives the maximal number of requests that can be queued for the service before
+     /// backpressure is applied to callers.
+-    pub fn with_executor<E>(service: T, bound: usize, executor: &mut E) -> Self
++    pub fn with_executor<E>(service: T, bound: usize, executor: &mut E) -> Result<Self, Error>
+     where
+         E: WorkerExecutor<T, Request>,
+     {
+         let (tx, rx) = mpsc::channel(bound);
+-        let worker = Worker::spawn(service, rx, executor);
+-        Buffer { tx, worker }
+-    }
+ 
+-    fn get_worker_error(&self) -> Error {
+-        self.worker
+-            .as_ref()
+-            .map(|w| w.get_error_on_closed())
+-            .unwrap_or_else(|| {
+-                // If there's no worker handle, that's because spawning it
+-                // at the beginning failed.
+-                SpawnError::new().into()
+-            })
++        Worker::spawn(service, rx, executor).map(|worker| Buffer { tx, worker })
+     }
+ }
+ 
+@@ -83,7 +72,9 @@ where
+ 
+     fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+         // If the inner service has errored, then we error here.
+-        self.tx.poll_ready().map_err(|_| self.get_worker_error())
++        self.tx
++            .poll_ready()
++            .map_err(|_| self.worker.get_error_on_closed())
+     }
+ 
+     fn call(&mut self, request: Request) -> Self::Future {
+@@ -96,7 +87,7 @@ where
+         match self.tx.try_send(Message { request, tx }) {
+             Err(e) => {
+                 if e.is_closed() {
+-                    ResponseFuture::failed(self.get_worker_error())
++                    ResponseFuture::failed(self.worker.get_error_on_closed())
+                 } else {
+                     // When `mpsc::Sender::poll_ready` returns `Ready`, a slot
+                     // in the channel is reserved for the handle. Other `Sender`
+diff --git a/tower-buffer/src/worker.rs b/tower-buffer/src/worker.rs
+index a9955a8..52a4f36 100644
+--- a/tower-buffer/src/worker.rs
++++ b/tower-buffer/src/worker.rs
+@@ -1,5 +1,5 @@
+ use crate::{
+-    error::{Closed, Error, ServiceError},
++    error::{Closed, Error, ServiceError, SpawnError},
+     message::Message,
+ };
+ use futures::{try_ready, Async, Future, Poll, Stream};
+@@ -58,7 +58,7 @@ where
+         service: T,
+         rx: mpsc::Receiver<Message<Request, T::Future>>,
+         executor: &mut E,
+-    ) -> Option<Handle>
++    ) -> Result<Handle, Error>
+     where
+         E: WorkerExecutor<T, Request>,
+     {
+@@ -76,8 +76,8 @@ where
+         };
+ 
+         match executor.spawn(worker) {
+-            Ok(()) => Some(handle),
+-            Err(_) => None,
++            Ok(()) => Ok(handle),
++            Err(_) => Err(SpawnError::new().into()),
+         }
+     }
+ 
+diff --git a/tower-buffer/tests/buffer.rs b/tower-buffer/tests/buffer.rs
+index 196918b..3f61b6e 100644
+--- a/tower-buffer/tests/buffer.rs
++++ b/tower-buffer/tests/buffer.rs
+@@ -99,46 +99,20 @@ fn when_inner_fails() {
+     });
+ }
+ 
+-#[test]
+-fn when_spawn_fails() {
+-    let (service, _handle) = mock::pair::<(), ()>();
+-
+-    let mut exec = ExecFn(|_| Err(()));
+-
+-    let mut service = Buffer::with_executor(service, 1, &mut exec);
+-
+-    let err = with_task(|| {
+-        service
+-            .poll_ready()
+-            .expect_err("buffer poll_ready should error")
+-    });
+-
+-    assert!(
+-        err.is::<error::SpawnError>(),
+-        "should be a SpawnError: {:?}",
+-        err
+-    );
+-}
+-
+ #[test]
+ fn poll_ready_when_worker_is_dropped_early() {
+     let (service, _handle) = mock::pair::<(), ()>();
+ 
+     // drop that worker right on the floor!
+-    let mut exec = ExecFn(|fut| {
+-        drop(fut);
+-        Ok(())
+-    });
++    let mut exec = ExecFn(drop);
+ 
+-    let mut service = Buffer::with_executor(service, 1, &mut exec);
++    let mut service = Buffer::with_executor(service, 1, &mut exec).unwrap();
+ 
+-    let err = with_task(|| {
++    with_task(|| {
+         service
+             .poll_ready()
+-            .expect_err("buffer poll_ready should error")
++            .expect_err("buffer poll_ready should error");
+     });
+-
+-    assert!(err.is::<error::Closed>(), "should be a Closed: {:?}", err);
+ }
+ 
+ #[test]
+@@ -147,12 +121,9 @@ fn response_future_when_worker_is_dropped_early() {
+ 
+     // hold the worker in a cell until we want to drop it later
+     let cell = RefCell::new(None);
+-    let mut exec = ExecFn(|fut| {
+-        *cell.borrow_mut() = Some(fut);
+-        Ok(())
+-    });
++    let mut exec = ExecFn(|fut| *cell.borrow_mut() = Some(fut));
+ 
+-    let mut service = Buffer::with_executor(service, 1, &mut exec);
++    let mut service = Buffer::with_executor(service, 1, &mut exec).unwrap();
+ 
+     // keep the request in the worker
+     handle.allow(0);
+@@ -161,8 +132,7 @@ fn response_future_when_worker_is_dropped_early() {
+     // drop the worker (like an executor closing up)
+     cell.borrow_mut().take();
+ 
+-    let err = response.wait().expect_err("res.wait");
+-    assert!(err.is::<error::Closed>(), "should be a Closed: {:?}", err);
++    response.wait().expect_err("res.wait");
+ }
+ 
+ type Mock = mock::Mock<&'static str, &'static str>;
+@@ -186,22 +156,23 @@ struct ExecFn<Func>(Func);
+ 
+ impl<Func, F> TypedExecutor<F> for ExecFn<Func>
+ where
+-    Func: Fn(F) -> Result<(), ()>,
++    Func: Fn(F),
+     F: Future<Item = (), Error = ()> + Send + 'static,
+ {
+     fn spawn(&mut self, fut: F) -> Result<(), SpawnError> {
+-        (self.0)(fut).map_err(|()| SpawnError::shutdown())
++        (self.0)(fut);
++        Ok(())
+     }
+ }
+ 
+ fn new_service() -> (Buffer<Mock, &'static str>, Handle) {
+     let (service, handle) = mock::pair();
+     // bound is >0 here because clears_canceled_requests needs multiple outstanding requests
+-    let service = Buffer::with_executor(service, 10, &mut Exec);
++    let service = Buffer::with_executor(service, 10, &mut Exec).unwrap();
+     (service, handle)
+ }
+ 
+ fn with_task<F: FnOnce() -> U, U>(f: F) -> U {
+-    use futures::future::lazy;
++    use futures::future::{lazy, Future};
+     lazy(|| Ok::<_, ()>(f())).wait().unwrap()
+ }

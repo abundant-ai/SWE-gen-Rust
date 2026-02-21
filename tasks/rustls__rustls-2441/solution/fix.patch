@@ -1,0 +1,853 @@
+diff --git a/rustls/src/client/ech.rs b/rustls/src/client/ech.rs
+index fb2d9924..dec0f6ef 100644
+--- a/rustls/src/client/ech.rs
++++ b/rustls/src/client/ech.rs
+@@ -19,7 +19,7 @@ use crate::msgs::handshake::{
+     ClientExtension, ClientHelloPayload, EchConfigContents, EchConfigPayload, Encoding,
+     EncryptedClientHello, EncryptedClientHelloOuter, HandshakeMessagePayload, HandshakePayload,
+     HelloRetryRequest, HpkeKeyConfig, HpkeSymmetricCipherSuite, PresharedKeyBinder,
+-    PresharedKeyOffer, Random, ServerHelloPayload,
++    PresharedKeyOffer, Random, ServerHelloPayload, ServerNamePayload,
+ };
+ use crate::msgs::message::{Message, MessagePayload};
+ use crate::msgs::persist;
+@@ -620,7 +620,9 @@ impl EchState {
+                 if let Some(sni_value) = inner_sni {
+                     inner_hello
+                         .extensions
+-                        .push(ClientExtension::make_sni(&sni_value.borrow()));
++                        .push(ClientExtension::ServerName(ServerNamePayload::from(
++                            sni_value,
++                        )));
+                 }
+                 // We don't want to add, or compress, the SNI from the outer hello.
+                 continue;
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index 35bd5114..5e10682c 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -29,10 +29,12 @@ use crate::msgs::base::Payload;
+ use crate::msgs::enums::{
+     CertificateType, Compression, ECPointFormat, ExtensionType, PskKeyExchangeMode,
+ };
++use crate::msgs::handshake::ProtocolName;
++use crate::msgs::handshake::SupportedProtocolVersions;
+ use crate::msgs::handshake::{
+     CertificateStatusRequest, ClientExtension, ClientHelloPayload, ClientSessionTicket,
+-    ConvertProtocolNameList, HandshakeMessagePayload, HandshakePayload, HasServerExtensions,
+-    HelloRetryRequest, KeyShareEntry, Random, SessionId,
++    HandshakeMessagePayload, HandshakePayload, HasServerExtensions, HelloRetryRequest,
++    KeyShareEntry, Random, SessionId,
+ };
+ use crate::msgs::message::{Message, MessagePayload};
+ use crate::msgs::persist;
+@@ -249,31 +251,21 @@ fn emit_client_hello_for_retry(
+     // Defense in depth: the ECH state should be None if ECH is disabled based on config
+     // builder semantics.
+     let forbids_tls12 = cx.common.is_quic() || ech_state.is_some();
+-    let support_tls12 = config.supports_version(ProtocolVersion::TLSv1_2) && !forbids_tls12;
+-    let support_tls13 = config.supports_version(ProtocolVersion::TLSv1_3);
+ 
+-    let mut supported_versions = Vec::new();
+-    if support_tls13 {
+-        supported_versions.push(ProtocolVersion::TLSv1_3);
+-    }
+-
+-    if support_tls12 {
+-        supported_versions.push(ProtocolVersion::TLSv1_2);
+-    }
++    let supported_versions = SupportedProtocolVersions {
++        tls12: config.supports_version(ProtocolVersion::TLSv1_2) && !forbids_tls12,
++        tls13: config.supports_version(ProtocolVersion::TLSv1_3),
++    };
+ 
+     // should be unreachable thanks to config builder
+-    assert!(!supported_versions.is_empty());
++    assert!(supported_versions.any(|_| true));
+ 
+     // offer groups which are usable for any offered version
+     let offered_groups = config
+         .provider
+         .kx_groups
+         .iter()
+-        .filter(|skxg| {
+-            supported_versions
+-                .iter()
+-                .any(|v| skxg.usable_for_version(*v))
+-        })
++        .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
+         .map(|skxg| skxg.name())
+         .collect();
+ 
+@@ -289,7 +281,7 @@ fn emit_client_hello_for_retry(
+         ClientExtension::CertificateStatusRequest(CertificateStatusRequest::build_ocsp()),
+     ];
+ 
+-    if support_tls13 {
++    if supported_versions.tls13 {
+         if let Some(cas_extension) = config.verifier.root_hint_subjects() {
+             exts.push(ClientExtension::AuthorityNames(cas_extension.to_owned()));
+         }
+@@ -312,13 +304,15 @@ fn emit_client_hello_for_retry(
+         // as the SNI domain name. This happens unconditionally so we ignore the
+         // `enable_sni` value. That will be used later to decide what to do for
+         // the protected inner hello's SNI.
+-        (Some(ech_state), _) => exts.push(ClientExtension::make_sni(&ech_state.outer_name)),
++        (Some(ech_state), _) => {
++            exts.push(ClientExtension::ServerName((&ech_state.outer_name).into()))
++        }
+ 
+         // If we have no ECH state, and SNI is enabled, try to use the input server_name
+         // for the SNI domain name.
+         (None, true) => {
+             if let ServerName::DnsName(dns_name) = &input.server_name {
+-                exts.push(ClientExtension::make_sni(dns_name))
++                exts.push(ClientExtension::ServerName(dns_name.into()));
+             }
+         }
+ 
+@@ -327,7 +321,7 @@ fn emit_client_hello_for_retry(
+     };
+ 
+     if let Some(key_share) = &key_share {
+-        debug_assert!(support_tls13);
++        debug_assert!(supported_versions.tls13);
+         let mut shares = vec![KeyShareEntry::new(key_share.group(), key_share.pub_key())];
+ 
+         if !retryreq
+@@ -358,7 +352,7 @@ fn emit_client_hello_for_retry(
+         exts.push(ClientExtension::Cookie(cookie.clone()));
+     }
+ 
+-    if support_tls13 {
++    if supported_versions.tls13 {
+         // We could support PSK_KE here too. Such connections don't
+         // have forward secrecy, and are similar to TLS1.2 resumption.
+         let psk_modes = vec![PskKeyExchangeMode::PSK_DHE_KE];
+@@ -367,29 +361,29 @@ fn emit_client_hello_for_retry(
+ 
+     // Add ALPN extension if we have any protocols
+     if !input.hello.alpn_protocols.is_empty() {
+-        exts.push(ClientExtension::Protocols(Vec::from_slices(
+-            &input
++        exts.push(ClientExtension::Protocols(
++            input
+                 .hello
+                 .alpn_protocols
+                 .iter()
+-                .map(|proto| &proto[..])
++                .map(|proto| ProtocolName::from(proto.clone()))
+                 .collect::<Vec<_>>(),
+-        )));
++        ));
+     }
+ 
+-    input.hello.offered_cert_compression = if support_tls13 && !config.cert_decompressors.is_empty()
+-    {
+-        exts.push(ClientExtension::CertificateCompressionAlgorithms(
+-            config
+-                .cert_decompressors
+-                .iter()
+-                .map(|dec| dec.algorithm())
+-                .collect(),
+-        ));
+-        true
+-    } else {
+-        false
+-    };
++    input.hello.offered_cert_compression =
++        if supported_versions.tls13 && !config.cert_decompressors.is_empty() {
++            exts.push(ClientExtension::CertificateCompressionAlgorithms(
++                config
++                    .cert_decompressors
++                    .iter()
++                    .map(|dec| dec.algorithm())
++                    .collect(),
++            ));
++            true
++        } else {
++            false
++        };
+ 
+     if config
+         .client_auth_cert_resolver
+@@ -602,7 +596,7 @@ fn emit_client_hello_for_retry(
+         ech_state,
+     };
+ 
+-    Ok(if support_tls13 && retryreq.is_none() {
++    Ok(if supported_versions.tls13 && retryreq.is_none() {
+         Box::new(ExpectServerHelloOrHelloRetryRequest { next, extra_exts })
+     } else {
+         Box::new(next)
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 70b7d0e7..ca7c1500 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -1084,7 +1084,7 @@ impl State<ClientConnectionData> for ExpectCertificate {
+                 PeerMisbehaved::BadCertChainExtensions,
+             ));
+         }
+-        let end_entity_ocsp = cert_chain.end_entity_ocsp();
++        let end_entity_ocsp = cert_chain.end_entity_ocsp().to_vec();
+         let server_cert = ServerCertDetails::new(
+             cert_chain
+                 .into_certificate_chain()
+diff --git a/rustls/src/lib.rs b/rustls/src/lib.rs
+index d19183ef..8dec9a50 100644
+--- a/rustls/src/lib.rs
++++ b/rustls/src/lib.rs
+@@ -487,7 +487,7 @@ pub mod internal {
+                 CertificateChain, ClientExtension, ClientHelloPayload, DistinguishedName,
+                 EchConfigContents, EchConfigPayload, HandshakeMessagePayload, HandshakePayload,
+                 HpkeKeyConfig, HpkeSymmetricCipherSuite, KeyShareEntry, Random, ServerExtension,
+-                ServerName, SessionId,
++                SessionId,
+             };
+         }
+         pub mod message {
+diff --git a/rustls/src/msgs/codec.rs b/rustls/src/msgs/codec.rs
+index b73e713c..17cf35c6 100644
+--- a/rustls/src/msgs/codec.rs
++++ b/rustls/src/msgs/codec.rs
+@@ -225,22 +225,7 @@ impl<'a, T: Codec<'a> + TlsListElement + Debug> Codec<'a> for Vec<T> {
+     }
+ 
+     fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+-        let len = match T::SIZE_LEN {
+-            ListLength::NonZeroU8 { empty_error } => match usize::from(u8::read(r)?) {
+-                0 => return Err(empty_error),
+-                len => len,
+-            },
+-            ListLength::U16 => usize::from(u16::read(r)?),
+-            ListLength::NonZeroU16 { empty_error } => match usize::from(u16::read(r)?) {
+-                0 => return Err(empty_error),
+-                len => len,
+-            },
+-            ListLength::U24 { max, error } => match usize::from(u24::read(r)?) {
+-                len if len > max => return Err(error),
+-                len => len,
+-            },
+-        };
+-
++        let len = T::SIZE_LEN.read(r)?;
+         let mut sub = r.sub(len)?;
+         let mut ret = Self::new();
+         while sub.any_left() {
+@@ -280,6 +265,26 @@ pub(crate) enum ListLength {
+     U24 { max: usize, error: InvalidMessage },
+ }
+ 
++impl ListLength {
++    pub(crate) fn read(&self, r: &mut Reader<'_>) -> Result<usize, InvalidMessage> {
++        Ok(match self {
++            Self::NonZeroU8 { empty_error } => match usize::from(u8::read(r)?) {
++                0 => return Err(*empty_error),
++                len => len,
++            },
++            Self::U16 => usize::from(u16::read(r)?),
++            Self::NonZeroU16 { empty_error } => match usize::from(u16::read(r)?) {
++                0 => return Err(*empty_error),
++                len => len,
++            },
++            Self::U24 { max, error } => match usize::from(u24::read(r)?) {
++                len if len > *max => return Err(*error),
++                len => len,
++            },
++        })
++    }
++}
++
+ /// Tracks encoding a length-delimited structure in a single pass.
+ pub(crate) struct LengthPrefixedBuffer<'a> {
+     pub(crate) buf: &'a mut Vec<u8>,
+diff --git a/rustls/src/msgs/handshake.rs b/rustls/src/msgs/handshake.rs
+index 152e9a89..453de5b7 100644
+--- a/rustls/src/msgs/handshake.rs
++++ b/rustls/src/msgs/handshake.rs
+@@ -228,100 +228,131 @@ impl TlsListElement for SignatureScheme {
+ }
+ 
+ #[derive(Clone, Debug)]
+-pub(crate) enum ServerNamePayload {
+-    HostName(DnsName<'static>),
+-    IpAddress(PayloadU16),
+-    Unknown(Payload<'static>),
+-}
+-
+-impl ServerNamePayload {
+-    pub(crate) fn new_hostname(hostname: DnsName<'static>) -> Self {
+-        Self::HostName(hostname)
+-    }
++pub enum ServerNamePayload<'a> {
++    /// A successfully decoded value:
++    SingleDnsName(DnsName<'a>),
+ 
+-    fn read_hostname(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+-        use pki_types::ServerName;
+-        let raw = PayloadU16::read(r)?;
++    /// A DNS name which was actually an IP address
++    IpAddress,
+ 
+-        match ServerName::try_from(raw.0.as_slice()) {
+-            Ok(ServerName::DnsName(d)) => Ok(Self::HostName(d.to_owned())),
+-            Ok(ServerName::IpAddress(_)) => Ok(Self::IpAddress(raw)),
+-            Ok(_) | Err(_) => {
+-                warn!(
+-                    "Illegal SNI hostname received {:?}",
+-                    String::from_utf8_lossy(&raw.0)
+-                );
+-                Err(InvalidMessage::InvalidServerName)
+-            }
+-        }
+-    }
++    /// A successfully decoded, but syntactically-invalid value.
++    Invalid,
++}
+ 
+-    fn encode(&self, bytes: &mut Vec<u8>) {
++impl ServerNamePayload<'_> {
++    fn into_owned(self) -> ServerNamePayload<'static> {
+         match self {
+-            Self::HostName(name) => {
+-                (name.as_ref().len() as u16).encode(bytes);
+-                bytes.extend_from_slice(name.as_ref().as_bytes());
+-            }
+-            Self::IpAddress(r) => r.encode(bytes),
+-            Self::Unknown(r) => r.encode(bytes),
++            Self::SingleDnsName(d) => ServerNamePayload::SingleDnsName(d.to_owned()),
++            Self::IpAddress => ServerNamePayload::IpAddress,
++            Self::Invalid => ServerNamePayload::Invalid,
+         }
+     }
+-}
+ 
+-#[derive(Clone, Debug)]
+-pub struct ServerName {
+-    pub(crate) typ: ServerNameType,
+-    pub(crate) payload: ServerNamePayload,
++    /// RFC6066: `ServerName server_name_list<1..2^16-1>`
++    const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
++        empty_error: InvalidMessage::IllegalEmptyList("ServerNames"),
++    };
+ }
+ 
+-impl Codec<'_> for ServerName {
++/// Simplified encoding/decoding for a `ServerName` extension payload to/from `DnsName`
++///
++/// This is possible because:
++///
++/// - the spec (RFC6066) disallows multiple names for a given name type
++/// - name types other than ServerNameType::HostName are not defined, and they and
++///   any data that follows them cannot be skipped over.
++impl<'a> Codec<'a> for ServerNamePayload<'a> {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+-        self.typ.encode(bytes);
+-        self.payload.encode(bytes);
++        let server_name_list = LengthPrefixedBuffer::new(Self::SIZE_LEN, bytes);
++
++        let ServerNamePayload::SingleDnsName(dns_name) = self else {
++            return;
++        };
++
++        ServerNameType::HostName.encode(server_name_list.buf);
++        let name_slice = dns_name.as_ref().as_bytes();
++        (name_slice.len() as u16).encode(server_name_list.buf);
++        server_name_list
++            .buf
++            .extend_from_slice(name_slice);
+     }
+ 
+-    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+-        let typ = ServerNameType::read(r)?;
++    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
++        let mut found = None;
+ 
+-        let payload = match typ {
+-            ServerNameType::HostName => ServerNamePayload::read_hostname(r)?,
+-            _ => ServerNamePayload::Unknown(Payload::read(r).into_owned()),
+-        };
++        let len = Self::SIZE_LEN.read(r)?;
++        let mut sub = r.sub(len)?;
+ 
+-        Ok(Self { typ, payload })
++        while sub.any_left() {
++            let typ = ServerNameType::read(&mut sub)?;
++
++            let payload = match typ {
++                ServerNameType::HostName => HostNamePayload::read(&mut sub)?,
++                _ => {
++                    // Consume remainder of extension bytes.  Since the length of the item
++                    // is an unknown encoding, we cannot continue.
++                    sub.rest();
++                    break;
++                }
++            };
++
++            // "The ServerNameList MUST NOT contain more than one name of
++            // the same name_type." - RFC6066
++            if found.is_some() {
++                warn!("Illegal SNI extension: duplicate host_name received");
++                return Err(InvalidMessage::InvalidServerName);
++            }
++
++            found = match payload {
++                HostNamePayload::HostName(dns_name) => {
++                    Some(Self::SingleDnsName(dns_name.to_owned()))
++                }
++
++                HostNamePayload::IpAddress(_invalid) => {
++                    warn!(
++                        "Illegal SNI extension: ignoring IP address presented as hostname ({:?})",
++                        _invalid
++                    );
++                    Some(Self::IpAddress)
++                }
++
++                HostNamePayload::Invalid(_invalid) => {
++                    warn!(
++                        "Illegal SNI hostname received {:?}",
++                        String::from_utf8_lossy(&_invalid.0)
++                    );
++                    Some(Self::Invalid)
++                }
++            };
++        }
++
++        Ok(found.unwrap_or(Self::Invalid))
+     }
+ }
+ 
+-/// RFC6066: `ServerName server_name_list<1..2^16-1>`
+-impl TlsListElement for ServerName {
+-    const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
+-        empty_error: InvalidMessage::IllegalEmptyList("ServerNames"),
+-    };
++impl<'a> From<&DnsName<'a>> for ServerNamePayload<'static> {
++    fn from(value: &DnsName<'a>) -> Self {
++        Self::SingleDnsName(trim_hostname_trailing_dot_for_sni(value))
++    }
+ }
+ 
+-pub(crate) trait ConvertServerNameList {
+-    fn has_duplicate_names_for_type(&self) -> bool;
+-    fn single_hostname(&self) -> Option<DnsName<'_>>;
++#[derive(Clone, Debug)]
++pub(crate) enum HostNamePayload {
++    HostName(DnsName<'static>),
++    IpAddress(PayloadU16<NonEmpty>),
++    Invalid(PayloadU16<NonEmpty>),
+ }
+ 
+-impl ConvertServerNameList for [ServerName] {
+-    /// RFC6066: "The ServerNameList MUST NOT contain more than one name of the same name_type."
+-    fn has_duplicate_names_for_type(&self) -> bool {
+-        has_duplicates::<_, _, u8>(self.iter().map(|name| name.typ))
+-    }
++impl HostNamePayload {
++    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
++        use pki_types::ServerName;
++        let raw = PayloadU16::<NonEmpty>::read(r)?;
+ 
+-    fn single_hostname(&self) -> Option<DnsName<'_>> {
+-        fn only_dns_hostnames(name: &ServerName) -> Option<DnsName<'_>> {
+-            if let ServerNamePayload::HostName(dns) = &name.payload {
+-                Some(dns.borrow())
+-            } else {
+-                None
+-            }
++        match ServerName::try_from(raw.0.as_slice()) {
++            Ok(ServerName::DnsName(d)) => Ok(Self::HostName(d.to_owned())),
++            Ok(ServerName::IpAddress(_)) => Ok(Self::IpAddress(raw)),
++            Ok(_) | Err(_) => Ok(Self::Invalid(raw)),
+         }
+-
+-        self.iter()
+-            .filter_map(only_dns_hostnames)
+-            .next()
+     }
+ }
+ 
+@@ -337,38 +368,46 @@ impl TlsListElement for ProtocolName {
+     };
+ }
+ 
+-pub(crate) trait ConvertProtocolNameList {
+-    fn from_slices(names: &[&[u8]]) -> Self;
+-    fn to_slices(&self) -> Vec<&[u8]>;
+-    fn as_single_slice(&self) -> Option<&[u8]>;
+-}
++/// RFC7301 encodes a single protocol name as `Vec<ProtocolName>`
++#[derive(Clone, Debug)]
++pub struct SingleProtocolName(ProtocolName);
+ 
+-impl ConvertProtocolNameList for Vec<ProtocolName> {
+-    fn from_slices(names: &[&[u8]]) -> Self {
+-        let mut ret = Self::new();
++impl SingleProtocolName {
++    pub(crate) fn new(bytes: Vec<u8>) -> Self {
++        Self(ProtocolName::from(bytes))
++    }
+ 
+-        for name in names {
+-            ret.push(ProtocolName::from(name.to_vec()));
+-        }
++    const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
++        empty_error: InvalidMessage::IllegalEmptyList("ProtocolNames"),
++    };
++}
+ 
+-        ret
++impl Codec<'_> for SingleProtocolName {
++    fn encode(&self, bytes: &mut Vec<u8>) {
++        let body = LengthPrefixedBuffer::new(Self::SIZE_LEN, bytes);
++        self.0.encode(body.buf);
+     }
+ 
+-    fn to_slices(&self) -> Vec<&[u8]> {
+-        self.iter()
+-            .map(|proto| proto.as_ref())
+-            .collect::<Vec<&[u8]>>()
+-    }
++    fn read(reader: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
++        let len = Self::SIZE_LEN.read(reader)?;
++        let mut sub = reader.sub(len)?;
++
++        let item = ProtocolName::read(&mut sub)?;
+ 
+-    fn as_single_slice(&self) -> Option<&[u8]> {
+-        if self.len() == 1 {
+-            Some(self[0].as_ref())
++        if sub.any_left() {
++            Err(InvalidMessage::TrailingData("SingleProtocolName"))
+         } else {
+-            None
++            Ok(Self(item))
+         }
+     }
+ }
+ 
++impl AsRef<[u8]> for SingleProtocolName {
++    fn as_ref(&self) -> &[u8] {
++        self.0.as_ref()
++    }
++}
++
+ // --- TLS 1.3 Key shares ---
+ #[derive(Clone, Debug)]
+ pub struct KeyShareEntry {
+@@ -570,7 +609,66 @@ impl TlsListElement for KeyShareEntry {
+     const SIZE_LEN: ListLength = ListLength::U16;
+ }
+ 
++/// The body of the `SupportedVersions` extension when it appears in a
++/// `ClientHello`
++///
++/// This is documented as a preference-order vector, but we (as a server)
++/// ignore the preference of the client.
++///
+ /// RFC8446: `ProtocolVersion versions<2..254>;`
++#[derive(Clone, Copy, Debug, Default)]
++pub struct SupportedProtocolVersions {
++    pub(crate) tls13: bool,
++    pub(crate) tls12: bool,
++}
++
++impl SupportedProtocolVersions {
++    /// Return true if `filter` returns true for any enabled version.
++    pub(crate) fn any(&self, filter: impl Fn(ProtocolVersion) -> bool) -> bool {
++        if self.tls13 && filter(ProtocolVersion::TLSv1_3) {
++            return true;
++        }
++        if self.tls12 && filter(ProtocolVersion::TLSv1_2) {
++            return true;
++        }
++        false
++    }
++
++    const LIST_LENGTH: ListLength = ListLength::NonZeroU8 {
++        empty_error: InvalidMessage::IllegalEmptyList("ProtocolVersions"),
++    };
++}
++
++impl Codec<'_> for SupportedProtocolVersions {
++    fn encode(&self, bytes: &mut Vec<u8>) {
++        let inner = LengthPrefixedBuffer::new(Self::LIST_LENGTH, bytes);
++        if self.tls13 {
++            ProtocolVersion::TLSv1_3.encode(inner.buf);
++        }
++        if self.tls12 {
++            ProtocolVersion::TLSv1_2.encode(inner.buf);
++        }
++    }
++
++    fn read(reader: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
++        let len = Self::LIST_LENGTH.read(reader)?;
++        let mut sub = reader.sub(len)?;
++
++        let mut tls12 = false;
++        let mut tls13 = false;
++
++        while sub.any_left() {
++            match ProtocolVersion::read(&mut sub)? {
++                ProtocolVersion::TLSv1_3 => tls13 = true,
++                ProtocolVersion::TLSv1_2 => tls12 = true,
++                _ => continue,
++            };
++        }
++
++        Ok(Self { tls13, tls12 })
++    }
++}
++
+ impl TlsListElement for ProtocolVersion {
+     const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
+         empty_error: InvalidMessage::IllegalEmptyList("ProtocolVersions"),
+@@ -598,10 +696,10 @@ pub enum ClientExtension {
+     EcPointFormats(Vec<ECPointFormat>),
+     NamedGroups(Vec<NamedGroup>),
+     SignatureAlgorithms(Vec<SignatureScheme>),
+-    ServerName(Vec<ServerName>),
++    ServerName(ServerNamePayload<'static>),
+     SessionTicket(ClientSessionTicket),
+     Protocols(Vec<ProtocolName>),
+-    SupportedVersions(Vec<ProtocolVersion>),
++    SupportedVersions(SupportedProtocolVersions),
+     KeyShare(Vec<KeyShareEntry>),
+     PresharedKeyModes(Vec<PskKeyExchangeMode>),
+     PresharedKey(PresharedKeyOffer),
+@@ -695,7 +793,9 @@ impl Codec<'_> for ClientExtension {
+             ExtensionType::ECPointFormats => Self::EcPointFormats(Vec::read(&mut sub)?),
+             ExtensionType::EllipticCurves => Self::NamedGroups(Vec::read(&mut sub)?),
+             ExtensionType::SignatureAlgorithms => Self::SignatureAlgorithms(Vec::read(&mut sub)?),
+-            ExtensionType::ServerName => Self::ServerName(Vec::read(&mut sub)?),
++            ExtensionType::ServerName => {
++                Self::ServerName(ServerNamePayload::read(&mut sub)?.into_owned())
++            }
+             ExtensionType::SessionTicket => {
+                 if sub.any_left() {
+                     let contents = Payload::read(&mut sub).into_owned();
+@@ -705,7 +805,9 @@ impl Codec<'_> for ClientExtension {
+                 }
+             }
+             ExtensionType::ALProtocolNegotiation => Self::Protocols(Vec::read(&mut sub)?),
+-            ExtensionType::SupportedVersions => Self::SupportedVersions(Vec::read(&mut sub)?),
++            ExtensionType::SupportedVersions => {
++                Self::SupportedVersions(SupportedProtocolVersions::read(&mut sub)?)
++            }
+             ExtensionType::KeyShare => Self::KeyShare(Vec::read(&mut sub)?),
+             ExtensionType::PSKKeyExchangeModes => Self::PresharedKeyModes(Vec::read(&mut sub)?),
+             ExtensionType::PreSharedKey => Self::PresharedKey(PresharedKeyOffer::read(&mut sub)?),
+@@ -760,18 +862,6 @@ fn trim_hostname_trailing_dot_for_sni(dns_name: &DnsName<'_>) -> DnsName<'static
+     }
+ }
+ 
+-impl ClientExtension {
+-    /// Make a basic SNI ServerNameRequest quoting `hostname`.
+-    pub(crate) fn make_sni(dns_name: &DnsName<'_>) -> Self {
+-        let name = ServerName {
+-            typ: ServerNameType::HostName,
+-            payload: ServerNamePayload::new_hostname(trim_hostname_trailing_dot_for_sni(dns_name)),
+-        };
+-
+-        Self::ServerName(vec![name])
+-    }
+-}
+-
+ #[derive(Clone, Debug)]
+ pub enum ClientSessionTicket {
+     Request,
+@@ -784,7 +874,7 @@ pub enum ServerExtension {
+     ServerNameAck,
+     SessionTicketAck,
+     RenegotiationInfo(PayloadU8),
+-    Protocols(Vec<ProtocolName>),
++    Protocols(SingleProtocolName),
+     KeyShare(KeyShareEntry),
+     PresharedKey(u16),
+     ExtendedMasterSecretAck,
+@@ -861,7 +951,9 @@ impl Codec<'_> for ServerExtension {
+             ExtensionType::SessionTicket => Self::SessionTicketAck,
+             ExtensionType::StatusRequest => Self::CertificateStatusAck,
+             ExtensionType::RenegotiationInfo => Self::RenegotiationInfo(PayloadU8::read(&mut sub)?),
+-            ExtensionType::ALProtocolNegotiation => Self::Protocols(Vec::read(&mut sub)?),
++            ExtensionType::ALProtocolNegotiation => {
++                Self::Protocols(SingleProtocolName::read(&mut sub)?)
++            }
+             ExtensionType::ClientCertificateType => {
+                 Self::ClientCertType(CertificateType::read(&mut sub)?)
+             }
+@@ -891,10 +983,6 @@ impl Codec<'_> for ServerExtension {
+ }
+ 
+ impl ServerExtension {
+-    pub(crate) fn make_alpn(proto: &[&[u8]]) -> Self {
+-        Self::Protocols(Vec::from_slices(proto))
+-    }
+-
+     #[cfg(feature = "tls12")]
+     pub(crate) fn make_empty_renegotiation_info() -> Self {
+         let empty = Vec::new();
+@@ -1043,26 +1131,10 @@ impl ClientHelloPayload {
+             .find(|x| x.ext_type() == ext)
+     }
+ 
+-    pub(crate) fn sni_extension(&self) -> Option<&[ServerName]> {
++    pub(crate) fn sni_extension(&self) -> Option<&ServerNamePayload<'_>> {
+         let ext = self.find_extension(ExtensionType::ServerName)?;
+         match ext {
+-            // Does this comply with RFC6066?
+-            //
+-            // [RFC6066][] specifies that literal IP addresses are illegal in
+-            // `ServerName`s with a `name_type` of `host_name`.
+-            //
+-            // Some clients incorrectly send such extensions: we choose to
+-            // successfully parse these (into `ServerNamePayload::IpAddress`)
+-            // but then act like the client sent no `server_name` extension.
+-            //
+-            // [RFC6066]: https://datatracker.ietf.org/doc/html/rfc6066#section-3
+-            ClientExtension::ServerName(req)
+-                if !req
+-                    .iter()
+-                    .any(|name| matches!(name.payload, ServerNamePayload::IpAddress(_))) =>
+-            {
+-                Some(req)
+-            }
++            ClientExtension::ServerName(req) => Some(req),
+             _ => None,
+         }
+     }
+@@ -1132,10 +1204,10 @@ impl ClientHelloPayload {
+         self.find_extension(ExtensionType::SessionTicket)
+     }
+ 
+-    pub(crate) fn versions_extension(&self) -> Option<&[ProtocolVersion]> {
++    pub(crate) fn versions_extension(&self) -> Option<SupportedProtocolVersions> {
+         let ext = self.find_extension(ExtensionType::SupportedVersions)?;
+         match ext {
+-            ClientExtension::SupportedVersions(vers) => Some(vers),
++            ClientExtension::SupportedVersions(vers) => Some(*vers),
+             _ => None,
+         }
+     }
+@@ -1794,11 +1866,10 @@ impl<'a> CertificatePayloadTls13<'a> {
+         false
+     }
+ 
+-    pub(crate) fn end_entity_ocsp(&self) -> Vec<u8> {
++    pub(crate) fn end_entity_ocsp(&self) -> &[u8] {
+         self.entries
+             .first()
+             .and_then(CertificateEntry::ocsp_response)
+-            .map(|resp| resp.to_vec())
+             .unwrap_or_default()
+     }
+ 
+@@ -2152,7 +2223,7 @@ pub(crate) trait HasServerExtensions {
+     fn alpn_protocol(&self) -> Option<&[u8]> {
+         let ext = self.find_extension(ExtensionType::ALProtocolNegotiation)?;
+         match ext {
+-            ServerExtension::Protocols(protos) => protos.as_single_slice(),
++            ServerExtension::Protocols(protos) => Some(protos.as_ref()),
+             _ => None,
+         }
+     }
+diff --git a/rustls/src/server/hs.rs b/rustls/src/server/hs.rs
+index 2453a86f..f426cff8 100644
+--- a/rustls/src/server/hs.rs
++++ b/rustls/src/server/hs.rs
+@@ -21,8 +21,8 @@ use crate::msgs::enums::{CertificateType, Compression, ExtensionType, NamedGroup
+ #[cfg(feature = "tls12")]
+ use crate::msgs::handshake::SessionId;
+ use crate::msgs::handshake::{
+-    ClientHelloPayload, ConvertProtocolNameList, ConvertServerNameList, HandshakePayload,
+-    KeyExchangeAlgorithm, Random, ServerExtension,
++    ClientHelloPayload, HandshakePayload, KeyExchangeAlgorithm, Random, ServerExtension,
++    ServerNamePayload, SingleProtocolName,
+ };
+ use crate::msgs::message::{Message, MessagePayload};
+ use crate::msgs::persist;
+@@ -82,23 +82,20 @@ impl ExtensionProcessing {
+         let our_protocols = &config.alpn_protocols;
+         let maybe_their_protocols = hello.alpn_extension();
+         if let Some(their_protocols) = maybe_their_protocols {
+-            let their_protocols = their_protocols.to_slices();
+-
+-            if their_protocols
+-                .iter()
+-                .any(|protocol| protocol.is_empty())
+-            {
+-                return Err(PeerMisbehaved::OfferedEmptyApplicationProtocol.into());
+-            }
+-
+             cx.common.alpn_protocol = our_protocols
+                 .iter()
+-                .find(|protocol| their_protocols.contains(&protocol.as_slice()))
++                .find(|ours| {
++                    their_protocols
++                        .iter()
++                        .any(|theirs| theirs.as_ref() == ours.as_slice())
++                })
+                 .cloned();
+             if let Some(selected_protocol) = &cx.common.alpn_protocol {
+                 debug!("Chosen ALPN protocol {:?}", selected_protocol);
+                 self.exts
+-                    .push(ServerExtension::make_alpn(&[selected_protocol]));
++                    .push(ServerExtension::Protocols(SingleProtocolName::new(
++                        selected_protocol.clone(),
++                    )));
+             } else if !our_protocols.is_empty() {
+                 return Err(cx.common.send_fatal_alert(
+                     AlertDescription::NoApplicationProtocol,
+@@ -348,9 +345,9 @@ impl ExpectClientHello {
+         // Are we doing TLS1.3?
+         let maybe_versions_ext = client_hello.versions_extension();
+         let version = if let Some(versions) = maybe_versions_ext {
+-            if versions.contains(&ProtocolVersion::TLSv1_3) && tls13_enabled {
++            if versions.tls13 && tls13_enabled {
+                 ProtocolVersion::TLSv1_3
+-            } else if !versions.contains(&ProtocolVersion::TLSv1_2) || !tls12_enabled {
++            } else if !versions.tls12 || !tls12_enabled {
+                 return Err(cx.common.send_fatal_alert(
+                     AlertDescription::ProtocolVersion,
+                     PeerIncompatible::Tls12NotOfferedOrEnabled,
+@@ -702,23 +699,23 @@ pub(super) fn process_client_hello<'m>(
+     // send an Illegal Parameter alert instead of the Internal Error alert
+     // (or whatever) that we'd send if this were checked later or in a
+     // different way.
++    //
++    // [RFC6066][] specifies that literal IP addresses are illegal in
++    // `ServerName`s with a `name_type` of `host_name`.
++    //
++    // Some clients incorrectly send such extensions: we choose to
++    // successfully parse these (into `ServerNamePayload::IpAddress`)
++    // but then act like the client sent no `server_name` extension.
++    //
++    // [RFC6066]: https://datatracker.ietf.org/doc/html/rfc6066#section-3
+     let sni: Option<DnsName<'_>> = match client_hello.sni_extension() {
+-        Some(sni) => {
+-            if sni.has_duplicate_names_for_type() {
+-                return Err(cx.common.send_fatal_alert(
+-                    AlertDescription::DecodeError,
+-                    PeerMisbehaved::DuplicateServerNameTypes,
+-                ));
+-            }
+-
+-            if let Some(hostname) = sni.single_hostname() {
+-                Some(hostname.to_lowercase_owned())
+-            } else {
+-                return Err(cx.common.send_fatal_alert(
+-                    AlertDescription::IllegalParameter,
+-                    PeerMisbehaved::ServerNameMustContainOneHostName,
+-                ));
+-            }
++        Some(ServerNamePayload::SingleDnsName(dns_name)) => Some(dns_name.to_lowercase_owned()),
++        Some(ServerNamePayload::IpAddress) => None,
++        Some(ServerNamePayload::Invalid) => {
++            return Err(cx.common.send_fatal_alert(
++                AlertDescription::IllegalParameter,
++                PeerMisbehaved::ServerNameMustContainOneHostName,
++            ));
+         }
+         None => None,
+     };

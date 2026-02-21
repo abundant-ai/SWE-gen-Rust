@@ -1,0 +1,433 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 28de9d37..c8b409a9 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -22,7 +22,7 @@ include = [
+ bytes = "0.4.4"
+ futures = "0.1.21"
+ futures-cpupool = { version = "0.1.6", optional = true }
+-http = "0.1.7"
++http = "0.1.5"
+ httparse = "1.0"
+ h2 = "0.1.5"
+ iovec = "0.1"
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index dbf75506..b3421134 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -78,7 +78,7 @@
+ //! ```
+ 
+ use std::fmt;
+-use std::mem;
++use std::io;
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
+@@ -193,44 +193,33 @@ where C: Connect + Sync + 'static,
+ 
+     /// Send a constructed Request using this Client.
+     pub fn request(&self, mut req: Request<B>) -> ResponseFuture {
+-        let is_http_11 = self.ver == Ver::Http1 && match req.version() {
+-            Version::HTTP_11 => true,
+-            Version::HTTP_10 => false,
++        match req.version() {
++            Version::HTTP_10 |
++            Version::HTTP_11 => (),
+             other => {
+                 error!("Request has unsupported version \"{:?}\"", other);
+                 return ResponseFuture::new(Box::new(future::err(::Error::new_user_unsupported_version())));
+             }
+-        };
+-
+-        let is_http_connect = req.method() == &Method::CONNECT;
++        }
+ 
+-        if !is_http_11 && is_http_connect {
+-            debug!("client does not support CONNECT requests for {:?}", req.version());
++        if req.method() == &Method::CONNECT {
++            debug!("Client does not support CONNECT requests");
+             return ResponseFuture::new(Box::new(future::err(::Error::new_user_unsupported_request_method())));
+         }
+ 
+-
+         let uri = req.uri().clone();
+         let domain = match (uri.scheme_part(), uri.authority_part()) {
+             (Some(scheme), Some(auth)) => {
+                 format!("{}://{}", scheme, auth)
+             }
+-            (None, Some(auth)) if is_http_connect => {
+-                let scheme = match auth.port() {
+-                    Some(443) => {
+-                        set_scheme(req.uri_mut(), Scheme::HTTPS);
+-                        "https"
+-                    },
+-                    _ => {
+-                        set_scheme(req.uri_mut(), Scheme::HTTP);
+-                        "http"
+-                    },
+-                };
+-                format!("{}://{}", scheme, auth)
+-            },
+             _ => {
+-                debug!("Client requires absolute-form URIs, received: {:?}", uri);
+-                return ResponseFuture::new(Box::new(future::err(::Error::new_user_absolute_uri_required())))
++                //TODO: replace this with a proper variant
++                return ResponseFuture::new(Box::new(future::err(::Error::new_io(
++                    io::Error::new(
++                        io::ErrorKind::InvalidInput,
++                        "invalid URI for Client Request"
++                    )
++                ))));
+             }
+         };
+ 
+@@ -330,6 +319,7 @@ where C: Connect + Sync + 'static,
+                 //
+                 // In both cases, we should just wait for the other future.
+                 if e.is_canceled() {
++                    //trace!("checkout/connect race canceled: {}", e);
+                     Either::A(other.map_err(ClientError::Normal))
+                 } else {
+                     Either::B(future::err(ClientError::Normal(e)))
+@@ -340,21 +330,8 @@ where C: Connect + Sync + 'static,
+         let resp = race.and_then(move |mut pooled| {
+             let conn_reused = pooled.is_reused();
+             if ver == Ver::Http1 {
+-                // CONNECT always sends origin-form, so check it first...
+-                if req.method() == &Method::CONNECT {
+-                    authority_form(req.uri_mut());
+-                } else if pooled.is_proxied {
+-                    absolute_form(req.uri_mut());
+-                } else {
+-                    origin_form(req.uri_mut());
+-                };
+-            } else {
+-                debug_assert!(
+-                    req.method() != &Method::CONNECT,
+-                    "Client should have returned Error for HTTP2 CONNECT"
+-                );
++                set_relative_uri(req.uri_mut(), pooled.is_proxied);
+             }
+-
+             let fut = pooled.send_request_retryable(req);
+ 
+             // As of futures@0.1.21, there is a race condition in the mpsc
+@@ -635,7 +612,10 @@ enum Ver {
+     Http2,
+ }
+ 
+-fn origin_form(uri: &mut Uri) {
++fn set_relative_uri(uri: &mut Uri, is_proxied: bool) {
++    if is_proxied && uri.scheme_part() != Some(&Scheme::HTTPS) {
++        return;
++    }
+     let path = match uri.path_and_query() {
+         Some(path) if path.as_str() != "/" => {
+             let mut parts = ::http::uri::Parts::default();
+@@ -643,56 +623,10 @@ fn origin_form(uri: &mut Uri) {
+             Uri::from_parts(parts).expect("path is valid uri")
+         },
+         _none_or_just_slash => {
+-            debug_assert!(Uri::default() == "/");
+-            Uri::default()
++            "/".parse().expect("/ is valid path")
+         }
+     };
+-    *uri = path
+-}
+-
+-fn absolute_form(uri: &mut Uri) {
+-    debug_assert!(uri.scheme_part().is_some(), "absolute_form needs a scheme");
+-    debug_assert!(uri.authority_part().is_some(), "absolute_form needs an authority");
+-    // If the URI is to HTTPS, and the connector claimed to be a proxy,
+-    // then it *should* have tunneled, and so we don't want to send
+-    // absolute-form in that case.
+-    if uri.scheme_part() == Some(&Scheme::HTTPS) {
+-        origin_form(uri);
+-    }
+-}
+-
+-fn authority_form(uri: &mut Uri) {
+-    if log_enabled!(::log::Level::Warn) {
+-        if let Some(path) = uri.path_and_query() {
+-            // `https://hyper.rs` would parse with `/` path, don't
+-            // annoy people about that...
+-            if path != "/" {
+-                warn!(
+-                    "HTTP/1.1 CONNECT request stripping path: {:?}",
+-                    path
+-                );
+-            }
+-        }
+-    }
+-    *uri = match uri.authority_part() {
+-        Some(auth) => {
+-            let mut parts = ::http::uri::Parts::default();
+-            parts.authority = Some(auth.clone());
+-            Uri::from_parts(parts).expect("authority is valid")
+-        },
+-        None => {
+-            unreachable!("authority_form with relative uri");
+-        }
+-    };
+-}
+-
+-fn set_scheme(uri: &mut Uri, scheme: Scheme) {
+-    debug_assert!(uri.scheme_part().is_none(), "set_scheme expects no existing scheme");
+-    let old = mem::replace(uri, Uri::default());
+-    let mut parts: ::http::uri::Parts = old.into();
+-    parts.scheme = Some(scheme);
+-    parts.path_and_query = Some("/".parse().expect("slash is a valid path"));
+-    *uri = Uri::from_parts(parts).expect("scheme is valid");
++    *uri = path;
+ }
+ 
+ /// Builder for a Client
+@@ -884,43 +818,8 @@ mod unit_tests {
+     #[test]
+     fn set_relative_uri_with_implicit_path() {
+         let mut uri = "http://hyper.rs".parse().unwrap();
+-        origin_form(&mut uri);
+-        assert_eq!(uri.to_string(), "/");
+-    }
+-
+-    #[test]
+-    fn test_origin_form() {
+-        let mut uri = "http://hyper.rs/guides".parse().unwrap();
+-        origin_form(&mut uri);
+-        assert_eq!(uri.to_string(), "/guides");
+-
+-        let mut uri = "http://hyper.rs/guides?foo=bar".parse().unwrap();
+-        origin_form(&mut uri);
+-        assert_eq!(uri.to_string(), "/guides?foo=bar");
+-    }
+-
+-    #[test]
+-    fn test_absolute_form() {
+-        let mut uri = "http://hyper.rs/guides".parse().unwrap();
+-        absolute_form(&mut uri);
+-        assert_eq!(uri.to_string(), "http://hyper.rs/guides");
+-
+-        let mut uri = "https://hyper.rs/guides".parse().unwrap();
+-        absolute_form(&mut uri);
+-        assert_eq!(uri.to_string(), "/guides");
+-    }
+-
+-    #[test]
+-    fn test_authority_form() {
+-        extern crate pretty_env_logger;
+-        let _ = pretty_env_logger::try_init();
+-
+-        let mut uri = "http://hyper.rs".parse().unwrap();
+-        authority_form(&mut uri);
+-        assert_eq!(uri.to_string(), "hyper.rs");
++        set_relative_uri(&mut uri, false);
+ 
+-        let mut uri = "hyper.rs".parse().unwrap();
+-        authority_form(&mut uri);
+-        assert_eq!(uri.to_string(), "hyper.rs");
++        assert_eq!(uri.to_string(), "/");
+     }
+ }
+diff --git a/src/error.rs b/src/error.rs
+index 7c915186..90e0a432 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -61,8 +61,6 @@ pub(crate) enum Kind {
+     UnsupportedVersion,
+     /// User tried to create a CONNECT Request with the Client.
+     UnsupportedRequestMethod,
+-    /// User tried to send a Request with Client with non-absolute URI.
+-    AbsoluteUriRequired,
+ 
+     /// User tried polling for an upgrade that doesn't exist.
+     NoUpgrade,
+@@ -119,7 +117,6 @@ impl Error {
+             Kind::Closed |
+             Kind::UnsupportedVersion |
+             Kind::UnsupportedRequestMethod |
+-            Kind::AbsoluteUriRequired |
+             Kind::NoUpgrade |
+             Kind::Execute => true,
+             _ => false,
+@@ -227,10 +224,6 @@ impl Error {
+         Error::new(Kind::UnsupportedRequestMethod, None)
+     }
+ 
+-    pub(crate) fn new_user_absolute_uri_required() -> Error {
+-        Error::new(Kind::AbsoluteUriRequired, None)
+-    }
+-
+     pub(crate) fn new_user_no_upgrade() -> Error {
+         Error::new(Kind::NoUpgrade, None)
+     }
+@@ -310,7 +303,6 @@ impl StdError for Error {
+             Kind::Http2 => "http2 general error",
+             Kind::UnsupportedVersion => "request has unsupported HTTP version",
+             Kind::UnsupportedRequestMethod => "request has unsupported HTTP method",
+-            Kind::AbsoluteUriRequired => "client requires absolute-form URIs",
+             Kind::NoUpgrade => "no upgrade available",
+             Kind::ManualUpgrade => "upgrade expected but low level API in use",
+             Kind::Execute => "executor failed to spawn task",
+diff --git a/tests/client.rs b/tests/client.rs
+index dfdb4464..93eb77cd 100644
+--- a/tests/client.rs
++++ b/tests/client.rs
+@@ -425,6 +425,32 @@ test! {
+             body: None,
+ }
+ 
++/*TODO: when new Connect trait allows stating connection is proxied
++test! {
++    name: client_http_proxy,
++
++    server:
++        expected: "\
++            GET http://{addr}/proxy HTTP/1.1\r\n\
++            host: {addr}\r\n\
++            \r\n\
++            ",
++        reply: REPLY_OK,
++
++    client:
++        proxy: true,
++        request:
++            method: GET,
++            url: "http://{addr}/proxy",
++            headers: {},
++            body: None,
++        response:
++            status: OK,
++            headers: {},
++            body: None,
++}
++*/
++
+ test! {
+     name: client_head_ignores_body,
+ 
+@@ -483,21 +509,6 @@ test! {
+             body: None,
+ }
+ 
+-test! {
+-    name: client_requires_absolute_uri,
+-
+-    server:
+-        expected: "won't get here {addr}",
+-        reply: "won't reply",
+-
+-    client:
+-        request:
+-            method: GET,
+-            url: "/relative-{addr}",
+-            headers: {},
+-            body: None,
+-        error: |err| err.to_string() == "client requires absolute-form URIs",
+-}
+ 
+ test! {
+     name: client_error_unexpected_eof,
+@@ -585,51 +596,19 @@ test! {
+     server:
+         expected: "\
+             CONNECT {addr} HTTP/1.1\r\n\
+-            host: {addr}\r\n\
+-            \r\n\
+-            ",
+-        reply: "\
+-            HTTP/1.1 200 OK\r\n\
+-            \r\n\
+-            ",
+-
+-    client:
+-        request:
+-            method: CONNECT,
+-            url: "{addr}",
+-            headers: {},
+-            body: None,
+-        response:
+-            status: OK,
+-            headers: {},
+-            body: None,
+-
+-}
+-
+-test! {
+-    name: client_connect_method_with_absolute_uri,
+-
+-    server:
+-        expected: "\
+-            CONNECT {addr} HTTP/1.1\r\n\
+-            host: {addr}\r\n\
+-            \r\n\
+-            ",
+-        reply: "\
+-            HTTP/1.1 200 OK\r\n\
++            Host: {addr}\r\n\
+             \r\n\
+             ",
++        // won't ever get to reply
++        reply: "",
+ 
+     client:
+         request:
+             method: CONNECT,
+-            url: "http://{addr}",
+-            headers: {},
+-            body: None,
+-        response:
+-            status: OK,
++            url: "http://{addr}/",
+             headers: {},
+             body: None,
++        error: |err| err.is_user(),
+ 
+ }
+ 
+@@ -1243,44 +1222,6 @@ mod dispatch_impl {
+         rt.block_on(res.join(rx).map(|r| r.0)).unwrap();
+     }
+ 
+-    #[test]
+-    fn connect_proxy_http_connect_sends_authority_form() {
+-        let _ = pretty_env_logger::try_init();
+-        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+-        let addr = server.local_addr().unwrap();
+-        let mut rt = Runtime::new().unwrap();
+-        let connector = DebugConnector::new()
+-            .proxy();
+-
+-        let client = Client::builder()
+-            .build(connector);
+-
+-        let (tx1, rx1) = oneshot::channel();
+-        thread::spawn(move || {
+-            let mut sock = server.accept().unwrap().0;
+-            //drop(server);
+-            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+-            sock.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+-            let mut buf = [0; 4096];
+-            let n = sock.read(&mut buf).expect("read 1");
+-            let expected = format!("CONNECT {addr} HTTP/1.1\r\nhost: {addr}\r\n\r\n", addr=addr);
+-            assert_eq!(s(&buf[..n]), expected);
+-
+-            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").expect("write 1");
+-            let _ = tx1.send(());
+-        });
+-
+-
+-        let rx = rx1.expect("thread panicked");
+-        let req = Request::builder()
+-            .method("CONNECT")
+-            .uri(&*format!("http://{}/useless/path", addr))
+-            .body(Body::empty())
+-            .unwrap();
+-        let res = client.request(req);
+-        rt.block_on(res.join(rx).map(|r| r.0)).unwrap();
+-    }
+-
+     #[test]
+     fn client_upgrade() {
+         use tokio_io::io::{read_to_end, write_all};

@@ -1,0 +1,319 @@
+diff --git a/tokio/src/runtime/context.rs b/tokio/src/runtime/context.rs
+index 0e7b636a..4f30d337 100644
+--- a/tokio/src/runtime/context.rs
++++ b/tokio/src/runtime/context.rs
+@@ -7,8 +7,7 @@ use std::cell::Cell;
+ use crate::util::rand::{FastRand, RngSeed};
+ 
+ cfg_rt! {
+-    use crate::runtime::scheduler;
+-    use crate::runtime::task::Id;
++    use crate::runtime::{scheduler, task::Id, Defer};
+ 
+     use std::cell::RefCell;
+     use std::marker::PhantomData;
+@@ -19,6 +18,7 @@ struct Context {
+     /// Handle to the runtime scheduler running on the current thread.
+     #[cfg(feature = "rt")]
+     handle: RefCell<Option<scheduler::Handle>>,
++
+     #[cfg(feature = "rt")]
+     current_task_id: Cell<Option<Id>>,
+ 
+@@ -30,6 +30,11 @@ struct Context {
+     #[cfg(feature = "rt")]
+     runtime: Cell<EnterRuntime>,
+ 
++    /// Yielded task wakers are stored here and notified after resource drivers
++    /// are polled.
++    #[cfg(feature = "rt")]
++    defer: RefCell<Option<Defer>>,
++
+     #[cfg(any(feature = "rt", feature = "macros"))]
+     rng: FastRand,
+ 
+@@ -56,6 +61,9 @@ tokio_thread_local! {
+             #[cfg(feature = "rt")]
+             runtime: Cell::new(EnterRuntime::NotEntered),
+ 
++            #[cfg(feature = "rt")]
++            defer: RefCell::new(None),
++
+             #[cfg(any(feature = "rt", feature = "macros"))]
+             rng: FastRand::new(RngSeed::new()),
+ 
+@@ -159,7 +167,12 @@ cfg_rt! {
+             if c.runtime.get().is_entered() {
+                 None
+             } else {
++                // Set the entered flag
+                 c.runtime.set(EnterRuntime::Entered { allow_block_in_place });
++
++                // Initialize queue to track yielded tasks
++                *c.defer.borrow_mut() = Some(Defer::new());
++
+                 Some(EnterRuntimeGuard {
+                     blocking: BlockingRegionGuard::new(),
+                     handle: c.set_current(handle),
+@@ -201,6 +214,14 @@ cfg_rt! {
+         DisallowBlockInPlaceGuard(reset)
+     }
+ 
++    pub(crate) fn with_defer<R>(f: impl FnOnce(&mut Defer) -> R) -> Option<R> {
++        CONTEXT.with(|c| {
++            let mut defer = c.defer.borrow_mut();
++
++            defer.as_mut().map(f)
++        })
++    }
++
+     impl Context {
+         fn set_current(&self, handle: &scheduler::Handle) -> SetCurrentGuard {
+             let rng_seed = handle.seed_generator().next_seed();
+@@ -235,6 +256,7 @@ cfg_rt! {
+             CONTEXT.with(|c| {
+                 assert!(c.runtime.get().is_entered());
+                 c.runtime.set(EnterRuntime::NotEntered);
++                *c.defer.borrow_mut() = None;
+             });
+         }
+     }
+@@ -286,6 +308,10 @@ cfg_rt! {
+                     return Err(());
+                 }
+ 
++                // Wake any yielded tasks before parking in order to avoid
++                // blocking.
++                with_defer(|defer| defer.wake());
++
+                 park.park_timeout(when - now);
+             }
+         }
+diff --git a/tokio/src/runtime/defer.rs b/tokio/src/runtime/defer.rs
+new file mode 100644
+index 00000000..4078512d
+--- /dev/null
++++ b/tokio/src/runtime/defer.rs
+@@ -0,0 +1,27 @@
++use std::task::Waker;
++
++pub(crate) struct Defer {
++    deferred: Vec<Waker>,
++}
++
++impl Defer {
++    pub(crate) fn new() -> Defer {
++        Defer {
++            deferred: Default::default(),
++        }
++    }
++
++    pub(crate) fn defer(&mut self, waker: Waker) {
++        self.deferred.push(waker);
++    }
++
++    pub(crate) fn is_empty(&self) -> bool {
++        self.deferred.is_empty()
++    }
++
++    pub(crate) fn wake(&mut self) {
++        for waker in self.deferred.drain(..) {
++            waker.wake();
++        }
++    }
++}
+diff --git a/tokio/src/runtime/mod.rs b/tokio/src/runtime/mod.rs
+index 6e527801..45b79b0a 100644
+--- a/tokio/src/runtime/mod.rs
++++ b/tokio/src/runtime/mod.rs
+@@ -228,6 +228,9 @@ cfg_rt! {
+         pub use crate::util::rand::RngSeed;
+     }
+ 
++    mod defer;
++    pub(crate) use defer::Defer;
++
+     mod handle;
+     pub use handle::{EnterGuard, Handle, TryCurrentError};
+ 
+diff --git a/tokio/src/runtime/park.rs b/tokio/src/runtime/park.rs
+index 9dfbfae0..dc86f42a 100644
+--- a/tokio/src/runtime/park.rs
++++ b/tokio/src/runtime/park.rs
+@@ -32,6 +32,12 @@ tokio_thread_local! {
+     static CURRENT_PARKER: ParkThread = ParkThread::new();
+ }
+ 
++// Bit of a hack, but it is only for loom
++#[cfg(loom)]
++tokio_thread_local! {
++    static CURRENT_THREAD_PARK_COUNT: AtomicUsize = AtomicUsize::new(0);
++}
++
+ // ==== impl ParkThread ====
+ 
+ impl ParkThread {
+@@ -51,10 +57,15 @@ impl ParkThread {
+     }
+ 
+     pub(crate) fn park(&mut self) {
++        #[cfg(loom)]
++        CURRENT_THREAD_PARK_COUNT.with(|count| count.fetch_add(1, SeqCst));
+         self.inner.park();
+     }
+ 
+     pub(crate) fn park_timeout(&mut self, duration: Duration) {
++        #[cfg(loom)]
++        CURRENT_THREAD_PARK_COUNT.with(|count| count.fetch_add(1, SeqCst));
++
+         // Wasm doesn't have threads, so just sleep.
+         #[cfg(not(tokio_wasm))]
+         self.inner.park_timeout(duration);
+@@ -273,6 +284,11 @@ impl CachedParkThread {
+                 return Ok(v);
+             }
+ 
++            // Wake any yielded tasks before parking in order to avoid
++            // blocking.
++            #[cfg(feature = "rt")]
++            crate::runtime::context::with_defer(|defer| defer.wake());
++
+             self.park();
+         }
+     }
+@@ -330,3 +346,8 @@ unsafe fn wake_by_ref(raw: *const ()) {
+     // We don't actually own a reference to the unparker
+     mem::forget(unparker);
+ }
++
++#[cfg(loom)]
++pub(crate) fn current_thread_park_count() -> usize {
++    CURRENT_THREAD_PARK_COUNT.with(|count| count.load(SeqCst))
++}
+diff --git a/tokio/src/runtime/scheduler/current_thread.rs b/tokio/src/runtime/scheduler/current_thread.rs
+index d874448c..375e47c4 100644
+--- a/tokio/src/runtime/scheduler/current_thread.rs
++++ b/tokio/src/runtime/scheduler/current_thread.rs
+@@ -3,7 +3,7 @@ use crate::loom::sync::atomic::AtomicBool;
+ use crate::loom::sync::{Arc, Mutex};
+ use crate::runtime::driver::{self, Driver};
+ use crate::runtime::task::{self, JoinHandle, OwnedTasks, Schedule, Task};
+-use crate::runtime::{blocking, scheduler, Config};
++use crate::runtime::{blocking, context, scheduler, Config};
+ use crate::runtime::{MetricsBatch, SchedulerMetrics, WorkerMetrics};
+ use crate::sync::notify::Notify;
+ use crate::util::atomic_cell::AtomicCell;
+@@ -267,6 +267,14 @@ impl Core {
+     }
+ }
+ 
++fn did_defer_tasks() -> bool {
++    context::with_defer(|deferred| !deferred.is_empty()).unwrap()
++}
++
++fn wake_deferred_tasks() {
++    context::with_defer(|deferred| deferred.wake());
++}
++
+ // ===== impl Context =====
+ 
+ impl Context {
+@@ -299,6 +307,7 @@ impl Context {
+ 
+             let (c, _) = self.enter(core, || {
+                 driver.park(&handle.driver);
++                wake_deferred_tasks();
+             });
+ 
+             core = c;
+@@ -324,6 +333,7 @@ impl Context {
+         core.metrics.submit(&handle.shared.worker_metrics);
+         let (mut core, _) = self.enter(core, || {
+             driver.park_timeout(&handle.driver, Duration::from_millis(0));
++            wake_deferred_tasks();
+         });
+ 
+         core.driver = Some(driver);
+@@ -557,7 +567,11 @@ impl CoreGuard<'_> {
+                     let task = match entry {
+                         Some(entry) => entry,
+                         None => {
+-                            core = context.park(core, handle);
++                            core = if did_defer_tasks() {
++                                context.park_yield(core, handle)
++                            } else {
++                                context.park(core, handle)
++                            };
+ 
+                             // Try polling the `block_on` future next
+                             continue 'outer;
+diff --git a/tokio/src/runtime/scheduler/multi_thread/worker.rs b/tokio/src/runtime/scheduler/multi_thread/worker.rs
+index ee076523..ce6c313b 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/worker.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/worker.rs
+@@ -412,7 +412,11 @@ impl Context {
+                 core = self.run_task(task, core)?;
+             } else {
+                 // Wait for work
+-                core = self.park(core);
++                core = if did_defer_tasks() {
++                    self.park_timeout(core, Some(Duration::from_millis(0)))
++                } else {
++                    self.park(core)
++                };
+             }
+         }
+ 
+@@ -535,6 +539,8 @@ impl Context {
+             park.park(&self.worker.handle.driver);
+         }
+ 
++        wake_deferred_tasks();
++
+         // Remove `core` from context
+         core = self.core.borrow_mut().take().expect("core missing");
+ 
+@@ -853,6 +859,14 @@ impl Handle {
+     }
+ }
+ 
++fn did_defer_tasks() -> bool {
++    context::with_defer(|deferred| !deferred.is_empty()).unwrap()
++}
++
++fn wake_deferred_tasks() {
++    context::with_defer(|deferred| deferred.wake());
++}
++
+ cfg_metrics! {
+     impl Shared {
+         pub(super) fn injection_queue_depth(&self) -> usize {
+diff --git a/tokio/src/task/yield_now.rs b/tokio/src/task/yield_now.rs
+index 148e3dc0..7b61dd86 100644
+--- a/tokio/src/task/yield_now.rs
++++ b/tokio/src/task/yield_now.rs
+@@ -1,3 +1,5 @@
++use crate::runtime::context;
++
+ use std::future::Future;
+ use std::pin::Pin;
+ use std::task::{Context, Poll};
+@@ -49,7 +51,17 @@ pub async fn yield_now() {
+             }
+ 
+             self.yielded = true;
+-            cx.waker().wake_by_ref();
++
++            let defer = context::with_defer(|rt| {
++                rt.defer(cx.waker().clone());
++            });
++
++            if defer.is_none() {
++                //  Not currently in a runtime, just notify ourselves
++                //  immediately.
++                cx.waker().wake_by_ref();
++            }
++
+             Poll::Pending
+         }
+     }

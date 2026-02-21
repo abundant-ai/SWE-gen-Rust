@@ -1,0 +1,611 @@
+diff --git a/tower-balance/src/lib.rs b/tower-balance/src/lib.rs
+index cdd4f67..e7482bc 100644
+--- a/tower-balance/src/lib.rs
++++ b/tower-balance/src/lib.rs
+@@ -53,6 +53,7 @@ pub struct Balance<D: Discover, C> {
+ pub enum Error<T, U> {
+     Inner(T),
+     Balance(U),
++    NotReady,
+ }
+ 
+ pub struct ResponseFuture<F: Future, E>(F, PhantomData<E>);
+@@ -356,6 +357,7 @@ where
+         match *self {
+             Error::Inner(ref why) => fmt::Display::fmt(why, f),
+             Error::Balance(ref why) => write!(f, "load balancing failed: {}", why),
++            Error::NotReady => f.pad("not ready"),
+         }
+     }
+ }
+@@ -369,6 +371,7 @@ where
+         match *self {
+             Error::Inner(ref why) => Some(why),
+             Error::Balance(ref why) => Some(why),
++            _ => None,
+         }
+     }
+ 
+@@ -376,6 +379,7 @@ where
+         match *self {
+             Error::Inner(_) => "inner service error",
+             Error::Balance(_) => "load balancing failed",
++            Error::NotReady => "not ready",
+         }
+     }
+ }
+diff --git a/tower-buffer/src/lib.rs b/tower-buffer/src/lib.rs
+index 6c621ea..2e9bd52 100644
+--- a/tower-buffer/src/lib.rs
++++ b/tower-buffer/src/lib.rs
+@@ -58,6 +58,8 @@ pub enum Error<E> {
+     Inner(E),
+     /// The underlying `Service` failed. All subsequent requests will fail.
+     Closed(Arc<ServiceError<E>>),
++    /// The underlying `Service` is currently at capacity; wait for `poll_ready`.
++    Full,
+ }
+ 
+ mod sealed {
+@@ -111,6 +113,7 @@ struct State<E> {
+ }
+ 
+ enum ResponseState<T, E> {
++    Full,
+     Failed(Arc<ServiceError<E>>),
+     Rx(oneshot::Receiver<Result<T, Arc<ServiceError<E>>>>),
+     Poll(T),
+@@ -199,14 +202,9 @@ where
+                         state: ResponseState::Failed(self.get_error_on_closed()),
+                     }
+                 } else {
+-                    // When `mpsc::Sender::poll_ready` returns `Ready`, a slot
+-                    // in the channel is reserved for the handle. Other `Sender`
+-                    // handles may not send a message using that slot. This
+-                    // guarantees capacity for `request`.
+-                    //
+-                    // Given this, the only way to hit this code path is if
+-                    // `poll_ready` has not been called & `Ready` returned.
+-                    panic!("buffer full; poll_ready must be called first");
++                    ResponseFuture {
++                        state: ResponseState::Full,
++                    }
+                 }
+             }
+             Ok(_) => ResponseFuture {
+@@ -244,6 +242,9 @@ where
+             let fut;
+ 
+             match self.state {
++                Full => {
++                    return Err(Error::Full);
++                }
+                 Failed(ref e) => {
+                     return Err(Error::Closed(e.clone()));
+                 }
+@@ -432,6 +433,7 @@ where
+         match *self {
+             Error::Inner(ref why) => fmt::Display::fmt(why, f),
+             Error::Closed(ref e) => write!(f, "Service::{} failed: {}", e.method, e.inner),
++            Error::Full => f.pad("Service at capacity"),
+         }
+     }
+ }
+@@ -444,6 +446,7 @@ where
+         match *self {
+             Error::Inner(ref why) => Some(why),
+             Error::Closed(ref e) => Some(&e.inner),
++            Error::Full => None,
+         }
+     }
+ 
+@@ -451,6 +454,7 @@ where
+         match *self {
+             Error::Inner(ref e) => e.description(),
+             Error::Closed(ref e) => e.inner.description(),
++            Error::Full => "Service as capacity",
+         }
+     }
+ }
+diff --git a/tower-filter/src/lib.rs b/tower-filter/src/lib.rs
+index 76b51bd..f35fa6c 100644
+--- a/tower-filter/src/lib.rs
++++ b/tower-filter/src/lib.rs
+@@ -25,7 +25,7 @@ pub struct ResponseFuture<T, S, Request>
+ where
+     S: Service<Request>,
+ {
+-    inner: ResponseInner<T, S, Request>,
++    inner: Option<ResponseInner<T, S, Request>>,
+ }
+ 
+ #[derive(Debug)]
+@@ -47,6 +47,9 @@ pub enum Error<T, U> {
+ 
+     /// The inner service produced an error.
+     Inner(U),
++
++    /// The service is out of capacity.
++    NoCapacity,
+ }
+ 
+ /// Checks a request
+@@ -71,7 +74,7 @@ enum State<Request, U> {
+     Check(Request),
+     WaitReady(Request),
+     WaitResponse(U),
+-    Invalid,
++    NoCapacity,
+ }
+ 
+ // ===== impl Filter =====
+@@ -122,7 +125,7 @@ where
+         let rem = self.counts.rem.load(SeqCst);
+ 
+         if rem == 0 {
+-            panic!("service not ready; poll_ready must be called first");
++            return ResponseFuture { inner: None };
+         }
+ 
+         // Decrement
+@@ -138,12 +141,12 @@ where
+         let counts = self.counts.clone();
+ 
+         ResponseFuture {
+-            inner: ResponseInner {
++            inner: Some(ResponseInner {
+                 state: State::Check(request),
+                 check,
+                 service,
+                 counts,
+-            },
++            }),
+         }
+     }
+ }
+@@ -174,7 +177,10 @@ where
+     type Error = Error<T::Error, S::Error>;
+ 
+     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+-        self.inner.poll()
++        match self.inner {
++            Some(ref mut inner) => inner.poll(),
++            None => Err(Error::NoCapacity),
++        }
+     }
+ }
+ 
+@@ -209,7 +215,7 @@ where
+         use self::State::*;
+ 
+         loop {
+-            match mem::replace(&mut self.state, Invalid) {
++            match mem::replace(&mut self.state, NoCapacity) {
+                 Check(request) => {
+                     // Poll predicate
+                     match self.check.poll() {
+@@ -252,8 +258,8 @@ where
+ 
+                     return ret;
+                 }
+-                Invalid => {
+-                    panic!("invalid state");
++                NoCapacity => {
++                    return Err(Error::NoCapacity);
+                 }
+             }
+         }
+diff --git a/tower-in-flight-limit/src/lib.rs b/tower-in-flight-limit/src/lib.rs
+index dadebe8..13d3262 100644
+--- a/tower-in-flight-limit/src/lib.rs
++++ b/tower-in-flight-limit/src/lib.rs
+@@ -22,12 +22,13 @@ pub struct InFlightLimit<T> {
+ /// Error returned when the service has reached its limit.
+ #[derive(Debug)]
+ pub enum Error<T> {
++    NoCapacity,
+     Upstream(T),
+ }
+ 
+ #[derive(Debug)]
+ pub struct ResponseFuture<T> {
+-    inner: T,
++    inner: Option<T>,
+     shared: Arc<Shared>,
+ }
+ 
+@@ -113,12 +114,15 @@ where
+         } else {
+             // Try to reserve
+             if !self.state.shared.reserve() {
+-                panic!("service not ready; call poll_ready first");
++                return ResponseFuture {
++                    inner: None,
++                    shared: self.state.shared.clone(),
++                };
+             }
+         }
+ 
+         ResponseFuture {
+-            inner: self.inner.call(request),
++            inner: Some(self.inner.call(request)),
+             shared: self.state.shared.clone(),
+         }
+     }
+@@ -136,19 +140,35 @@ where
+     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+         use futures::Async::*;
+ 
+-        match self.inner.poll() {
+-            Ok(Ready(v)) => Ok(Ready(v)),
+-            Ok(NotReady) => {
+-                return Ok(NotReady);
+-            }
+-            Err(e) => Err(Error::Upstream(e)),
+-        }
++        let res = match self.inner {
++            Some(ref mut f) => match f.poll() {
++                Ok(Ready(v)) => {
++                    self.shared.release();
++                    Ok(Ready(v))
++                }
++                Ok(NotReady) => {
++                    return Ok(NotReady);
++                }
++                Err(e) => {
++                    self.shared.release();
++                    Err(Error::Upstream(e))
++                }
++            },
++            None => Err(Error::NoCapacity),
++        };
++
++        // Drop the inner future
++        self.inner = None;
++
++        res
+     }
+ }
+ 
+ impl<T> Drop for ResponseFuture<T> {
+     fn drop(&mut self) {
+-        self.shared.release();
++        if self.inner.is_some() {
++            self.shared.release();
++        }
+     }
+ }
+ 
+@@ -218,6 +238,7 @@ where
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+         match *self {
+             Error::Upstream(ref why) => fmt::Display::fmt(why, f),
++            Error::NoCapacity => write!(f, "in-flight limit exceeded"),
+         }
+     }
+ }
+@@ -227,14 +248,17 @@ where
+     T: error::Error,
+ {
+     fn cause(&self) -> Option<&error::Error> {
+-        match *self {
+-            Error::Upstream(ref why) => Some(why),
++        if let Error::Upstream(ref why) = *self {
++            Some(why)
++        } else {
++            None
+         }
+     }
+ 
+     fn description(&self) -> &str {
+         match *self {
+             Error::Upstream(_) => "upstream service error",
++            Error::NoCapacity => "in-flight limit exceeded",
+         }
+     }
+ }
+diff --git a/tower-in-flight-limit/tests/in_flight_limit.rs b/tower-in-flight-limit/tests/in_flight_limit.rs
+index 0bc3d50..eda033b 100644
+--- a/tower-in-flight-limit/tests/in_flight_limit.rs
++++ b/tower-in-flight-limit/tests/in_flight_limit.rs
+@@ -68,7 +68,6 @@ fn basic_service_limit_functionality_with_poll_ready() {
+ }
+ 
+ #[test]
+-#[should_panic]
+ fn basic_service_limit_functionality_without_poll_ready() {
+     let mut task = MockTask::new();
+ 
+@@ -113,7 +112,6 @@ fn basic_service_limit_functionality_without_poll_ready() {
+ }
+ 
+ #[test]
+-#[should_panic]
+ fn request_without_capacity() {
+     let mut task = MockTask::new();
+ 
+diff --git a/tower-mock/src/lib.rs b/tower-mock/src/lib.rs
+index b7fc9d6..7f62032 100644
+--- a/tower-mock/src/lib.rs
++++ b/tower-mock/src/lib.rs
+@@ -52,6 +52,7 @@ pub struct ResponseFuture<T, E> {
+ #[derive(Debug, PartialEq)]
+ pub enum Error<T> {
+     Closed,
++    NoCapacity,
+     Other(T),
+ }
+ 
+@@ -147,7 +148,9 @@ impl<T, U, E> Service<T> for Mock<T, U, E> {
+ 
+         if !self.can_send {
+             if state.rem == 0 {
+-                panic!("service not ready; poll_ready must be called first");
++                return ResponseFuture {
++                    rx: Error::NoCapacity,
++                };
+             }
+         }
+ 
+@@ -203,17 +206,7 @@ impl<T, U, E> Clone for Mock<T, U, E> {
+ 
+ impl<T, U, E> Drop for Mock<T, U, E> {
+     fn drop(&mut self) {
+-        let mut state = match self.state.lock() {
+-            Ok(v) => v,
+-            Err(e) => {
+-                if ::std::thread::panicking() {
+-                    return;
+-                }
+-
+-                panic!("{:?}", e);
+-            }
+-        };
+-
++        let mut state = self.state.lock().unwrap();
+         state.tasks.remove(&self.id);
+     }
+ }
+@@ -259,17 +252,7 @@ impl<T, U, E> Handle<T, U, E> {
+ 
+ impl<T, U, E> Drop for Handle<T, U, E> {
+     fn drop(&mut self) {
+-        let mut state = match self.state.lock() {
+-            Ok(v) => v,
+-            Err(e) => {
+-                if ::std::thread::panicking() {
+-                    return;
+-                }
+-
+-                panic!("{:?}", e);
+-            }
+-        };
+-
++        let mut state = self.state.lock().unwrap();
+         state.is_closed = true;
+ 
+         for (_, task) in state.tasks.drain() {
+@@ -331,6 +314,7 @@ impl<T, E> Future for ResponseFuture<T, E> {
+                 Ok(Async::NotReady) => Ok(Async::NotReady),
+                 Err(_) => Err(Error::Closed),
+             },
++            Error::NoCapacity => Err(Error::NoCapacity),
+             Error::Closed => Err(Error::Closed),
+         }
+     }
+diff --git a/tower-mock/tests/mock.rs b/tower-mock/tests/mock.rs
+index 0bd0b7f..23339c4 100644
+--- a/tower-mock/tests/mock.rs
++++ b/tower-mock/tests/mock.rs
+@@ -35,7 +35,6 @@ fn single_request_ready() {
+ }
+ 
+ #[test]
+-#[should_panic]
+ fn backpressure() {
+     let (mut mock, mut handle) = new_mock();
+ 
+@@ -47,7 +46,15 @@ fn backpressure() {
+     });
+ 
+     // Try to send a request
+-    mock.call("hello?".into());
++    let response = mock.call("hello?".into());
++
++    // Did not send
++    with_task(|| {
++        assert!(handle.poll_request().unwrap().is_not_ready());
++    });
++
++    // Response is an error
++    assert!(response.wait().is_err());
+ }
+ 
+ type Mock = tower_mock::Mock<String, String, ()>;
+diff --git a/tower-rate-limit/src/lib.rs b/tower-rate-limit/src/lib.rs
+index f9136f4..b7acbd3 100644
+--- a/tower-rate-limit/src/lib.rs
++++ b/tower-rate-limit/src/lib.rs
+@@ -1,5 +1,7 @@
+-//! A Tower middleware that rate limits the requests that are passed to the
+-//! inner service.
++//! Tower middleware that applies a timeout to requests.
++//!
++//! If the response does not complete within the specified timeout, the response
++//! will be aborted.
+ 
+ #[macro_use]
+ extern crate futures;
+@@ -36,7 +38,7 @@ pub enum Error<T> {
+ }
+ 
+ pub struct ResponseFuture<T> {
+-    inner: T,
++    inner: Option<T>,
+ }
+ 
+ #[derive(Debug)]
+@@ -143,10 +145,10 @@ where
+                 }
+ 
+                 // Call the inner future
+-                let inner = self.inner.call(request);
++                let inner = Some(self.inner.call(request));
+                 ResponseFuture { inner }
+             }
+-            State::Limited(..) => panic!("service not ready; poll_ready must be called first"),
++            State::Limited(..) => ResponseFuture { inner: None },
+         }
+     }
+ }
+@@ -159,7 +161,10 @@ where
+     type Error = Error<T::Error>;
+ 
+     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+-        self.inner.poll().map_err(Error::Upstream)
++        match self.inner {
++            Some(ref mut f) => f.poll().map_err(Error::Upstream),
++            None => Err(Error::RateLimit),
++        }
+     }
+ }
+ 
+diff --git a/tower-rate-limit/tests/rate_limit.rs b/tower-rate-limit/tests/rate_limit.rs
+index 6696011..0edb7e6 100644
+--- a/tower-rate-limit/tests/rate_limit.rs
++++ b/tower-rate-limit/tests/rate_limit.rs
+@@ -25,11 +25,14 @@ fn reaching_capacity() {
+     let response = rt.block_on(response);
+     assert_eq!(response.unwrap(), "world");
+ 
+-    rt.block_on(future::lazy(|| {
+-        assert!(service.poll_ready().unwrap().is_not_ready());
+-        Ok::<_, ()>(())
+-    }))
+-    .unwrap();
++    // Sending another request is rejected
++    let response = service.call("no");
++
++    let poll_request = rt.block_on(future::lazy(|| handle.poll_request()));
++    assert!(poll_request.unwrap().is_not_ready());
++
++    let response = rt.block_on(response);
++    assert!(response.is_err());
+ 
+     let poll_request = rt.block_on(future::lazy(|| handle.poll_request()));
+     assert!(poll_request.unwrap().is_not_ready());
+diff --git a/tower-reconnect/src/lib.rs b/tower-reconnect/src/lib.rs
+index 80505a3..87bbcfb 100644
+--- a/tower-reconnect/src/lib.rs
++++ b/tower-reconnect/src/lib.rs
+@@ -23,10 +23,11 @@ where
+ pub enum Error<T, U> {
+     Service(T),
+     Connect(U),
++    NotReady,
+ }
+ 
+ pub struct ResponseFuture<F, E> {
+-    inner: F,
++    inner: Option<F>,
+     _connect_error_marker: PhantomData<fn() -> E>,
+ }
+ 
+@@ -134,11 +135,11 @@ where
+     fn call(&mut self, request: Request) -> Self::Future {
+         let service = match self.state {
+             State::Connected(ref mut service) => service,
+-            _ => panic!("service not ready; poll_ready must be called first"),
++            _ => return ResponseFuture::new(None),
+         };
+ 
+         let fut = service.call(request);
+-        ResponseFuture::new(fut)
++        ResponseFuture::new(Some(fut))
+     }
+ }
+ 
+@@ -161,7 +162,7 @@ where
+ // ===== impl ResponseFuture =====
+ 
+ impl<F, E> ResponseFuture<F, E> {
+-    fn new(inner: F) -> Self {
++    fn new(inner: Option<F>) -> Self {
+         ResponseFuture {
+             inner,
+             _connect_error_marker: PhantomData,
+@@ -177,7 +178,10 @@ where
+     type Error = Error<F::Error, E>;
+ 
+     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+-        self.inner.poll().map_err(Error::Service)
++        match self.inner {
++            Some(ref mut f) => f.poll().map_err(Error::Service),
++            None => Err(Error::NotReady),
++        }
+     }
+ }
+ 
+@@ -192,6 +196,7 @@ where
+         match *self {
+             Error::Service(ref why) => fmt::Display::fmt(why, f),
+             Error::Connect(ref why) => write!(f, "connection failed: {}", why),
++            Error::NotReady => f.pad("not ready"),
+         }
+     }
+ }
+@@ -205,6 +210,7 @@ where
+         match *self {
+             Error::Service(ref why) => Some(why),
+             Error::Connect(ref why) => Some(why),
++            Error::NotReady => None,
+         }
+     }
+ 
+@@ -212,6 +218,7 @@ where
+         match *self {
+             Error::Service(_) => "inner service error",
+             Error::Connect(_) => "connection failed",
++            Error::NotReady => "not ready",
+         }
+     }
+ }
+diff --git a/tower-service/src/lib.rs b/tower-service/src/lib.rs
+index 224cbe2..1b64414 100644
+--- a/tower-service/src/lib.rs
++++ b/tower-service/src/lib.rs
+@@ -171,26 +171,20 @@ pub trait Service<Request> {
+     /// is notified when the service becomes ready again. This function is
+     /// expected to be called while on a task.
+     ///
+-    /// If `Err` is returned, the service is no longer able to service requests
+-    /// and the caller should discard the service instance.
+-    ///
+-    /// Once `poll_ready` returns `Ready`, a request may be dispatched to the
+-    /// service using `call`. Until a request is dispatched, repeated calls to
+-    /// `poll_ready` must return either `Ready` or `Err`.
++    /// This is a **best effort** implementation. False positives are permitted.
++    /// It is permitted for the service to return `Ready` from a `poll_ready`
++    /// call and the next invocation of `call` results in an error.
+     fn poll_ready(&mut self) -> Poll<(), Self::Error>;
+ 
+     /// Process the request and return the response asynchronously.
+     ///
+     /// This function is expected to be callable off task. As such,
+-    /// implementations should take care to not call `poll_ready`.
+-    ///
+-    /// Before dispatching a request, `poll_ready` must be called and return
+-    /// `Ready`.
+-    ///
+-    /// # Panics
++    /// implementations should take care to not call `poll_ready`. If the
++    /// service is at capacity and the request is unable to be handled, the
++    /// returned `Future` should resolve to an error.
+     ///
+-    /// Implementations are permitted to panic if `call` is invoked without
+-    /// obtaining `Ready` from `poll_ready`.
++    /// Calling `call` without calling `poll_ready` is permitted. The
++    /// implementation must be resilient to this fact.
+     fn call(&mut self, req: Request) -> Self::Future;
+ }
+ 

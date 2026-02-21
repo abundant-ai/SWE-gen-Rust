@@ -1,0 +1,243 @@
+diff --git a/serde_codegen/src/ser.rs b/serde_codegen/src/ser.rs
+index 449a2490..53160416 100644
+--- a/serde_codegen/src/ser.rs
++++ b/serde_codegen/src/ser.rs
+@@ -255,77 +255,123 @@ fn serialize_variant(
+ 
+     let variant_ident = variant.ident.clone();
+     let variant_name = variant.attrs.name().serialize_name();
+-
+-    match variant.style {
+-        Style::Unit => {
+-            quote! {
+-                #type_ident::#variant_ident =>
+-                    _serde::ser::Serializer::serialize_unit_variant(
+-                        _serializer,
+-                        #type_name,
+-                        #variant_index,
+-                        #variant_name,
+-                    ),
+-            }
+-        },
+-        Style::Newtype => {
+-            let block = serialize_newtype_variant(
+-                type_name,
+-                variant_index,
+-                variant_name,
+-                ty,
+-                generics,
+-                &variant.fields[0],
+-            );
+-
+-            quote! {
+-                #type_ident::#variant_ident(ref __simple_value) => #block,
++    let skipped_err = quote! {
++        Err(_serde::ser::Error::invalid_value("The enum variant was skipped for serialization"))
++    };
++
++    if variant.attrs.skip_serializing() {
++        match variant.style {
++            Style::Unit => {
++                quote! {
++                    #type_ident::#variant_ident =>  #skipped_err,
++                }
++            },
++            Style::Newtype => {
++                quote! {
++                    #type_ident::#variant_ident(ref __simple_value) => #skipped_err,
++                }
++            },
++            Style::Tuple => {
++                let field_names: Vec<Tokens> = (0 .. variant.fields.len())
++                    .map(|i| {
++                        let id = aster::id(format!("__field{}", i));
++                        quote!(ref #id)
++                    })
++                    .collect();
++
++                let pat = quote!(#type_ident::#variant_ident(#(#field_names),*));
++
++                quote! {
++                    #pat => #skipped_err,
++                }
+             }
+-        },
+-        Style::Tuple => {
+-            let field_names: Vec<Tokens> = (0 .. variant.fields.len())
+-                .map(|i| {
+-                    let id = aster::id(format!("__field{}", i));
++            Style::Struct => {
++                let fields = variant.fields.iter().map(|field| {
++                    let id = match field.ident {
++                        Some(ref name) => name.clone(),
++                        None => panic!("struct variant has unnamed fields"),
++                    };
+                     quote!(ref #id)
+-                })
+-                .collect();
+-
+-            let pat = quote!(#type_ident::#variant_ident(#(#field_names),*));
+-
+-            let block = serialize_tuple_variant(
+-                type_name,
+-                variant_index,
+-                variant_name,
+-                generics,
+-                ty,
+-                &variant.fields,
+-            );
++                });
++                let pat = quote!(#type_ident::#variant_ident { #(#fields),* });
+ 
+-            quote! {
+-                #pat => { #block }
++                quote! {
++                    #pat => #skipped_err,
++                }
+             }
+         }
+-        Style::Struct => {
+-            let fields = variant.fields.iter().map(|field| {
+-                let id = match field.ident {
+-                    Some(ref name) => name.clone(),
+-                    None => panic!("struct variant has unnamed fields"),
+-                };
+-                quote!(ref #id)
+-            });
+-            let pat = quote!(#type_ident::#variant_ident { #(#fields),* });
+-
+-            let block = serialize_struct_variant(
+-                variant_index,
+-                variant_name,
+-                generics,
+-                ty,
+-                &variant.fields,
+-                item_attrs,
+-            );
++    } else { // variant wasn't skipped
++        match variant.style {
++            Style::Unit => {
++                quote! {
++                    #type_ident::#variant_ident =>
++                        _serde::ser::Serializer::serialize_unit_variant(
++                            _serializer,
++                            #type_name,
++                            #variant_index,
++                            #variant_name,
++                        ),
++                }
++            },
++            Style::Newtype => {
++                let block = serialize_newtype_variant(
++                    type_name,
++                    variant_index,
++                    variant_name,
++                    ty,
++                    generics,
++                    &variant.fields[0],
++                );
++
++                quote! {
++                    #type_ident::#variant_ident(ref __simple_value) => #block,
++                }
++            },
++            Style::Tuple => {
++                let field_names: Vec<Tokens> = (0 .. variant.fields.len())
++                    .map(|i| {
++                        let id = aster::id(format!("__field{}", i));
++                        quote!(ref #id)
++                    })
++                    .collect();
++
++                let pat = quote!(#type_ident::#variant_ident(#(#field_names),*));
++
++                let block = serialize_tuple_variant(
++                    type_name,
++                    variant_index,
++                    variant_name,
++                    generics,
++                    ty,
++                    &variant.fields,
++                );
++
++                quote! {
++                    #pat => { #block }
++                }
++            }
++            Style::Struct => {
++                let fields = variant.fields.iter().map(|field| {
++                    let id = match field.ident {
++                        Some(ref name) => name.clone(),
++                        None => panic!("struct variant has unnamed fields"),
++                    };
++                    quote!(ref #id)
++                });
++                let pat = quote!(#type_ident::#variant_ident { #(#fields),* });
+ 
+-            quote! {
+-                #pat => { #block }
++                let block = serialize_struct_variant(
++                    variant_index,
++                    variant_name,
++                    generics,
++                    ty,
++                    &variant.fields,
++                    item_attrs,
++                );
++
++                quote! {
++                    #pat => { #block }
++                }
+             }
+         }
+     }
+diff --git a/serde_codegen_internals/src/attr.rs b/serde_codegen_internals/src/attr.rs
+index a9a69169..632dd508 100644
+--- a/serde_codegen_internals/src/attr.rs
++++ b/serde_codegen_internals/src/attr.rs
+@@ -188,6 +188,7 @@ impl Item {
+ pub struct Variant {
+     name: Name,
+     skip_deserializing: bool,
++    skip_serializing: bool,
+ }
+ 
+ impl Variant {
+@@ -195,6 +196,7 @@ impl Variant {
+         let mut ser_name = Attr::none(cx, "rename");
+         let mut de_name = Attr::none(cx, "rename");
+         let mut skip_deserializing = BoolAttr::none(cx, "skip_deserializing");
++        let mut skip_serializing = BoolAttr::none(cx, "skip_serializing");
+ 
+         for meta_items in variant.attrs.iter().filter_map(get_serde_meta_items) {
+             for meta_item in meta_items {
+@@ -218,6 +220,10 @@ impl Variant {
+                     MetaItem(Word(ref name)) if name == "skip_deserializing" => {
+                         skip_deserializing.set_true();
+                     }
++                    // Parse `#[serde(skip_serializing)]`
++                    MetaItem(Word(ref name)) if name == "skip_serializing" => {
++                        skip_serializing.set_true();
++                    }
+ 
+                     MetaItem(ref meta_item) => {
+                         cx.error(format!("unknown serde variant attribute `{}`",
+@@ -237,6 +243,7 @@ impl Variant {
+                 deserialize: de_name.get().unwrap_or_else(|| variant.ident.to_string()),
+             },
+             skip_deserializing: skip_deserializing.get(),
++            skip_serializing: skip_serializing.get(),
+         }
+     }
+ 
+@@ -247,6 +254,10 @@ impl Variant {
+     pub fn skip_deserializing(&self) -> bool {
+         self.skip_deserializing
+     }
++
++    pub fn skip_serializing(&self) -> bool {
++        self.skip_serializing
++    }
+ }
+ 
+ /// Represents field attribute information

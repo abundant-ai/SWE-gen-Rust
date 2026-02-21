@@ -1,0 +1,265 @@
+diff --git a/tower-in-flight-limit/Cargo.toml b/tower-in-flight-limit/Cargo.toml
+index 17de5b7..4e90b6c 100644
+--- a/tower-in-flight-limit/Cargo.toml
++++ b/tower-in-flight-limit/Cargo.toml
+@@ -9,5 +9,4 @@ futures = "0.1"
+ tower-service = { version = "0.1", path = "../tower-service" }
+ 
+ [dev-dependencies]
+-tokio-test = { git = "https://github.com/carllerche/tokio-test" }
+ tower-mock = { version = "0.1", path = "../tower-mock" }
+diff --git a/tower-in-flight-limit/src/lib.rs b/tower-in-flight-limit/src/lib.rs
+index fa60ec5..303a41f 100644
+--- a/tower-in-flight-limit/src/lib.rs
++++ b/tower-in-flight-limit/src/lib.rs
+@@ -218,14 +218,7 @@ impl Shared {
+     /// request has completed OR the service that made the reservation has
+     /// dropped.
+     pub fn release(&self) {
+-        let prev = self.curr.fetch_sub(1, SeqCst);
+-
+-        // Cannot go above the max number of in-flight
+-        debug_assert!(prev <= self.max);
+-
+-        if prev == self.max {
+-            self.task.notify();
+-        }
++        self.curr.fetch_sub(1, SeqCst);
+     }
+ }
+ 
+diff --git a/tower-in-flight-limit/tests/in_flight_limit.rs b/tower-in-flight-limit/tests/in_flight_limit.rs
+index 24c93b4..59284cc 100644
+--- a/tower-in-flight-limit/tests/in_flight_limit.rs
++++ b/tower-in-flight-limit/tests/in_flight_limit.rs
+@@ -1,5 +1,4 @@
+ extern crate futures;
+-extern crate tokio_test;
+ extern crate tower_mock;
+ extern crate tower_in_flight_limit;
+ extern crate tower_service;
+@@ -8,12 +7,9 @@ use tower_in_flight_limit::InFlightLimit;
+ use tower_service::Service;
+ 
+ use futures::future::{Future, poll_fn};
+-use tokio_test::MockTask;
+ 
+ #[test]
+ fn basic_service_limit_functionality_with_poll_ready() {
+-    let mut task = MockTask::new();
+-
+     let (mut service, mut handle) =
+         new_service(2);
+ 
+@@ -23,12 +19,10 @@ fn basic_service_limit_functionality_with_poll_ready() {
+     poll_fn(|| service.poll_ready()).wait().unwrap();
+     let r2 = service.call("hello 2");
+ 
+-    task.enter(|| {
++    with_task(|| {
+         assert!(service.poll_ready().unwrap().is_not_ready());
+     });
+ 
+-    assert!(!task.is_notified());
+-
+     // The request gets passed through
+     let request = handle.next_request().unwrap();
+     assert_eq!(*request, "hello 1");
+@@ -40,21 +34,17 @@ fn basic_service_limit_functionality_with_poll_ready() {
+     request.respond("world 2");
+ 
+     // There are no more requests
+-    task.enter(|| {
++    with_task(|| {
+         assert!(handle.poll_request().unwrap().is_not_ready());
+     });
+ 
+     assert_eq!(r1.wait().unwrap(), "world 1");
+-    assert!(task.is_notified());
+ 
+     // Another request can be sent
+-    task.enter(|| {
+-        assert!(service.poll_ready().unwrap().is_ready());
+-    });
+-
++    poll_fn(|| service.poll_ready()).wait().unwrap();
+     let r3 = service.call("hello 3");
+ 
+-    task.enter(|| {
++    with_task(|| {
+         assert!(service.poll_ready().unwrap().is_not_ready());
+     });
+ 
+@@ -70,8 +60,6 @@ fn basic_service_limit_functionality_with_poll_ready() {
+ 
+ #[test]
+ fn basic_service_limit_functionality_without_poll_ready() {
+-    let mut task = MockTask::new();
+-
+     let (mut service, mut handle) =
+         new_service(2);
+ 
+@@ -91,7 +79,7 @@ fn basic_service_limit_functionality_without_poll_ready() {
+     request.respond("world 2");
+ 
+     // There are no more requests
+-    task.enter(|| {
++    with_task(|| {
+         assert!(handle.poll_request().unwrap().is_not_ready());
+     });
+ 
+@@ -115,19 +103,17 @@ fn basic_service_limit_functionality_without_poll_ready() {
+ 
+ #[test]
+ fn request_without_capacity() {
+-    let mut task = MockTask::new();
+-
+     let (mut service, mut handle) =
+         new_service(0);
+ 
+-    task.enter(|| {
++    with_task(|| {
+         assert!(service.poll_ready().unwrap().is_not_ready());
+     });
+ 
+     let response = service.call("hello");
+ 
+     // There are no more requests
+-    task.enter(|| {
++    with_task(|| {
+         assert!(handle.poll_request().unwrap().is_not_ready());
+     });
+ 
+@@ -136,20 +122,18 @@ fn request_without_capacity() {
+ 
+ #[test]
+ fn reserve_capacity_without_sending_request() {
+-    let mut task = MockTask::new();
+-
+     let (mut s1, mut handle) =
+         new_service(1);
+ 
+     let mut s2 = s1.clone();
+ 
+     // Reserve capacity in s1
+-    task.enter(|| {
++    with_task(|| {
+         assert!(s1.poll_ready().unwrap().is_ready());
+     });
+ 
+     // Service 2 cannot get capacity
+-    task.enter(|| {
++    with_task(|| {
+         assert!(s2.poll_ready().unwrap().is_not_ready());
+     });
+ 
+@@ -158,54 +142,50 @@ fn reserve_capacity_without_sending_request() {
+     let request = handle.next_request().unwrap();
+     request.respond("world");
+ 
+-    task.enter(|| {
++    with_task(|| {
+         assert!(s2.poll_ready().unwrap().is_not_ready());
+     });
+ 
+     r1.wait().unwrap();
+ 
+-    task.enter(|| {
++    with_task(|| {
+         assert!(s2.poll_ready().unwrap().is_ready());
+     });
+ }
+ 
+ #[test]
+ fn service_drop_frees_capacity() {
+-    let mut task = MockTask::new();
+-
+     let (mut s1, _handle) =
+         new_service(1);
+ 
+     let mut s2 = s1.clone();
+ 
+     // Reserve capacity in s1
+-    task.enter(|| {
++    with_task(|| {
+         assert!(s1.poll_ready().unwrap().is_ready());
+     });
+ 
+     // Service 2 cannot get capacity
+-    task.enter(|| {
++    with_task(|| {
+         assert!(s2.poll_ready().unwrap().is_not_ready());
+     });
+ 
+     drop(s1);
+ 
+-    task.enter(|| {
++    with_task(|| {
+         assert!(s2.poll_ready().unwrap().is_ready());
+     });
+ }
+ 
+ #[test]
+ fn response_error_releases_capacity() {
+-    let mut task = MockTask::new();
+-
+     let (mut s1, mut handle) =
+         new_service(1);
+ 
+     let mut s2 = s1.clone();
+ 
+     // Reserve capacity in s1
+-    task.enter(|| {
++    with_task(|| {
+         assert!(s1.poll_ready().unwrap().is_ready());
+     });
+ 
+@@ -216,35 +196,33 @@ fn response_error_releases_capacity() {
+ 
+     r1.wait().unwrap_err();
+ 
+-    task.enter(|| {
++    with_task(|| {
+         assert!(s2.poll_ready().unwrap().is_ready());
+     });
+ }
+ 
+ #[test]
+ fn response_future_drop_releases_capacity() {
+-    let mut task = MockTask::new();
+-
+     let (mut s1, _handle) =
+         new_service(1);
+ 
+     let mut s2 = s1.clone();
+ 
+     // Reserve capacity in s1
+-    task.enter(|| {
++    with_task(|| {
+         assert!(s1.poll_ready().unwrap().is_ready());
+     });
+ 
+     // s1 sends the request, then s2 is able to get capacity
+     let r1 = s1.call("hello");
+ 
+-    task.enter(|| {
++    with_task(|| {
+         assert!(s2.poll_ready().unwrap().is_not_ready());
+     });
+ 
+     drop(r1);
+ 
+-    task.enter(|| {
++    with_task(|| {
+         assert!(s2.poll_ready().unwrap().is_ready());
+     });
+ }
+@@ -257,3 +235,8 @@ fn new_service(max: usize) -> (InFlightLimit<Mock>, Handle) {
+     let service = InFlightLimit::new(service, max);
+     (service, handle)
+ }
++
++fn with_task<F: FnOnce() -> U, U>(f: F) -> U {
++    use futures::future::{Future, lazy};
++    lazy(|| Ok::<_, ()>(f())).wait().unwrap()
++}

@@ -1,0 +1,242 @@
+diff --git a/tokio/src/runtime/metrics/runtime.rs b/tokio/src/runtime/metrics/runtime.rs
+index 014995c7..8e52fead 100644
+--- a/tokio/src/runtime/metrics/runtime.rs
++++ b/tokio/src/runtime/metrics/runtime.rs
+@@ -68,25 +68,6 @@ impl RuntimeMetrics {
+         self.handle.inner.num_blocking_threads()
+     }
+ 
+-    /// Returns the number of active tasks in the runtime.
+-    ///
+-    /// # Examples
+-    ///
+-    /// ```
+-    /// use tokio::runtime::Handle;
+-    ///
+-    /// #[tokio::main]
+-    /// async fn main() {
+-    ///    let metrics = Handle::current().metrics();
+-    ///
+-    ///     let n = metrics.active_tasks_count();
+-    ///     println!("Runtime has {} active tasks", n);
+-    /// }
+-    /// ```
+-    pub fn active_tasks_count(&self) -> usize {
+-        self.handle.inner.active_tasks_count()
+-    }
+-
+     /// Returns the number of idle threads, which have spawned by the runtime
+     /// for `spawn_blocking` calls.
+     ///
+diff --git a/tokio/src/runtime/scheduler/current_thread.rs b/tokio/src/runtime/scheduler/current_thread.rs
+index 64e1265c..375e47c4 100644
+--- a/tokio/src/runtime/scheduler/current_thread.rs
++++ b/tokio/src/runtime/scheduler/current_thread.rs
+@@ -430,10 +430,6 @@ cfg_metrics! {
+         pub(crate) fn blocking_queue_depth(&self) -> usize {
+             self.blocking_spawner.queue_depth()
+         }
+-
+-        pub(crate) fn active_tasks_count(&self) -> usize {
+-            self.shared.owned.active_tasks_count()
+-        }
+     }
+ }
+ 
+diff --git a/tokio/src/runtime/scheduler/mod.rs b/tokio/src/runtime/scheduler/mod.rs
+index 0ea207e1..f45d8a80 100644
+--- a/tokio/src/runtime/scheduler/mod.rs
++++ b/tokio/src/runtime/scheduler/mod.rs
+@@ -135,14 +135,6 @@ cfg_rt! {
+                 }
+             }
+ 
+-            pub(crate) fn active_tasks_count(&self) -> usize {
+-                match self {
+-                    Handle::CurrentThread(handle) => handle.active_tasks_count(),
+-                    #[cfg(all(feature = "rt-multi-thread", not(tokio_wasi)))]
+-                    Handle::MultiThread(handle) => handle.active_tasks_count(),
+-                }
+-            }
+-
+             pub(crate) fn scheduler_metrics(&self) -> &SchedulerMetrics {
+                 match self {
+                     Handle::CurrentThread(handle) => handle.scheduler_metrics(),
+diff --git a/tokio/src/runtime/scheduler/multi_thread/handle.rs b/tokio/src/runtime/scheduler/multi_thread/handle.rs
+index 77baaeb0..69a4620c 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/handle.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/handle.rs
+@@ -69,10 +69,6 @@ cfg_metrics! {
+             self.blocking_spawner.num_idle_threads()
+         }
+ 
+-        pub(crate) fn active_tasks_count(&self) -> usize {
+-            self.shared.owned.active_tasks_count()
+-        }
+-
+         pub(crate) fn scheduler_metrics(&self) -> &SchedulerMetrics {
+             &self.shared.scheduler_metrics
+         }
+diff --git a/tokio/src/runtime/task/list.rs b/tokio/src/runtime/task/list.rs
+index c520cb04..159c13e1 100644
+--- a/tokio/src/runtime/task/list.rs
++++ b/tokio/src/runtime/task/list.rs
+@@ -10,7 +10,7 @@ use crate::future::Future;
+ use crate::loom::cell::UnsafeCell;
+ use crate::loom::sync::Mutex;
+ use crate::runtime::task::{JoinHandle, LocalNotified, Notified, Schedule, Task};
+-use crate::util::linked_list::{CountedLinkedList, Link, LinkedList};
++use crate::util::linked_list::{Link, LinkedList};
+ 
+ use std::marker::PhantomData;
+ 
+@@ -54,13 +54,9 @@ cfg_not_has_atomic_u64! {
+ }
+ 
+ pub(crate) struct OwnedTasks<S: 'static> {
+-    inner: Mutex<CountedOwnedTasksInner<S>>,
++    inner: Mutex<OwnedTasksInner<S>>,
+     id: u64,
+ }
+-struct CountedOwnedTasksInner<S: 'static> {
+-    list: CountedLinkedList<Task<S>, <Task<S> as Link>::Target>,
+-    closed: bool,
+-}
+ pub(crate) struct LocalOwnedTasks<S: 'static> {
+     inner: UnsafeCell<OwnedTasksInner<S>>,
+     id: u64,
+@@ -74,8 +70,8 @@ struct OwnedTasksInner<S: 'static> {
+ impl<S: 'static> OwnedTasks<S> {
+     pub(crate) fn new() -> Self {
+         Self {
+-            inner: Mutex::new(CountedOwnedTasksInner {
+-                list: CountedLinkedList::new(),
++            inner: Mutex::new(OwnedTasksInner {
++                list: LinkedList::new(),
+                 closed: false,
+             }),
+             id: get_next_id(),
+@@ -157,10 +153,6 @@ impl<S: 'static> OwnedTasks<S> {
+         }
+     }
+ 
+-    pub(crate) fn active_tasks_count(&self) -> usize {
+-        self.inner.lock().list.count()
+-    }
+-
+     pub(crate) fn remove(&self, task: &Task<S>) -> Option<Task<S>> {
+         let task_id = task.header().get_owner_id();
+         if task_id == 0 {
+diff --git a/tokio/src/util/linked_list.rs b/tokio/src/util/linked_list.rs
+index 74a684d1..6bf26818 100644
+--- a/tokio/src/util/linked_list.rs
++++ b/tokio/src/util/linked_list.rs
+@@ -228,53 +228,6 @@ impl<L: Link> fmt::Debug for LinkedList<L, L::Target> {
+     }
+ }
+ 
+-// ===== impl CountedLinkedList ====
+-
+-// Delegates operations to the base LinkedList implementation, and adds a counter to the elements
+-// in the list.
+-pub(crate) struct CountedLinkedList<L: Link, T> {
+-    list: LinkedList<L, T>,
+-    count: usize,
+-}
+-
+-impl<L: Link> CountedLinkedList<L, L::Target> {
+-    pub(crate) fn new() -> CountedLinkedList<L, L::Target> {
+-        CountedLinkedList {
+-            list: LinkedList::new(),
+-            count: 0,
+-        }
+-    }
+-
+-    pub(crate) fn push_front(&mut self, val: L::Handle) {
+-        self.list.push_front(val);
+-        self.count += 1;
+-    }
+-
+-    pub(crate) fn pop_back(&mut self) -> Option<L::Handle> {
+-        let val = self.list.pop_back();
+-        if val.is_some() {
+-            self.count -= 1;
+-        }
+-        val
+-    }
+-
+-    pub(crate) fn is_empty(&self) -> bool {
+-        self.list.is_empty()
+-    }
+-
+-    pub(crate) unsafe fn remove(&mut self, node: NonNull<L::Target>) -> Option<L::Handle> {
+-        let val = self.list.remove(node);
+-        if val.is_some() {
+-            self.count -= 1;
+-        }
+-        val
+-    }
+-
+-    pub(crate) fn count(&self) -> usize {
+-        self.count
+-    }
+-}
+-
+ #[cfg(any(
+     feature = "fs",
+     feature = "rt",
+@@ -766,26 +719,6 @@ pub(crate) mod tests {
+         }
+     }
+ 
+-    #[test]
+-    fn count() {
+-        let mut list = CountedLinkedList::<&Entry, <&Entry as Link>::Target>::new();
+-        assert_eq!(0, list.count());
+-
+-        let a = entry(5);
+-        let b = entry(7);
+-        list.push_front(a.as_ref());
+-        list.push_front(b.as_ref());
+-        assert_eq!(2, list.count());
+-
+-        list.pop_back();
+-        assert_eq!(1, list.count());
+-
+-        unsafe {
+-            list.remove(ptr(&b));
+-        }
+-        assert_eq!(0, list.count());
+-    }
+-
+     /// This is a fuzz test. You run it by entering `cargo fuzz run fuzz_linked_list` in CLI in `/tokio/` module.
+     #[cfg(fuzzing)]
+     pub fn fuzz_linked_list(ops: &[u8]) {
+diff --git a/tokio/tests/rt_metrics.rs b/tokio/tests/rt_metrics.rs
+index 76aa0587..d238808c 100644
+--- a/tokio/tests/rt_metrics.rs
++++ b/tokio/tests/rt_metrics.rs
+@@ -81,23 +81,6 @@ fn blocking_queue_depth() {
+     assert_eq!(0, rt.metrics().blocking_queue_depth());
+ }
+ 
+-#[test]
+-fn active_tasks_count() {
+-    let rt = current_thread();
+-    let metrics = rt.metrics();
+-    assert_eq!(0, metrics.active_tasks_count());
+-    rt.spawn(async move {
+-        assert_eq!(1, metrics.active_tasks_count());
+-    });
+-
+-    let rt = threaded();
+-    let metrics = rt.metrics();
+-    assert_eq!(0, metrics.active_tasks_count());
+-    rt.spawn(async move {
+-        assert_eq!(1, metrics.active_tasks_count());
+-    });
+-}
+-
+ #[test]
+ fn remote_schedule_count() {
+     use std::thread;

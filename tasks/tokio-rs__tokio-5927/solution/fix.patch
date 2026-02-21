@@ -1,0 +1,140 @@
+diff --git a/tokio/src/runtime/metrics/batch.rs b/tokio/src/runtime/metrics/batch.rs
+index 1bb4e261..1d0f3dea 100644
+--- a/tokio/src/runtime/metrics/batch.rs
++++ b/tokio/src/runtime/metrics/batch.rs
+@@ -73,7 +73,8 @@ impl MetricsBatch {
+         }
+     }
+ 
+-    pub(crate) fn submit(&mut self, worker: &WorkerMetrics) {
++    pub(crate) fn submit(&mut self, worker: &WorkerMetrics, mean_poll_time: u64) {
++        worker.mean_poll_time.store(mean_poll_time, Relaxed);
+         worker.park_count.store(self.park_count, Relaxed);
+         worker.noop_count.store(self.noop_count, Relaxed);
+         worker.steal_count.store(self.steal_count, Relaxed);
+diff --git a/tokio/src/runtime/metrics/mock.rs b/tokio/src/runtime/metrics/mock.rs
+index 8f8345c0..e4bb3a99 100644
+--- a/tokio/src/runtime/metrics/mock.rs
++++ b/tokio/src/runtime/metrics/mock.rs
+@@ -37,7 +37,7 @@ impl MetricsBatch {
+         Self {}
+     }
+ 
+-    pub(crate) fn submit(&mut self, _to: &WorkerMetrics) {}
++    pub(crate) fn submit(&mut self, _to: &WorkerMetrics, _mean_poll_time: u64) {}
+     pub(crate) fn about_to_park(&mut self) {}
+     pub(crate) fn inc_local_schedule_count(&mut self) {}
+     pub(crate) fn start_processing_scheduled_tasks(&mut self) {}
+diff --git a/tokio/src/runtime/metrics/runtime.rs b/tokio/src/runtime/metrics/runtime.rs
+index 1f990a1f..95b517c9 100644
+--- a/tokio/src/runtime/metrics/runtime.rs
++++ b/tokio/src/runtime/metrics/runtime.rs
+@@ -769,6 +769,47 @@ impl RuntimeMetrics {
+             .unwrap_or_default()
+     }
+ 
++    /// Returns the mean duration of task polls, in nanoseconds.
++    ///
++    /// This is an exponentially weighted moving average. Currently, this metric
++    /// is only provided by the multi-threaded runtime.
++    ///
++    /// # Arguments
++    ///
++    /// `worker` is the index of the worker being queried. The given value must
++    /// be between 0 and `num_workers()`. The index uniquely identifies a single
++    /// worker and will continue to identify the worker throughout the lifetime
++    /// of the runtime instance.
++    ///
++    /// # Panics
++    ///
++    /// The method panics when `worker` represents an invalid worker, i.e. is
++    /// greater than or equal to `num_workers()`.
++    ///
++    /// # Examples
++    ///
++    /// ```
++    /// use tokio::runtime::Handle;
++    ///
++    /// #[tokio::main]
++    /// async fn main() {
++    ///     let metrics = Handle::current().metrics();
++    ///
++    ///     let n = metrics.worker_mean_poll_time(0);
++    ///     println!("worker 0 has a mean poll time of {:?}", n);
++    /// }
++    /// ```
++    #[track_caller]
++    pub fn worker_mean_poll_time(&self, worker: usize) -> Duration {
++        let nanos = self
++            .handle
++            .inner
++            .worker_metrics(worker)
++            .mean_poll_time
++            .load(Relaxed);
++        Duration::from_nanos(nanos)
++    }
++
+     /// Returns the number of tasks currently scheduled in the blocking
+     /// thread pool, spawned using `spawn_blocking`.
+     ///
+diff --git a/tokio/src/runtime/metrics/worker.rs b/tokio/src/runtime/metrics/worker.rs
+index e0f23e6a..b53a86bc 100644
+--- a/tokio/src/runtime/metrics/worker.rs
++++ b/tokio/src/runtime/metrics/worker.rs
+@@ -28,6 +28,9 @@ pub(crate) struct WorkerMetrics {
+     /// Number of tasks the worker polled.
+     pub(crate) poll_count: AtomicU64,
+ 
++    /// EWMA task poll time, in nanoseconds.
++    pub(crate) mean_poll_time: AtomicU64,
++
+     /// Amount of time the worker spent doing work vs. parking.
+     pub(crate) busy_duration_total: AtomicU64,
+ 
+@@ -62,6 +65,7 @@ impl WorkerMetrics {
+             steal_count: AtomicU64::new(0),
+             steal_operations: AtomicU64::new(0),
+             poll_count: AtomicU64::new(0),
++            mean_poll_time: AtomicU64::new(0),
+             overflow_count: AtomicU64::new(0),
+             busy_duration_total: AtomicU64::new(0),
+             local_schedule_count: AtomicU64::new(0),
+diff --git a/tokio/src/runtime/scheduler/current_thread/mod.rs b/tokio/src/runtime/scheduler/current_thread/mod.rs
+index 1100147d..30b17c0e 100644
+--- a/tokio/src/runtime/scheduler/current_thread/mod.rs
++++ b/tokio/src/runtime/scheduler/current_thread/mod.rs
+@@ -321,7 +321,7 @@ impl Core {
+     }
+ 
+     fn submit_metrics(&mut self, handle: &Handle) {
+-        self.metrics.submit(&handle.shared.worker_metrics);
++        self.metrics.submit(&handle.shared.worker_metrics, 0);
+     }
+ }
+ 
+diff --git a/tokio/src/runtime/scheduler/multi_thread/stats.rs b/tokio/src/runtime/scheduler/multi_thread/stats.rs
+index f01daaa1..3b8c5020 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/stats.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/stats.rs
+@@ -74,7 +74,7 @@ impl Stats {
+     }
+ 
+     pub(crate) fn submit(&mut self, to: &WorkerMetrics) {
+-        self.batch.submit(to);
++        self.batch.submit(to, self.task_poll_time_ewma as u64);
+     }
+ 
+     pub(crate) fn about_to_park(&mut self) {
+diff --git a/tokio/src/runtime/scheduler/multi_thread_alt/stats.rs b/tokio/src/runtime/scheduler/multi_thread_alt/stats.rs
+index 57657bb0..228e7977 100644
+--- a/tokio/src/runtime/scheduler/multi_thread_alt/stats.rs
++++ b/tokio/src/runtime/scheduler/multi_thread_alt/stats.rs
+@@ -93,7 +93,7 @@ impl Stats {
+     }
+ 
+     pub(crate) fn submit(&mut self, to: &WorkerMetrics) {
+-        self.batch.submit(to);
++        self.batch.submit(to, self.task_poll_time_ewma as u64);
+     }
+ 
+     pub(crate) fn about_to_park(&mut self) {

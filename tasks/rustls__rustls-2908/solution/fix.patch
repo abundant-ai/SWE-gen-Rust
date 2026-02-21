@@ -1,0 +1,1408 @@
+diff --git a/bogo/src/main.rs b/bogo/src/main.rs
+index 53693d69..6da6689d 100644
+--- a/bogo/src/main.rs
++++ b/bogo/src/main.rs
+@@ -41,7 +41,9 @@ use rustls::pki_types::{
+     CertificateDer, EchConfigListBytes, PrivateKeyDer, ServerName, SubjectPublicKeyInfoDer,
+ };
+ use rustls::server::danger::{ClientIdentity, ClientVerifier, SignatureVerificationInput};
+-use rustls::server::{self, ClientHello, ServerConfig, ServerConnection, WebPkiClientVerifier};
++use rustls::server::{
++    self, ClientHello, ServerConfig, ServerConnection, ServerSessionKey, WebPkiClientVerifier,
++};
+ use rustls::{Connection, DistinguishedName, HandshakeKind, RootCertStore, compress};
+ use rustls_aws_lc_rs::hpke;
+ 
+@@ -1252,7 +1254,7 @@ fn align_time() {
+ }
+ 
+ impl server::StoresServerSessions for ServerCacheWithResumptionDelay {
+-    fn put(&self, key: Vec<u8>, mut value: Vec<u8>) -> bool {
++    fn put(&self, key: ServerSessionKey<'_>, mut value: Vec<u8>) -> bool {
+         // The creation time should be stored directly after the 2-byte version discriminant.
+         let creation_time_sec = &mut value[2..10];
+         let original = u64::from_be_bytes(creation_time_sec.try_into().unwrap());
+@@ -1261,11 +1263,11 @@ impl server::StoresServerSessions for ServerCacheWithResumptionDelay {
+         self.storage.put(key, value)
+     }
+ 
+-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
++    fn get(&self, key: ServerSessionKey<'_>) -> Option<Vec<u8>> {
+         self.storage.get(key)
+     }
+ 
+-    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
++    fn take(&self, key: ServerSessionKey<'_>) -> Option<Vec<u8>> {
+         self.storage.take(key)
+     }
+ 
+diff --git a/rustls/src/limited_cache.rs b/rustls/src/limited_cache.rs
+index de9b5a0c..10e1af42 100644
+--- a/rustls/src/limited_cache.rs
++++ b/rustls/src/limited_cache.rs
+@@ -1,5 +1,6 @@
+ use alloc::collections::VecDeque;
+ use core::borrow::Borrow;
++use core::fmt::Debug;
+ use core::hash::Hash;
+ 
+ use crate::hash_map::{Entry, HashMap};
+@@ -12,53 +13,14 @@ use crate::hash_map::{Entry, HashMap};
+ /// storage.
+ ///
+ /// This is inefficient: it stores keys twice.
+-pub(crate) struct LimitedCache<K: Clone + Hash + Eq, V> {
++pub(crate) struct LimitedCache<K, V> {
+     map: HashMap<K, V>,
+ 
+     // first item is the oldest key
+     oldest: VecDeque<K>,
+ }
+ 
+-impl<K, V> LimitedCache<K, V>
+-where
+-    K: Eq + Hash + Clone + core::fmt::Debug,
+-    V: Default,
+-{
+-    pub(crate) fn get_or_insert_default_and_edit(&mut self, k: K, edit: impl FnOnce(&mut V)) {
+-        let inserted_new_item = match self.map.entry(k) {
+-            Entry::Occupied(value) => {
+-                edit(value.into_mut());
+-                false
+-            }
+-            entry @ Entry::Vacant(_) => {
+-                self.oldest
+-                    .push_back(entry.key().clone());
+-                edit(entry.or_insert_with(V::default));
+-                true
+-            }
+-        };
+-
+-        // ensure next insertion does not require a realloc
+-        if inserted_new_item && self.oldest.capacity() == self.oldest.len() {
+-            if let Some(oldest_key) = self.oldest.pop_front() {
+-                self.map.remove(&oldest_key);
+-            }
+-        }
+-    }
+-
+-    pub(crate) fn get_mut<Q: Hash + Eq + ?Sized>(&mut self, k: &Q) -> Option<&mut V>
+-    where
+-        K: Borrow<Q>,
+-    {
+-        self.map.get_mut(k)
+-    }
+-}
+-
+-impl<K, V> LimitedCache<K, V>
+-where
+-    K: Eq + Hash + Clone + core::fmt::Debug,
+-    V: Default,
+-{
++impl<K: Eq + Hash + Clone + Debug, V> LimitedCache<K, V> {
+     /// Create a new LimitedCache with the given rough capacity.
+     pub(crate) fn new(capacity_order_of_magnitude: usize) -> Self {
+         Self {
+@@ -91,6 +53,13 @@ where
+         }
+     }
+ 
++    pub(crate) fn get_mut<Q: Hash + Eq + ?Sized>(&mut self, k: &Q) -> Option<&mut V>
++    where
++        K: Borrow<Q>,
++    {
++        self.map.get_mut(k)
++    }
++
+     pub(crate) fn get<Q: Hash + Eq + ?Sized>(&self, k: &Q) -> Option<&V>
+     where
+         K: Borrow<Q>,
+@@ -117,6 +86,30 @@ where
+     }
+ }
+ 
++impl<K: Eq + Hash + Clone + Debug, V: Default> LimitedCache<K, V> {
++    pub(crate) fn get_or_insert_default_and_edit(&mut self, k: K, edit: impl FnOnce(&mut V)) {
++        let inserted_new_item = match self.map.entry(k) {
++            Entry::Occupied(value) => {
++                edit(value.into_mut());
++                false
++            }
++            entry @ Entry::Vacant(_) => {
++                self.oldest
++                    .push_back(entry.key().clone());
++                edit(entry.or_insert_with(V::default));
++                true
++            }
++        };
++
++        // ensure next insertion does not require a realloc
++        if inserted_new_item && self.oldest.capacity() == self.oldest.len() {
++            if let Some(oldest_key) = self.oldest.pop_front() {
++                self.map.remove(&oldest_key);
++            }
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use alloc::string::String;
+diff --git a/rustls/src/msgs/handshake.rs b/rustls/src/msgs/handshake.rs
+index f15a7076..443c32fc 100644
+--- a/rustls/src/msgs/handshake.rs
++++ b/rustls/src/msgs/handshake.rs
+@@ -75,24 +75,22 @@ pub(crate) struct SessionId {
+     len: usize,
+ }
+ 
+-impl fmt::Debug for SessionId {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        hex(f, &self.data[..self.len])
++impl SessionId {
++    pub(crate) fn random(secure_random: &dyn SecureRandom) -> Result<Self, GetRandomFailed> {
++        let mut data = [0u8; 32];
++        secure_random.fill(&mut data)?;
++        Ok(Self { data, len: 32 })
+     }
+-}
+ 
+-impl PartialEq for SessionId {
+-    fn eq(&self, other: &Self) -> bool {
+-        if self.len != other.len {
+-            return false;
+-        }
+-
+-        let mut diff = 0u8;
+-        for i in 0..self.len {
+-            diff |= self.data[i] ^ other.data[i];
++    pub(crate) fn empty() -> Self {
++        Self {
++            data: [0u8; 32],
++            len: 0,
+         }
++    }
+ 
+-        diff == 0u8
++    pub(crate) fn is_empty(&self) -> bool {
++        self.len == 0
+     }
+ }
+ 
+@@ -119,22 +117,18 @@ impl Codec<'_> for SessionId {
+     }
+ }
+ 
+-impl SessionId {
+-    pub(crate) fn random(secure_random: &dyn SecureRandom) -> Result<Self, GetRandomFailed> {
+-        let mut data = [0u8; 32];
+-        secure_random.fill(&mut data)?;
+-        Ok(Self { data, len: 32 })
+-    }
++impl PartialEq for SessionId {
++    fn eq(&self, other: &Self) -> bool {
++        if self.len != other.len {
++            return false;
++        }
+ 
+-    pub(crate) fn empty() -> Self {
+-        Self {
+-            data: [0u8; 32],
+-            len: 0,
++        let mut diff = 0u8;
++        for i in 0..self.len {
++            diff |= self.data[i] ^ other.data[i];
+         }
+-    }
+ 
+-    pub(crate) fn is_empty(&self) -> bool {
+-        self.len == 0
++        diff == 0u8
+     }
+ }
+ 
+@@ -144,6 +138,12 @@ impl AsRef<[u8]> for SessionId {
+     }
+ }
+ 
++impl fmt::Debug for SessionId {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        hex(f, &self.data[..self.len])
++    }
++}
++
+ #[derive(Clone, Copy, Debug)]
+ pub(crate) struct SupportedEcPointFormats {
+     pub(crate) uncompressed: bool,
+diff --git a/rustls/src/server/config.rs b/rustls/src/server/config.rs
+index 368d699b..2e558048 100644
+--- a/rustls/src/server/config.rs
++++ b/rustls/src/server/config.rs
+@@ -7,8 +7,8 @@ use core::marker::PhantomData;
+ use pki_types::PrivateKeyDer;
+ use pki_types::{DnsName, FipsStatus, UnixTime};
+ 
+-use super::handy;
+ use super::hs::ClientHelloInput;
++use super::{ServerSessionKey, handy};
+ use crate::builder::{ConfigBuilder, WantsVerifier};
+ #[cfg(doc)]
+ use crate::crypto;
+@@ -328,15 +328,15 @@ pub trait StoresServerSessions: Debug + Send + Sync {
+     /// Store session secrets encoded in `value` against `key`,
+     /// overwrites any existing value against `key`.  Returns `true`
+     /// if the value was stored.
+-    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool;
++    fn put(&self, key: ServerSessionKey<'_>, value: Vec<u8>) -> bool;
+ 
+     /// Find a value with the given `key`.  Return it, or None
+     /// if it doesn't exist.
+-    fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
++    fn get(&self, key: ServerSessionKey<'_>) -> Option<Vec<u8>>;
+ 
+     /// Find a value with the given `key`.  Return it and delete it;
+     /// or None if it doesn't exist.
+-    fn take(&self, key: &[u8]) -> Option<Vec<u8>>;
++    fn take(&self, key: ServerSessionKey<'_>) -> Option<Vec<u8>>;
+ 
+     /// Whether the store can cache another session. This is used to indicate to clients
+     /// whether their session can be resumed; the implementation is not required to remember
+diff --git a/rustls/src/server/handy.rs b/rustls/src/server/handy.rs
+index 65351fe8..f6e7f827 100644
+--- a/rustls/src/server/handy.rs
++++ b/rustls/src/server/handy.rs
+@@ -1,21 +1,21 @@
+ use alloc::vec::Vec;
+ use core::fmt::Debug;
+ 
+-use crate::server;
++use crate::server::{ServerSessionKey, StoresServerSessions};
+ 
+ /// Something which never stores sessions.
+ #[expect(clippy::exhaustive_structs)]
+ #[derive(Debug)]
+ pub struct NoServerSessionStorage {}
+ 
+-impl server::StoresServerSessions for NoServerSessionStorage {
+-    fn put(&self, _id: Vec<u8>, _sec: Vec<u8>) -> bool {
++impl StoresServerSessions for NoServerSessionStorage {
++    fn put(&self, _id: ServerSessionKey<'_>, _sec: Vec<u8>) -> bool {
+         false
+     }
+-    fn get(&self, _id: &[u8]) -> Option<Vec<u8>> {
++    fn get(&self, _id: ServerSessionKey<'_>) -> Option<Vec<u8>> {
+         None
+     }
+-    fn take(&self, _id: &[u8]) -> Option<Vec<u8>> {
++    fn take(&self, _id: ServerSessionKey<'_>) -> Option<Vec<u8>> {
+         None
+     }
+     fn can_cache(&self) -> bool {
+@@ -24,12 +24,13 @@ impl server::StoresServerSessions for NoServerSessionStorage {
+ }
+ 
+ mod cache {
+-    use alloc::vec::Vec;
+-    use core::fmt::{Debug, Formatter};
++    use core::fmt::Formatter;
+ 
++    use super::*;
++    use crate::limited_cache;
+     use crate::lock::Mutex;
++    use crate::server::StoresServerSessions;
+     use crate::sync::Arc;
+-    use crate::{limited_cache, server};
+ 
+     /// An implementer of `StoresServerSessions` that stores everything
+     /// in memory.  If enforces a limit on the number of stored sessions
+@@ -49,25 +50,28 @@ mod cache {
+         }
+     }
+ 
+-    impl server::StoresServerSessions for ServerSessionMemoryCache {
+-        fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
++    impl StoresServerSessions for ServerSessionMemoryCache {
++        fn put(&self, key: ServerSessionKey<'_>, value: Vec<u8>) -> bool {
+             self.cache
+                 .lock()
+                 .unwrap()
+-                .insert(key, value);
++                .insert(key.as_ref().to_vec(), value);
+             true
+         }
+ 
+-        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
++        fn get(&self, key: ServerSessionKey<'_>) -> Option<Vec<u8>> {
+             self.cache
+                 .lock()
+                 .unwrap()
+-                .get(key)
++                .get(key.as_ref())
+                 .cloned()
+         }
+ 
+-        fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+-            self.cache.lock().unwrap().remove(key)
++        fn take(&self, key: ServerSessionKey<'_>) -> Option<Vec<u8>> {
++            self.cache
++                .lock()
++                .unwrap()
++                .remove(key.as_ref())
+         }
+ 
+         fn can_cache(&self) -> bool {
+@@ -92,39 +96,50 @@ mod cache {
+         #[test]
+         fn test_serversessionmemorycache_accepts_put() {
+             let c = ServerSessionMemoryCache::new(4);
+-            assert!(c.put(vec![0x01], vec![0x02]));
++            assert!(c.put(ServerSessionKey::new(&[0x01]), vec![0x02]));
+         }
+ 
+         #[test]
+         fn test_serversessionmemorycache_persists_put() {
+             let c = ServerSessionMemoryCache::new(4);
+-            assert!(c.put(vec![0x01], vec![0x02]));
+-            assert_eq!(c.get(&[0x01]), Some(vec![0x02]));
+-            assert_eq!(c.get(&[0x01]), Some(vec![0x02]));
++            assert!(c.put(ServerSessionKey::new(&[0x01]), vec![0x02]));
++            assert_eq!(c.get(ServerSessionKey::new(&[0x01])), Some(vec![0x02]));
++            assert_eq!(c.get(ServerSessionKey::new(&[0x01])), Some(vec![0x02]));
+         }
+ 
+         #[test]
+         fn test_serversessionmemorycache_overwrites_put() {
+             let c = ServerSessionMemoryCache::new(4);
+-            assert!(c.put(vec![0x01], vec![0x02]));
+-            assert!(c.put(vec![0x01], vec![0x04]));
+-            assert_eq!(c.get(&[0x01]), Some(vec![0x04]));
++            assert!(c.put(ServerSessionKey::new(&[0x01]), vec![0x02]));
++            assert!(c.put(ServerSessionKey::new(&[0x01]), vec![0x04]));
++            assert_eq!(c.get(ServerSessionKey::new(&[0x01])), Some(vec![0x04]));
+         }
+ 
+         #[test]
+         fn test_serversessionmemorycache_drops_to_maintain_size_invariant() {
+             let c = ServerSessionMemoryCache::new(2);
+-            assert!(c.put(vec![0x01], vec![0x02]));
+-            assert!(c.put(vec![0x03], vec![0x04]));
+-            assert!(c.put(vec![0x05], vec![0x06]));
+-            assert!(c.put(vec![0x07], vec![0x08]));
+-            assert!(c.put(vec![0x09], vec![0x0a]));
+-
+-            let count = c.get(&[0x01]).iter().count()
+-                + c.get(&[0x03]).iter().count()
+-                + c.get(&[0x05]).iter().count()
+-                + c.get(&[0x07]).iter().count()
+-                + c.get(&[0x09]).iter().count();
++            assert!(c.put(ServerSessionKey::new(&[0x01]), vec![0x02]));
++            assert!(c.put(ServerSessionKey::new(&[0x03]), vec![0x04]));
++            assert!(c.put(ServerSessionKey::new(&[0x05]), vec![0x06]));
++            assert!(c.put(ServerSessionKey::new(&[0x07]), vec![0x08]));
++            assert!(c.put(ServerSessionKey::new(&[0x09]), vec![0x0a]));
++
++            let count = c
++                .get(ServerSessionKey::new(&[0x01]))
++                .iter()
++                .count()
++                + c.get(ServerSessionKey::new(&[0x03]))
++                    .iter()
++                    .count()
++                + c.get(ServerSessionKey::new(&[0x05]))
++                    .iter()
++                    .count()
++                + c.get(ServerSessionKey::new(&[0x07]))
++                    .iter()
++                    .count()
++                + c.get(ServerSessionKey::new(&[0x09]))
++                    .iter()
++                    .count();
+ 
+             assert!(count < 5);
+         }
+@@ -270,23 +285,23 @@ mod tests {
+     #[test]
+     fn test_noserversessionstorage_drops_put() {
+         let c = NoServerSessionStorage {};
+-        assert!(!c.put(vec![0x01], vec![0x02]));
++        assert!(!c.put(ServerSessionKey::new(&[0x01]), vec![0x02]));
+     }
+ 
+     #[test]
+     fn test_noserversessionstorage_denies_gets() {
+         let c = NoServerSessionStorage {};
+-        c.put(vec![0x01], vec![0x02]);
+-        assert_eq!(c.get(&[]), None);
+-        assert_eq!(c.get(&[0x01]), None);
+-        assert_eq!(c.get(&[0x02]), None);
++        c.put(ServerSessionKey::new(&[0x01]), vec![0x02]);
++        assert_eq!(c.get(ServerSessionKey::new(&[])), None);
++        assert_eq!(c.get(ServerSessionKey::new(&[0x01])), None);
++        assert_eq!(c.get(ServerSessionKey::new(&[0x02])), None);
+     }
+ 
+     #[test]
+     fn test_noserversessionstorage_denies_takes() {
+         let c = NoServerSessionStorage {};
+-        assert_eq!(c.take(&[]), None);
+-        assert_eq!(c.take(&[0x01]), None);
+-        assert_eq!(c.take(&[0x02]), None);
++        assert_eq!(c.take(ServerSessionKey::new(&[])), None);
++        assert_eq!(c.take(ServerSessionKey::new(&[0x01])), None);
++        assert_eq!(c.take(ServerSessionKey::new(&[0x02])), None);
+     }
+ }
+diff --git a/rustls/src/server/mod.rs b/rustls/src/server/mod.rs
+index 075632e8..459742d5 100644
+--- a/rustls/src/server/mod.rs
++++ b/rustls/src/server/mod.rs
+@@ -1,13 +1,12 @@
+ use alloc::vec::Vec;
+ 
+ use pki_types::{DnsName, UnixTime};
+-use zeroize::Zeroizing;
+ 
+ use crate::crypto::cipher::Payload;
+ use crate::crypto::{CipherSuite, Identity};
+ use crate::enums::{ApplicationProtocol, ProtocolVersion};
+ use crate::error::InvalidMessage;
+-use crate::msgs::{Codec, MaybeEmpty, Reader, SizedPayload};
++use crate::msgs::{Codec, MaybeEmpty, Reader, SessionId, SizedPayload};
+ pub use crate::verify::NoClientAuth;
+ #[cfg(feature = "webpki")]
+ pub use crate::webpki::{
+@@ -35,9 +34,11 @@ pub(crate) use hs::ServerHandler;
+ 
+ mod tls12;
+ pub(crate) use tls12::TLS12_HANDLER;
++use tls12::Tls12ServerSessionValue;
+ 
+ mod tls13;
+ pub(crate) use tls13::TLS13_HANDLER;
++use tls13::Tls13ServerSessionValue;
+ 
+ /// Dangerous configuration that should be audited and used with extreme care.
+ pub mod danger {
+@@ -78,119 +79,6 @@ impl Codec<'_> for ServerSessionValue {
+     }
+ }
+ 
+-#[derive(Debug)]
+-pub(crate) struct Tls12ServerSessionValue {
+-    pub(crate) common: CommonServerSessionValue,
+-    pub(crate) master_secret: Zeroizing<[u8; 48]>,
+-    pub(crate) extended_ms: bool,
+-}
+-
+-impl Tls12ServerSessionValue {
+-    pub(crate) fn new(
+-        common: CommonServerSessionValue,
+-        master_secret: &[u8; 48],
+-        extended_ms: bool,
+-    ) -> Self {
+-        Self {
+-            common,
+-            master_secret: Zeroizing::new(*master_secret),
+-            extended_ms,
+-        }
+-    }
+-}
+-
+-impl Codec<'_> for Tls12ServerSessionValue {
+-    fn encode(&self, bytes: &mut Vec<u8>) {
+-        self.common.encode(bytes);
+-        bytes.extend_from_slice(self.master_secret.as_ref());
+-        (self.extended_ms as u8).encode(bytes);
+-    }
+-
+-    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+-        Ok(Self {
+-            common: CommonServerSessionValue::read(r)?,
+-            master_secret: Zeroizing::new(r.take_array("MasterSecret").copied()?),
+-            extended_ms: matches!(u8::read(r)?, 1),
+-        })
+-    }
+-}
+-
+-impl From<Tls12ServerSessionValue> for ServerSessionValue {
+-    fn from(value: Tls12ServerSessionValue) -> Self {
+-        Self::Tls12(value)
+-    }
+-}
+-
+-#[derive(Debug)]
+-pub(crate) struct Tls13ServerSessionValue {
+-    pub(crate) common: CommonServerSessionValue,
+-    pub(crate) secret: Zeroizing<SizedPayload<'static, u8>>,
+-    pub(crate) age_obfuscation_offset: u32,
+-
+-    // not encoded vv
+-    freshness: Option<bool>,
+-}
+-
+-impl Tls13ServerSessionValue {
+-    pub(crate) fn new(
+-        common: CommonServerSessionValue,
+-        secret: &[u8],
+-        age_obfuscation_offset: u32,
+-    ) -> Self {
+-        Self {
+-            common,
+-            secret: Zeroizing::new(secret.to_vec().into()),
+-            age_obfuscation_offset,
+-            freshness: None,
+-        }
+-    }
+-
+-    pub(crate) fn set_freshness(
+-        mut self,
+-        obfuscated_client_age_ms: u32,
+-        time_now: UnixTime,
+-    ) -> Self {
+-        let client_age_ms = obfuscated_client_age_ms.wrapping_sub(self.age_obfuscation_offset);
+-        let server_age_ms = (time_now
+-            .as_secs()
+-            .saturating_sub(self.common.creation_time_sec) as u32)
+-            .saturating_mul(1000);
+-
+-        let age_difference = server_age_ms.abs_diff(client_age_ms);
+-
+-        self.freshness = Some(age_difference <= MAX_FRESHNESS_SKEW_MS);
+-        self
+-    }
+-
+-    pub(crate) fn is_fresh(&self) -> bool {
+-        self.freshness.unwrap_or_default()
+-    }
+-}
+-
+-impl Codec<'_> for Tls13ServerSessionValue {
+-    fn encode(&self, bytes: &mut Vec<u8>) {
+-        self.common.encode(bytes);
+-        self.secret.encode(bytes);
+-        self.age_obfuscation_offset
+-            .encode(bytes);
+-    }
+-
+-    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+-        Ok(Self {
+-            common: CommonServerSessionValue::read(r)?,
+-            secret: Zeroizing::new(SizedPayload::read(r)?.into_owned()),
+-            age_obfuscation_offset: u32::read(r)?,
+-            freshness: None,
+-        })
+-    }
+-}
+-
+-impl From<Tls13ServerSessionValue> for ServerSessionValue {
+-    fn from(value: Tls13ServerSessionValue) -> Self {
+-        Self::Tls13(value)
+-    }
+-}
+-
+ #[derive(Debug)]
+ pub(crate) struct CommonServerSessionValue {
+     pub(crate) creation_time_sec: u64,
+@@ -294,8 +182,25 @@ impl Codec<'_> for CommonServerSessionValue {
+     }
+ }
+ 
+-/// This is the maximum allowed skew between server and client clocks, over
+-/// the maximum ticket lifetime period.  This encompasses TCP retransmission
+-/// times in case packet loss occurs when the client sends the ClientHello
+-/// or receives the NewSessionTicket, _and_ actual clock skew over this period.
+-static MAX_FRESHNESS_SKEW_MS: u32 = 60 * 1000;
++/// A key that identifies a server-side resumable session.
++pub struct ServerSessionKey<'a> {
++    inner: &'a [u8],
++}
++
++impl<'a> ServerSessionKey<'a> {
++    pub(crate) fn new(inner: &'a [u8]) -> Self {
++        Self { inner }
++    }
++}
++
++impl<'a> From<&'a SessionId> for ServerSessionKey<'a> {
++    fn from(session_id: &'a SessionId) -> Self {
++        Self::new(session_id.as_ref())
++    }
++}
++
++impl AsRef<[u8]> for ServerSessionKey<'_> {
++    fn as_ref(&self) -> &[u8] {
++        self.inner
++    }
++}
+diff --git a/rustls/src/server/tls12.rs b/rustls/src/server/tls12.rs
+index 687e1416..9f6f5442 100644
+--- a/rustls/src/server/tls12.rs
++++ b/rustls/src/server/tls12.rs
+@@ -5,10 +5,11 @@ use alloc::vec::Vec;
+ pub(crate) use client_hello::TLS12_HANDLER;
+ use pki_types::{DnsName, UnixTime};
+ use subtle::ConstantTimeEq;
++use zeroize::Zeroizing;
+ 
+ use super::config::ServerConfig;
+ use super::connection::ServerConnectionData;
+-use super::{CommonServerSessionValue, ServerSessionValue, Tls12ServerSessionValue, hs};
++use super::{CommonServerSessionValue, ServerSessionKey, ServerSessionValue, hs};
+ use crate::check::inappropriate_message;
+ use crate::common_state::{Event, HandshakeFlightTls12, HandshakeKind, Input, Output, Side, State};
+ use crate::conn::ConnectionRandoms;
+@@ -19,13 +20,13 @@ use crate::crypto::{Identity, TicketProducer};
+ use crate::enums::{
+     ApplicationProtocol, CertificateType, ContentType, HandshakeType, ProtocolVersion,
+ };
+-use crate::error::{ApiMisuse, Error, PeerIncompatible, PeerMisbehaved};
++use crate::error::{ApiMisuse, Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
+ use crate::hash_hs::HandshakeHash;
+ use crate::log::{debug, trace};
+ use crate::msgs::{
+     CertificateChain, ChangeCipherSpecPayload, ClientKeyExchangeParams, Codec,
+     HandshakeAlignedProof, HandshakeMessagePayload, HandshakePayload, Message, MessagePayload,
+-    NewSessionTicketPayload, NewSessionTicketPayloadTls13, SessionId,
++    NewSessionTicketPayload, NewSessionTicketPayloadTls13, Reader, SessionId,
+ };
+ use crate::suites::PartiallyExtractedSecrets;
+ use crate::sync::Arc;
+@@ -106,63 +107,13 @@ mod client_hello {
+                 randoms.server[24..].copy_from_slice(&tls12::DOWNGRADE_SENTINEL);
+             }
+ 
+-            // -- Check for resumption --
+-            // We can do this either by (in order of preference):
+-            // 1. receiving a ticket that decrypts
+-            // 2. receiving a sessionid that is in our cache
+-            //
+-            // If we receive a ticket, the sessionid won't be in our
+-            // cache, so don't check.
+-            //
+-            // If either works, we end up with a ServerConnectionValue
+-            // which is passed to start_resumption and concludes
+-            // our handling of the ClientHello.
+-            //
+-            let mut ticket_received = false;
+-            let resume_data = input
+-                .client_hello
+-                .session_ticket
+-                .as_ref()
+-                .and_then(|ticket_ext| match ticket_ext {
+-                    ClientSessionTicket::Offer(ticket) => Some(ticket),
+-                    _ => None,
+-                })
+-                .and_then(|ticket| {
+-                    ticket_received = true;
+-                    debug!("Ticket received");
+-                    let data = st
+-                        .config
+-                        .ticketer
+-                        .as_ref()
+-                        .and_then(|ticketer| ticketer.decrypt(ticket.bytes()));
+-                    if data.is_none() {
+-                        debug!("Ticket didn't decrypt");
+-                    }
+-                    data
+-                })
+-                .or_else(|| {
+-                    // Perhaps resume?  If we received a ticket, the sessionid
+-                    // does not correspond to a real session.
+-                    if input.client_hello.session_id.is_empty() || ticket_received {
+-                        return None;
+-                    }
+-
+-                    st.config
+-                        .session_storage
+-                        .get(input.client_hello.session_id.as_ref())
+-                })
+-                .and_then(|x| ServerSessionValue::read_bytes(&x).ok())
+-                .and_then(|resumedata| match resumedata {
+-                    ServerSessionValue::Tls12(tls12) => Some(tls12),
+-                    _ => None,
+-                })
+-                .filter(|resumedata| {
+-                    resumedata
+-                        .common
+-                        .can_resume(suite.common.suite, st.sni.as_ref())
+-                        && (resumedata.extended_ms == st.using_ems
+-                            || (resumedata.extended_ms && !st.using_ems))
+-                });
++            let (ticket_received, resume_data) = check_session(
++                input.client_hello,
++                st.sni.as_ref(),
++                st.using_ems,
++                suite,
++                &st.config,
++            );
+ 
+             if let Some(data) = resume_data {
+                 let proof = input.proof;
+@@ -254,6 +205,67 @@ mod client_hello {
+ 
+     impl Sealed for Handler {}
+ 
++    /// Check for resumption
++    fn check_session(
++        hello: &ClientHelloPayload,
++        sni: Option<&DnsName<'_>>,
++        using_ems: bool,
++        suite: &'static Tls12CipherSuite,
++        config: &ServerConfig,
++    ) -> (bool, Option<Tls12ServerSessionValue>) {
++        // First, check for a ticket that decrypts
++        let (ticket, encoded) = match hello.session_ticket.as_ref() {
++            Some(ClientSessionTicket::Offer(ticket)) => {
++                debug!("Ticket received");
++                let data = config
++                    .ticketer
++                    .as_ref()
++                    .and_then(|ticketer| ticketer.decrypt(ticket.bytes()));
++                match data {
++                    Some(data) => (true, Some(data)),
++                    None => {
++                        debug!("Ticket didn't decrypt");
++                        (true, None)
++                    }
++                }
++            }
++            Some(_) | None => (false, None),
++        };
++
++        let (ticket, encoded) = match (ticket, encoded) {
++            (_, Some(data)) => (true, data),
++            // If we've received a ticket, the session ID won't be in our cache, so skip checking
++            (false, None) if !hello.session_id.is_empty() => {
++                // Check for a session ID in our cache
++                let store = &config.session_storage;
++                match store.get(ServerSessionKey::from(&hello.session_id)) {
++                    Some(data) => (false, data),
++                    None => return (false, None),
++                }
++            }
++            (ticket, None) => return (ticket, None),
++        };
++
++        // Try to parse the encoded session value
++        let Ok(ServerSessionValue::Tls12(session)) = ServerSessionValue::read_bytes(&encoded)
++        else {
++            return (ticket, None);
++        };
++
++        // Check that the session is compatible with the current connection
++        if !session
++            .common
++            .can_resume(suite.common.suite, sni)
++        {
++            return (ticket, None);
++        }
++
++        match session.extended_ms == using_ems || session.extended_ms && !using_ems {
++            true => (ticket, Some(session)),
++            false => (ticket, None),
++        }
++    }
++
+     fn start_resumption(
+         suite: &'static Tls12CipherSuite,
+         using_ems: bool,
+@@ -745,29 +757,43 @@ impl State<ServerConnectionData> for ExpectCcs {
+     }
+ }
+ 
+-// --- Process client's Finished ---
+-fn get_server_connection_value_tls12(
+-    secrets: &ConnectionSecrets,
+-    using_ems: bool,
+-    peer_identity: Option<&Identity<'static>>,
+-    alpn_protocol: Option<&ApplicationProtocol<'_>>,
+-    sni: Option<&DnsName<'static>>,
+-    resumption_data: &[u8],
+-    time_now: UnixTime,
+-) -> ServerSessionValue {
+-    Tls12ServerSessionValue::new(
+-        CommonServerSessionValue::new(
+-            sni,
+-            secrets.suite().common.suite,
+-            peer_identity.cloned(),
+-            alpn_protocol.map(|p| p.to_owned()),
+-            resumption_data.to_vec(),
+-            time_now,
+-        ),
+-        secrets.master_secret(),
+-        using_ems,
+-    )
+-    .into()
++#[derive(Debug)]
++pub(crate) struct Tls12ServerSessionValue {
++    common: CommonServerSessionValue,
++    master_secret: Zeroizing<[u8; 48]>,
++    extended_ms: bool,
++}
++
++impl Tls12ServerSessionValue {
++    fn new(common: CommonServerSessionValue, master_secret: &[u8; 48], extended_ms: bool) -> Self {
++        Self {
++            common,
++            master_secret: Zeroizing::new(*master_secret),
++            extended_ms,
++        }
++    }
++}
++
++impl Codec<'_> for Tls12ServerSessionValue {
++    fn encode(&self, bytes: &mut Vec<u8>) {
++        self.common.encode(bytes);
++        bytes.extend_from_slice(self.master_secret.as_ref());
++        (self.extended_ms as u8).encode(bytes);
++    }
++
++    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
++        Ok(Self {
++            common: CommonServerSessionValue::read(r)?,
++            master_secret: Zeroizing::new(r.take_array("MasterSecret").copied()?),
++            extended_ms: matches!(u8::read(r)?, 1),
++        })
++    }
++}
++
++impl From<Tls12ServerSessionValue> for ServerSessionValue {
++    fn from(value: Tls12ServerSessionValue) -> Self {
++        Self::Tls12(value)
++    }
+ }
+ 
+ fn emit_ticket(
+@@ -782,15 +808,18 @@ fn emit_ticket(
+     ticketer: &dyn TicketProducer,
+     now: UnixTime,
+ ) -> Result<(), Error> {
+-    let plain = get_server_connection_value_tls12(
+-        secrets,
++    let plain = ServerSessionValue::from(Tls12ServerSessionValue::new(
++        CommonServerSessionValue::new(
++            sni,
++            secrets.suite().common.suite,
++            peer_identity.cloned(),
++            alpn_protocol.map(|p| p.to_owned()),
++            resumption_data.to_vec(),
++            now,
++        ),
++        secrets.master_secret(),
+         using_ems,
+-        peer_identity,
+-        alpn_protocol,
+-        sni,
+-        resumption_data,
+-        now,
+-    )
++    ))
+     .get_encoding();
+ 
+     // If we can't produce a ticket for some reason, we can't
+@@ -887,22 +916,23 @@ impl State<ServerConnectionData> for ExpectFinished {
+ 
+         // Save connection, perhaps
+         if !self.resuming && !self.session_id.is_empty() {
+-            let now = self.config.current_time()?;
+-
+-            let value = get_server_connection_value_tls12(
+-                &self.secrets,
++            let value = ServerSessionValue::from(Tls12ServerSessionValue::new(
++                CommonServerSessionValue::new(
++                    self.sni.as_ref(),
++                    self.secrets.suite().common.suite,
++                    self.peer_identity.clone(),
++                    self.alpn_protocol.clone(),
++                    self.resumption_data.to_vec(),
++                    self.config.current_time()?,
++                ),
++                self.secrets.master_secret(),
+                 self.using_ems,
+-                self.peer_identity.as_ref(),
+-                self.alpn_protocol.as_ref(),
+-                self.sni.as_ref(),
+-                &self.resumption_data,
+-                now,
+-            );
++            ));
+ 
+-            let worked = self
+-                .config
+-                .session_storage
+-                .put(self.session_id.as_ref().to_vec(), value.get_encoding());
++            let worked = self.config.session_storage.put(
++                ServerSessionKey::from(&self.session_id),
++                value.get_encoding(),
++            );
+             if worked {
+                 debug!("Session saved");
+             } else {
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index a3e813be..eb874d7e 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -6,11 +6,12 @@ use core::time::Duration;
+ pub(crate) use client_hello::TLS13_HANDLER;
+ use pki_types::{DnsName, UnixTime};
+ use subtle::ConstantTimeEq;
++use zeroize::Zeroizing;
+ 
+ use super::config::ServerConfig;
+ use super::connection::ServerConnectionData;
+ use super::hs::{self, HandshakeHashOrBuffer};
+-use super::{CommonServerSessionValue, ServerSessionValue, Tls13ServerSessionValue};
++use super::{CommonServerSessionValue, ServerSessionKey, ServerSessionValue};
+ use crate::check::{inappropriate_handshake_message, inappropriate_message};
+ use crate::common_state::{
+     Event, HandshakeFlightTls13, HandshakeKind, Input, Output, Side, State, TrafficTemperCounters,
+@@ -28,7 +29,7 @@ use crate::log::{debug, trace, warn};
+ use crate::msgs::{
+     CERTIFICATE_MAX_SIZE_LIMIT, CertificatePayloadTls13, Codec, HandshakeMessagePayload,
+     HandshakePayload, KeyUpdateRequest, Message, MessagePayload, NewSessionTicketPayloadTls13,
+-    Reader,
++    PresharedKeyIdentity, Reader, SizedPayload,
+ };
+ use crate::suites::PartiallyExtractedSecrets;
+ use crate::sync::Arc;
+@@ -57,8 +58,8 @@ mod client_hello {
+         ServerExtensionsInput, ServerHelloPayload, SessionId, SizedPayload,
+     };
+     use crate::sealed::Sealed;
++    use crate::server::Tls13ServerSessionValue;
+     use crate::server::hs::{CertificateTypes, ClientHelloInput, ExpectClientHello, ServerHandler};
+-    use crate::server::{ServerSessionValue, Tls13ServerSessionValue};
+     use crate::tls13::key_schedule::{
+         KeyScheduleEarlyServer, KeyScheduleHandshake, KeySchedulePreHandshake,
+     };
+@@ -180,62 +181,14 @@ mod client_hello {
+                 };
+             };
+ 
+-            let mut chosen_psk_index = None;
+-            let mut resumedata = None;
+-
+-            if let Some(psk_offer) = &input.client_hello.preshared_key_offer {
+-                // "A client MUST provide a "psk_key_exchange_modes" extension if it
+-                //  offers a "pre_shared_key" extension. If clients offer
+-                //  "pre_shared_key" without a "psk_key_exchange_modes" extension,
+-                //  servers MUST abort the handshake." - RFC8446 4.2.9
+-                if input
+-                    .client_hello
+-                    .preshared_key_modes
+-                    .is_none()
+-                {
+-                    return Err(PeerMisbehaved::MissingPskModesExtension.into());
+-                }
+-
+-                if psk_offer.binders.is_empty() {
+-                    return Err(PeerMisbehaved::MissingBinderInPskExtension.into());
+-                }
+-
+-                if psk_offer.binders.len() != psk_offer.identities.len() {
+-                    return Err(PeerMisbehaved::PskExtensionWithMismatchedIdsAndBinders.into());
+-                }
+-
+-                let now = st.config.current_time()?;
+-
+-                for (i, psk_id) in psk_offer.identities.iter().enumerate() {
+-                    let maybe_resume_data =
+-                        attempt_tls13_ticket_decryption(psk_id.identity.bytes(), &st.config)
+-                            .map(|resumedata| {
+-                                resumedata.set_freshness(psk_id.obfuscated_ticket_age, now)
+-                            })
+-                            .filter(|resumedata| {
+-                                resumedata
+-                                    .common
+-                                    .can_resume(suite.common.suite, st.sni.as_ref())
+-                            });
+-
+-                    let Some(resume) = maybe_resume_data else {
+-                        continue;
+-                    };
+-
+-                    if !check_binder(
+-                        &transcript,
+-                        &KeyScheduleEarlyServer::new(st.protocol, suite, resume.secret.bytes()),
+-                        input.message,
+-                        psk_offer.binders[i].as_ref(),
+-                    ) {
+-                        return Err(PeerMisbehaved::IncorrectBinder.into());
+-                    }
+-
+-                    chosen_psk_index = Some(i);
+-                    resumedata = Some(resume);
+-                    break;
+-                }
+-            }
++            let mut resuming = handle_psk_offer(
++                &input,
++                &transcript,
++                st.sni.as_ref(),
++                suite,
++                st.protocol,
++                &st.config,
++            )?;
+ 
+             if !input
+                 .client_hello
+@@ -246,15 +199,14 @@ mod client_hello {
+             {
+                 debug!("Client unwilling to resume, PSK_DHE_KE not offered");
+                 st.send_tickets = 0;
+-                chosen_psk_index = None;
+-                resumedata = None;
++                resuming = None;
+             } else {
+                 st.send_tickets = st.config.send_tls13_tickets;
+             }
+ 
+-            if let Some(resume) = &resumedata {
++            if let Some((_, session)) = &resuming {
+                 output.emit(Event::ResumptionData(
+-                    resume
++                    session
+                         .common
+                         .application_data
+                         .bytes()
+@@ -262,7 +214,7 @@ mod client_hello {
+                 ));
+             }
+ 
+-            let full_handshake = resumedata.is_none();
++            let full_handshake = resuming.is_none();
+             transcript.add_message(input.message);
+             let key_schedule = emit_server_hello(
+                 &mut transcript,
+@@ -272,10 +224,7 @@ mod client_hello {
+                 output,
+                 &input.client_hello.session_id,
+                 chosen_share_and_kxg,
+-                chosen_psk_index,
+-                resumedata
+-                    .as_ref()
+-                    .map(|x| x.secret.bytes()),
++                resuming.as_ref(),
+                 &input.proof,
+                 &st.config,
+             )?;
+@@ -301,7 +250,9 @@ mod client_hello {
+                 output,
+                 &mut ocsp_response,
+                 input.client_hello,
+-                resumedata.as_ref(),
++                resuming
++                    .as_ref()
++                    .map(|(_, session)| session),
+                 st.extra_exts,
+                 &st.config,
+             )?;
+@@ -411,7 +362,7 @@ mod client_hello {
+                     key_schedule: key_schedule_traffic,
+                     alpn_protocol,
+                     sni: st.sni,
+-                    peer_identity: resumedata.and_then(|r| r.common.peer_identity),
++                    peer_identity: resuming.and_then(|(_, r)| r.common.peer_identity),
+                     resumption_data: st.resumption_data,
+                     send_tickets: st.send_tickets,
+                     remaining_length: max_length as usize,
+@@ -424,7 +375,7 @@ mod client_hello {
+                     key_schedule: key_schedule_traffic,
+                     alpn_protocol,
+                     sni: st.sni,
+-                    peer_identity: resumedata.and_then(|r| r.common.peer_identity),
++                    peer_identity: resuming.and_then(|(_, r)| r.common.peer_identity),
+                     resumption_data: st.resumption_data,
+                     send_tickets: st.send_tickets,
+                 }))
+@@ -456,6 +407,67 @@ mod client_hello {
+         }
+     }
+ 
++    fn handle_psk_offer(
++        input: &ClientHelloInput<'_>,
++        transcript: &HandshakeHash,
++        sni: Option<&DnsName<'_>>,
++        suite: &'static Tls13CipherSuite,
++        protocol: Protocol,
++        config: &ServerConfig,
++    ) -> Result<Option<(usize, Tls13ServerSessionValue)>, Error> {
++        let Some(psk_offer) = &input.client_hello.preshared_key_offer else {
++            return Ok(None);
++        };
++
++        // "A client MUST provide a "psk_key_exchange_modes" extension if it
++        //  offers a "pre_shared_key" extension. If clients offer
++        //  "pre_shared_key" without a "psk_key_exchange_modes" extension,
++        //  servers MUST abort the handshake." - RFC8446 4.2.9
++        if input
++            .client_hello
++            .preshared_key_modes
++            .is_none()
++        {
++            return Err(PeerMisbehaved::MissingPskModesExtension.into());
++        }
++
++        if psk_offer.binders.is_empty() {
++            return Err(PeerMisbehaved::MissingBinderInPskExtension.into());
++        }
++
++        if psk_offer.binders.len() != psk_offer.identities.len() {
++            return Err(PeerMisbehaved::PskExtensionWithMismatchedIdsAndBinders.into());
++        }
++
++        let now = config.current_time()?;
++        for (i, psk_id) in psk_offer.identities.iter().enumerate() {
++            let Some(mut session) = Tls13ServerSessionValue::from_ticket(psk_id, config) else {
++                continue;
++            };
++
++            session.set_freshness(psk_id.obfuscated_ticket_age, now);
++            if !session
++                .common
++                .can_resume(suite.common.suite, sni)
++            {
++                continue;
++            }
++
++            if !check_binder(
++                transcript,
++                &KeyScheduleEarlyServer::new(protocol, suite, session.secret.bytes()),
++                input.message,
++                psk_offer.binders[i].as_ref(),
++            ) {
++                return Err(PeerMisbehaved::IncorrectBinder.into());
++            }
++
++            return Ok(Some((i, session)));
++        }
++
++        Ok(None)
++    }
++
+     fn check_binder(
+         transcript: &HandshakeHash,
+         key_schedule: &KeyScheduleEarlyServer,
+@@ -477,21 +489,6 @@ mod client_hello {
+         ConstantTimeEq::ct_eq(real_binder.as_ref(), binder).into()
+     }
+ 
+-    fn attempt_tls13_ticket_decryption(
+-        ticket: &[u8],
+-        config: &ServerConfig,
+-    ) -> Option<Tls13ServerSessionValue> {
+-        let plain = match config.ticketer.as_deref() {
+-            Some(ticketer) => ticketer.decrypt(ticket)?,
+-            None => config.session_storage.take(ticket)?,
+-        };
+-
+-        match ServerSessionValue::read_bytes(&plain).ok()? {
+-            ServerSessionValue::Tls13(tls13) => Some(tls13),
+-            _ => None,
+-        }
+-    }
+-
+     fn emit_server_hello(
+         transcript: &mut HandshakeHash,
+         randoms: &ConnectionRandoms,
+@@ -500,8 +497,7 @@ mod client_hello {
+         output: &mut dyn Output,
+         session_id: &SessionId,
+         share_and_kxgroup: (&KeyShareEntry, &'static dyn SupportedKxGroup),
+-        chosen_psk_idx: Option<usize>,
+-        resuming_psk: Option<&[u8]>,
++        resuming: Option<&(usize, Tls13ServerSessionValue)>,
+         proof: &HandshakeAlignedProof,
+         config: &ServerConfig,
+     ) -> Result<KeyScheduleHandshake, Error> {
+@@ -513,7 +509,7 @@ mod client_hello {
+ 
+         let extensions = Box::new(ServerExtensions {
+             key_share: Some(KeyShareEntry::new(ckx.group, ckx.pub_key)),
+-            preshared_key: chosen_psk_idx.map(|idx| idx as u16),
++            preshared_key: resuming.map(|&(idx, _)| idx as u16),
+             selected_version: Some(ProtocolVersion::TLSv1_3),
+             ..Default::default()
+         });
+@@ -539,8 +535,9 @@ mod client_hello {
+         output.emit(Event::PlainMessage(sh));
+ 
+         // Start key schedule
+-        let key_schedule_pre_handshake = if let Some(psk) = resuming_psk {
+-            let early_key_schedule = KeyScheduleEarlyServer::new(protocol, suite, psk);
++        let key_schedule_pre_handshake = if let Some((_, psk)) = resuming {
++            let early_key_schedule =
++                KeyScheduleEarlyServer::new(protocol, suite, psk.secret.bytes());
+             early_key_schedule.client_early_traffic_secret(
+                 &client_hello_hash,
+                 &*config.key_log,
+@@ -1195,33 +1192,82 @@ impl State<ServerConnectionData> for ExpectEarlyData {
+     }
+ }
+ 
+-// --- Process client's Finished ---
+-fn get_server_session_value(
+-    suite: &'static Tls13CipherSuite,
+-    resumption: &KeyScheduleResumption,
+-    peer_identity: Option<Identity<'static>>,
+-    chosen_alpn_protocol: Option<ApplicationProtocol<'static>>,
+-    sni: Option<DnsName<'static>>,
+-    resumption_data: &[u8],
+-    nonce: &[u8],
+-    time_now: UnixTime,
++#[derive(Debug)]
++pub(crate) struct Tls13ServerSessionValue {
++    common: CommonServerSessionValue,
++    secret: Zeroizing<SizedPayload<'static, u8>>,
+     age_obfuscation_offset: u32,
+-) -> ServerSessionValue {
+-    let secret = resumption.derive_ticket_psk(nonce);
+-
+-    Tls13ServerSessionValue::new(
+-        CommonServerSessionValue::new(
+-            sni.as_ref(),
+-            suite.common.suite,
+-            peer_identity,
+-            chosen_alpn_protocol,
+-            resumption_data.to_vec(),
+-            time_now,
+-        ),
+-        secret.as_ref(),
+-        age_obfuscation_offset,
+-    )
+-    .into()
++
++    // not encoded vv
++    freshness: Option<bool>,
++}
++
++impl Tls13ServerSessionValue {
++    fn from_ticket(id: &PresharedKeyIdentity, config: &ServerConfig) -> Option<Self> {
++        let plain = match config.ticketer.as_deref() {
++            Some(ticketer) => ticketer.decrypt(id.identity.bytes())?,
++            None => config
++                .session_storage
++                .take(ServerSessionKey::new(id.identity.bytes()))?,
++        };
++
++        match ServerSessionValue::read_bytes(&plain).ok()? {
++            ServerSessionValue::Tls13(tls13) => Some(tls13),
++            _ => None,
++        }
++    }
++
++    pub(super) fn new(
++        common: CommonServerSessionValue,
++        secret: &[u8],
++        age_obfuscation_offset: u32,
++    ) -> Self {
++        Self {
++            common,
++            secret: Zeroizing::new(secret.to_vec().into()),
++            age_obfuscation_offset,
++            freshness: None,
++        }
++    }
++
++    fn set_freshness(&mut self, obfuscated_client_age_ms: u32, time_now: UnixTime) {
++        let client_age_ms = obfuscated_client_age_ms.wrapping_sub(self.age_obfuscation_offset);
++        let server_age_ms = (time_now
++            .as_secs()
++            .saturating_sub(self.common.creation_time_sec) as u32)
++            .saturating_mul(1000);
++
++        let age_difference = server_age_ms.abs_diff(client_age_ms);
++        self.freshness = Some(age_difference <= MAX_FRESHNESS_SKEW_MS);
++    }
++
++    fn is_fresh(&self) -> bool {
++        self.freshness.unwrap_or_default()
++    }
++}
++
++impl Codec<'_> for Tls13ServerSessionValue {
++    fn encode(&self, bytes: &mut Vec<u8>) {
++        self.common.encode(bytes);
++        self.secret.encode(bytes);
++        self.age_obfuscation_offset
++            .encode(bytes);
++    }
++
++    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
++        Ok(Self {
++            common: CommonServerSessionValue::read(r)?,
++            secret: Zeroizing::new(SizedPayload::read(r)?.into_owned()),
++            age_obfuscation_offset: u32::read(r)?,
++            freshness: None,
++        })
++    }
++}
++
++impl From<Tls13ServerSessionValue> for ServerSessionValue {
++    fn from(value: Tls13ServerSessionValue) -> Self {
++        Self::Tls13(value)
++    }
+ }
+ 
+ struct ExpectFinished {
+@@ -1252,18 +1298,19 @@ impl ExpectFinished {
+         let age_add = rand::random_u32(secure_random)?;
+ 
+         let now = config.current_time()?;
+-
+-        let plain = get_server_session_value(
+-            suite,
+-            resumption,
+-            peer_identity,
+-            chosen_alpn_protocol,
+-            sni,
+-            resumption_data,
+-            &nonce,
+-            now,
++        let secret = resumption.derive_ticket_psk(&nonce);
++        let plain = ServerSessionValue::from(Tls13ServerSessionValue::new(
++            CommonServerSessionValue::new(
++                sni.as_ref(),
++                suite.common.suite,
++                peer_identity,
++                chosen_alpn_protocol,
++                resumption_data.to_vec(),
++                now,
++            ),
++            secret.as_ref(),
+             age_add,
+-        )
++        ))
+         .get_encoding();
+ 
+         let ticketer = config.ticketer.as_deref();
+@@ -1273,16 +1320,16 @@ impl ExpectFinished {
+             };
+             (ticket, ticketer.lifetime())
+         } else {
+-            let id = rand::random_array::<32>(secure_random)?.to_vec();
++            let id = rand::random_array::<32>(secure_random)?;
+             let stored = config
+                 .session_storage
+-                .put(id.clone(), plain);
++                .put(ServerSessionKey::new(&id), plain);
+             if !stored {
+                 trace!("resumption not available; not issuing ticket");
+                 return Ok(());
+             }
+             let stateful_lifetime = Duration::from_secs(24 * 60 * 60); // this is a bit of a punt
+-            (id, stateful_lifetime)
++            (id.to_vec(), stateful_lifetime)
+         };
+ 
+         let mut payload = NewSessionTicketPayloadTls13::new(lifetime, age_add, nonce, ticket);
+@@ -1522,3 +1569,9 @@ impl KernelState for ExpectQuicTraffic {
+         unreachable!("handle_new_session_ticket should not be called for server-side connections")
+     }
+ }
++
++/// This is the maximum allowed skew between server and client clocks, over
++/// the maximum ticket lifetime period.  This encompasses TCP retransmission
++/// times in case packet loss occurs when the client sends the ClientHello
++/// or receives the NewSessionTicket, _and_ actual clock skew over this period.
++static MAX_FRESHNESS_SKEW_MS: u32 = 60 * 1000;

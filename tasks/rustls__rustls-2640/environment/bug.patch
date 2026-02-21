@@ -1,0 +1,199 @@
+diff --git a/bogo/src/main.rs b/bogo/src/main.rs
+index 4956b129..a2977249 100644
+--- a/bogo/src/main.rs
++++ b/bogo/src/main.rs
+@@ -1159,8 +1159,8 @@ fn handle_err(opts: &Options, err: Error) -> ! {
+         Error::PeerMisbehaved(PeerMisbehaved::KeyEpochWithPendingFragment) => {
+             quit(":EXCESS_HANDSHAKE_DATA:")
+         }
+-        Error::PeerMisbehaved(PeerMisbehaved::NoCertificatesPresented) => quit(":NO_CERTS:"),
+         Error::PeerMisbehaved(_) => quit(":PEER_MISBEHAVIOUR:"),
++        Error::NoCertificatesPresented => quit(":NO_CERTS:"),
+         Error::AlertReceived(AlertDescription::UnexpectedMessage) => quit(":BAD_ALERT:"),
+         Error::AlertReceived(AlertDescription::DecompressionFailure) => {
+             quit_err(":SSLV3_ALERT_DECOMPRESSION_FAILURE:")
+diff --git a/rustls/src/client/tls12.rs b/rustls/src/client/tls12.rs
+index 9d8dd4b1..6babd04b 100644
+--- a/rustls/src/client/tls12.rs
++++ b/rustls/src/client/tls12.rs
+@@ -888,7 +888,7 @@ impl State<ClientConnectionData> for ExpectServerDone<'_> {
+         .ok_or_else(|| {
+             cx.common.send_fatal_alert(
+                 AlertDescription::BadCertificate,
+-                PeerMisbehaved::NoCertificatesPresented,
++                Error::NoCertificatesPresented,
+             )
+         })?;
+ 
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 6f65ebfa..55803c91 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -1239,7 +1239,7 @@ impl State<ClientConnectionData> for ExpectCertificateVerify<'_> {
+         .ok_or_else(|| {
+             cx.common.send_fatal_alert(
+                 AlertDescription::BadCertificate,
+-                PeerMisbehaved::NoCertificatesPresented,
++                Error::NoCertificatesPresented,
+             )
+         })?;
+ 
+diff --git a/rustls/src/crypto/signer.rs b/rustls/src/crypto/signer.rs
+index 1a8221e2..346ac10b 100644
+--- a/rustls/src/crypto/signer.rs
++++ b/rustls/src/crypto/signer.rs
+@@ -10,7 +10,7 @@ use crate::enums::{SignatureAlgorithm, SignatureScheme};
+ use crate::error::{Error, InconsistentKeys};
+ use crate::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
+ use crate::sync::Arc;
+-use crate::{ApiMisuse, x509};
++use crate::x509;
+ 
+ /// An abstract signing key.
+ ///
+@@ -187,7 +187,7 @@ impl CertifiedKey {
+         let parsed = ParsedCertificate::try_from(
+             cert_chain
+                 .first()
+-                .ok_or(ApiMisuse::EmptyCertificateChain)?,
++                .ok_or(Error::NoCertificatesPresented)?,
+         )?;
+ 
+         match (key.public_key(), parsed.subject_public_key_info()) {
+@@ -239,7 +239,7 @@ impl CertifiedKey {
+     pub fn end_entity_cert(&self) -> Result<&CertificateDer<'_>, Error> {
+         self.cert_chain
+             .first()
+-            .ok_or(Error::ApiMisuse(ApiMisuse::EmptyCertificateChain))
++            .ok_or(Error::NoCertificatesPresented)
+     }
+ }
+ 
+diff --git a/rustls/src/error.rs b/rustls/src/error.rs
+index c4870dab..119623b5 100644
+--- a/rustls/src/error.rs
++++ b/rustls/src/error.rs
+@@ -44,6 +44,9 @@ pub enum Error {
+     /// The peer sent us a TLS message with invalid contents.
+     InvalidMessage(InvalidMessage),
+ 
++    /// The peer didn't give us any certificates.
++    NoCertificatesPresented,
++
+     /// The certificate verifier doesn't support the given type of name.
+     UnsupportedNameType,
+ 
+@@ -298,7 +301,6 @@ pub enum PeerMisbehaved {
+     MissingKeyShare,
+     MissingPskModesExtension,
+     MissingQuicTransportParameters,
+-    NoCertificatesPresented,
+     OfferedDuplicateCertificateCompressions,
+     OfferedDuplicateKeyShares,
+     OfferedEarlyDataWithOldProtocolVersion,
+@@ -1060,6 +1062,7 @@ impl fmt::Display for Error {
+             Self::InvalidCertRevocationList(err) => {
+                 write!(f, "invalid certificate revocation list: {err:?}")
+             }
++            Self::NoCertificatesPresented => write!(f, "peer sent no certificates"),
+             Self::UnsupportedNameType => write!(f, "presented server name type wasn't supported"),
+             Self::DecryptError => write!(f, "cannot decrypt peer's message"),
+             Self::InvalidEncryptedClientHello(err) => {
+@@ -1174,9 +1177,6 @@ pub enum ApiMisuse {
+     /// QUIC attempted with a configuration that does not support a ciphersuite that supports QUIC.
+     NoQuicCompatibleCipherSuites,
+ 
+-    /// An empty certificate chain was provided.
+-    EmptyCertificateChain,
+-
+     /// QUIC attempted with unsupported [`ServerConfig::max_early_data_size`][]
+     ///
+     /// This field must be either zero or [`u32::MAX`] for QUIC.
+@@ -1509,6 +1509,7 @@ mod tests {
+                 got_type: HandshakeType::ServerHello,
+             },
+             Error::InvalidMessage(InvalidMessage::InvalidCcs),
++            Error::NoCertificatesPresented,
+             Error::DecryptError,
+             super::PeerIncompatible::Tls12NotOffered.into(),
+             super::PeerMisbehaved::UnsolicitedCertExtension.into(),
+diff --git a/rustls/src/server/tls12.rs b/rustls/src/server/tls12.rs
+index 6b8143ce..6040a1bc 100644
+--- a/rustls/src/server/tls12.rs
++++ b/rustls/src/server/tls12.rs
+@@ -506,7 +506,7 @@ impl State<ServerConnectionData> for ExpectCertificate {
+                 None if mandatory => {
+                     return Err(cx.common.send_fatal_alert(
+                         AlertDescription::CertificateRequired,
+-                        PeerMisbehaved::NoCertificatesPresented,
++                        Error::NoCertificatesPresented,
+                     ));
+                 }
+                 None => {
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index 68e0505b..30caf98e 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -1137,7 +1137,7 @@ impl State<ServerConnectionData> for ExpectCertificate {
+ 
+             return Err(cx.common.send_fatal_alert(
+                 AlertDescription::CertificateRequired,
+-                PeerMisbehaved::NoCertificatesPresented,
++                Error::NoCertificatesPresented,
+             ));
+         };
+ 
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index b9c93105..620253d8 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -1821,9 +1821,7 @@ fn test_client_cert_resolve(
+ 
+         assert_eq!(
+             do_handshake_until_error(&mut client, &mut server),
+-            Err(ErrorFromPeer::Server(Error::PeerMisbehaved(
+-                PeerMisbehaved::NoCertificatesPresented
+-            )))
++            Err(ErrorFromPeer::Server(Error::NoCertificatesPresented))
+         );
+     }
+ }
+@@ -3477,11 +3475,11 @@ fn sni_resolver_rejects_bad_certs() {
+     let signing_key: Arc<dyn sign::SigningKey> = Arc::new(signing_key);
+ 
+     assert_eq!(
++        Err(Error::NoCertificatesPresented),
+         resolver.add(
+             DnsName::try_from("localhost").unwrap(),
+             sign::CertifiedKey::new_unchecked(vec![], signing_key.clone())
+-        ),
+-        Err(ApiMisuse::EmptyCertificateChain.into()),
++        )
+     );
+ 
+     let bad_chain = vec![CertificateDer::from(vec![0xa0])];
+diff --git a/rustls/tests/client_cert_verifier.rs b/rustls/tests/client_cert_verifier.rs
+index 1bb844a6..08c96018 100644
+--- a/rustls/tests/client_cert_verifier.rs
++++ b/rustls/tests/client_cert_verifier.rs
+@@ -13,8 +13,7 @@ use common::{
+ };
+ use rustls::server::danger::ClientCertVerified;
+ use rustls::{
+-    AlertDescription, ClientConnection, Error, InvalidMessage, PeerMisbehaved, ServerConfig,
+-    ServerConnection,
++    AlertDescription, ClientConnection, Error, InvalidMessage, ServerConfig, ServerConnection,
+ };
+ 
+ // Client is authorized!
+@@ -105,9 +104,7 @@ fn client_verifier_no_auth_yes_root() {
+             assert_eq!(
+                 errs,
+                 Err(vec![
+-                    ErrorFromPeer::Server(Error::PeerMisbehaved(
+-                        PeerMisbehaved::NoCertificatesPresented
+-                    )),
++                    ErrorFromPeer::Server(Error::NoCertificatesPresented),
+                     ErrorFromPeer::Client(Error::AlertReceived(
+                         AlertDescription::CertificateRequired
+                     ))

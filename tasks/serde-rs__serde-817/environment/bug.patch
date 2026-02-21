@@ -1,0 +1,390 @@
+diff --git a/serde/src/export.rs b/serde/src/export.rs
+index 89b1a65a..9c635457 100644
+--- a/serde/src/export.rs
++++ b/serde/src/export.rs
+@@ -7,7 +7,7 @@ use std::borrow::Cow;
+ use collections::borrow::Cow;
+ 
+ pub use core::default::Default;
+-pub use core::{fmt, clone, convert};
++pub use core::fmt;
+ pub use core::marker::PhantomData;
+ pub use core::option::Option::{self, None, Some};
+ pub use core::result::Result::{self, Ok, Err};
+diff --git a/serde/src/lib.rs b/serde/src/lib.rs
+index 36eb6723..e6a8205f 100644
+--- a/serde/src/lib.rs
++++ b/serde/src/lib.rs
+@@ -79,8 +79,7 @@ extern crate core as actual_core;
+ #[cfg(feature = "std")]
+ mod core {
+     pub use std::{ops, hash, fmt, cmp, marker, mem, i8, i16, i32, i64, u8, u16, u32, u64, isize,
+-                  usize, f32, f64, char, str, num, slice, iter, cell, default, result, option,
+-                  clone, convert};
++                  usize, f32, f64, char, str, num, slice, iter, cell, default, result, option};
+     #[cfg(feature = "unstable")]
+     pub use actual_core::nonzero;
+ }
+diff --git a/serde_codegen_internals/src/attr.rs b/serde_codegen_internals/src/attr.rs
+index ca6697a3..92a183c4 100644
+--- a/serde_codegen_internals/src/attr.rs
++++ b/serde_codegen_internals/src/attr.rs
+@@ -98,8 +98,6 @@ pub struct Item {
+     ser_bound: Option<Vec<syn::WherePredicate>>,
+     de_bound: Option<Vec<syn::WherePredicate>>,
+     tag: EnumTag,
+-    from_type: Option<syn::Ty>,
+-    into_type: Option<syn::Ty>,
+ }
+ 
+ /// Styles of representing an enum.
+@@ -147,8 +145,6 @@ impl Item {
+         let mut untagged = BoolAttr::none(cx, "untagged");
+         let mut internal_tag = Attr::none(cx, "tag");
+         let mut content = Attr::none(cx, "content");
+-        let mut from_type = Attr::none(cx, "from");
+-        let mut into_type = Attr::none(cx, "into");
+ 
+         for meta_items in item.attrs.iter().filter_map(get_serde_meta_items) {
+             for meta_item in meta_items {
+@@ -274,18 +270,6 @@ impl Item {
+                         }
+                     }
+ 
+-                    // Parse `#[serde(from = "type", into = "type")]
+-                    MetaItem(NameValue(ref name, ref lit)) if name == "from" => {
+-                        if let Ok(from_ty) = get_type(cx, name.as_ref(), lit) {
+-                            from_type.set_opt(Some(from_ty));
+-                        }
+-                    }
+-                    MetaItem(NameValue(ref name, ref lit)) if name == "into" => {
+-                        if let Ok(into_ty) = get_type(cx, name.as_ref(), lit) {
+-                            into_type.set_opt(Some(into_ty));
+-                        }
+-                    }
+-
+                     MetaItem(ref meta_item) => {
+                         cx.error(format!("unknown serde container attribute `{}`",
+                                          meta_item.name()));
+@@ -355,8 +339,6 @@ impl Item {
+             ser_bound: ser_bound.get(),
+             de_bound: de_bound.get(),
+             tag: tag,
+-            from_type: from_type.get(),
+-            into_type: into_type.get(),
+         }
+     }
+ 
+@@ -387,14 +369,6 @@ impl Item {
+     pub fn tag(&self) -> &EnumTag {
+         &self.tag
+     }
+-
+-    pub fn from_type(&self) -> Option<&syn::Ty> {
+-        self.from_type.as_ref()
+-    }
+-
+-    pub fn into_type(&self) -> Option<&syn::Ty> {
+-        self.into_type.as_ref()
+-    }
+ }
+ 
+ /// Represents variant attribute information
+@@ -772,18 +746,6 @@ fn get_ser_and_de<T, F>(cx: &Ctxt,
+     Ok((ser_item.get(), de_item.get()))
+ }
+ 
+-fn get_type(cx: &Ctxt,
+-            attr_name: &str,
+-            lit: &syn::Lit)
+-            -> Result<syn::Ty, ()> {
+-    if let Ok(ty) = parse_lit_into_ty(cx, attr_name, &lit) {
+-        Ok(ty)
+-    } else {
+-        cx.error(format!("error parsing type for attribute {}", attr_name));
+-        return Err(());
+-    }
+-}
+-
+ fn get_renames(cx: &Ctxt, items: &[syn::NestedMetaItem]) -> Result<SerAndDe<String>, ()> {
+     get_ser_and_de(cx, "rename", items, get_string_from_lit)
+ }
+@@ -835,16 +797,3 @@ fn parse_lit_into_where(cx: &Ctxt,
+ 
+     syn::parse_where_clause(&where_string).map(|wh| wh.predicates).map_err(|err| cx.error(err))
+ }
+-
+-fn parse_lit_into_ty(cx: &Ctxt,
+-                     attr_name: &str,
+-                     lit: &syn::Lit)
+-                     -> Result<syn::Ty, ()> {
+-    let string = try!(get_string_from_lit(cx, attr_name, attr_name, lit));
+-
+-    if let Ok(ty) = syn::parse_type(&string) {
+-        Ok(ty)
+-    } else {
+-        Err(())
+-    }
+-}
+diff --git a/serde_derive/src/de.rs b/serde_derive/src/de.rs
+index e31a150d..b47f334b 100644
+--- a/serde_derive/src/de.rs
++++ b/serde_derive/src/de.rs
+@@ -85,48 +85,36 @@ fn requires_default(attrs: &attr::Field) -> bool {
+ }
+ 
+ fn deserialize_body(item: &Item, generics: &syn::Generics) -> Fragment {
+-    if let Some(fr_ty) = item.attrs.from_type() {
+-        deserialize_from(fr_ty)
+-    } else {
+-        match item.body {
+-            Body::Enum(ref variants) => {
+-                deserialize_item_enum(&item.ident, generics, variants, &item.attrs)
+-            }
+-            Body::Struct(Style::Struct, ref fields) => {
+-                if fields.iter().any(|field| field.ident.is_none()) {
+-                    panic!("struct has unnamed fields");
+-                }
+-                deserialize_struct(&item.ident,
+-                                   None,
+-                                   generics,
+-                                   fields,
+-                                   &item.attrs,
+-                                   None)
+-            }
+-            Body::Struct(Style::Tuple, ref fields) |
+-            Body::Struct(Style::Newtype, ref fields) => {
+-                if fields.iter().any(|field| field.ident.is_some()) {
+-                    panic!("tuple struct has named fields");
+-                }
+-                deserialize_tuple(&item.ident,
+-                                  None,
+-                                  generics,
+-                                  fields,
+-                                  &item.attrs,
+-                                  None)
++    match item.body {
++        Body::Enum(ref variants) => {
++            deserialize_item_enum(&item.ident, generics, variants, &item.attrs)
++        }
++        Body::Struct(Style::Struct, ref fields) => {
++            if fields.iter().any(|field| field.ident.is_none()) {
++                panic!("struct has unnamed fields");
+             }
+-            Body::Struct(Style::Unit, _) => deserialize_unit_struct(&item.ident, &item.attrs),
++
++            deserialize_struct(&item.ident,
++                               None,
++                               generics,
++                               fields,
++                               &item.attrs,
++                               None)
+         }
+-    }
+-}
++        Body::Struct(Style::Tuple, ref fields) |
++        Body::Struct(Style::Newtype, ref fields) => {
++            if fields.iter().any(|field| field.ident.is_some()) {
++                panic!("tuple struct has named fields");
++            }
+ 
+-fn deserialize_from(from_type: &syn::Ty) -> Fragment {
+-    quote_block! {
+-        let de_val = <#from_type as _serde::Deserialize>::deserialize(deserializer);
+-        match de_val {
+-            _serde::export::Result::Ok(from_in) => _serde::export::Result::Ok(_serde::export::convert::From::from(from_in)),
+-            _serde::export::Result::Err(e) => _serde::export::Result::Err(e)
++            deserialize_tuple(&item.ident,
++                              None,
++                              generics,
++                              fields,
++                              &item.attrs,
++                              None)
+         }
++        Body::Struct(Style::Unit, _) => deserialize_unit_struct(&item.ident, &item.attrs),
+     }
+ }
+ 
+diff --git a/serde_derive/src/ser.rs b/serde_derive/src/ser.rs
+index a2412558..425bfa4e 100644
+--- a/serde_derive/src/ser.rs
++++ b/serde_derive/src/ser.rs
+@@ -61,37 +61,28 @@ fn needs_serialize_bound(attrs: &attr::Field) -> bool {
+ }
+ 
+ fn serialize_body(item: &Item, generics: &syn::Generics) -> Fragment {
+-    if let Some(in_ty) = item.attrs.into_type() {
+-        serialize_into(in_ty)
+-    } else {
+-        match item.body {
+-            Body::Enum(ref variants) => {
+-                serialize_item_enum(&item.ident, generics, variants, &item.attrs)
+-            }
+-            Body::Struct(Style::Struct, ref fields) => {
+-                if fields.iter().any(|field| field.ident.is_none()) {
+-                    panic!("struct has unnamed fields");
+-                }
+-                serialize_struct(&item.ident, generics, fields, &item.attrs)
+-            }
+-            Body::Struct(Style::Tuple, ref fields) => {
+-                if fields.iter().any(|field| field.ident.is_some()) {
+-                    panic!("tuple struct has named fields");
+-                }
+-                serialize_tuple_struct(&item.ident, generics, fields, &item.attrs)
+-            }
+-            Body::Struct(Style::Newtype, ref fields) => {
+-                serialize_newtype_struct(&item.ident, generics, &fields[0], &item.attrs)
++    match item.body {
++        Body::Enum(ref variants) => {
++            serialize_item_enum(&item.ident, generics, variants, &item.attrs)
++        }
++        Body::Struct(Style::Struct, ref fields) => {
++            if fields.iter().any(|field| field.ident.is_none()) {
++                panic!("struct has unnamed fields");
+             }
+-            Body::Struct(Style::Unit, _) => serialize_unit_struct(&item.attrs),
++
++            serialize_struct(&item.ident, generics, fields, &item.attrs)
+         }
+-    }
+-}
++        Body::Struct(Style::Tuple, ref fields) => {
++            if fields.iter().any(|field| field.ident.is_some()) {
++                panic!("tuple struct has named fields");
++            }
+ 
+-fn serialize_into(into_type: &syn::Ty) -> Fragment {
+-    quote_block! {
+-        let cloned_val: #into_type = _serde::export::convert::Into::into(_serde::export::clone::Clone::clone(self));
+-        _serde::Serialize::serialize(&cloned_val, _serializer)
++            serialize_tuple_struct(&item.ident, generics, fields, &item.attrs)
++        }
++        Body::Struct(Style::Newtype, ref fields) => {
++            serialize_newtype_struct(&item.ident, generics, &fields[0], &item.attrs)
++        }
++        Body::Struct(Style::Unit, _) => serialize_unit_struct(&item.attrs),
+     }
+ }
+ 
+diff --git a/test_suite/tests/compile-fail/type-attribute/type_attribute_fail_from.rs b/test_suite/tests/compile-fail/type-attribute/type_attribute_fail_from.rs
+deleted file mode 100644
+index 86556615..00000000
+--- a/test_suite/tests/compile-fail/type-attribute/type_attribute_fail_from.rs
++++ /dev/null
+@@ -1,11 +0,0 @@
+-#[macro_use]
+-extern crate serde_derive;
+-
+-#[derive(Deserialize)] //~ ERROR: proc-macro derive panicked
+-#[serde(from="")]
+-enum TestOne {
+-    Testing,
+-    One,
+-    Two,
+-    Three,
+-}
+diff --git a/test_suite/tests/compile-fail/type-attribute/type_attribute_fail_into.rs b/test_suite/tests/compile-fail/type-attribute/type_attribute_fail_into.rs
+deleted file mode 100644
+index 3d84dcf4..00000000
+--- a/test_suite/tests/compile-fail/type-attribute/type_attribute_fail_into.rs
++++ /dev/null
+@@ -1,11 +0,0 @@
+-#[macro_use]
+-extern crate serde_derive;
+-
+-#[derive(Serialize)] //~ ERROR: proc-macro derive panicked
+-#[serde(into="")]
+-enum TestOne {
+-    Testing,
+-    One,
+-    Two,
+-    Three,
+-}
+diff --git a/test_suite/tests/test_annotations.rs b/test_suite/tests/test_annotations.rs
+index af49203b..b839c1af 100644
+--- a/test_suite/tests/test_annotations.rs
++++ b/test_suite/tests/test_annotations.rs
+@@ -977,83 +977,3 @@ fn test_invalid_length_enum() {
+         Error::Message("invalid length 1, expected tuple of 2 elements".to_owned()),
+     );
+ }
+-
+-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+-#[serde(into="EnumToU32", from="EnumToU32")]
+-struct StructFromEnum(Option<u32>);
+-
+-impl Into<EnumToU32> for StructFromEnum {
+-    fn into(self) -> EnumToU32 {
+-        match self {
+-            StructFromEnum(v) => v.into()
+-        }
+-    }
+-}
+-
+-impl From<EnumToU32> for StructFromEnum {
+-    fn from(v: EnumToU32) -> Self {
+-        StructFromEnum(v.into())
+-    }
+-}
+-
+-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+-#[serde(into="Option<u32>", from="Option<u32>")]
+-enum EnumToU32 {
+-    One,
+-    Two,
+-    Three,
+-    Four,
+-    Nothing
+-}
+-
+-impl Into<Option<u32>> for EnumToU32 {
+-    fn into(self) -> Option<u32> {
+-        match self {
+-            EnumToU32::One => Some(1),
+-            EnumToU32::Two => Some(2),
+-            EnumToU32::Three => Some(3),
+-            EnumToU32::Four => Some(4),
+-            EnumToU32::Nothing => None
+-        }
+-    }
+-}
+-
+-impl From<Option<u32>> for EnumToU32 {
+-    fn from(v: Option<u32>) -> Self {
+-        match v {
+-            Some(1) => EnumToU32::One,
+-            Some(2) => EnumToU32::Two,
+-            Some(3) => EnumToU32::Three,
+-            Some(4) => EnumToU32::Four,
+-            _ => EnumToU32::Nothing
+-        }
+-    }
+-}
+-
+-#[test]
+-fn test_from_into_traits() {
+-    assert_ser_tokens::<EnumToU32>(&EnumToU32::One,
+-        &[Token::Option(true),
+-          Token::U32(1)
+-        ] 
+-    );
+-    assert_ser_tokens::<EnumToU32>(&EnumToU32::Nothing,
+-        &[Token::Option(false)] 
+-    );
+-    assert_de_tokens::<EnumToU32>(&EnumToU32::Two,
+-        &[Token::Option(true),
+-          Token::U32(2)
+-        ]
+-    );
+-    assert_ser_tokens::<StructFromEnum>(&StructFromEnum(Some(5)),
+-        &[Token::Option(false)]
+-    );
+-    assert_ser_tokens::<StructFromEnum>(&StructFromEnum(None),
+-        &[Token::Option(false)]
+-    );
+-    assert_de_tokens::<StructFromEnum>(&StructFromEnum(Some(2)),
+-        &[Token::Option(true),
+-          Token::U32(2)
+-        ]
+-    );
+-}

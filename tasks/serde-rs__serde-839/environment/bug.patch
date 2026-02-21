@@ -1,0 +1,403 @@
+diff --git a/serde/src/de/impls.rs b/serde/src/de/impls.rs
+index 1aa91db5..9b6f1f5d 100644
+--- a/serde/src/de/impls.rs
++++ b/serde/src/de/impls.rs
+@@ -80,6 +80,12 @@ impl<'de> Visitor<'de> for UnitVisitor {
+     {
+         Ok(())
+     }
++
++    fn visit_seq<V>(self, _: V) -> Result<(), V::Error>
++        where V: SeqVisitor<'de>
++    {
++        Ok(())
++    }
+ }
+ 
+ impl<'de> Deserialize<'de> for () {
+@@ -107,6 +113,16 @@ impl<'de> Visitor<'de> for BoolVisitor {
+     {
+         Ok(v)
+     }
++
++    fn visit_str<E>(self, s: &str) -> Result<bool, E>
++        where E: Error
++    {
++        match s.trim_matches(::utils::Pattern_White_Space) {
++            "true" => Ok(true),
++            "false" => Ok(false),
++            _ => Err(Error::invalid_type(Unexpected::Str(s), &self)),
++        }
++    }
+ }
+ 
+ impl<'de> Deserialize<'de> for bool {
+@@ -159,6 +175,15 @@ macro_rules! impl_deserialize_num {
+                     impl_deserialize_num_method!($ty, u64, visit_u64, from_u64, Unsigned, u64);
+                     impl_deserialize_num_method!($ty, f32, visit_f32, from_f32, Float, f64);
+                     impl_deserialize_num_method!($ty, f64, visit_f64, from_f64, Float, f64);
++
++                    #[inline]
++                    fn visit_str<E>(self, s: &str) -> Result<$ty, E>
++                        where E: Error,
++                    {
++                        str::FromStr::from_str(s.trim_matches(::utils::Pattern_White_Space)).or_else(|_| {
++                            Err(Error::invalid_type(Unexpected::Str(s), &self))
++                        })
++                    }
+                 }
+ 
+                 deserializer.$method(PrimitiveVisitor)
+@@ -244,6 +269,12 @@ impl<'de> Visitor<'de> for StringVisitor {
+         Ok(v)
+     }
+ 
++    fn visit_unit<E>(self) -> Result<String, E>
++        where E: Error
++    {
++        Ok(String::new())
++    }
++
+     fn visit_bytes<E>(self, v: &[u8]) -> Result<String, E>
+         where E: Error
+     {
+@@ -472,6 +503,13 @@ macro_rules! seq_impl {
+                 formatter.write_str("a sequence")
+             }
+ 
++            #[inline]
++            fn visit_unit<E>(self) -> Result<Self::Value, E>
++                where E: Error,
++            {
++                Ok($ctor)
++            }
++
+             #[inline]
+             fn visit_seq<V>(self, mut $visitor: V) -> Result<Self::Value, V::Error>
+                 where V: SeqVisitor<'de>,
+@@ -575,6 +613,13 @@ impl<'de, T> Visitor<'de> for ArrayVisitor<[T; 0]>
+         formatter.write_str("an empty array")
+     }
+ 
++    #[inline]
++    fn visit_unit<E>(self) -> Result<[T; 0], E>
++        where E: Error
++    {
++        Ok([])
++    }
++
+     #[inline]
+     fn visit_seq<V>(self, _: V) -> Result<[T; 0], V::Error>
+         where V: SeqVisitor<'de>
+@@ -774,6 +819,13 @@ macro_rules! map_impl {
+                 formatter.write_str("a map")
+             }
+ 
++            #[inline]
++            fn visit_unit<E>(self) -> Result<Self::Value, E>
++                where E: Error,
++            {
++                Ok($ctor)
++            }
++
+             #[inline]
+             fn visit_map<Visitor>(self, mut $visitor: Visitor) -> Result<Self::Value, Visitor::Error>
+                 where Visitor: MapVisitor<'de>,
+diff --git a/serde/src/utils.rs b/serde/src/utils.rs
+index 4e81616a..927d1256 100644
+--- a/serde/src/utils.rs
++++ b/serde/src/utils.rs
+@@ -48,3 +48,27 @@ impl EncodeUtf8 {
+         ::core::str::from_utf8(&self.buf[self.pos..]).unwrap()
+     }
+ }
++
++#[allow(non_upper_case_globals)]
++const Pattern_White_Space_table: &'static [(char, char)] = &[('\u{9}', '\u{d}'),
++                                                             ('\u{20}', '\u{20}'),
++                                                             ('\u{85}', '\u{85}'),
++                                                             ('\u{200e}', '\u{200f}'),
++                                                             ('\u{2028}', '\u{2029}')];
++
++fn bsearch_range_table(c: char, r: &'static [(char, char)]) -> bool {
++    use core::cmp::Ordering::{Equal, Less, Greater};
++    r.binary_search_by(|&(lo, hi)| if c < lo {
++                              Greater
++                          } else if hi < c {
++            Less
++        } else {
++            Equal
++        })
++        .is_ok()
++}
++
++#[allow(non_snake_case)]
++pub fn Pattern_White_Space(c: char) -> bool {
++    bsearch_range_table(c, Pattern_White_Space_table)
++}
+diff --git a/test_suite/tests/test_de.rs b/test_suite/tests/test_de.rs
+index 552e58cb..8d21844c 100644
+--- a/test_suite/tests/test_de.rs
++++ b/test_suite/tests/test_de.rs
+@@ -245,6 +245,18 @@ declare_tests! {
+     }
+     test_unit {
+         () => &[Token::Unit],
++        () => &[
++            Token::SeqStart(Some(0)),
++            Token::SeqEnd,
++        ],
++        () => &[
++            Token::SeqStart(None),
++            Token::SeqEnd,
++        ],
++        () => &[
++            Token::TupleStructStart("Anything", 0),
++            Token::TupleStructEnd,
++        ],
+     }
+     test_unit_struct {
+         UnitStruct => &[Token::Unit],
+@@ -260,6 +272,9 @@ declare_tests! {
+             Token::SeqEnd,
+         ],
+     }
++    test_unit_string {
++        String::new() => &[Token::Unit],
++    }
+     test_tuple_struct {
+         TupleStruct(1, 2, 3) => &[
+             Token::SeqStart(Some(3)),
+@@ -311,6 +326,9 @@ declare_tests! {
+         ],
+     }
+     test_btreeset {
++        BTreeSet::<isize>::new() => &[
++            Token::Unit,
++        ],
+         BTreeSet::<isize>::new() => &[
+             Token::SeqStart(Some(0)),
+             Token::SeqEnd,
+@@ -337,12 +355,18 @@ declare_tests! {
+                 Token::SeqEnd,
+             Token::SeqEnd,
+         ],
++        BTreeSet::<isize>::new() => &[
++            Token::UnitStruct("Anything"),
++        ],
+         BTreeSet::<isize>::new() => &[
+             Token::TupleStructStart("Anything", 0),
+             Token::TupleStructEnd,
+         ],
+     }
+     test_hashset {
++        HashSet::<isize>::new() => &[
++            Token::Unit,
++        ],
+         HashSet::<isize>::new() => &[
+             Token::SeqStart(Some(0)),
+             Token::SeqEnd,
+@@ -359,6 +383,9 @@ declare_tests! {
+                 Token::I32(3),
+             Token::SeqEnd,
+         ],
++        HashSet::<isize>::new() => &[
++            Token::UnitStruct("Anything"),
++        ],
+         HashSet::<isize>::new() => &[
+             Token::TupleStructStart("Anything", 0),
+             Token::TupleStructEnd,
+@@ -377,6 +404,9 @@ declare_tests! {
+         ],
+     }
+     test_vec {
++        Vec::<isize>::new() => &[
++            Token::Unit,
++        ],
+         Vec::<isize>::new() => &[
+             Token::SeqStart(Some(0)),
+             Token::SeqEnd,
+@@ -403,12 +433,18 @@ declare_tests! {
+                 Token::SeqEnd,
+             Token::SeqEnd,
+         ],
++        Vec::<isize>::new() => &[
++            Token::UnitStruct("Anything"),
++        ],
+         Vec::<isize>::new() => &[
+             Token::TupleStructStart("Anything", 0),
+             Token::TupleStructEnd,
+         ],
+     }
+     test_array {
++        [0; 0] => &[
++            Token::Unit,
++        ],
+         [0; 0] => &[
+             Token::SeqStart(Some(0)),
+             Token::SeqEnd,
+@@ -461,6 +497,9 @@ declare_tests! {
+                 Token::SeqEnd,
+             Token::SeqEnd,
+         ],
++        [0; 0] => &[
++            Token::UnitStruct("Anything"),
++        ],
+         [0; 0] => &[
+             Token::TupleStructStart("Anything", 0),
+             Token::TupleStructEnd,
+@@ -505,6 +544,9 @@ declare_tests! {
+         ],
+     }
+     test_btreemap {
++        BTreeMap::<isize, isize>::new() => &[
++            Token::Unit,
++        ],
+         BTreeMap::<isize, isize>::new() => &[
+             Token::MapStart(Some(0)),
+             Token::MapEnd,
+@@ -547,12 +589,18 @@ declare_tests! {
+                 Token::MapEnd,
+             Token::MapEnd,
+         ],
++        BTreeMap::<isize, isize>::new() => &[
++            Token::UnitStruct("Anything"),
++        ],
+         BTreeMap::<isize, isize>::new() => &[
+             Token::StructStart("Anything", 0),
+             Token::StructEnd,
+         ],
+     }
+     test_hashmap {
++        HashMap::<isize, isize>::new() => &[
++            Token::Unit,
++        ],
+         HashMap::<isize, isize>::new() => &[
+             Token::MapStart(Some(0)),
+             Token::MapEnd,
+@@ -595,6 +643,9 @@ declare_tests! {
+                 Token::MapEnd,
+             Token::MapEnd,
+         ],
++        HashMap::<isize, isize>::new() => &[
++            Token::UnitStruct("Anything"),
++        ],
+         HashMap::<isize, isize>::new() => &[
+             Token::StructStart("Anything", 0),
+             Token::StructEnd,
+@@ -1068,115 +1119,4 @@ declare_error_tests! {
+         ],
+         Error::Message("nul byte found in provided data at position: 2".into()),
+     }
+-    test_unit_from_empty_seq<()> {
+-        &[
+-            Token::SeqStart(Some(0)),
+-            Token::SeqEnd,
+-        ],
+-        Error::Message("invalid type: sequence, expected unit".into()),
+-    }
+-    test_unit_from_empty_seq_without_len<()> {
+-        &[
+-            Token::SeqStart(None),
+-            Token::SeqEnd,
+-        ],
+-        Error::Message("invalid type: sequence, expected unit".into()),
+-    }
+-    test_unit_from_tuple_struct<()> {
+-        &[
+-            Token::TupleStructStart("Anything", 0),
+-            Token::TupleStructEnd,
+-        ],
+-        Error::Message("invalid type: sequence, expected unit".into()),
+-    }
+-    test_string_from_unit<String> {
+-        &[
+-            Token::Unit,
+-        ],
+-        Error::Message("invalid type: unit value, expected a string".into()),
+-    }
+-    test_btreeset_from_unit<BTreeSet<isize>> {
+-        &[
+-            Token::Unit,
+-        ],
+-        Error::Message("invalid type: unit value, expected a sequence".into()),
+-    }
+-    test_btreeset_from_unit_struct<BTreeSet<isize>> {
+-        &[
+-            Token::UnitStruct("Anything"),
+-        ],
+-        Error::Message("invalid type: unit value, expected a sequence".into()),
+-    }
+-    test_hashset_from_unit<HashSet<isize>> {
+-        &[
+-            Token::Unit,
+-        ],
+-        Error::Message("invalid type: unit value, expected a sequence".into()),
+-    }
+-    test_hashset_from_unit_struct<HashSet<isize>> {
+-        &[
+-            Token::UnitStruct("Anything"),
+-        ],
+-        Error::Message("invalid type: unit value, expected a sequence".into()),
+-    }
+-    test_vec_from_unit<Vec<isize>> {
+-        &[
+-            Token::Unit,
+-        ],
+-        Error::Message("invalid type: unit value, expected a sequence".into()),
+-    }
+-    test_vec_from_unit_struct<Vec<isize>> {
+-        &[
+-            Token::UnitStruct("Anything"),
+-        ],
+-        Error::Message("invalid type: unit value, expected a sequence".into()),
+-    }
+-    test_zero_array_from_unit<[isize; 0]> {
+-        &[
+-            Token::Unit,
+-        ],
+-        Error::Message("invalid type: unit value, expected an empty array".into()),
+-    }
+-    test_zero_array_from_unit_struct<[isize; 0]> {
+-        &[
+-            Token::UnitStruct("Anything"),
+-        ],
+-        Error::Message("invalid type: unit value, expected an empty array".into()),
+-    }
+-    test_btreemap_from_unit<BTreeMap<isize, isize>> {
+-        &[
+-            Token::Unit,
+-        ],
+-        Error::Message("invalid type: unit value, expected a map".into()),
+-    }
+-    test_btreemap_from_unit_struct<BTreeMap<isize, isize>> {
+-        &[
+-            Token::UnitStruct("Anything"),
+-        ],
+-        Error::Message("invalid type: unit value, expected a map".into()),
+-    }
+-    test_hashmap_from_unit<HashMap<isize, isize>> {
+-        &[
+-            Token::Unit,
+-        ],
+-        Error::Message("invalid type: unit value, expected a map".into()),
+-    }
+-    test_hashmap_from_unit_struct<HashMap<isize, isize>> {
+-        &[
+-            Token::UnitStruct("Anything"),
+-        ],
+-        Error::Message("invalid type: unit value, expected a map".into()),
+-    }
+-    test_bool_from_string<bool> {
+-        &[
+-            Token::Str("false"),
+-        ],
+-        Error::Message("invalid type: string \"false\", expected a boolean".into()),
+-    }
+-    test_number_from_string<isize> {
+-        &[
+-            Token::Str("1"),
+-        ],
+-        Error::Message("invalid type: string \"1\", expected isize".into()),
+-    }
+ }

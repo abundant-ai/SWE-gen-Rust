@@ -1,0 +1,189 @@
+diff --git a/tokio/src/io/util/empty.rs b/tokio/src/io/util/empty.rs
+index 289725ce..06be4ff3 100644
+--- a/tokio/src/io/util/empty.rs
++++ b/tokio/src/io/util/empty.rs
+@@ -1,4 +1,3 @@
+-use crate::io::util::poll_proceed_and_make_progress;
+ use crate::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
+ 
+ use std::fmt;
+@@ -139,6 +138,20 @@ impl fmt::Debug for Empty {
+     }
+ }
+ 
++cfg_coop! {
++    fn poll_proceed_and_make_progress(cx: &mut Context<'_>) -> Poll<()> {
++        let coop = ready!(crate::runtime::coop::poll_proceed(cx));
++        coop.made_progress();
++        Poll::Ready(())
++    }
++}
++
++cfg_not_coop! {
++    fn poll_proceed_and_make_progress(_: &mut Context<'_>) -> Poll<()> {
++        Poll::Ready(())
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/tokio/src/io/util/mod.rs b/tokio/src/io/util/mod.rs
+index 47b951f2..21199d0b 100644
+--- a/tokio/src/io/util/mod.rs
++++ b/tokio/src/io/util/mod.rs
+@@ -85,20 +85,6 @@ cfg_io_util! {
+     // used by `BufReader` and `BufWriter`
+     // https://github.com/rust-lang/rust/blob/master/library/std/src/sys_common/io.rs#L1
+     const DEFAULT_BUF_SIZE: usize = 8 * 1024;
+-
+-    cfg_coop! {
+-        fn poll_proceed_and_make_progress(cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+-            let coop = ready!(crate::runtime::coop::poll_proceed(cx));
+-            coop.made_progress();
+-            std::task::Poll::Ready(())
+-        }
+-    }
+-
+-    cfg_not_coop! {
+-        fn poll_proceed_and_make_progress(_: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+-            std::task::Poll::Ready(())
+-        }
+-    }
+ }
+ 
+ cfg_not_io_util! {
+diff --git a/tokio/src/io/util/repeat.rs b/tokio/src/io/util/repeat.rs
+index 4a3ac78e..1142765d 100644
+--- a/tokio/src/io/util/repeat.rs
++++ b/tokio/src/io/util/repeat.rs
+@@ -1,4 +1,3 @@
+-use crate::io::util::poll_proceed_and_make_progress;
+ use crate::io::{AsyncRead, ReadBuf};
+ 
+ use std::io;
+@@ -51,11 +50,9 @@ impl AsyncRead for Repeat {
+     #[inline]
+     fn poll_read(
+         self: Pin<&mut Self>,
+-        cx: &mut Context<'_>,
++        _: &mut Context<'_>,
+         buf: &mut ReadBuf<'_>,
+     ) -> Poll<io::Result<()>> {
+-        ready!(crate::trace::trace_leaf(cx));
+-        ready!(poll_proceed_and_make_progress(cx));
+         // TODO: could be faster, but should we unsafe it?
+         while buf.remaining() != 0 {
+             buf.put_slice(&[self.byte]);
+diff --git a/tokio/src/io/util/sink.rs b/tokio/src/io/util/sink.rs
+index 1c0102d4..05ee773f 100644
+--- a/tokio/src/io/util/sink.rs
++++ b/tokio/src/io/util/sink.rs
+@@ -1,4 +1,3 @@
+-use crate::io::util::poll_proceed_and_make_progress;
+ use crate::io::AsyncWrite;
+ 
+ use std::fmt;
+@@ -54,25 +53,19 @@ impl AsyncWrite for Sink {
+     #[inline]
+     fn poll_write(
+         self: Pin<&mut Self>,
+-        cx: &mut Context<'_>,
++        _: &mut Context<'_>,
+         buf: &[u8],
+     ) -> Poll<Result<usize, io::Error>> {
+-        ready!(crate::trace::trace_leaf(cx));
+-        ready!(poll_proceed_and_make_progress(cx));
+         Poll::Ready(Ok(buf.len()))
+     }
+ 
+     #[inline]
+-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+-        ready!(crate::trace::trace_leaf(cx));
+-        ready!(poll_proceed_and_make_progress(cx));
++    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+         Poll::Ready(Ok(()))
+     }
+ 
+     #[inline]
+-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+-        ready!(crate::trace::trace_leaf(cx));
+-        ready!(poll_proceed_and_make_progress(cx));
++    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+         Poll::Ready(Ok(()))
+     }
+ }
+diff --git a/tokio/tests/io_repeat.rs b/tokio/tests/io_repeat.rs
+deleted file mode 100644
+index 8094ffe7..00000000
+--- a/tokio/tests/io_repeat.rs
++++ /dev/null
+@@ -1,18 +0,0 @@
+-#![warn(rust_2018_idioms)]
+-#![cfg(all(feature = "full"))]
+-
+-use tokio::io::AsyncReadExt;
+-
+-#[tokio::test]
+-async fn repeat_poll_read_is_cooperative() {
+-    tokio::select! {
+-        biased;
+-        _ = async {
+-            loop {
+-                let mut buf = [0u8; 4096];
+-                tokio::io::repeat(0b101).read_exact(&mut buf).await.unwrap();
+-            }
+-        } => {},
+-        _ = tokio::task::yield_now() => {}
+-    }
+-}
+diff --git a/tokio/tests/io_sink.rs b/tokio/tests/io_sink.rs
+deleted file mode 100644
+index 9b4fb31f..00000000
+--- a/tokio/tests/io_sink.rs
++++ /dev/null
+@@ -1,44 +0,0 @@
+-#![warn(rust_2018_idioms)]
+-#![cfg(all(feature = "full"))]
+-
+-use tokio::io::AsyncWriteExt;
+-
+-#[tokio::test]
+-async fn sink_poll_write_is_cooperative() {
+-    tokio::select! {
+-        biased;
+-        _ = async {
+-            loop {
+-                let buf = vec![1, 2, 3];
+-                tokio::io::sink().write_all(&buf).await.unwrap();
+-            }
+-        } => {},
+-        _ = tokio::task::yield_now() => {}
+-    }
+-}
+-
+-#[tokio::test]
+-async fn sink_poll_flush_is_cooperative() {
+-    tokio::select! {
+-        biased;
+-        _ = async {
+-            loop {
+-                tokio::io::sink().flush().await.unwrap();
+-            }
+-        } => {},
+-        _ = tokio::task::yield_now() => {}
+-    }
+-}
+-
+-#[tokio::test]
+-async fn sink_poll_shutdown_is_cooperative() {
+-    tokio::select! {
+-        biased;
+-        _ = async {
+-            loop {
+-                tokio::io::sink().shutdown().await.unwrap();
+-            }
+-        } => {},
+-        _ = tokio::task::yield_now() => {}
+-    }
+-}

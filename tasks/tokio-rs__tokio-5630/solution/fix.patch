@@ -1,0 +1,57 @@
+diff --git a/tokio-util/src/time/wheel/level.rs b/tokio-util/src/time/wheel/level.rs
+index 8ea30af3..151e0948 100644
+--- a/tokio-util/src/time/wheel/level.rs
++++ b/tokio-util/src/time/wheel/level.rs
+@@ -140,11 +140,31 @@ impl<T: Stack> Level<T> {
+ 
+         // TODO: This can probably be simplified w/ power of 2 math
+         let level_start = now - (now % level_range);
+-        let deadline = level_start + slot as u64 * slot_range;
+-
++        let mut deadline = level_start + slot as u64 * slot_range;
++        if deadline < now {
++            // A timer is in a slot "prior" to the current time. This can occur
++            // because we do not have an infinite hierarchy of timer levels, and
++            // eventually a timer scheduled for a very distant time might end up
++            // being placed in a slot that is beyond the end of all of the
++            // arrays.
++            //
++            // To deal with this, we first limit timers to being scheduled no
++            // more than MAX_DURATION ticks in the future; that is, they're at
++            // most one rotation of the top level away. Then, we force timers
++            // that logically would go into the top+1 level, to instead go into
++            // the top level's slots.
++            //
++            // What this means is that the top level's slots act as a
++            // pseudo-ring buffer, and we rotate around them indefinitely. If we
++            // compute a deadline before now, and it's the top level, it
++            // therefore means we're actually looking at a slot in the future.
++            debug_assert_eq!(self.level, super::NUM_LEVELS - 1);
++
++            deadline += level_range;
++        }
+         debug_assert!(
+             deadline >= now,
+-            "deadline={}; now={}; level={}; slot={}; occupied={:b}",
++            "deadline={:016X}; now={:016X}; level={}; slot={}; occupied={:b}",
+             deadline,
+             now,
+             self.level,
+diff --git a/tokio-util/src/time/wheel/mod.rs b/tokio-util/src/time/wheel/mod.rs
+index ffa05ab7..c5a03fd4 100644
+--- a/tokio-util/src/time/wheel/mod.rs
++++ b/tokio-util/src/time/wheel/mod.rs
+@@ -254,8 +254,11 @@ fn level_for(elapsed: u64, when: u64) -> usize {
+ 
+     // Mask in the trailing bits ignored by the level calculation in order to cap
+     // the possible leading zeros
+-    let masked = elapsed ^ when | SLOT_MASK;
+-
++    let mut masked = elapsed ^ when | SLOT_MASK;
++    if masked >= MAX_DURATION {
++        // Fudge the timer into the top level
++        masked = MAX_DURATION - 1;
++    }
+     let leading_zeros = masked.leading_zeros() as usize;
+     let significant = 63 - leading_zeros;
+     significant / 6

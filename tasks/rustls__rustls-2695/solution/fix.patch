@@ -1,0 +1,213 @@
+diff --git a/bogo/src/main.rs b/bogo/src/main.rs
+index 900e9f1b..d12ca2e9 100644
+--- a/bogo/src/main.rs
++++ b/bogo/src/main.rs
+@@ -50,10 +50,10 @@ use rustls::server::{
+ };
+ use rustls::sign::{CertifiedSigner, SingleCertAndKey};
+ use rustls::{
+-    AlertDescription, CertificateCompressionAlgorithm, CertificateError, Connection,
+-    DistinguishedName, Error, HandshakeKind, InvalidMessage, NamedGroup, PeerIncompatible,
+-    PeerMisbehaved, ProtocolVersion, RootCertStore, Side, SignatureAlgorithm, SignatureScheme,
+-    client, compress, server, sign,
++    AlertDescription, CertificateCompressionAlgorithm, CertificateError, CertificateType,
++    Connection, DistinguishedName, Error, HandshakeKind, InvalidMessage, NamedGroup,
++    PeerIncompatible, PeerMisbehaved, ProtocolVersion, RootCertStore, Side, SignatureAlgorithm,
++    SignatureScheme, client, compress, server, sign,
+ };
+ 
+ static BOGO_NACK: i32 = 89;
+@@ -624,8 +624,11 @@ impl client::ResolvesClientCert for MultipleClientCredentialResolver {
+         })
+     }
+ 
+-    fn has_certs(&self) -> bool {
+-        self.default.is_some() || !self.additional.is_empty()
++    fn supported_certificate_types(&self) -> &'static [CertificateType] {
++        match self.default.is_some() || !self.additional.is_empty() {
++            true => &[CertificateType::X509],
++            false => &[],
++        }
+     }
+ }
+ 
+diff --git a/rustls/src/client/client_conn.rs b/rustls/src/client/client_conn.rs
+index d2398f2e..45a293f8 100644
+--- a/rustls/src/client/client_conn.rs
++++ b/rustls/src/client/client_conn.rs
+@@ -131,16 +131,11 @@ pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
+ 
+     /// Returns which [`CertificateType`]s this resolver supports.
+     ///
+-    /// Returning an empty slice will result in an error. The default implementation signals
+-    /// support for X.509 certificates. Implementations should return the same value every time.
++    /// Should return the empty slice if the resolver does not have any credentials to send.
++    /// Implementations should return the same value every time.
+     ///
+     /// See [RFC 7250](https://tools.ietf.org/html/rfc7250) for more information.
+-    fn supported_certificate_types(&self) -> &'static [CertificateType] {
+-        &[CertificateType::X509]
+-    }
+-
+-    /// Return true if any certificates at all are available.
+-    fn has_certs(&self) -> bool;
++    fn supported_certificate_types(&self) -> &'static [CertificateType];
+ }
+ 
+ /// Common configuration for (typically) all connections made by a program.
+diff --git a/rustls/src/client/ech.rs b/rustls/src/client/ech.rs
+index 05d929c2..f7a3d32f 100644
+--- a/rustls/src/client/ech.rs
++++ b/rustls/src/client/ech.rs
+@@ -132,9 +132,10 @@ impl EchConfig {
+         EchState::new(
+             self,
+             server_name.clone(),
+-            config
++            !config
+                 .client_auth_cert_resolver
+-                .has_certs(),
++                .supported_certificate_types()
++                .is_empty(),
+             config.provider.secure_random,
+             config.enable_sni,
+         )
+diff --git a/rustls/src/client/handy.rs b/rustls/src/client/handy.rs
+index f50d895f..2be3338a 100644
+--- a/rustls/src/client/handy.rs
++++ b/rustls/src/client/handy.rs
+@@ -196,8 +196,8 @@ impl client::ResolvesClientCert for FailResolveClientCert {
+         None
+     }
+ 
+-    fn has_certs(&self) -> bool {
+-        false
++    fn supported_certificate_types(&self) -> &'static [CertificateType] {
++        &[]
+     }
+ }
+ 
+@@ -227,14 +227,6 @@ impl client::ResolvesClientCert for AlwaysResolvesClientRawPublicKeys {
+     fn supported_certificate_types(&self) -> &'static [CertificateType] {
+         &[CertificateType::RawPublicKey]
+     }
+-
+-    /// Returns true if the resolver is ready to present an identity.
+-    ///
+-    /// Even though the function is called `has_certs`, it returns true
+-    /// although only an RPK (Raw Public Key) is available, not an actual certificate.
+-    fn has_certs(&self) -> bool {
+-        true
+-    }
+ }
+ 
+ #[cfg(test)]
+@@ -248,6 +240,8 @@ mod tests {
+     use super::provider::cipher_suite;
+     use crate::client::danger::{HandshakeSignatureValid, PeerVerified, ServerVerifier};
+     use crate::client::{ClientSessionStore, ResolvesClientCert};
++    use crate::enums::{CertificateType, SignatureScheme};
++    use crate::error::Error;
+     use crate::msgs::base::PayloadU16;
+     use crate::msgs::enums::NamedGroup;
+     use crate::msgs::handshake::SessionId;
+@@ -257,7 +251,6 @@ mod tests {
+     use crate::verify::{
+         CertificateIdentity, PeerIdentity, ServerIdentity, SignatureVerificationInput,
+     };
+-    use crate::{Error, SignatureScheme};
+ 
+     #[test]
+     fn test_noclientsessionstorage_does_nothing() {
+@@ -366,7 +359,7 @@ mod tests {
+         }
+ 
+         #[cfg_attr(coverage_nightly, coverage(off))]
+-        fn has_certs(&self) -> bool {
++        fn supported_certificate_types(&self) -> &'static [CertificateType] {
+             unreachable!()
+         }
+     }
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index 5a2f65da..2db234b9 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -522,10 +522,11 @@ impl ClientHelloInput {
+         cx: &mut ClientContext<'_>,
+     ) -> NextStateOrError<'static> {
+         let mut transcript_buffer = HandshakeHashBuffer::new();
+-        if self
++        if !self
+             .config
+             .client_auth_cert_resolver
+-            .has_certs()
++            .supported_certificate_types()
++            .is_empty()
+         {
+             transcript_buffer.set_client_auth_enabled();
+         }
+@@ -715,8 +716,7 @@ fn emit_client_hello_for_retry(
+         .client_auth_cert_resolver
+         .supported_certificate_types();
+     match client_certificate_types {
+-        &[] => return Err(ApiMisuse::NoSupportedCertificateTypes.into()),
+-        &[CertificateType::X509] => {}
++        &[] | &[CertificateType::X509] => {}
+         supported => {
+             exts.client_certificate_types = Some(supported.to_vec());
+         }
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 4a141b8d..0df78cd6 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -22,7 +22,7 @@ use crate::crypto::{ActiveKeyExchange, SharedSecret};
+ use crate::enums::{
+     AlertDescription, CertificateType, ContentType, HandshakeType, ProtocolVersion, SignatureScheme,
+ };
+-use crate::error::{ApiMisuse, Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
++use crate::error::{Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
+ use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
+ use crate::log::{debug, trace, warn};
+ use crate::msgs::base::{Payload, PayloadU8};
+@@ -662,12 +662,12 @@ fn check_cert_type(
+     client_supported: &[CertificateType],
+     server_negotiated: Option<CertificateType>,
+ ) -> Result<(), Error> {
+-    if client_supported.is_empty() {
+-        return Err(ApiMisuse::NoSupportedCertificateTypes.into());
+-    }
+-
+     match server_negotiated {
+-        None if client_supported.contains(&CertificateType::X509) => Ok(()),
++        None if client_supported.is_empty()
++            || client_supported.contains(&CertificateType::X509) =>
++        {
++            Ok(())
++        }
+         Some(ct) if client_supported.contains(&ct) => Ok(()),
+         _ => Err(common.send_fatal_alert(
+             AlertDescription::HandshakeFailure,
+diff --git a/rustls/src/crypto/signer.rs b/rustls/src/crypto/signer.rs
+index 5bcc353e..d0999d4c 100644
+--- a/rustls/src/crypto/signer.rs
++++ b/rustls/src/crypto/signer.rs
+@@ -6,7 +6,7 @@ use pki_types::{AlgorithmIdentifier, CertificateDer, PrivateKeyDer, SubjectPubli
+ 
+ use super::CryptoProvider;
+ use crate::client::ResolvesClientCert;
+-use crate::enums::{SignatureAlgorithm, SignatureScheme};
++use crate::enums::{CertificateType, SignatureAlgorithm, SignatureScheme};
+ use crate::error::{ApiMisuse, Error, InconsistentKeys, PeerIncompatible};
+ use crate::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
+ use crate::sync::Arc;
+@@ -95,8 +95,8 @@ impl ResolvesClientCert for SingleCertAndKey {
+         self.0.signer(sig_schemes)
+     }
+ 
+-    fn has_certs(&self) -> bool {
+-        true
++    fn supported_certificate_types(&self) -> &'static [CertificateType] {
++        &[CertificateType::X509]
+     }
+ }
+ 

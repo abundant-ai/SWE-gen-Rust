@@ -31,6 +31,9 @@ RUN git reset --hard
 COPY bug.patch /tmp/bug.patch
 RUN patch -p1 < /tmp/bug.patch && rm /tmp/bug.patch
 
+# Fix unused import error caused by bug.patch (slice import becomes unused after patch)
+RUN sed -i '123s/, slice//' serde/src/lib.rs
+
 # Fix test_gen.rs - remove deny(warnings) line that causes issues with newer Rust nightlies
 RUN sed -i '/^#!\[deny(warnings)\]/d' test_suite/tests/test_gen.rs
 

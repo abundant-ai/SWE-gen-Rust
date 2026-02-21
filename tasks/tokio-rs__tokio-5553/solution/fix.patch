@@ -1,0 +1,84 @@
+diff --git a/tokio/src/runtime/time/entry.rs b/tokio/src/runtime/time/entry.rs
+index f86d9ed9..6aea2b15 100644
+--- a/tokio/src/runtime/time/entry.rs
++++ b/tokio/src/runtime/time/entry.rs
+@@ -527,9 +527,9 @@ impl TimerEntry {
+         unsafe { self.driver().clear_entry(NonNull::from(self.inner())) };
+     }
+ 
+-    pub(crate) fn reset(mut self: Pin<&mut Self>, new_time: Instant) {
++    pub(crate) fn reset(mut self: Pin<&mut Self>, new_time: Instant, reregister: bool) {
+         unsafe { self.as_mut().get_unchecked_mut() }.deadline = new_time;
+-        unsafe { self.as_mut().get_unchecked_mut() }.registered = true;
++        unsafe { self.as_mut().get_unchecked_mut() }.registered = reregister;
+ 
+         let tick = self.driver().time_source().deadline_to_tick(new_time);
+ 
+@@ -537,9 +537,11 @@ impl TimerEntry {
+             return;
+         }
+ 
+-        unsafe {
+-            self.driver()
+-                .reregister(&self.driver.driver().io, tick, self.inner().into());
++        if reregister {
++            unsafe {
++                self.driver()
++                    .reregister(&self.driver.driver().io, tick, self.inner().into());
++            }
+         }
+     }
+ 
+@@ -553,7 +555,7 @@ impl TimerEntry {
+ 
+         if !self.registered {
+             let deadline = self.deadline;
+-            self.as_mut().reset(deadline);
++            self.as_mut().reset(deadline, true);
+         }
+ 
+         let this = unsafe { self.get_unchecked_mut() };
+diff --git a/tokio/src/time/interval.rs b/tokio/src/time/interval.rs
+index ea8b3939..9b98cd77 100644
+--- a/tokio/src/time/interval.rs
++++ b/tokio/src/time/interval.rs
+@@ -482,7 +482,10 @@ impl Interval {
+             timeout + self.period
+         };
+ 
+-        self.delay.as_mut().reset(next);
++        // When we arrive here, the internal delay returned `Poll::Ready`.
++        // Reset the delay but do not register it. It should be registered with
++        // the next call to [`poll_tick`].
++        self.delay.as_mut().reset_without_reregister(next);
+ 
+         // Return the time when we were scheduled to tick
+         Poll::Ready(timeout)
+diff --git a/tokio/src/time/sleep.rs b/tokio/src/time/sleep.rs
+index 370a98b9..ccf53ef8 100644
+--- a/tokio/src/time/sleep.rs
++++ b/tokio/src/time/sleep.rs
+@@ -353,9 +353,22 @@ impl Sleep {
+         self.reset_inner(deadline)
+     }
+ 
++    /// Resets the `Sleep` instance to a new deadline without reregistering it
++    /// to be woken up.
++    ///
++    /// Calling this function allows changing the instant at which the `Sleep`
++    /// future completes without having to create new associated state and
++    /// without having it registered. This is required in e.g. the
++    /// [crate::time::Interval] where we want to reset the internal [Sleep]
++    /// without having it wake up the last task that polled it.
++    pub(crate) fn reset_without_reregister(self: Pin<&mut Self>, deadline: Instant) {
++        let mut me = self.project();
++        me.entry.as_mut().reset(deadline, false);
++    }
++
+     fn reset_inner(self: Pin<&mut Self>, deadline: Instant) {
+         let mut me = self.project();
+-        me.entry.as_mut().reset(deadline);
++        me.entry.as_mut().reset(deadline, true);
+ 
+         #[cfg(all(tokio_unstable, feature = "tracing"))]
+         {

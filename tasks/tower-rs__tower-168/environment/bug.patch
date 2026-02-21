@@ -1,0 +1,601 @@
+diff --git a/tower-balance/examples/demo.rs b/tower-balance/examples/demo.rs
+index 8b2f7f2..0560d4d 100644
+--- a/tower-balance/examples/demo.rs
++++ b/tower-balance/examples/demo.rs
+@@ -18,7 +18,6 @@ use futures::{future, stream, Async, Future, Poll, Stream};
+ use hdrsample::Histogram;
+ use rand::Rng;
+ use std::collections::VecDeque;
+-use std::fmt;
+ use std::time::{Duration, Instant};
+ use tokio::{runtime, timer};
+ use tower_balance as lb;
+@@ -105,9 +104,9 @@ where
+     D: Discover + Send + 'static,
+     D::Key: Send,
+     D::Service: Service<Req, Response = Rsp> + Send,
+-    D::Error: ::std::error::Error + Send + Sync + 'static,
++    D::Error: Send + Sync,
+     <D::Service as Service<Req>>::Future: Send,
+-    <D::Service as Service<Req>>::Error: ::std::error::Error + Send + Sync + 'static,
++    <D::Service as Service<Req>>::Error: Send + Sync,
+     C: lb::Choose<D::Key, D::Service> + Send + 'static,
+ {
+     println!("{}", name);
+@@ -218,14 +217,14 @@ impl Future for Delay {
+ 
+ impl Discover for Disco {
+     type Key = usize;
+-    type Error = DiscoError;
+-    type Service = Errify<InFlightLimit<Buffer<DelayService, Req>>>;
++    type Error = ();
++    type Service = InFlightLimit<Buffer<DelayService, Req>>;
+ 
+     fn poll(&mut self) -> Poll<Change<Self::Key, Self::Service>, Self::Error> {
+         match self.changes.pop_front() {
+             Some(Change::Insert(k, svc)) => {
+                 let svc = Buffer::new(svc, 0).unwrap();
+-                let svc = Errify(InFlightLimit::new(svc, ENDPOINT_CAPACITY));
++                let svc = InFlightLimit::new(svc, ENDPOINT_CAPACITY);
+                 Ok(Async::Ready(Change::Insert(k, svc)))
+             }
+             Some(Change::Remove(k)) => Ok(Async::Ready(Change::Remove(k))),
+@@ -234,25 +233,12 @@ impl Discover for Disco {
+     }
+ }
+ 
+-#[derive(Debug)]
+-pub struct DiscoError;
+-
+-impl fmt::Display for DiscoError {
+-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+-        write!(fmt, "discovery error")
+-    }
+-}
+-
+-impl std::error::Error for DiscoError {}
+-
+ type DemoService<D, C> = InFlightLimit<Buffer<lb::Balance<D, C>, Req>>;
+ 
+ struct SendRequests<D, C>
+ where
+     D: Discover,
+-    D::Error: ::std::error::Error + Send + Sync + 'static,
+     D::Service: Service<Req>,
+-    <D::Service as Service<Req>>::Error: ::std::error::Error + Send + Sync + 'static,
+     C: lb::Choose<D::Key, D::Service>,
+ {
+     send_remaining: usize,
+@@ -263,9 +249,7 @@ where
+ impl<D, C> SendRequests<D, C>
+ where
+     D: Discover + Send + 'static,
+-    D::Error: ::std::error::Error + Send + Sync + 'static,
+     D::Service: Service<Req>,
+-    <D::Service as Service<Req>>::Error: ::std::error::Error + Send + Sync + 'static,
+     D::Key: Send,
+     D::Service: Send,
+     D::Error: Send + Sync,
+@@ -285,9 +269,7 @@ where
+ impl<D, C> Stream for SendRequests<D, C>
+ where
+     D: Discover,
+-    D::Error: ::std::error::Error + Send + Sync + 'static,
+     D::Service: Service<Req>,
+-    <D::Service as Service<Req>>::Error: ::std::error::Error + Send + Sync + 'static,
+     C: lb::Choose<D::Key, D::Service>,
+ {
+     type Item = <DemoService<D, C> as Service<Req>>::Response;
+@@ -323,31 +305,3 @@ where
+         Ok(Async::Ready(None))
+     }
+ }
+-
+-pub struct Errify<T>(T);
+-
+-impl<T, Request> Service<Request> for Errify<T>
+-where
+-    T: Service<Request>,
+-{
+-    type Response = T::Response;
+-    type Error = DiscoError;
+-    type Future = Errify<T::Future>;
+-
+-    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+-        self.0.poll_ready().map_err(|_| DiscoError)
+-    }
+-
+-    fn call(&mut self, request: Request) -> Self::Future {
+-        Errify(self.0.call(request))
+-    }
+-}
+-
+-impl<T: Future> Future for Errify<T> {
+-    type Item = T::Item;
+-    type Error = DiscoError;
+-
+-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+-        self.0.poll().map_err(|_| DiscoError)
+-    }
+-}
+diff --git a/tower-buffer/src/error.rs b/tower-buffer/src/error.rs
+index 394b279..5021ba6 100644
+--- a/tower-buffer/src/error.rs
++++ b/tower-buffer/src/error.rs
+@@ -5,9 +5,9 @@ use std::sync::Arc;
+ 
+ /// An error produced by a `Service` wrapped by a `Buffer`
+ #[derive(Debug)]
+-pub struct ServiceError {
++pub struct ServiceError<E> {
+     method: &'static str,
+-    inner: Arc<Error>,
++    inner: E,
+ }
+ 
+ /// Error produced when spawning the worker fails
+@@ -17,34 +17,50 @@ pub struct SpawnError<T> {
+ }
+ 
+ /// Errors produced by `Buffer`.
+-pub(crate) type Error = Box<::std::error::Error + Send + Sync>;
++#[derive(Debug)]
++pub enum Error<E> {
++    /// The `Service` call errored.
++    Inner(E),
++    /// The underlying `Service` failed. All subsequent requests will fail.
++    Closed(Arc<ServiceError<E>>),
++}
+ 
+-// ===== impl ServiceError =====
++// ===== impl Error =====
+ 
+-impl ServiceError {
+-    pub(crate) fn new(method: &'static str, inner: Error) -> ServiceError {
+-        let inner = Arc::new(inner);
+-        ServiceError { method, inner }
++impl<T> fmt::Display for Error<T>
++where
++    T: fmt::Display,
++{
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        match *self {
++            Error::Inner(ref why) => fmt::Display::fmt(why, f),
++            Error::Closed(ref e) => write!(f, "Service::{} failed: {}", e.method, e.inner),
++        }
+     }
++}
+ 
+-    /// Private to avoid exposing `Clone` trait as part of the public API
+-    pub(crate) fn clone(&self) -> ServiceError {
+-        ServiceError {
+-            method: self.method,
+-            inner: self.inner.clone(),
++impl<T> std::error::Error for Error<T>
++where
++    T: std::error::Error + 'static,
++{
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match *self {
++            Error::Inner(ref why) => Some(why),
++            Error::Closed(ref e) => Some(&e.inner),
+         }
+     }
+ }
+ 
+-impl fmt::Display for ServiceError {
+-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+-        write!(fmt, "Service::{} failed: {}", self.method, self.inner)
++// ===== impl ServiceError =====
++
++impl<E> ServiceError<E> {
++    pub(crate) fn new(method: &'static str, inner: E) -> ServiceError<E> {
++        ServiceError { method, inner }
+     }
+-}
+ 
+-impl std::error::Error for ServiceError {
+-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+-        Some(&**self.inner)
++    /// The error produced by the `Service` when `method` was called.
++    pub fn error(&self) -> &E {
++        &self.inner
+     }
+ }
+ 
+diff --git a/tower-buffer/src/future.rs b/tower-buffer/src/future.rs
+index 060e918..86898cd 100644
+--- a/tower-buffer/src/future.rs
++++ b/tower-buffer/src/future.rs
+@@ -3,43 +3,42 @@
+ use error::{Error, ServiceError};
+ use futures::{Async, Future, Poll};
+ use message;
++use std::sync::Arc;
+ 
+ /// Future eventually completed with the response to the original request.
+-pub struct ResponseFuture<T> {
+-    state: ResponseState<T>,
++pub struct ResponseFuture<T, E> {
++    state: ResponseState<T, E>,
+ }
+ 
+-enum ResponseState<T> {
+-    Failed(ServiceError),
+-    Rx(message::Rx<T>),
++enum ResponseState<T, E> {
++    Failed(Arc<ServiceError<E>>),
++    Rx(message::Rx<T, E>),
+     Poll(T),
+ }
+ 
+-impl<T> ResponseFuture<T>
++impl<T> ResponseFuture<T, T::Error>
+ where
+     T: Future,
+-    T::Error: Into<Error>,
+ {
+-    pub(crate) fn new(rx: message::Rx<T>) -> Self {
++    pub(crate) fn new(rx: message::Rx<T, T::Error>) -> Self {
+         ResponseFuture {
+             state: ResponseState::Rx(rx),
+         }
+     }
+ 
+-    pub(crate) fn failed(err: ServiceError) -> Self {
++    pub(crate) fn failed(err: Arc<ServiceError<T::Error>>) -> Self {
+         ResponseFuture {
+             state: ResponseState::Failed(err),
+         }
+     }
+ }
+ 
+-impl<T> Future for ResponseFuture<T>
++impl<T> Future for ResponseFuture<T, T::Error>
+ where
+     T: Future,
+-    T::Error: Into<Error>,
+ {
+     type Item = T::Item;
+-    type Error = Error;
++    type Error = Error<T::Error>;
+ 
+     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+         use self::ResponseState::*;
+@@ -49,18 +48,18 @@ where
+ 
+             match self.state {
+                 Failed(ref e) => {
+-                    return Err(e.clone().into());
++                    return Err(Error::Closed(e.clone()));
+                 }
+                 Rx(ref mut rx) => match rx.poll() {
+                     Ok(Async::Ready(Ok(f))) => fut = f,
+-                    Ok(Async::Ready(Err(e))) => return Err(e.into()),
++                    Ok(Async::Ready(Err(e))) => return Err(Error::Closed(e)),
+                     Ok(Async::NotReady) => return Ok(Async::NotReady),
+                     Err(_) => unreachable!(
+                         "Worker exited without sending error to all outstanding requests."
+                     ),
+                 },
+                 Poll(ref mut fut) => {
+-                    return fut.poll().map_err(Into::into);
++                    return fut.poll().map_err(Error::Inner);
+                 }
+             }
+ 
+diff --git a/tower-buffer/src/lib.rs b/tower-buffer/src/lib.rs
+index e23fe70..6fa3084 100644
+--- a/tower-buffer/src/lib.rs
++++ b/tower-buffer/src/lib.rs
+@@ -36,14 +36,13 @@ pub struct Buffer<T, Request>
+ where
+     T: Service<Request>,
+ {
+-    tx: mpsc::Sender<Message<Request, T::Future>>,
+-    worker: worker::Handle,
++    tx: mpsc::Sender<Message<Request, T::Future, T::Error>>,
++    worker: worker::Handle<T::Error>,
+ }
+ 
+ impl<T, Request> Buffer<T, Request>
+ where
+     T: Service<Request>,
+-    T::Error: Into<Error>,
+ {
+     /// Creates a new `Buffer` wrapping `service`.
+     ///
+@@ -86,17 +85,16 @@ where
+ impl<T, Request> Service<Request> for Buffer<T, Request>
+ where
+     T: Service<Request>,
+-    T::Error: Into<Error>,
+ {
+     type Response = T::Response;
+-    type Error = Error;
+-    type Future = ResponseFuture<T::Future>;
++    type Error = Error<T::Error>;
++    type Future = ResponseFuture<T::Future, T::Error>;
+ 
+     fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+         // If the inner service has errored, then we error here.
+         self.tx
+             .poll_ready()
+-            .map_err(move |_| self.worker.get_error_on_closed().into())
++            .map_err(move |_| Error::Closed(self.worker.get_error_on_closed()))
+     }
+ 
+     fn call(&mut self, request: Request) -> Self::Future {
+diff --git a/tower-buffer/src/message.rs b/tower-buffer/src/message.rs
+index 342ad22..b6f3d94 100644
+--- a/tower-buffer/src/message.rs
++++ b/tower-buffer/src/message.rs
+@@ -1,15 +1,16 @@
+ use error::ServiceError;
++use std::sync::Arc;
+ use tokio_sync::oneshot;
+ 
+ /// Message sent over buffer
+ #[derive(Debug)]
+-pub(crate) struct Message<Request, Fut> {
++pub(crate) struct Message<Request, Fut, E> {
+     pub(crate) request: Request,
+-    pub(crate) tx: Tx<Fut>,
++    pub(crate) tx: Tx<Fut, E>,
+ }
+ 
+ /// Response sender
+-pub(crate) type Tx<Fut> = oneshot::Sender<Result<Fut, ServiceError>>;
++pub(crate) type Tx<Fut, E> = oneshot::Sender<Result<Fut, Arc<ServiceError<E>>>>;
+ 
+ /// Response receiver
+-pub(crate) type Rx<Fut> = oneshot::Receiver<Result<Fut, ServiceError>>;
++pub(crate) type Rx<Fut, E> = oneshot::Receiver<Result<Fut, Arc<ServiceError<E>>>>;
+diff --git a/tower-buffer/src/worker.rs b/tower-buffer/src/worker.rs
+index dfd6ae9..a93d17d 100644
+--- a/tower-buffer/src/worker.rs
++++ b/tower-buffer/src/worker.rs
+@@ -1,4 +1,4 @@
+-use error::{Error, ServiceError};
++use error::ServiceError;
+ use futures::future::Executor;
+ use futures::{Async, Future, Poll, Stream};
+ use message::Message;
+@@ -16,19 +16,18 @@ use tower_service::Service;
+ pub struct Worker<T, Request>
+ where
+     T: Service<Request>,
+-    T::Error: Into<Error>,
+ {
+-    current_message: Option<Message<Request, T::Future>>,
+-    rx: mpsc::Receiver<Message<Request, T::Future>>,
++    current_message: Option<Message<Request, T::Future, T::Error>>,
++    rx: mpsc::Receiver<Message<Request, T::Future, T::Error>>,
+     service: T,
+     finish: bool,
+-    failed: Option<ServiceError>,
+-    handle: Handle,
++    failed: Option<Arc<ServiceError<T::Error>>>,
++    handle: Handle<T::Error>,
+ }
+ 
+ /// Get the error out
+-pub(crate) struct Handle {
+-    inner: Arc<Mutex<Option<ServiceError>>>,
++pub(crate) struct Handle<E> {
++    inner: Arc<Mutex<Option<Arc<ServiceError<E>>>>>,
+ }
+ 
+ /// This trait allows you to use either Tokio's threaded runtime's executor or the `current_thread`
+@@ -36,27 +35,23 @@ pub(crate) struct Handle {
+ pub trait WorkerExecutor<T, Request>: Executor<Worker<T, Request>>
+ where
+     T: Service<Request>,
+-    T::Error: Into<Error>,
+ {
+ }
+ 
+-impl<T, Request, E: Executor<Worker<T, Request>>> WorkerExecutor<T, Request> for E
+-where
+-    T: Service<Request>,
+-    T::Error: Into<Error>,
++impl<T, Request, E: Executor<Worker<T, Request>>> WorkerExecutor<T, Request> for E where
++    T: Service<Request>
+ {
+ }
+ 
+ impl<T, Request> Worker<T, Request>
+ where
+     T: Service<Request>,
+-    T::Error: Into<Error>,
+ {
+     pub(crate) fn spawn<E>(
+         service: T,
+-        rx: mpsc::Receiver<Message<Request, T::Future>>,
++        rx: mpsc::Receiver<Message<Request, T::Future, T::Error>>,
+         executor: &E,
+-    ) -> Result<Handle, T>
++    ) -> Result<Handle<T::Error>, T>
+     where
+         E: WorkerExecutor<T, Request>,
+     {
+@@ -80,7 +75,7 @@ where
+     }
+ 
+     /// Return the next queued Message that hasn't been canceled.
+-    fn poll_next_msg(&mut self) -> Poll<Option<Message<Request, T::Future>>, ()> {
++    fn poll_next_msg(&mut self) -> Poll<Option<Message<Request, T::Future, T::Error>>, ()> {
+         if self.finish {
+             // We've already received None and are shutting down
+             return Ok(Async::Ready(None));
+@@ -119,7 +114,7 @@ where
+         // request. We do this by *first* exposing the error, *then* closing the channel used to
+         // send more requests (so the client will see the error when the send fails), and *then*
+         // sending the error to all outstanding requests.
+-        let error = ServiceError::new(method, error.into());
++        let error = Arc::new(ServiceError::new(method, error));
+ 
+         let mut inner = self.handle.inner.lock().unwrap();
+ 
+@@ -143,7 +138,6 @@ where
+ impl<T, Request> Future for Worker<T, Request>
+ where
+     T: Service<Request>,
+-    T::Error: Into<Error>,
+ {
+     type Item = ();
+     type Error = ();
+@@ -182,9 +176,8 @@ where
+                             self.failed("poll_ready", e);
+                             let _ = msg.tx.send(Err(self
+                                 .failed
+-                                .as_ref()
+-                                .expect("Worker::failed did not set self.failed?")
+-                                .clone()));
++                                .clone()
++                                .expect("Worker::failed did not set self.failed?")));
+                         }
+                     }
+                 }
+@@ -207,8 +200,8 @@ where
+     }
+ }
+ 
+-impl Handle {
+-    pub(crate) fn get_error_on_closed(&self) -> ServiceError {
++impl<E> Handle<E> {
++    pub(crate) fn get_error_on_closed(&self) -> Arc<ServiceError<E>> {
+         self.inner
+             .lock()
+             .unwrap()
+@@ -218,8 +211,8 @@ impl Handle {
+     }
+ }
+ 
+-impl Clone for Handle {
+-    fn clone(&self) -> Handle {
++impl<E> Clone for Handle<E> {
++    fn clone(&self) -> Handle<E> {
+         Handle {
+             inner: self.inner.clone(),
+         }
+diff --git a/tower-buffer/tests/buffer.rs b/tower-buffer/tests/buffer.rs
+index 12945c6..82777a3 100644
+--- a/tower-buffer/tests/buffer.rs
++++ b/tower-buffer/tests/buffer.rs
+@@ -7,7 +7,6 @@ use futures::prelude::*;
+ use tower_buffer::*;
+ use tower_service::*;
+ 
+-use std::fmt;
+ use std::thread;
+ 
+ #[test]
+@@ -84,13 +83,11 @@ fn when_inner_is_not_ready() {
+ 
+ #[test]
+ fn when_inner_fails() {
+-    use std::error::Error as StdError;
+-
+     let (mut service, mut handle) = new_service();
+ 
+     // Make the service NotReady
+     handle.allow(0);
+-    handle.error(Error("foobar"));
++    handle.error("foobar");
+ 
+     let mut res1 = service.call("hello");
+ 
+@@ -98,42 +95,17 @@ fn when_inner_fails() {
+     ::std::thread::sleep(::std::time::Duration::from_millis(100));
+     with_task(|| {
+         let e = res1.poll().unwrap_err();
+-        if let Some(e) = e.downcast_ref::<error::ServiceError>() {
+-            assert!(format!("{}", e).contains("poll_ready"));
+-
+-            let e = e
+-                .source()
+-                .expect("nope 1")
+-                .downcast_ref::<tower_mock::Error<Error>>()
+-                .expect("nope 1_2");
+-
+-            match e {
+-                tower_mock::Error::Other(e) => assert_eq!(e.0, "foobar"),
+-                _ => panic!("unexpected mock error"),
+-            }
++        if let error::Error::Closed(e) = e {
++            assert!(format!("{:?}", e).contains("poll_ready"));
++            assert_eq!(e.error(), &tower_mock::Error::Other("foobar"));
+         } else {
+             panic!("unexpected error type: {:?}", e);
+         }
+     });
+ }
+ 
+-#[derive(Debug)]
+-struct Error(&'static str);
+-
+-impl fmt::Display for Error {
+-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+-        self.0.fmt(fmt)
+-    }
+-}
+-
+-impl ::std::error::Error for Error {
+-    fn source(&self) -> Option<&(::std::error::Error + 'static)> {
+-        None
+-    }
+-}
+-
+-type Mock = tower_mock::Mock<&'static str, &'static str, Error>;
+-type Handle = tower_mock::Handle<&'static str, &'static str, Error>;
++type Mock = tower_mock::Mock<&'static str, &'static str, &'static str>;
++type Handle = tower_mock::Handle<&'static str, &'static str, &'static str>;
+ 
+ struct Exec;
+ 
+diff --git a/tower-mock/src/lib.rs b/tower-mock/src/lib.rs
+index 6cfe2fe..b7fc9d6 100644
+--- a/tower-mock/src/lib.rs
++++ b/tower-mock/src/lib.rs
+@@ -10,7 +10,6 @@ use futures::task::{self, Task};
+ use futures::{Async, Future, Poll, Stream};
+ 
+ use std::collections::HashMap;
+-use std::fmt;
+ use std::sync::{Arc, Mutex};
+ use std::{ops, u64};
+ 
+@@ -337,32 +336,6 @@ impl<T, E> Future for ResponseFuture<T, E> {
+     }
+ }
+ 
+-// ===== impl Error =====
+-
+-impl<T> fmt::Display for Error<T>
+-where
+-    T: fmt::Display,
+-{
+-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+-        match self {
+-            Error::Closed => write!(fmt, "mock service is closed"),
+-            Error::Other(e) => e.fmt(fmt),
+-        }
+-    }
+-}
+-
+-impl<T> std::error::Error for Error<T>
+-where
+-    T: std::error::Error + 'static,
+-{
+-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+-        match self {
+-            Error::Closed => None,
+-            Error::Other(e) => Some(e),
+-        }
+-    }
+-}
+-
+ // ===== impl State =====
+ 
+ impl<E> State<E> {

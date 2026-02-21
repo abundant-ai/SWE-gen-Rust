@@ -1,0 +1,880 @@
+diff --git a/bogo/src/main.rs b/bogo/src/main.rs
+index 4e21eccd..282a528b 100644
+--- a/bogo/src/main.rs
++++ b/bogo/src/main.rs
+@@ -53,7 +53,7 @@ use rustls::{
+     AlertDescription, CertificateCompressionAlgorithm, CertificateError, Connection,
+     DigitallySignedStruct, DistinguishedName, Error, HandshakeKind, InvalidMessage, NamedGroup,
+     PeerIncompatible, PeerMisbehaved, ProtocolVersion, RootCertStore, Side, SignatureAlgorithm,
+-    SignatureScheme, SupportedProtocolVersion, client, compress, server, sign, version,
++    SignatureScheme, client, compress, server, sign,
+ };
+ 
+ static BOGO_NACK: i32 = 89;
+@@ -217,17 +217,21 @@ impl Options {
+         self.support_tls12 && self.version_allowed(ProtocolVersion::TLSv1_2)
+     }
+ 
+-    fn supported_versions(&self) -> Vec<&'static SupportedProtocolVersion> {
+-        let mut versions = vec![];
++    fn provider(&self) -> CryptoProvider {
++        let mut provider = self.provider.clone();
+ 
+-        if self.tls12_supported() {
+-            versions.push(&version::TLS12);
++        if let Some(groups) = &self.groups {
++            provider
++                .kx_groups
++                .retain(|kxg| groups.contains(&kxg.name()));
+         }
+ 
+-        if self.tls13_supported() {
+-            versions.push(&version::TLS13);
++        match (self.tls12_supported(), self.tls13_supported()) {
++            (true, true) => provider,
++            (true, false) => provider.with_only_tls12(),
++            (false, true) => provider.with_only_tls13(),
++            _ => panic!("nonsense version constraint"),
+         }
+-        versions
+     }
+ }
+ 
+@@ -782,16 +786,8 @@ fn make_server_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ServerConfi
+     let cred = &opts.credentials.default;
+     let (certs, key) = cred.load_from_file();
+ 
+-    let mut provider = opts.provider.clone();
+-
+-    if let Some(groups) = &opts.groups {
+-        provider
+-            .kx_groups
+-            .retain(|kxg| groups.contains(&kxg.name()));
+-    }
+-
+-    let mut cfg = ServerConfig::builder_with_provider(provider.into())
+-        .with_protocol_versions(&opts.supported_versions())
++    let mut cfg = ServerConfig::builder_with_provider(opts.provider().into())
++        .with_safe_default_protocol_versions()
+         .unwrap()
+         .with_client_cert_verifier(client_auth)
+         .with_single_cert_with_ocsp(certs, key, opts.server_ocsp_response.clone())
+@@ -926,15 +922,7 @@ impl Debug for ClientCacheWithoutKxHints {
+ }
+ 
+ fn make_client_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ClientConfig> {
+-    let mut provider = opts.provider.clone();
+-
+-    if let Some(groups) = &opts.groups {
+-        provider
+-            .kx_groups
+-            .retain(|kxg| groups.contains(&kxg.name()));
+-    }
+-
+-    let provider = Arc::new(provider);
++    let provider = Arc::new(opts.provider());
+     let cfg = ClientConfig::builder_with_provider(provider.clone());
+ 
+     let cfg = if opts.selected_provider.supports_ech() {
+@@ -954,11 +942,11 @@ fn make_client_cfg(opts: &Options, key_log: &Arc<KeyLogMemo>) -> Arc<ClientConfi
+             cfg.with_ech(ech_mode)
+                 .expect("invalid GREASE ECH config")
+         } else {
+-            cfg.with_protocol_versions(&opts.supported_versions())
++            cfg.with_safe_default_protocol_versions()
+                 .expect("inconsistent settings")
+         }
+     } else {
+-        cfg.with_protocol_versions(&opts.supported_versions())
++        cfg.with_safe_default_protocol_versions()
+             .expect("inconsistent settings")
+     };
+ 
+diff --git a/ci-bench/src/benchmark.rs b/ci-bench/src/benchmark.rs
+index 207a0d0a..fdf2d68f 100644
+--- a/ci-bench/src/benchmark.rs
++++ b/ci-bench/src/benchmark.rs
+@@ -92,7 +92,7 @@ pub struct BenchmarkParams {
+     /// Cipher suite
+     pub ciphersuite: rustls::SupportedCipherSuite,
+     /// TLS version
+-    pub version: &'static rustls::SupportedProtocolVersion,
++    pub version: rustls::ProtocolVersion,
+     /// A user-facing label that identifies these params
+     pub label: String,
+ }
+@@ -104,7 +104,7 @@ impl BenchmarkParams {
+         ticketer: &'static fn() -> Arc<dyn rustls::server::ProducesTickets>,
+         auth_key: AuthKeySource,
+         ciphersuite: rustls::SupportedCipherSuite,
+-        version: &'static rustls::SupportedProtocolVersion,
++        version: rustls::ProtocolVersion,
+         label: String,
+     ) -> Self {
+         Self {
+diff --git a/ci-bench/src/main.rs b/ci-bench/src/main.rs
+index e62b39e9..6f079a53 100644
+--- a/ci-bench/src/main.rs
++++ b/ci-bench/src/main.rs
+@@ -330,43 +330,43 @@ fn all_benchmarks_params() -> Vec<BenchmarkParams> {
+             (
+                 KeyType::Rsa2048,
+                 CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+-                &rustls::version::TLS12,
++                ProtocolVersion::TLSv1_2,
+                 "1.2_rsa_aes",
+             ),
+             (
+                 KeyType::Rsa2048,
+                 CipherSuite::TLS13_AES_128_GCM_SHA256,
+-                &rustls::version::TLS13,
++                ProtocolVersion::TLSv1_3,
+                 "1.3_rsa_aes",
+             ),
+             (
+                 KeyType::EcdsaP256,
+                 CipherSuite::TLS13_AES_128_GCM_SHA256,
+-                &rustls::version::TLS13,
++                ProtocolVersion::TLSv1_3,
+                 "1.3_ecdsap256_aes",
+             ),
+             (
+                 KeyType::EcdsaP384,
+                 CipherSuite::TLS13_AES_128_GCM_SHA256,
+-                &rustls::version::TLS13,
++                ProtocolVersion::TLSv1_3,
+                 "1.3_ecdsap384_aes",
+             ),
+             (
+                 KeyType::Rsa2048,
+                 CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+-                &rustls::version::TLS13,
++                ProtocolVersion::TLSv1_3,
+                 "1.3_rsa_chacha",
+             ),
+             (
+                 KeyType::EcdsaP256,
+                 CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+-                &rustls::version::TLS13,
++                ProtocolVersion::TLSv1_3,
+                 "1.3_ecdsap256_chacha",
+             ),
+             (
+                 KeyType::EcdsaP384,
+                 CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+-                &rustls::version::TLS13,
++                ProtocolVersion::TLSv1_3,
+                 "1.3_ecdsap384_chacha",
+             ),
+         ] {
+@@ -390,7 +390,7 @@ fn all_benchmarks_params() -> Vec<BenchmarkParams> {
+         make_ticketer,
+         AuthKeySource::FuzzingProvider,
+         rustls_fuzzing_provider::TLS13_FUZZING_SUITE,
+-        &rustls::version::TLS13,
++        ProtocolVersion::TLSv1_3,
+         "1.3_no_crypto".to_string(),
+     ));
+ 
+@@ -399,7 +399,7 @@ fn all_benchmarks_params() -> Vec<BenchmarkParams> {
+         make_ticketer,
+         AuthKeySource::FuzzingProvider,
+         rustls_fuzzing_provider::TLS_FUZZING_SUITE,
+-        &rustls::version::TLS12,
++        ProtocolVersion::TLSv1_2,
+         "1.2_no_crypto".to_string(),
+     ));
+ 
+@@ -539,7 +539,7 @@ struct ClientSideStepper<'a> {
+ 
+ impl ClientSideStepper<'_> {
+     fn make_config(params: &BenchmarkParams, resume: ResumptionKind) -> Arc<ClientConfig> {
+-        assert_eq!(params.ciphersuite.version(), *params.version);
++        assert_eq!(params.ciphersuite.version().version(), params.version);
+ 
+         let cfg = ClientConfig::builder_with_provider(
+             CryptoProvider {
+@@ -548,7 +548,7 @@ impl ClientSideStepper<'_> {
+             }
+             .into(),
+         )
+-        .with_protocol_versions(&[params.version])
++        .with_safe_default_protocol_versions()
+         .unwrap();
+ 
+         let mut cfg = match params.auth_key {
+@@ -634,10 +634,10 @@ struct ServerSideStepper<'a> {
+ 
+ impl ServerSideStepper<'_> {
+     fn make_config(params: &BenchmarkParams, resume: ResumptionKind) -> Arc<ServerConfig> {
+-        assert_eq!(params.ciphersuite.version(), *params.version);
++        assert_eq!(params.ciphersuite.version().version(), params.version);
+ 
+         let cfg = ServerConfig::builder_with_provider(params.provider.clone().into())
+-            .with_protocol_versions(&[params.version])
++            .with_safe_default_protocol_versions()
+             .unwrap();
+ 
+         let mut cfg = match params.auth_key {
+diff --git a/openssl-tests/src/ffdhe_kx_with_openssl.rs b/openssl-tests/src/ffdhe_kx_with_openssl.rs
+index c3f57ee7..02dfe08a 100644
+--- a/openssl-tests/src/ffdhe_kx_with_openssl.rs
++++ b/openssl-tests/src/ffdhe_kx_with_openssl.rs
+@@ -7,26 +7,22 @@ use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
+ use rustls::crypto::{CryptoProvider, aws_lc_rs as provider};
+ use rustls::pki_types::pem::PemObject;
+ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+-use rustls::version::{TLS12, TLS13};
+-use rustls::{ClientConfig, RootCertStore, ServerConfig, SupportedProtocolVersion};
++use rustls::{ClientConfig, RootCertStore, ServerConfig};
+ 
+ use crate::ffdhe::{self, FfdheKxGroup};
+ use crate::utils::verify_openssl3_available;
+ 
+ #[test]
+ fn rustls_server_with_ffdhe_kx_tls13() {
+-    test_rustls_server_with_ffdhe_kx(&TLS13, 1)
++    test_rustls_server_with_ffdhe_kx(ffdhe_provider().with_only_tls13(), 1)
+ }
+ 
+ #[test]
+ fn rustls_server_with_ffdhe_kx_tls12() {
+-    test_rustls_server_with_ffdhe_kx(&TLS12, 1)
++    test_rustls_server_with_ffdhe_kx(ffdhe_provider().with_only_tls12(), 1)
+ }
+ 
+-fn test_rustls_server_with_ffdhe_kx(
+-    protocol_version: &'static SupportedProtocolVersion,
+-    iters: usize,
+-) {
++fn test_rustls_server_with_ffdhe_kx(provider: CryptoProvider, iters: usize) {
+     verify_openssl3_available();
+ 
+     let message = "Hello from rustls!\n";
+@@ -35,7 +31,7 @@ fn test_rustls_server_with_ffdhe_kx(
+     let port = listener.local_addr().unwrap().port();
+ 
+     let server_thread = thread::spawn(move || {
+-        let config = Arc::new(server_config_with_ffdhe_kx(protocol_version));
++        let config = Arc::new(server_config_with_ffdhe_kx(provider));
+         for _ in 0..iters {
+             let mut server = rustls::ServerConnection::new(config.clone()).unwrap();
+             let (mut tcp_stream, _addr) = listener.accept().unwrap();
+@@ -147,12 +143,16 @@ fn test_rustls_client_with_ffdhe_kx(iters: usize) {
+ }
+ 
+ fn client_config_with_ffdhe_kx() -> ClientConfig {
+-    ClientConfig::builder_with_provider(ffdhe_provider().into())
++    ClientConfig::builder_with_provider(
+         // OpenSSL 3 does not support RFC 7919 with TLS 1.2: https://github.com/openssl/openssl/issues/10971
+-        .with_protocol_versions(&[&TLS13])
+-        .unwrap()
+-        .with_root_certificates(root_ca())
+-        .with_no_client_auth()
++        ffdhe_provider()
++            .with_only_tls13()
++            .into(),
++    )
++    .with_safe_default_protocol_versions()
++    .unwrap()
++    .with_root_certificates(root_ca())
++    .with_no_client_auth()
+ }
+ 
+ // TLS 1.2 requires stripping leading zeros of the shared secret,
+@@ -168,13 +168,13 @@ fn rustls_client_with_ffdhe_kx_repeated() {
+ #[test]
+ #[ignore]
+ fn rustls_server_with_ffdhe_tls13_repeated() {
+-    test_rustls_server_with_ffdhe_kx(&TLS13, 512)
++    test_rustls_server_with_ffdhe_kx(ffdhe_provider().with_only_tls13(), 512)
+ }
+ 
+ #[test]
+ #[ignore]
+ fn rustls_server_with_ffdhe_tls12_repeated() {
+-    test_rustls_server_with_ffdhe_kx(&TLS12, 512);
++    test_rustls_server_with_ffdhe_kx(ffdhe_provider().with_only_tls12(), 512);
+ }
+ 
+ fn root_ca() -> RootCertStore {
+@@ -208,9 +208,9 @@ fn ffdhe_provider() -> CryptoProvider {
+     }
+ }
+ 
+-fn server_config_with_ffdhe_kx(protocol: &'static SupportedProtocolVersion) -> ServerConfig {
+-    ServerConfig::builder_with_provider(ffdhe_provider().into())
+-        .with_protocol_versions(&[protocol])
++fn server_config_with_ffdhe_kx(provider: CryptoProvider) -> ServerConfig {
++    ServerConfig::builder_with_provider(provider.into())
++        .with_safe_default_protocol_versions()
+         .unwrap()
+         .with_no_client_auth()
+         .with_single_cert(load_certs(), load_private_key())
+diff --git a/openssl-tests/src/raw_key_openssl_interop.rs b/openssl-tests/src/raw_key_openssl_interop.rs
+index ae1daaae..53ce5af5 100644
+--- a/openssl-tests/src/raw_key_openssl_interop.rs
++++ b/openssl-tests/src/raw_key_openssl_interop.rs
+@@ -19,7 +19,6 @@ mod client {
+         CertificateDer, PrivateKeyDer, ServerName, SubjectPublicKeyInfoDer, UnixTime,
+     };
+     use rustls::sign::CertifiedKey;
+-    use rustls::version::TLS13;
+     use rustls::{
+         CertificateError, ClientConfig, ClientConnection, DigitallySignedStruct, Error,
+         InconsistentKeys, PeerIncompatible, SignatureScheme, Stream,
+@@ -48,7 +47,7 @@ mod client {
+             client_private_key,
+         ));
+ 
+-        ClientConfig::builder_with_protocol_versions(&[&TLS13])
++        ClientConfig::builder()
+             .dangerous()
+             .with_custom_certificate_verifier(Arc::new(SimpleRpkServerCertVerifier::new(vec![
+                 server_raw_key,
+@@ -167,7 +166,6 @@ mod server {
+     use rustls::server::AlwaysResolvesServerRawPublicKeys;
+     use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+     use rustls::sign::CertifiedKey;
+-    use rustls::version::TLS13;
+     use rustls::{
+         CertificateError, DigitallySignedStruct, DistinguishedName, Error, InconsistentKeys,
+         PeerIncompatible, ServerConfig, ServerConnection, SignatureScheme,
+@@ -199,7 +197,7 @@ mod server {
+         let client_cert_verifier = Arc::new(SimpleRpkClientCertVerifier::new(vec![client_raw_key]));
+         let server_cert_resolver = Arc::new(AlwaysResolvesServerRawPublicKeys::new(certified_key));
+ 
+-        ServerConfig::builder_with_protocol_versions(&[&TLS13])
++        ServerConfig::builder()
+             .with_client_cert_verifier(client_cert_verifier)
+             .with_cert_resolver(server_cert_resolver)
+     }
+diff --git a/rustls-bench/src/main.rs b/rustls-bench/src/main.rs
+index db1e7ddb..5403b3ab 100644
+--- a/rustls-bench/src/main.rs
++++ b/rustls-bench/src/main.rs
+@@ -37,7 +37,7 @@ use rustls::server::{
+ use rustls::unbuffered::{ConnectionState, EncryptError, InsufficientSizeError, UnbufferedStatus};
+ use rustls::{
+     CipherSuite, ClientConfig, ClientConnection, ConnectionCommon, Error, HandshakeKind,
+-    RootCertStore, ServerConfig, ServerConnection, SideData,
++    ProtocolVersion, RootCertStore, ServerConfig, ServerConnection, SideData,
+ };
+ use rustls_test::KeyType;
+ 
+@@ -813,7 +813,7 @@ impl Parameters {
+         };
+ 
+         let mut cfg = ServerConfig::builder_with_provider(provider)
+-            .with_protocol_versions(&[self.proto.version])
++            .with_safe_default_protocol_versions()
+             .unwrap()
+             .with_client_cert_verifier(client_auth)
+             .with_single_cert(
+@@ -853,7 +853,7 @@ impl Parameters {
+             }
+             .into(),
+         )
+-        .with_protocol_versions(&[self.proto.version])
++        .with_safe_default_protocol_versions()
+         .unwrap()
+         .with_root_certificates(root_store);
+ 
+@@ -1052,15 +1052,11 @@ impl Provider {
+ struct BenchmarkParam {
+     key_type: KeyType,
+     ciphersuite: CipherSuite,
+-    version: &'static rustls::SupportedProtocolVersion,
++    version: ProtocolVersion,
+ }
+ 
+ impl BenchmarkParam {
+-    const fn new(
+-        key_type: KeyType,
+-        ciphersuite: CipherSuite,
+-        version: &'static rustls::SupportedProtocolVersion,
+-    ) -> Self {
++    const fn new(key_type: KeyType, ciphersuite: CipherSuite, version: ProtocolVersion) -> Self {
+         Self {
+             key_type,
+             ciphersuite,
+@@ -1462,72 +1458,72 @@ static ALL_BENCHMARKS: &[BenchmarkParam] = &[
+     BenchmarkParam::new(
+         KeyType::Rsa2048,
+         CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+-        &rustls::version::TLS12,
++        ProtocolVersion::TLSv1_2,
+     ),
+     BenchmarkParam::new(
+         KeyType::EcdsaP256,
+         CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+-        &rustls::version::TLS12,
++        ProtocolVersion::TLSv1_2,
+     ),
+     BenchmarkParam::new(
+         KeyType::Rsa2048,
+         CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+-        &rustls::version::TLS12,
++        ProtocolVersion::TLSv1_2,
+     ),
+     BenchmarkParam::new(
+         KeyType::Rsa2048,
+         CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+-        &rustls::version::TLS12,
++        ProtocolVersion::TLSv1_2,
+     ),
+     BenchmarkParam::new(
+         KeyType::EcdsaP256,
+         CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+-        &rustls::version::TLS12,
++        ProtocolVersion::TLSv1_2,
+     ),
+     BenchmarkParam::new(
+         KeyType::EcdsaP384,
+         CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+-        &rustls::version::TLS12,
++        ProtocolVersion::TLSv1_2,
+     ),
+     BenchmarkParam::new(
+         KeyType::Ed25519,
+         CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+-        &rustls::version::TLS12,
++        ProtocolVersion::TLSv1_2,
+     ),
+     BenchmarkParam::new(
+         KeyType::Rsa2048,
+         CipherSuite::TLS13_CHACHA20_POLY1305_SHA256,
+-        &rustls::version::TLS13,
++        ProtocolVersion::TLSv1_3,
+     ),
+     BenchmarkParam::new(
+         KeyType::Rsa2048,
+         CipherSuite::TLS13_AES_256_GCM_SHA384,
+-        &rustls::version::TLS13,
++        ProtocolVersion::TLSv1_3,
+     ),
+     BenchmarkParam::new(
+         KeyType::EcdsaP256,
+         CipherSuite::TLS13_AES_256_GCM_SHA384,
+-        &rustls::version::TLS13,
++        ProtocolVersion::TLSv1_3,
+     ),
+     BenchmarkParam::new(
+         KeyType::Ed25519,
+         CipherSuite::TLS13_AES_256_GCM_SHA384,
+-        &rustls::version::TLS13,
++        ProtocolVersion::TLSv1_3,
+     ),
+     BenchmarkParam::new(
+         KeyType::Rsa2048,
+         CipherSuite::TLS13_AES_128_GCM_SHA256,
+-        &rustls::version::TLS13,
++        ProtocolVersion::TLSv1_3,
+     ),
+     BenchmarkParam::new(
+         KeyType::EcdsaP256,
+         CipherSuite::TLS13_AES_128_GCM_SHA256,
+-        &rustls::version::TLS13,
++        ProtocolVersion::TLSv1_3,
+     ),
+     BenchmarkParam::new(
+         KeyType::Ed25519,
+         CipherSuite::TLS13_AES_128_GCM_SHA256,
+-        &rustls::version::TLS13,
++        ProtocolVersion::TLSv1_3,
+     ),
+ ];
+ 
+diff --git a/rustls-test/src/lib.rs b/rustls-test/src/lib.rs
+index 9ea2e80c..0a40a9a3 100644
+--- a/rustls-test/src/lib.rs
++++ b/rustls-test/src/lib.rs
+@@ -485,15 +485,6 @@ pub fn server_config_builder(
+         .unwrap()
+ }
+ 
+-pub fn server_config_builder_with_versions(
+-    versions: &[&'static rustls::SupportedProtocolVersion],
+-    provider: &CryptoProvider,
+-) -> rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier> {
+-    ServerConfig::builder_with_provider(provider.clone().into())
+-        .with_protocol_versions(versions)
+-        .unwrap()
+-}
+-
+ pub fn client_config_builder(
+     provider: &CryptoProvider,
+ ) -> rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier> {
+@@ -502,15 +493,6 @@ pub fn client_config_builder(
+         .unwrap()
+ }
+ 
+-pub fn client_config_builder_with_versions(
+-    versions: &[&'static rustls::SupportedProtocolVersion],
+-    provider: &CryptoProvider,
+-) -> rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier> {
+-    ClientConfig::builder_with_provider(provider.clone().into())
+-        .with_protocol_versions(versions)
+-        .unwrap()
+-}
+-
+ pub fn finish_server_config(
+     kt: KeyType,
+     conf: rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier>,
+@@ -524,14 +506,6 @@ pub fn make_server_config(kt: KeyType, provider: &CryptoProvider) -> ServerConfi
+     finish_server_config(kt, server_config_builder(provider))
+ }
+ 
+-pub fn make_server_config_with_versions(
+-    kt: KeyType,
+-    versions: &[&'static rustls::SupportedProtocolVersion],
+-    provider: &CryptoProvider,
+-) -> ServerConfig {
+-    finish_server_config(kt, server_config_builder_with_versions(versions, provider))
+-}
+-
+ pub fn make_server_config_with_kx_groups(
+     kt: KeyType,
+     kx_groups: Vec<&'static dyn rustls::crypto::SupportedKxGroup>,
+@@ -623,7 +597,7 @@ pub fn make_server_config_with_raw_key_support(
+     ));
+     client_verifier.expect_raw_public_keys = true;
+     // We don't support tls1.2 for Raw Public Keys, hence the version is hard-coded.
+-    server_config_builder_with_versions(&[&rustls::version::TLS13], provider)
++    server_config_builder(provider)
+         .with_client_cert_verifier(Arc::new(client_verifier))
+         .with_cert_resolver(server_cert_resolver)
+ }
+@@ -638,36 +612,12 @@ pub fn make_client_config_with_raw_key_support(
+             .unwrap(),
+     ));
+     // We don't support tls1.2 for Raw Public Keys, hence the version is hard-coded.
+-    client_config_builder_with_versions(&[&rustls::version::TLS13], provider)
++    client_config_builder(provider)
+         .dangerous()
+         .with_custom_certificate_verifier(server_verifier)
+         .with_client_cert_resolver(client_cert_resolver)
+ }
+ 
+-pub fn make_client_config_with_cipher_suite_and_raw_key_support(
+-    kt: KeyType,
+-    cipher_suite: SupportedCipherSuite,
+-    provider: &CryptoProvider,
+-) -> ClientConfig {
+-    let server_verifier = Arc::new(MockServerVerifier::expects_raw_public_keys(provider));
+-    let client_cert_resolver = Arc::new(AlwaysResolvesClientRawPublicKeys::new(
+-        kt.get_certified_client_key(provider)
+-            .unwrap(),
+-    ));
+-    ClientConfig::builder_with_provider(
+-        CryptoProvider {
+-            cipher_suites: vec![cipher_suite],
+-            ..provider.clone()
+-        }
+-        .into(),
+-    )
+-    .with_protocol_versions(&[&rustls::version::TLS13])
+-    .unwrap()
+-    .dangerous()
+-    .with_custom_certificate_verifier(server_verifier)
+-    .with_client_cert_resolver(client_cert_resolver)
+-}
+-
+ pub fn finish_client_config(
+     kt: KeyType,
+     config: rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier>,
+@@ -718,32 +668,15 @@ pub fn make_client_config_with_kx_groups(
+     finish_client_config(kt, builder)
+ }
+ 
+-pub fn make_client_config_with_versions(
+-    kt: KeyType,
+-    versions: &[&'static rustls::SupportedProtocolVersion],
+-    provider: &CryptoProvider,
+-) -> ClientConfig {
+-    finish_client_config(kt, client_config_builder_with_versions(versions, provider))
+-}
+-
+ pub fn make_client_config_with_auth(kt: KeyType, provider: &CryptoProvider) -> ClientConfig {
+     finish_client_config_with_creds(kt, client_config_builder(provider))
+ }
+ 
+-pub fn make_client_config_with_versions_with_auth(
+-    kt: KeyType,
+-    versions: &[&'static rustls::SupportedProtocolVersion],
+-    provider: &CryptoProvider,
+-) -> ClientConfig {
+-    finish_client_config_with_creds(kt, client_config_builder_with_versions(versions, provider))
+-}
+-
+ pub fn make_client_config_with_verifier(
+-    versions: &[&'static rustls::SupportedProtocolVersion],
+     verifier_builder: ServerCertVerifierBuilder,
+     provider: &CryptoProvider,
+ ) -> ClientConfig {
+-    client_config_builder_with_versions(versions, provider)
++    client_config_builder(provider)
+         .dangerous()
+         .with_custom_certificate_verifier(verifier_builder.build().unwrap())
+         .with_no_client_auth()
+diff --git a/rustls/src/client/test.rs b/rustls/src/client/test.rs
+index 14964a98..388c57f9 100644
+--- a/rustls/src/client/test.rs
++++ b/rustls/src/client/test.rs
+@@ -41,18 +41,21 @@ mod tests {
+     use crate::sign::CertifiedKey;
+     use crate::tls13::key_schedule::{derive_traffic_iv, derive_traffic_key};
+     use crate::verify::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+-    use crate::{DigitallySignedStruct, DistinguishedName, KeyLog, version};
++    use crate::{DigitallySignedStruct, DistinguishedName, KeyLog};
+ 
+     /// Tests that session_ticket(35) extension
+     /// is not sent if the client does not support TLS 1.2.
+     #[test]
+     fn test_no_session_ticket_request_on_tls_1_3() {
+-        let mut config =
+-            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+-                .with_protocol_versions(&[&version::TLS13])
+-                .unwrap()
+-                .with_root_certificates(roots())
+-                .with_no_client_auth();
++        let mut config = ClientConfig::builder_with_provider(
++            super::provider::default_provider()
++                .with_only_tls13()
++                .into(),
++        )
++        .with_safe_default_protocol_versions()
++        .unwrap()
++        .with_root_certificates(roots())
++        .with_no_client_auth();
+         config.resumption = Resumption::in_memory_sessions(128)
+             .tls12_resumption(Tls12Resumption::SessionIdOrTickets);
+         let ch = client_hello_sent_for_config(config).unwrap();
+@@ -62,11 +65,15 @@ mod tests {
+     #[test]
+     fn test_no_renegotiation_scsv_on_tls_1_3() {
+         let ch = client_hello_sent_for_config(
+-            ClientConfig::builder_with_provider(super::provider::default_provider().into())
+-                .with_protocol_versions(&[&version::TLS13])
+-                .unwrap()
+-                .with_root_certificates(roots())
+-                .with_no_client_auth(),
++            ClientConfig::builder_with_provider(
++                super::provider::default_provider()
++                    .with_only_tls13()
++                    .into(),
++            )
++            .with_safe_default_protocol_versions()
++            .unwrap()
++            .with_root_certificates(roots())
++            .with_no_client_auth(),
+         )
+         .unwrap();
+         assert!(
+@@ -77,13 +84,15 @@ mod tests {
+ 
+     #[test]
+     fn test_client_does_not_offer_sha1() {
+-        for version in crate::ALL_VERSIONS {
+-            let config =
+-                ClientConfig::builder_with_provider(super::provider::default_provider().into())
+-                    .with_protocol_versions(&[version])
+-                    .unwrap()
+-                    .with_root_certificates(roots())
+-                    .with_no_client_auth();
++        for provider in [
++            super::provider::default_provider().with_only_tls12(),
++            super::provider::default_provider().with_only_tls13(),
++        ] {
++            let config = ClientConfig::builder_with_provider(provider.into())
++                .with_safe_default_protocol_versions()
++                .unwrap()
++                .with_root_certificates(roots())
++                .with_no_client_auth();
+             let ch = client_hello_sent_for_config(config).unwrap();
+             assert!(
+                 !ch.extensions
+@@ -184,12 +193,13 @@ mod tests {
+                 b"hello".to_vec(),
+             )]));
+ 
+-        for (protocol_version, cas_extension_expected) in
+-            [(&version::TLS12, false), (&version::TLS13, true)]
+-        {
++        for (provider, cas_extension_expected) in [
++            (super::provider::default_provider().with_only_tls12(), false),
++            (super::provider::default_provider().with_only_tls13(), true),
++        ] {
+             let client_hello = client_hello_sent_for_config(
+-                ClientConfig::builder_with_provider(super::provider::default_provider().into())
+-                    .with_protocol_versions(&[protocol_version])
++                ClientConfig::builder_with_provider(provider.into())
++                    .with_safe_default_protocol_versions()
+                     .unwrap()
+                     .dangerous()
+                     .with_custom_certificate_verifier(Arc::new(cas_sending_server_verifier.clone()))
+@@ -450,14 +460,18 @@ mod tests {
+     }
+ 
+     fn client_config_for_rpk(key_log: Arc<dyn KeyLog>) -> ClientConfig {
+-        let mut config = ClientConfig::builder_with_provider(x25519_provider().into())
+-            .with_protocol_versions(&[&version::TLS13])
+-            .unwrap()
+-            .dangerous()
+-            .with_custom_certificate_verifier(Arc::new(ServerVerifierRequiringRpk))
+-            .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(Arc::new(
+-                client_certified_key(),
+-            ))));
++        let mut config = ClientConfig::builder_with_provider(
++            x25519_provider()
++                .with_only_tls13()
++                .into(),
++        )
++        .with_safe_default_protocol_versions()
++        .unwrap()
++        .dangerous()
++        .with_custom_certificate_verifier(Arc::new(ServerVerifierRequiringRpk))
++        .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(Arc::new(
++            client_certified_key(),
++        ))));
+         config.key_log = key_log;
+         config
+     }
+diff --git a/rustls/src/crypto/mod.rs b/rustls/src/crypto/mod.rs
+index 090846ad..a5cb9ca5 100644
+--- a/rustls/src/crypto/mod.rs
++++ b/rustls/src/crypto/mod.rs
+@@ -304,6 +304,32 @@ See the documentation of the CryptoProvider type for more information.
+             && secure_random.fips()
+             && key_provider.fips()
+     }
++
++    /// Return a new `CryptoProvider` that only supports TLS1.3.
++    pub fn with_only_tls13(self) -> Self {
++        let cipher_suites = self
++            .cipher_suites
++            .into_iter()
++            .filter(|cs| cs.version() == crate::version::TLS13)
++            .collect();
++        Self {
++            cipher_suites,
++            ..self
++        }
++    }
++
++    /// Return a new `CryptoProvider` that only supports TLS1.2.
++    pub fn with_only_tls12(self) -> Self {
++        let cipher_suites = self
++            .cipher_suites
++            .into_iter()
++            .filter(|cs| cs.version() == crate::version::TLS12)
++            .collect();
++        Self {
++            cipher_suites,
++            ..self
++        }
++    }
+ }
+ 
+ /// A source of cryptographically secure randomness.
+diff --git a/rustls/src/server/test.rs b/rustls/src/server/test.rs
+index 9bce6817..07fe43b8 100644
+--- a/rustls/src/server/test.rs
++++ b/rustls/src/server/test.rs
+@@ -76,13 +76,13 @@ mod tests {
+     use crate::server::{AlwaysResolvesServerRawPublicKeys, ServerConfig, ServerConnection};
+     use crate::sign::CertifiedKey;
+     use crate::sync::Arc;
+-    use crate::{CipherSuiteCommon, SupportedCipherSuite, Tls12CipherSuite, version};
++    use crate::{CipherSuiteCommon, SupportedCipherSuite, Tls12CipherSuite};
+ 
+     #[test]
+     fn test_server_rejects_no_extended_master_secret_extension_when_require_ems_or_fips() {
+-        let provider = super::provider::default_provider();
++        let provider = super::provider::default_provider().with_only_tls12();
+         let mut config = ServerConfig::builder_with_provider(provider.into())
+-            .with_protocol_versions(&[&version::TLS12])
++            .with_safe_default_protocol_versions()
+             .unwrap()
+             .with_no_client_auth()
+             .with_single_cert(server_cert(), server_key())
+@@ -118,12 +118,16 @@ mod tests {
+ 
+     #[test]
+     fn server_picks_ffdhe_group_when_clienthello_has_no_ffdhe_group_in_groups_ext() {
+-        let config = ServerConfig::builder_with_provider(ffdhe_provider().into())
+-            .with_protocol_versions(&[&version::TLS12])
+-            .unwrap()
+-            .with_no_client_auth()
+-            .with_single_cert(server_cert(), server_key())
+-            .unwrap();
++        let config = ServerConfig::builder_with_provider(
++            ffdhe_provider()
++                .with_only_tls12()
++                .into(),
++        )
++        .with_safe_default_protocol_versions()
++        .unwrap()
++        .with_no_client_auth()
++        .with_single_cert(server_cert(), server_key())
++        .unwrap();
+ 
+         let mut ch = minimal_client_hello();
+         ch.cipher_suites
+@@ -137,12 +141,16 @@ mod tests {
+ 
+     #[test]
+     fn server_picks_ffdhe_group_when_clienthello_has_no_groups_ext() {
+-        let config = ServerConfig::builder_with_provider(ffdhe_provider().into())
+-            .with_protocol_versions(&[&version::TLS12])
+-            .unwrap()
+-            .with_no_client_auth()
+-            .with_single_cert(server_cert(), server_key())
+-            .unwrap();
++        let config = ServerConfig::builder_with_provider(
++            ffdhe_provider()
++                .with_only_tls12()
++                .into(),
++        )
++        .with_safe_default_protocol_versions()
++        .unwrap()
++        .with_no_client_auth()
++        .with_single_cert(server_cert(), server_key())
++        .unwrap();
+ 
+         let mut ch = minimal_client_hello();
+         ch.cipher_suites
+@@ -157,12 +165,16 @@ mod tests {
+ 
+     #[test]
+     fn server_accepts_client_with_no_ecpoints_extension_and_only_ffdhe_cipher_suites() {
+-        let config = ServerConfig::builder_with_provider(ffdhe_provider().into())
+-            .with_protocol_versions(&[&version::TLS12])
+-            .unwrap()
+-            .with_no_client_auth()
+-            .with_single_cert(server_cert(), server_key())
+-            .unwrap();
++        let config = ServerConfig::builder_with_provider(
++            ffdhe_provider()
++                .with_only_tls12()
++                .into(),
++        )
++        .with_safe_default_protocol_versions()
++        .unwrap()
++        .with_no_client_auth()
++        .with_single_cert(server_cert(), server_key())
++        .unwrap();
+ 
+         let mut ch = minimal_client_hello();
+         ch.cipher_suites
+@@ -240,8 +252,8 @@ mod tests {
+             kx_groups: vec![super::provider::kx_group::X25519],
+             ..super::provider::default_provider()
+         };
+-        ServerConfig::builder_with_provider(x25519_provider.into())
+-            .with_protocol_versions(&[&version::TLS13])
++        ServerConfig::builder_with_provider(x25519_provider.with_only_tls12().into())
++            .with_safe_default_protocol_versions()
+             .unwrap()
+             .with_no_client_auth()
+             .with_cert_resolver(Arc::new(AlwaysResolvesServerRawPublicKeys::new(Arc::new(

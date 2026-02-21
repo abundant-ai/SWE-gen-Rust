@@ -1,0 +1,269 @@
+diff --git a/rustls/src/client/client_conn.rs b/rustls/src/client/client_conn.rs
+index 1fefadfc..6dd8611d 100644
+--- a/rustls/src/client/client_conn.rs
++++ b/rustls/src/client/client_conn.rs
+@@ -702,25 +702,11 @@ mod connection {
+         /// we behave in the TLS protocol, `name` is the
+         /// name of the server we want to talk to.
+         pub fn new(config: Arc<ClientConfig>, name: ServerName<'static>) -> Result<Self, Error> {
+-            Self::new_with_alpn(Arc::clone(&config), name, config.alpn_protocols.clone())
+-        }
+-
+-        /// Make a new ClientConnection with custom ALPN protocols.
+-        pub fn new_with_alpn(
+-            config: Arc<ClientConfig>,
+-            name: ServerName<'static>,
+-            alpn_protocols: Vec<Vec<u8>>,
+-        ) -> Result<Self, Error> {
+             Ok(Self {
+-                inner: ConnectionCommon::from(ConnectionCore::for_client(
+-                    config,
+-                    name,
+-                    alpn_protocols,
+-                    Vec::new(),
+-                    Protocol::Tcp,
+-                )?),
++                inner: ConnectionCore::for_client(config, name, Vec::new(), Protocol::Tcp)?.into(),
+             })
+         }
++
+         /// Returns an `io::Write` implementer you can write bytes to
+         /// to send TLS1.3 early data (a.k.a. "0-RTT data") to the server.
+         ///
+@@ -835,7 +821,6 @@ impl ConnectionCore<ClientConnectionData> {
+     pub(crate) fn for_client(
+         config: Arc<ClientConfig>,
+         name: ServerName<'static>,
+-        alpn_protocols: Vec<Vec<u8>>,
+         extra_exts: Vec<ClientExtension>,
+         proto: Protocol,
+     ) -> Result<Self, Error> {
+@@ -853,7 +838,7 @@ impl ConnectionCore<ClientConnectionData> {
+             sendable_plaintext: None,
+         };
+ 
+-        let state = hs::start_handshake(name, alpn_protocols, extra_exts, config, &mut cx)?;
++        let state = hs::start_handshake(name, extra_exts, config, &mut cx)?;
+         Ok(Self::new(state, data, common_state))
+     }
+ 
+@@ -874,23 +859,8 @@ impl UnbufferedClientConnection {
+     /// Make a new ClientConnection. `config` controls how we behave in the TLS protocol, `name` is
+     /// the name of the server we want to talk to.
+     pub fn new(config: Arc<ClientConfig>, name: ServerName<'static>) -> Result<Self, Error> {
+-        Self::new_with_alpn(Arc::clone(&config), name, config.alpn_protocols.clone())
+-    }
+-
+-    /// Make a new UnbufferedClientConnection with custom ALPN protocols.
+-    pub fn new_with_alpn(
+-        config: Arc<ClientConfig>,
+-        name: ServerName<'static>,
+-        alpn_protocols: Vec<Vec<u8>>,
+-    ) -> Result<Self, Error> {
+         Ok(Self {
+-            inner: UnbufferedConnectionCommon::from(ConnectionCore::for_client(
+-                config,
+-                name,
+-                alpn_protocols,
+-                Vec::new(),
+-                Protocol::Tcp,
+-            )?),
++            inner: ConnectionCore::for_client(config, name, Vec::new(), Protocol::Tcp)?.into(),
+         })
+     }
+ 
+diff --git a/rustls/src/client/common.rs b/rustls/src/client/common.rs
+index 74803a86..048b77a6 100644
+--- a/rustls/src/client/common.rs
++++ b/rustls/src/client/common.rs
+@@ -35,16 +35,14 @@ impl<'a> ServerCertDetails<'a> {
+ }
+ 
+ pub(super) struct ClientHelloDetails {
+-    pub(super) alpn_protocols: Vec<Vec<u8>>,
+     pub(super) sent_extensions: Vec<ExtensionType>,
+     pub(super) extension_order_seed: u16,
+     pub(super) offered_cert_compression: bool,
+ }
+ 
+ impl ClientHelloDetails {
+-    pub(super) fn new(alpn_protocols: Vec<Vec<u8>>, extension_order_seed: u16) -> Self {
++    pub(super) fn new(extension_order_seed: u16) -> Self {
+         Self {
+-            alpn_protocols,
+             sent_extensions: Vec::new(),
+             extension_order_seed,
+             offered_cert_compression: false,
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index 35bd5114..1c55a87c 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -100,7 +100,6 @@ fn find_session(
+ 
+ pub(super) fn start_handshake(
+     server_name: ServerName<'static>,
+-    alpn_protocols: Vec<Vec<u8>>,
+     extra_exts: Vec<ClientExtension>,
+     config: Arc<ClientConfig>,
+     cx: &mut ClientContext<'_>,
+@@ -186,7 +185,7 @@ pub(super) fn start_handshake(
+             #[cfg(feature = "tls12")]
+             using_ems: false,
+             sent_tls13_fake_ccs: false,
+-            hello: ClientHelloDetails::new(alpn_protocols, extension_order_seed),
++            hello: ClientHelloDetails::new(extension_order_seed),
+             session_id,
+             server_name,
+             prev_ech_ext: None,
+@@ -365,11 +364,9 @@ fn emit_client_hello_for_retry(
+         exts.push(ClientExtension::PresharedKeyModes(psk_modes));
+     }
+ 
+-    // Add ALPN extension if we have any protocols
+-    if !input.hello.alpn_protocols.is_empty() {
++    if !config.alpn_protocols.is_empty() {
+         exts.push(ClientExtension::Protocols(Vec::from_slices(
+-            &input
+-                .hello
++            &config
+                 .alpn_protocols
+                 .iter()
+                 .map(|proto| &proto[..])
+@@ -680,13 +677,16 @@ fn prepare_resumption<'a>(
+ 
+ pub(super) fn process_alpn_protocol(
+     common: &mut CommonState,
+-    offered_protocols: &[Vec<u8>],
++    config: &ClientConfig,
+     proto: Option<&[u8]>,
+ ) -> Result<(), Error> {
+     common.alpn_protocol = proto.map(ToOwned::to_owned);
+ 
+     if let Some(alpn_protocol) = &common.alpn_protocol {
+-        if !offered_protocols.contains(alpn_protocol) {
++        if !config
++            .alpn_protocols
++            .contains(alpn_protocol)
++        {
+             return Err(common.send_fatal_alert(
+                 AlertDescription::IllegalParameter,
+                 PeerMisbehaved::SelectedUnofferedApplicationProtocol,
+@@ -700,7 +700,7 @@ pub(super) fn process_alpn_protocol(
+     // mechanism) if and only if any ALPN protocols were configured. This defends against badly-behaved
+     // servers which accept a connection that requires an application-layer protocol they do not
+     // understand.
+-    if common.is_quic() && common.alpn_protocol.is_none() && !offered_protocols.is_empty() {
++    if common.is_quic() && common.alpn_protocol.is_none() && !config.alpn_protocols.is_empty() {
+         return Err(common.send_fatal_alert(
+             AlertDescription::NoApplicationProtocol,
+             Error::NoApplicationProtocol,
+@@ -838,11 +838,7 @@ impl State<ClientConnectionData> for ExpectServerHello {
+ 
+         // Extract ALPN protocol
+         if !cx.common.is_tls13() {
+-            process_alpn_protocol(
+-                cx.common,
+-                &self.input.hello.alpn_protocols,
+-                server_hello.alpn_protocol(),
+-            )?;
++            process_alpn_protocol(cx.common, config, server_hello.alpn_protocol())?;
+         }
+ 
+         // If ECPointFormats extension is supplied by the server, it must contain
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 70b7d0e7..c37cc9ef 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -473,7 +473,7 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
+         self.transcript.add_message(&m);
+ 
+         validate_encrypted_extensions(cx.common, &self.hello, exts)?;
+-        hs::process_alpn_protocol(cx.common, &self.hello.alpn_protocols, exts.alpn_protocol())?;
++        hs::process_alpn_protocol(cx.common, &self.config, exts.alpn_protocol())?;
+         hs::process_client_cert_type_extension(cx.common, &self.config, exts.client_cert_type())?;
+         hs::process_server_cert_type_extension(cx.common, &self.config, exts.server_cert_type())?;
+ 
+diff --git a/rustls/src/quic.rs b/rustls/src/quic.rs
+index df806eca..69c2fc49 100644
+--- a/rustls/src/quic.rs
++++ b/rustls/src/quic.rs
+@@ -163,23 +163,6 @@ mod connection {
+             quic_version: Version,
+             name: ServerName<'static>,
+             params: Vec<u8>,
+-        ) -> Result<Self, Error> {
+-            Self::new_with_alpn(
+-                Arc::clone(&config),
+-                quic_version,
+-                name,
+-                params,
+-                config.alpn_protocols.clone(),
+-            )
+-        }
+-
+-        /// Make a new QUIC ClientConnection with custom ALPN protocols.
+-        pub fn new_with_alpn(
+-            config: Arc<ClientConfig>,
+-            quic_version: Version,
+-            name: ServerName<'static>,
+-            params: Vec<u8>,
+-            alpn_protocols: Vec<Vec<u8>>,
+         ) -> Result<Self, Error> {
+             if !config.supports_version(ProtocolVersion::TLSv1_3) {
+                 return Err(Error::General(
+@@ -198,13 +181,7 @@ mod connection {
+                 Version::V1 | Version::V2 => ClientExtension::TransportParameters(params),
+             };
+ 
+-            let mut inner = ConnectionCore::for_client(
+-                config,
+-                name,
+-                alpn_protocols,
+-                vec![ext],
+-                Protocol::Quic,
+-            )?;
++            let mut inner = ConnectionCore::for_client(config, name, vec![ext], Protocol::Quic)?;
+             inner.common_state.quic.version = quic_version;
+             Ok(Self {
+                 inner: inner.into(),
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index 4d797308..2f4e32c6 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -510,36 +510,6 @@ fn alpn() {
+     );
+ }
+ 
+-#[test]
+-fn connection_level_alpn_protocols() {
+-    let mut server_config = make_server_config(KeyType::Rsa2048);
+-    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+-    let server_config = Arc::new(server_config);
+-
+-    // Config specifies `h2`
+-    let mut client_config = make_client_config(KeyType::Rsa2048);
+-    client_config.alpn_protocols = vec![b"h2".to_vec()];
+-    let client_config = Arc::new(client_config);
+-
+-    // Client relies on config-specified `h2`, server agrees
+-    let mut client =
+-        ClientConnection::new(client_config.clone(), server_name("localhost")).unwrap();
+-    let mut server = ServerConnection::new(server_config.clone()).unwrap();
+-    do_handshake_until_error(&mut client, &mut server).unwrap();
+-    assert_eq!(client.alpn_protocol(), Some(&b"h2"[..]));
+-
+-    // Specify `http/1.1` for the connection, server agrees
+-    let mut client = ClientConnection::new_with_alpn(
+-        client_config,
+-        server_name("localhost"),
+-        vec![b"http/1.1".to_vec()],
+-    )
+-    .unwrap();
+-    let mut server = ServerConnection::new(server_config).unwrap();
+-    do_handshake_until_error(&mut client, &mut server).unwrap();
+-    assert_eq!(client.alpn_protocol(), Some(&b"http/1.1"[..]));
+-}
+-
+ fn version_test(
+     client_versions: &[&'static rustls::SupportedProtocolVersion],
+     server_versions: &[&'static rustls::SupportedProtocolVersion],

@@ -1,0 +1,156 @@
+diff --git a/rustls/src/quic.rs b/rustls/src/quic.rs
+index 5747e9f8..f5b72066 100644
+--- a/rustls/src/quic.rs
++++ b/rustls/src/quic.rs
+@@ -22,7 +22,7 @@ mod connection {
+     use core::fmt::{self, Debug};
+     use core::ops::{Deref, DerefMut};
+ 
+-    use pki_types::ServerName;
++    use pki_types::{DnsName, ServerName};
+ 
+     use super::{DirectionalKeys, KeyChange, Version};
+     use crate::client::{ClientConfig, ClientConnectionData};
+@@ -313,8 +313,8 @@ mod connection {
+         /// when the client provides the SNI extension.
+         ///
+         /// The server name is also used to match sessions during session resumption.
+-        pub fn server_name(&self) -> Option<&str> {
+-            self.inner.core.get_sni_str()
++        pub fn server_name(&self) -> Option<&DnsName<'_>> {
++            self.inner.core.data.sni.as_ref()
+         }
+     }
+ 
+diff --git a/rustls/src/server/handy.rs b/rustls/src/server/handy.rs
+index 0497a430..c51fc45c 100644
+--- a/rustls/src/server/handy.rs
++++ b/rustls/src/server/handy.rs
+@@ -192,7 +192,6 @@ impl server::ResolvesServerCert for AlwaysResolvesServerRawPublicKeys {
+ 
+ #[cfg(any(feature = "std", feature = "hashbrown"))]
+ mod sni_resolver {
+-    use alloc::string::{String, ToString};
+     use core::fmt::Debug;
+ 
+     use pki_types::{DnsName, ServerName};
+@@ -208,7 +207,7 @@ mod sni_resolver {
+     /// on client-supplied server name (via SNI).
+     #[derive(Debug)]
+     pub struct ResolvesServerCertUsingSni {
+-        by_name: HashMap<String, Arc<sign::CertifiedKey>>,
++        by_name: HashMap<DnsName<'static>, Arc<sign::CertifiedKey>>,
+     }
+ 
+     impl ResolvesServerCertUsingSni {
+@@ -221,17 +220,9 @@ mod sni_resolver {
+ 
+         /// Add a new `sign::CertifiedKey` to be used for the given SNI `name`.
+         ///
+-        /// This function fails if `name` is not a valid DNS name, or if
+-        /// it's not valid for the supplied certificate, or if the certificate
+-        /// chain is syntactically faulty.
+-        pub fn add(&mut self, name: &str, ck: sign::CertifiedKey) -> Result<(), Error> {
+-            let server_name = {
+-                let checked_name = DnsName::try_from(name)
+-                    .map_err(|_| Error::General("Bad DNS name".into()))
+-                    .map(|name| name.to_lowercase_owned())?;
+-                ServerName::DnsName(checked_name)
+-            };
+-
++        /// This function fails if the `name` is not valid for the supplied certificate, or if
++        /// the certificate chain is syntactically faulty.
++        pub fn add(&mut self, name: DnsName<'static>, ck: sign::CertifiedKey) -> Result<(), Error> {
+             // Check the certificate chain for validity:
+             // - it should be non-empty list
+             // - the first certificate should be parsable as a x509v3,
+@@ -241,14 +232,16 @@ mod sni_resolver {
+             // These checks are not security-sensitive.  They are the
+             // *server* attempting to detect accidental misconfiguration.
+ 
++            let wrapped = ServerName::DnsName(name);
+             ck.end_entity_cert()
+                 .and_then(ParsedCertificate::try_from)
+-                .and_then(|cert| verify_server_name(&cert, &server_name))?;
++                .and_then(|cert| verify_server_name(&cert, &wrapped))?;
+ 
+-            if let ServerName::DnsName(name) = server_name {
+-                self.by_name
+-                    .insert(name.as_ref().to_string(), Arc::new(ck));
+-            }
++            let ServerName::DnsName(name) = wrapped else {
++                unreachable!()
++            };
++
++            self.by_name.insert(name, Arc::new(ck));
+             Ok(())
+         }
+     }
+diff --git a/rustls/src/server/server_conn.rs b/rustls/src/server/server_conn.rs
+index 6c7d0e7c..dd8d16f3 100644
+--- a/rustls/src/server/server_conn.rs
++++ b/rustls/src/server/server_conn.rs
+@@ -154,10 +154,8 @@ impl<'a> ClientHello<'a> {
+     /// Get the server name indicator.
+     ///
+     /// Returns `None` if the client did not supply a SNI.
+-    pub fn server_name(&self) -> Option<&str> {
+-        self.server_name
+-            .as_ref()
+-            .map(<DnsName<'_> as AsRef<str>>::as_ref)
++    pub fn server_name(&self) -> Option<&DnsName<'_>> {
++        self.server_name.as_ref()
+     }
+ 
+     /// Get the compatible signature schemes.
+@@ -590,6 +588,8 @@ mod connection {
+     use core::ops::{Deref, DerefMut};
+     use std::io;
+ 
++    use pki_types::DnsName;
++
+     use super::{Accepted, Accepting, EarlyDataState, ServerConfig, ServerConnectionData};
+     use crate::common_state::{CommonState, Context, Side};
+     use crate::conn::{ConnectionCommon, ConnectionCore};
+@@ -657,8 +657,8 @@ mod connection {
+         /// when the client provides the SNI extension.
+         ///
+         /// The server name is also used to match sessions during session resumption.
+-        pub fn server_name(&self) -> Option<&str> {
+-            self.inner.core.get_sni_str()
++        pub fn server_name(&self) -> Option<&DnsName<'_>> {
++            self.inner.core.data.sni.as_ref()
+         }
+ 
+         /// Application-controlled portion of the resumption ticket supplied by the client, if any.
+@@ -1220,29 +1220,17 @@ impl ConnectionCore<ServerConnectionData> {
+         );
+         self.data.early_data.reject();
+     }
+-
+-    #[cfg(feature = "std")]
+-    pub(crate) fn get_sni_str(&self) -> Option<&str> {
+-        self.data.get_sni_str()
+-    }
+ }
+ 
+ /// State associated with a server connection.
+ #[derive(Default, Debug)]
+ pub struct ServerConnectionData {
+-    pub(super) sni: Option<DnsName<'static>>,
++    pub(crate) sni: Option<DnsName<'static>>,
+     pub(super) received_resumption_data: Option<Vec<u8>>,
+     pub(super) resumption_data: Vec<u8>,
+     pub(super) early_data: EarlyDataState,
+ }
+ 
+-impl ServerConnectionData {
+-    #[cfg(feature = "std")]
+-    pub(super) fn get_sni_str(&self) -> Option<&str> {
+-        self.sni.as_ref().map(AsRef::as_ref)
+-    }
+-}
+-
+ impl crate::conn::SideData for ServerConnectionData {}
+ 
+ #[cfg(feature = "std")]

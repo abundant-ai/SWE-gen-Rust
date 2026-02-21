@@ -48,8 +48,11 @@ RUN cargo build --release
 RUN git reset --hard
 
 # Apply bug.patch to revert to buggy state (BASE)
+# Extract only text portions of the patch (first 40 lines) to avoid binary file issues
 COPY bug.patch /tmp/bug.patch
-RUN patch -p1 < /tmp/bug.patch && rm /tmp/bug.patch
+RUN head -40 /tmp/bug.patch | git apply && \
+    rm -rf alacritty_terminal/tests/ref/origin_goto && \
+    rm /tmp/bug.patch
 
 # Rebuild after applying bug.patch (required for Rust)
 RUN cargo build --release

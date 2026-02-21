@@ -1,0 +1,428 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 622e2eab..a6478230 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -493,7 +493,7 @@ version = "0.1.0"
+ dependencies = [
+  "base64",
+  "env_logger",
+- "rustls 0.23.22",
++ "rustls 0.23.23",
+  "rustls-post-quantum",
+ ]
+ 
+@@ -2445,7 +2445,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "rustls"
+-version = "0.23.22"
++version = "0.23.23"
+ dependencies = [
+  "aws-lc-rs",
+  "base64",
+@@ -2479,7 +2479,7 @@ name = "rustls-bench"
+ version = "0.1.0"
+ dependencies = [
+  "clap",
+- "rustls 0.23.22",
++ "rustls 0.23.23",
+  "rustls-post-quantum",
+  "tikv-jemallocator",
+ ]
+@@ -2496,7 +2496,7 @@ dependencies = [
+  "fxhash",
+  "itertools 0.14.0",
+  "rayon",
+- "rustls 0.23.22",
++ "rustls 0.23.23",
+  "tikv-jemallocator",
+ ]
+ 
+@@ -2507,7 +2507,7 @@ dependencies = [
+  "hickory-resolver",
+  "regex",
+  "ring",
+- "rustls 0.23.22",
++ "rustls 0.23.23",
+  "tokio",
+ ]
+ 
+@@ -2522,7 +2522,7 @@ dependencies = [
+  "log",
+  "mio",
+  "rcgen",
+- "rustls 0.23.22",
++ "rustls 0.23.23",
+  "serde",
+  "tokio",
+  "webpki-roots",
+@@ -2533,7 +2533,7 @@ name = "rustls-fuzzing-provider"
+ version = "0.1.0"
+ dependencies = [
+  "env_logger",
+- "rustls 0.23.22",
++ "rustls 0.23.23",
+  "rustls-webpki",
+ ]
+ 
+@@ -2546,7 +2546,7 @@ dependencies = [
+  "num-bigint",
+  "once_cell",
+  "openssl",
+- "rustls 0.23.22",
++ "rustls 0.23.23",
+ ]
+ 
+ [[package]]
+@@ -2561,7 +2561,7 @@ version = "0.2.2"
+ dependencies = [
+  "criterion",
+  "env_logger",
+- "rustls 0.23.22",
++ "rustls 0.23.23",
+  "webpki-roots",
+ ]
+ 
+@@ -2582,7 +2582,7 @@ dependencies = [
+  "rand_core",
+  "rcgen",
+  "rsa",
+- "rustls 0.23.22",
++ "rustls 0.23.23",
+  "rustls-webpki",
+  "sha2",
+  "signature",
+@@ -2595,7 +2595,7 @@ name = "rustls-provider-test"
+ version = "0.1.0"
+ dependencies = [
+  "hex",
+- "rustls 0.23.22",
++ "rustls 0.23.23",
+  "rustls-provider-example",
+  "serde",
+  "serde_json",
+diff --git a/fuzz/Cargo.lock b/fuzz/Cargo.lock
+index a0019149..dc9f44da 100644
+--- a/fuzz/Cargo.lock
++++ b/fuzz/Cargo.lock
+@@ -224,7 +224,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "rustls"
+-version = "0.23.22"
++version = "0.23.23"
+ dependencies = [
+  "log",
+  "once_cell",
+diff --git a/rustls/Cargo.toml b/rustls/Cargo.toml
+index 544e80f7..1f7a332e 100644
+--- a/rustls/Cargo.toml
++++ b/rustls/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "rustls"
+-version = "0.23.22"
++version = "0.23.23"
+ edition = "2021"
+ rust-version = "1.71"
+ license = "Apache-2.0 OR ISC OR MIT"
+diff --git a/rustls/src/client/builder.rs b/rustls/src/client/builder.rs
+index 9c0316f3..8b76bf0f 100644
+--- a/rustls/src/client/builder.rs
++++ b/rustls/src/client/builder.rs
+@@ -8,7 +8,7 @@ use crate::builder::{ConfigBuilder, WantsVerifier};
+ use crate::client::{handy, ClientConfig, EchMode, ResolvesClientCert};
+ use crate::error::Error;
+ use crate::key_log::NoKeyLog;
+-use crate::msgs::handshake::CertificateChain;
++use crate::sign::{CertifiedKey, SingleCertAndKey};
+ use crate::sync::Arc;
+ use crate::versions::TLS13;
+ use crate::webpki::{self, WebPkiServerVerifier};
+@@ -148,13 +148,8 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
+         cert_chain: Vec<CertificateDer<'static>>,
+         key_der: PrivateKeyDer<'static>,
+     ) -> Result<ClientConfig, Error> {
+-        let private_key = self
+-            .provider
+-            .key_provider
+-            .load_private_key(key_der)?;
+-        let resolver =
+-            handy::AlwaysResolvesClientCert::new(private_key, CertificateChain(cert_chain))?;
+-        Ok(self.with_client_cert_resolver(Arc::new(resolver)))
++        let certified_key = CertifiedKey::from_der(cert_chain, key_der, &self.provider)?;
++        Ok(self.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key))))
+     }
+ 
+     /// Do not support client auth.
+diff --git a/rustls/src/client/handy.rs b/rustls/src/client/handy.rs
+index 911894f2..80b02c27 100644
+--- a/rustls/src/client/handy.rs
++++ b/rustls/src/client/handy.rs
+@@ -1,8 +1,6 @@
+ use pki_types::ServerName;
+ 
+ use crate::enums::SignatureScheme;
+-use crate::error::Error;
+-use crate::msgs::handshake::CertificateChain;
+ use crate::msgs::persist;
+ use crate::sync::Arc;
+ use crate::{client, sign, NamedGroup};
+@@ -211,35 +209,6 @@ impl client::ResolvesClientCert for FailResolveClientCert {
+     }
+ }
+ 
+-#[derive(Debug)]
+-pub(super) struct AlwaysResolvesClientCert(Arc<sign::CertifiedKey>);
+-
+-impl AlwaysResolvesClientCert {
+-    pub(super) fn new(
+-        private_key: Arc<dyn sign::SigningKey>,
+-        chain: CertificateChain<'static>,
+-    ) -> Result<Self, Error> {
+-        Ok(Self(Arc::new(sign::CertifiedKey::new(
+-            chain.0,
+-            private_key,
+-        ))))
+-    }
+-}
+-
+-impl client::ResolvesClientCert for AlwaysResolvesClientCert {
+-    fn resolve(
+-        &self,
+-        _root_hint_subjects: &[&[u8]],
+-        _sigschemes: &[SignatureScheme],
+-    ) -> Option<Arc<sign::CertifiedKey>> {
+-        Some(Arc::clone(&self.0))
+-    }
+-
+-    fn has_certs(&self) -> bool {
+-        true
+-    }
+-}
+-
+ /// An exemplar `ResolvesClientCert` implementation that always resolves to a single
+ /// [RFC 7250] raw public key.
+ ///
+diff --git a/rustls/src/crypto/signer.rs b/rustls/src/crypto/signer.rs
+index 9f4edbb2..77bf402c 100644
+--- a/rustls/src/crypto/signer.rs
++++ b/rustls/src/crypto/signer.rs
+@@ -2,14 +2,17 @@ use alloc::boxed::Box;
+ use alloc::vec::Vec;
+ use core::fmt::Debug;
+ 
+-use pki_types::{AlgorithmIdentifier, CertificateDer, SubjectPublicKeyInfoDer};
++use pki_types::{AlgorithmIdentifier, CertificateDer, PrivateKeyDer, SubjectPublicKeyInfoDer};
+ 
++use crate::client::ResolvesClientCert;
+ use crate::enums::{SignatureAlgorithm, SignatureScheme};
+ use crate::error::{Error, InconsistentKeys};
+-use crate::server::ParsedCertificate;
++use crate::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
+ use crate::sync::Arc;
+ use crate::x509;
+ 
++use super::CryptoProvider;
++
+ /// An abstract signing key.
+ ///
+ /// This interface is used by rustls to use a private signing key
+@@ -85,6 +88,40 @@ pub trait Signer: Debug + Send + Sync {
+     fn scheme(&self) -> SignatureScheme;
+ }
+ 
++/// Server certificate resolver which always resolves to the same certificate and key.
++///
++/// For use with [`ConfigBuilder::with_cert_resolver()`].
++///
++/// [`ConfigBuilder::with_cert_resolver()`]: crate::ConfigBuilder::with_cert_resolver
++#[derive(Debug)]
++pub struct SingleCertAndKey(Arc<CertifiedKey>);
++
++impl From<CertifiedKey> for SingleCertAndKey {
++    fn from(certified_key: CertifiedKey) -> Self {
++        Self(Arc::new(certified_key))
++    }
++}
++
++impl ResolvesClientCert for SingleCertAndKey {
++    fn resolve(
++        &self,
++        _root_hint_subjects: &[&[u8]],
++        _sigschemes: &[SignatureScheme],
++    ) -> Option<Arc<CertifiedKey>> {
++        Some(Arc::clone(&self.0))
++    }
++
++    fn has_certs(&self) -> bool {
++        true
++    }
++}
++
++impl ResolvesServerCert for SingleCertAndKey {
++    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
++        Some(Arc::clone(&self.0))
++    }
++}
++
+ /// A packaged-together certificate chain, matching `SigningKey` and
+ /// optional stapled OCSP response.
+ ///
+@@ -107,6 +144,30 @@ pub struct CertifiedKey {
+ }
+ 
+ impl CertifiedKey {
++    /// Create a new `CertifiedKey` from a certificate chain and DER-encoded private key.
++    ///
++    /// Attempt to parse the private key with the given [`CryptoProvider`]'s [`KeyProvider`] and
++    /// verify that it matches the public key in the first certificate of the `cert_chain`
++    /// if possible.
++    ///
++    /// [`KeyProvider`]: crate::crypto::KeyProvider
++    pub fn from_der(
++        cert_chain: Vec<CertificateDer<'static>>,
++        key: PrivateKeyDer<'static>,
++        provider: &CryptoProvider,
++    ) -> Result<Self, Error> {
++        let private_key = provider
++            .key_provider
++            .load_private_key(key)?;
++
++        let certified_key = Self::new(cert_chain, private_key);
++        match certified_key.keys_match() {
++            // Don't treat unknown consistency as an error
++            Ok(()) | Err(Error::InconsistentKeys(InconsistentKeys::Unknown)) => Ok(certified_key),
++            Err(err) => Err(err),
++        }
++    }
++
+     /// Make a new CertifiedKey, with the given chain and key.
+     ///
+     /// The cert chain must not be empty. The first certificate in the chain
+diff --git a/rustls/src/lib.rs b/rustls/src/lib.rs
+index 7cf5b48b..dfcdd1d5 100644
+--- a/rustls/src/lib.rs
++++ b/rustls/src/lib.rs
+@@ -668,7 +668,7 @@ pub mod pki_types {
+ 
+ /// Message signing interfaces.
+ pub mod sign {
+-    pub use crate::crypto::signer::{CertifiedKey, Signer, SigningKey};
++    pub use crate::crypto::signer::{CertifiedKey, Signer, SigningKey, SingleCertAndKey};
+ }
+ 
+ /// APIs for implementing QUIC TLS
+diff --git a/rustls/src/server/builder.rs b/rustls/src/server/builder.rs
+index fb15e807..14407d5f 100644
+--- a/rustls/src/server/builder.rs
++++ b/rustls/src/server/builder.rs
+@@ -3,13 +3,13 @@ use core::marker::PhantomData;
+ 
+ use pki_types::{CertificateDer, PrivateKeyDer};
+ 
++use super::{handy, ResolvesServerCert, ServerConfig};
+ use crate::builder::{ConfigBuilder, WantsVerifier};
+ use crate::error::Error;
+-use crate::server::{handy, ResolvesServerCert, ServerConfig};
+-use crate::sign::CertifiedKey;
++use crate::sign::{CertifiedKey, SingleCertAndKey};
+ use crate::sync::Arc;
+ use crate::verify::{ClientCertVerifier, NoClientAuth};
+-use crate::{compress, versions, InconsistentKeys, NoKeyLog};
++use crate::{compress, versions, NoKeyLog};
+ 
+ impl ConfigBuilder<ServerConfig, WantsVerifier> {
+     /// Choose how to verify client certificates.
+@@ -67,20 +67,8 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
+         cert_chain: Vec<CertificateDer<'static>>,
+         key_der: PrivateKeyDer<'static>,
+     ) -> Result<ServerConfig, Error> {
+-        let private_key = self
+-            .provider
+-            .key_provider
+-            .load_private_key(key_der)?;
+-
+-        let certified_key = CertifiedKey::new(cert_chain, private_key);
+-        match certified_key.keys_match() {
+-            // Don't treat unknown consistency as an error
+-            Ok(()) | Err(Error::InconsistentKeys(InconsistentKeys::Unknown)) => (),
+-            Err(err) => return Err(err),
+-        }
+-
+-        let resolver = handy::AlwaysResolvesChain::new(certified_key);
+-        Ok(self.with_cert_resolver(Arc::new(resolver)))
++        let certified_key = CertifiedKey::from_der(cert_chain, key_der, self.crypto_provider())?;
++        Ok(self.with_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key))))
+     }
+ 
+     /// Sets a single certificate chain, matching private key and optional OCSP
+@@ -102,20 +90,10 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
+         key_der: PrivateKeyDer<'static>,
+         ocsp: Vec<u8>,
+     ) -> Result<ServerConfig, Error> {
+-        let private_key = self
+-            .provider
+-            .key_provider
+-            .load_private_key(key_der)?;
+-
+-        let certified_key = CertifiedKey::new(cert_chain, private_key);
+-        match certified_key.keys_match() {
+-            // Don't treat unknown consistency as an error
+-            Ok(()) | Err(Error::InconsistentKeys(InconsistentKeys::Unknown)) => (),
+-            Err(err) => return Err(err),
+-        }
+-
+-        let resolver = handy::AlwaysResolvesChain::new_with_extras(certified_key, ocsp);
+-        Ok(self.with_cert_resolver(Arc::new(resolver)))
++        let mut certified_key =
++            CertifiedKey::from_der(cert_chain, key_der, self.crypto_provider())?;
++        certified_key.ocsp = Some(ocsp);
++        Ok(self.with_cert_resolver(Arc::new(SingleCertAndKey::from(certified_key))))
+     }
+ 
+     /// Sets a custom [`ResolvesServerCert`].
+diff --git a/rustls/src/server/handy.rs b/rustls/src/server/handy.rs
+index be26b065..a3467d7a 100644
+--- a/rustls/src/server/handy.rs
++++ b/rustls/src/server/handy.rs
+@@ -166,39 +166,6 @@ impl server::ProducesTickets for NeverProducesTickets {
+     }
+ }
+ 
+-/// Something which always resolves to the same cert chain.
+-#[derive(Debug)]
+-pub(super) struct AlwaysResolvesChain(Arc<sign::CertifiedKey>);
+-
+-impl AlwaysResolvesChain {
+-    /// Creates an `AlwaysResolvesChain`, using the supplied `CertifiedKey`.
+-    pub(super) fn new(certified_key: sign::CertifiedKey) -> Self {
+-        Self(Arc::new(certified_key))
+-    }
+-
+-    /// Creates an `AlwaysResolvesChain`, using the supplied `CertifiedKey` and OCSP response.
+-    ///
+-    /// If non-empty, the given OCSP response is attached.
+-    pub(super) fn new_with_extras(certified_key: sign::CertifiedKey, ocsp: Vec<u8>) -> Self {
+-        let mut r = Self::new(certified_key);
+-
+-        {
+-            let cert = Arc::make_mut(&mut r.0);
+-            if !ocsp.is_empty() {
+-                cert.ocsp = Some(ocsp);
+-            }
+-        }
+-
+-        r
+-    }
+-}
+-
+-impl server::ResolvesServerCert for AlwaysResolvesChain {
+-    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<sign::CertifiedKey>> {
+-        Some(Arc::clone(&self.0))
+-    }
+-}
+-
+ /// An exemplar `ResolvesServerCert` implementation that always resolves to a single
+ /// [RFC 7250] raw public key.
+ ///

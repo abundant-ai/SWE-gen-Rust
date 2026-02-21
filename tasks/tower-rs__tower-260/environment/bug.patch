@@ -1,0 +1,189 @@
+diff --git a/tower/Cargo.toml b/tower/Cargo.toml
+index 8c8458c..85860c6 100644
+--- a/tower/Cargo.toml
++++ b/tower/Cargo.toml
+@@ -28,6 +28,7 @@ tower-retry = { version = "0.1", path = "../tower-retry" }
+ tower-buffer = { version = "0.1", path = "../tower-buffer" }
+ tower-load-shed = { version = "0.1", path = "../tower-load-shed" }
+ tower-discover = { version = "0.1", path = "../tower-discover" }
++tower-reconnect = { version = "0.1", path = "../tower-reconnect" }
+ tower-timeout = { version = "0.1", path = "../tower-timeout" }
+ 
+ [dev-dependencies]
+diff --git a/tower/examples/client.rs b/tower/examples/client.rs
+index 6f97f64..08f0434 100644
+--- a/tower/examples/client.rs
++++ b/tower/examples/client.rs
+@@ -4,7 +4,7 @@ use hyper::{
+     Request, Response, Uri,
+ };
+ use std::time::Duration;
+-use tower::{builder::ServiceBuilder, ServiceExt};
++use tower::{builder::ServiceBuilder, reconnect::Reconnect, Service, ServiceExt};
+ use tower_hyper::{
+     client::{Builder, Connect},
+     retry::{Body, RetryPolicy},
+@@ -34,7 +34,7 @@ fn request() -> impl Future<Item = Response<hyper::Body>, Error = ()> {
+     // - provide backpressure for the RateLimitLayer, and ConcurrencyLimitLayer
+     // - meet `RetryLayer`'s requirement that our service implement `Service + Clone`
+     // - ..and to provide cheap clones on the service.
+-    let client = ServiceBuilder::new()
++    let maker = ServiceBuilder::new()
+         .buffer(5)
+         .rate_limit(5, Duration::from_secs(1))
+         .concurrency_limit(5)
+@@ -42,17 +42,18 @@ fn request() -> impl Future<Item = Response<hyper::Body>, Error = ()> {
+         .buffer(5)
+         .make_service(hyper);
+ 
++    // `Reconnect` accepts a destination and a MakeService, creating a new service
++    // any time the connection encounters an error.
++    let client = Reconnect::new(maker, dst);
++
++    let request = Request::builder()
++        .method("GET")
++        .body(Body::from(Vec::new()))
++        .unwrap();
++
++    // we check to see if the client is ready to accept requests.
+     client
+-        // Make a `Service` to `dst`...
+-        .oneshot(dst)
+-        .map_err(|e| panic!("connect error: {:?}", e))
+-        .and_then(|svc| {
+-            let req = Request::builder()
+-                .method("GET")
+-                .body(Body::from(Vec::new()))
+-                .unwrap();
+-            // Send the request when `svc` is ready...
+-            svc.oneshot(req)
+-        })
+-        .map_err(|e| panic!("ruh roh: {:?}", e))
++        .ready()
++        .map_err(|e| panic!("Service is not ready: {:?}", e))
++        .and_then(|mut c| c.call(request).map_err(|e| panic!("{:?}", e)))
+ }
+diff --git a/tower/src/builder/mod.rs b/tower/src/builder/mod.rs
+index e9faae2..38a2e46 100644
+--- a/tower/src/builder/mod.rs
++++ b/tower/src/builder/mod.rs
+@@ -13,6 +13,7 @@ use crate::{
+ };
+ 
+ use tower_layer::Layer;
++use tower_service::Service;
+ use tower_util::{
+     layer::{Identity, Stack},
+     MakeService,
+@@ -20,6 +21,8 @@ use tower_util::{
+ 
+ use std::time::Duration;
+ 
++pub(super) type Error = Box<dyn std::error::Error + Send + Sync>;
++
+ /// Declaratively construct Service values.
+ ///
+ /// `ServiceBuilder` provides a [builder-like interface][builder] for composing
+diff --git a/tower/src/lib.rs b/tower/src/lib.rs
+index 4ec02e6..a47ec4b 100644
+--- a/tower/src/lib.rs
++++ b/tower/src/lib.rs
+@@ -9,6 +9,7 @@ pub use tower_buffer as buffer;
+ pub use tower_discover as discover;
+ pub use tower_limit as limit;
+ pub use tower_load_shed as load_shed;
++pub use tower_reconnect as reconnect;
+ pub use tower_retry as retry;
+ pub use tower_timeout as timeout;
+ 
+diff --git a/tower/tests/builder.rs b/tower/tests/builder.rs
+index 3d60ceb..156a67f 100644
+--- a/tower/tests/builder.rs
++++ b/tower/tests/builder.rs
+@@ -6,21 +6,61 @@ use std::time::Duration;
+ use tower::builder::ServiceBuilder;
+ use tower_buffer::BufferLayer;
+ use tower_limit::{concurrency::ConcurrencyLimitLayer, rate::RateLimitLayer};
++use tower_reconnect::Reconnect;
+ use tower_retry::{Policy, RetryLayer};
+ use tower_service::*;
+ use void::Void;
+ 
++#[test]
++fn builder_make_service() {
++    tokio::run(future::lazy(|| {
++        let maker = ServiceBuilder::new()
++            .layer(BufferLayer::new(5))
++            .layer(ConcurrencyLimitLayer::new(5))
++            .layer(RateLimitLayer::new(5, Duration::from_secs(1)))
++            .make_service(MockMaker);
++
++        let mut client = Reconnect::new(maker, ());
++
++        client.poll_ready().unwrap();
++        client
++            .call(Request)
++            .map(|_| ())
++            .map_err(|_| panic!("this is bad"))
++    }));
++}
++
+ #[test]
+ fn builder_service() {
+     tokio::run(future::lazy(|| {
+-        let policy = MockPolicy;
+         let mut client = ServiceBuilder::new()
+             .layer(BufferLayer::new(5))
+             .layer(ConcurrencyLimitLayer::new(5))
+             .layer(RateLimitLayer::new(5, Duration::from_secs(1)))
++            .service(MockSvc);
++
++        client.poll_ready().unwrap();
++        client
++            .call(Request)
++            .map(|_| ())
++            .map_err(|_| panic!("this is bad"))
++    }));
++}
++
++#[test]
++fn builder_make_service_retry() {
++    tokio::run(future::lazy(|| {
++        let policy = MockPolicy;
++
++        let maker = ServiceBuilder::new()
++            .layer(BufferLayer::new(5))
++            .layer(RateLimitLayer::new(5, Duration::from_secs(1)))
++            .layer(ConcurrencyLimitLayer::new(5))
+             .layer(RetryLayer::new(policy))
+             .layer(BufferLayer::new(5))
+-            .service(MockSvc);
++            .make_service(MockMaker);
++
++        let mut client = Reconnect::new(maker, ());
+ 
+         client.poll_ready().unwrap();
+         client
+@@ -30,6 +70,22 @@ fn builder_service() {
+     }));
+ }
+ 
++#[derive(Debug)]
++struct MockMaker;
++impl Service<()> for MockMaker {
++    type Response = MockSvc;
++    type Error = Void;
++    type Future = FutureResult<Self::Response, Self::Error>;
++
++    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
++        Ok(().into())
++    }
++
++    fn call(&mut self, _: ()) -> Self::Future {
++        future::ok(MockSvc)
++    }
++}
++
+ #[derive(Debug, Clone)]
+ struct Request;
+ #[derive(Debug, Clone)]

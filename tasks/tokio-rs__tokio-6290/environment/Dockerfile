@@ -33,7 +33,7 @@ RUN cargo fetch
 # Build the workspace to ensure everything compiles
 RUN cargo build --workspace --features full
 
-# If install/build steps touched tracked files, reset them so bug.patch applies cleanly,
+# If install/build steps touched tracked files, reset them so bug.patch applies cleanly
 RUN git reset --hard
 
 # Apply bug.patch to revert to buggy state (BASE)

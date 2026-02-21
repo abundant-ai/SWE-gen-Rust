@@ -1,0 +1,191 @@
+diff --git a/tower-balance/examples/demo.rs b/tower-balance/examples/demo.rs
+index 5560598..68a46a1 100644
+--- a/tower-balance/examples/demo.rs
++++ b/tower-balance/examples/demo.rs
+@@ -213,7 +213,7 @@ impl Discover for Disco {
+     fn poll(&mut self) -> Poll<Change<Self::Key, Self::Service>, Self::Error> {
+         match self.changes.pop_front() {
+             Some(Change::Insert(k, svc)) => {
+-                let svc = Buffer::new(svc, 0).unwrap();
++                let svc = Buffer::new(svc).unwrap();
+                 let svc = InFlightLimit::new(svc, ENDPOINT_CAPACITY);
+                 Ok(Async::Ready(Change::Insert(k, svc)))
+             }
+@@ -249,7 +249,7 @@ where
+     pub fn new(lb: lb::Balance<D, C>, total: usize, concurrency: usize) -> Self {
+         Self {
+             send_remaining: total,
+-            lb: InFlightLimit::new(Buffer::new(lb, 0).ok().expect("buffer"), concurrency),
++            lb: InFlightLimit::new(Buffer::new(lb).ok().expect("buffer"), concurrency),
+             responses: stream::FuturesUnordered::new(),
+         }
+     }
+diff --git a/tower-buffer/src/lib.rs b/tower-buffer/src/lib.rs
+index 49560dd..437bfd1 100644
+--- a/tower-buffer/src/lib.rs
++++ b/tower-buffer/src/lib.rs
+@@ -4,6 +4,10 @@
+ //! out of the buffer and dispatching them to the inner service. By adding a
+ //! buffer and a dedicated task, the `Buffer` layer in front of the service can
+ //! be `Clone` even if the inner service is not.
++//!
++//! Currently, `Buffer` uses an unbounded buffering strategy, which is not a
++//! good thing to put in production situations. However, it illustrates the idea
++//! and capabilities around adding buffering to an arbitrary `Service`.
+ 
+ #[macro_use]
+ extern crate futures;
+@@ -12,8 +16,8 @@ extern crate tokio_executor;
+ extern crate tower_direct_service;
+ 
+ use futures::future::Executor;
+-use futures::sync::mpsc;
+ use futures::sync::oneshot;
++use futures::sync::mpsc::{self, UnboundedSender, UnboundedReceiver};
+ use futures::{Async, Future, Poll, Stream};
+ use std::marker::PhantomData;
+ use std::sync::atomic::AtomicBool;
+@@ -31,7 +35,7 @@ pub struct Buffer<T, Request>
+ where
+     T: Service<Request>,
+ {
+-    tx: mpsc::Sender<Message<Request, T::Future>>,
++    tx: UnboundedSender<Message<Request, T::Future>>,
+     state: Arc<State>,
+ }
+ 
+@@ -121,7 +125,7 @@ mod sealed {
+         T: DirectService<Request>,
+     {
+         pub(crate) current_message: Option<Message<Request, T::Future>>,
+-        pub(crate) rx: mpsc::Receiver<Message<Request, T::Future>>,
++        pub(crate) rx: UnboundedReceiver<Message<Request, T::Future>>,
+         pub(crate) service: T,
+         pub(crate) finish: bool,
+         pub(crate) state: Arc<State>,
+@@ -161,7 +165,6 @@ struct State {
+ }
+ 
+ enum ResponseState<T> {
+-    Failed,
+     Rx(oneshot::Receiver<T>),
+     Poll(T),
+ }
+@@ -172,18 +175,15 @@ where
+ {
+     /// Creates a new `Buffer` wrapping `service`.
+     ///
+-    /// `bound` gives the maximal number of requests that can be queued for the service before
+-    /// backpressure is applied to callers.
+-    ///
+     /// The default Tokio executor is used to run the given service, which means that this method
+     /// must be called while on the Tokio runtime.
+-    pub fn new(service: T, bound: usize) -> Result<Self, SpawnError<T>>
++    pub fn new(service: T) -> Result<Self, SpawnError<T>>
+     where
+         T: Send + 'static,
+         T::Future: Send,
+         Request: Send + 'static,
+     {
+-        Self::with_executor(service, bound, &DefaultExecutor::current())
++        Self::with_executor(service, &DefaultExecutor::current())
+     }
+ 
+     /// Creates a new `Buffer` wrapping `service`.
+@@ -191,14 +191,11 @@ where
+     /// `executor` is used to spawn a new `Worker` task that is dedicated to
+     /// draining the buffer and dispatching the requests to the internal
+     /// service.
+-    ///
+-    /// `bound` gives the maximal number of requests that can be queued for the service before
+-    /// backpressure is applied to callers.
+-    pub fn with_executor<E>(service: T, bound: usize, executor: &E) -> Result<Self, SpawnError<T>>
++    pub fn with_executor<E>(service: T, executor: &E) -> Result<Self, SpawnError<T>>
+     where
+         E: WorkerExecutor<DirectedService<T>, Request>,
+     {
+-        let (tx, rx) = mpsc::channel(bound);
++        let (tx, rx) = mpsc::unbounded();
+ 
+         let state = Arc::new(State {
+             open: AtomicBool::new(true),
+@@ -232,14 +229,11 @@ where
+     /// `executor` is used to spawn a new `Worker` task that is dedicated to
+     /// draining the buffer and dispatching the requests to the internal
+     /// service.
+-    ///
+-    /// `bound` gives the maximal number of requests that can be queued for the service before
+-    /// backpressure is applied to callers.
+-    pub fn new_direct<E>(service: T, bound: usize, executor: &E) -> Result<Self, SpawnError<T>>
++    pub fn new_direct<E>(service: T, executor: &E) -> Result<Self, SpawnError<T>>
+     where
+         E: Executor<Worker<T, Request>>,
+     {
+-        let (tx, rx) = mpsc::channel(bound);
++        let (tx, rx) = mpsc::unbounded();
+ 
+         let state = Arc::new(State {
+             open: AtomicBool::new(true),
+@@ -273,28 +267,25 @@ where
+         if !self.state.open.load(Ordering::Acquire) {
+             return Err(Error::Closed);
+         } else {
+-            self.tx.poll_ready().map_err(|_| Error::Closed)
++            // Ideally we could query if the `mpsc` is closed, but this is not
++            // currently possible.
++            Ok(().into())
+         }
+     }
+ 
+     fn call(&mut self, request: Request) -> Self::Future {
+-        // TODO:
+-        // ideally we'd poll_ready again here so we don't allocate the oneshot
+-        // if the try_send is about to fail, but sadly we can't call poll_ready
+-        // outside of task context.
+         let (tx, rx) = oneshot::channel();
+ 
+-        let sent = self.tx.try_send(Message { request, tx });
++        let sent = self.tx.unbounded_send(Message {
++            request,
++            tx,
++        });
++
+         if sent.is_err() {
+             self.state.open.store(false, Ordering::Release);
+-            ResponseFuture {
+-                state: ResponseState::Failed,
+-            }
+-        } else {
+-            ResponseFuture {
+-                state: ResponseState::Rx(rx),
+-            }
+         }
++
++        ResponseFuture { state: ResponseState::Rx(rx) }
+     }
+ }
+ 
+@@ -326,9 +317,6 @@ where
+             let fut;
+ 
+             match self.state {
+-                Failed => {
+-                    return Err(Error::Closed);
+-                }
+                 Rx(ref mut rx) => {
+                     match rx.poll() {
+                         Ok(Async::Ready(f)) => fut = f,
+diff --git a/tower-buffer/tests/buffer.rs b/tower-buffer/tests/buffer.rs
+index 566c5d2..9b6e520 100644
+--- a/tower-buffer/tests/buffer.rs
++++ b/tower-buffer/tests/buffer.rs
+@@ -100,8 +100,7 @@ where
+ 
+ fn new_service() -> (Buffer<Mock, &'static str>, Handle) {
+     let (service, handle) = Mock::new();
+-    // bound is >0 here because clears_canceled_requests needs multiple outstanding requests
+-    let service = Buffer::with_executor(service, 10, &Exec).unwrap();
++    let service = Buffer::with_executor(service, &Exec).unwrap();
+     (service, handle)
+ }
+ 

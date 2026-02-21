@@ -1,0 +1,207 @@
+diff --git a/rustls/src/client/client_conn.rs b/rustls/src/client/client_conn.rs
+index f1bbc6c5..f0c7dae4 100644
+--- a/rustls/src/client/client_conn.rs
++++ b/rustls/src/client/client_conn.rs
+@@ -430,15 +430,11 @@ impl ClientConfig {
+         group: NamedGroup,
+         version: ProtocolVersion,
+     ) -> Option<&'static dyn SupportedKxGroup> {
+-        if !group.usable_for_version(version) {
+-            return None;
+-        }
+-
+         self.provider
+             .kx_groups
+             .iter()
+-            .find(|skxg| skxg.name() == group)
+             .copied()
++            .find(|skxg| skxg.usable_for_version(version) && skxg.name() == group)
+     }
+ 
+     pub(super) fn current_time(&self) -> Result<UnixTime, Error> {
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index 1efef9b0..ccb77ecb 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -262,12 +262,8 @@ fn emit_client_hello_for_retry(
+         .provider
+         .kx_groups
+         .iter()
+-        .filter_map(|skxg| {
+-            let named_group = skxg.name();
+-            supported_versions
+-                .any(|v| named_group.usable_for_version(v))
+-                .then_some(named_group)
+-        })
++        .filter(|skxg| supported_versions.any(|v| skxg.usable_for_version(v)))
++        .map(|skxg| skxg.name())
+         .collect();
+ 
+     let mut exts = vec![
+diff --git a/rustls/src/crypto/aws_lc_rs/pq/hybrid.rs b/rustls/src/crypto/aws_lc_rs/pq/hybrid.rs
+index ad943e79..8e30d782 100644
+--- a/rustls/src/crypto/aws_lc_rs/pq/hybrid.rs
++++ b/rustls/src/crypto/aws_lc_rs/pq/hybrid.rs
+@@ -4,7 +4,7 @@ use alloc::vec::Vec;
+ use super::INVALID_KEY_SHARE;
+ use crate::crypto::{ActiveKeyExchange, CompletedKeyExchange, SharedSecret, SupportedKxGroup};
+ use crate::ffdhe_groups::FfdheGroup;
+-use crate::{Error, NamedGroup};
++use crate::{Error, NamedGroup, ProtocolVersion};
+ 
+ /// A generalization of hybrid key exchange.
+ #[derive(Debug)]
+@@ -88,6 +88,10 @@ impl SupportedKxGroup for Hybrid {
+             false => self.classical.fips(),
+         }
+     }
++
++    fn usable_for_version(&self, version: ProtocolVersion) -> bool {
++        version == ProtocolVersion::TLSv1_3
++    }
+ }
+ 
+ struct ActiveHybrid {
+diff --git a/rustls/src/crypto/aws_lc_rs/pq/mlkem.rs b/rustls/src/crypto/aws_lc_rs/pq/mlkem.rs
+index 6fc38b18..fa2be078 100644
+--- a/rustls/src/crypto/aws_lc_rs/pq/mlkem.rs
++++ b/rustls/src/crypto/aws_lc_rs/pq/mlkem.rs
+@@ -6,7 +6,7 @@ use aws_lc_rs::kem;
+ use super::INVALID_KEY_SHARE;
+ use crate::crypto::{ActiveKeyExchange, CompletedKeyExchange, SharedSecret, SupportedKxGroup};
+ use crate::ffdhe_groups::FfdheGroup;
+-use crate::{Error, NamedGroup};
++use crate::{Error, NamedGroup, ProtocolVersion};
+ 
+ #[derive(Debug)]
+ pub(crate) struct MlKem768;
+@@ -65,6 +65,10 @@ impl SupportedKxGroup for MlKem768 {
+         // see <https://github.com/rustls/rustls/issues/2309>
+         super::super::fips()
+     }
++
++    fn usable_for_version(&self, version: ProtocolVersion) -> bool {
++        version == ProtocolVersion::TLSv1_3
++    }
+ }
+ 
+ struct Active {
+diff --git a/rustls/src/crypto/mod.rs b/rustls/src/crypto/mod.rs
+index 78eb0e39..0ff7b0bf 100644
+--- a/rustls/src/crypto/mod.rs
++++ b/rustls/src/crypto/mod.rs
+@@ -416,6 +416,13 @@ pub trait SupportedKxGroup: Send + Sync + Debug {
+     fn fips(&self) -> bool {
+         false
+     }
++
++    /// Return `true` if this should be offered/selected with the given version.
++    ///
++    /// The default implementation returns true for all versions.
++    fn usable_for_version(&self, _version: ProtocolVersion) -> bool {
++        true
++    }
+ }
+ 
+ /// An in-progress key exchange originating from a [`SupportedKxGroup`].
+diff --git a/rustls/src/msgs/enums.rs b/rustls/src/msgs/enums.rs
+index 5393162e..1b347165 100644
+--- a/rustls/src/msgs/enums.rs
++++ b/rustls/src/msgs/enums.rs
+@@ -1,7 +1,6 @@
+ #![allow(clippy::upper_case_acronyms)]
+ #![allow(non_camel_case_types)]
+ use crate::crypto::KeyExchangeAlgorithm;
+-use crate::enums::ProtocolVersion;
+ use crate::msgs::codec::{Codec, Reader};
+ 
+ enum_builder! {
+@@ -177,31 +176,16 @@ enum_builder! {
+         secp521r1 => 0x0019,
+         X25519 => 0x001d,
+         X448 => 0x001e,
+-        /// <https://www.iana.org/go/rfc8734>
+-        brainpoolP256r1tls13 => 0x001f,
+-        /// <https://www.iana.org/go/rfc8734>
+-        brainpoolP384r1tls13 => 0x0020,
+-        /// <https://www.iana.org/go/rfc8734>
+-        brainpoolP512r1tls13 => 0x0021,
+-        /// <https://www.iana.org/go/rfc8998>
+-        curveSM2 => 0x0029,
+         FFDHE2048 => 0x0100,
+         FFDHE3072 => 0x0101,
+         FFDHE4096 => 0x0102,
+         FFDHE6144 => 0x0103,
+         FFDHE8192 => 0x0104,
+-        /// <https://datatracker.ietf.org/doc/draft-ietf-tls-mlkem/>
+         MLKEM512 => 0x0200,
+-        /// <https://datatracker.ietf.org/doc/draft-ietf-tls-mlkem/>
+         MLKEM768 => 0x0201,
+-        /// <https://datatracker.ietf.org/doc/draft-ietf-tls-mlkem/>
+         MLKEM1024 => 0x0202,
+-        /// <https://datatracker.ietf.org/doc/draft-ietf-tls-ecdhe-mlkem/>
+         secp256r1MLKEM768 => 0x11eb,
+-        /// <https://datatracker.ietf.org/doc/draft-ietf-tls-ecdhe-mlkem/>
+         X25519MLKEM768 => 0x11ec,
+-        /// <https://datatracker.ietf.org/doc/draft-ietf-tls-ecdhe-mlkem/>
+-        secp384r1MLKEM1024 => 0x11ed,
+     }
+ }
+ 
+@@ -213,25 +197,6 @@ impl NamedGroup {
+             _ => KeyExchangeAlgorithm::ECDHE,
+         }
+     }
+-
+-    pub fn usable_for_version(&self, version: ProtocolVersion) -> bool {
+-        match version {
+-            ProtocolVersion::TLSv1_3 => true,
+-            _ => !matches!(
+-                self,
+-                Self::MLKEM512
+-                    | Self::MLKEM768
+-                    | Self::MLKEM1024
+-                    | Self::X25519MLKEM768
+-                    | Self::secp256r1MLKEM768
+-                    | Self::secp384r1MLKEM1024
+-                    | Self::brainpoolP256r1tls13
+-                    | Self::brainpoolP384r1tls13
+-                    | Self::brainpoolP512r1tls13
+-                    | Self::curveSM2
+-            ),
+-        }
+-    }
+ }
+ 
+ enum_builder! {
+diff --git a/rustls/src/server/hs.rs b/rustls/src/server/hs.rs
+index ae619a08..653985b2 100644
+--- a/rustls/src/server/hs.rs
++++ b/rustls/src/server/hs.rs
+@@ -532,9 +532,7 @@ impl ExpectClientHello {
+                 .kx_groups
+                 .iter()
+                 .find(|skxg| {
+-                    let named_group = skxg.name();
+-                    named_group == *offered_group
+-                        && named_group.usable_for_version(selected_version)
++                    skxg.usable_for_version(selected_version) && skxg.name() == *offered_group
+                 });
+ 
+             match offered_group.key_exchange_algorithm() {
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index 5225ea68..987a625a 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -5577,10 +5577,7 @@ fn test_client_config_keyshare_mismatch() {
+ fn exercise_all_key_exchange_methods() {
+     for version in rustls::ALL_VERSIONS {
+         for kx_group in provider::ALL_KX_GROUPS {
+-            if !kx_group
+-                .name()
+-                .usable_for_version(version.version)
+-            {
++            if !kx_group.usable_for_version(version.version) {
+                 continue;
+             }
+ 

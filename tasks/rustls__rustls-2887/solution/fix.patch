@@ -1,0 +1,571 @@
+diff --git a/fuzz/fuzzers/fragment.rs b/fuzz/fuzzers/fragment.rs
+index 8d3563cd..09605317 100644
+--- a/fuzz/fuzzers/fragment.rs
++++ b/fuzz/fuzzers/fragment.rs
+@@ -3,28 +3,6 @@
+ extern crate libfuzzer_sys;
+ extern crate rustls;
+ 
+-use rustls::crypto::cipher::{EncodedMessage, Payload};
+-use rustls::internal::msgs::{Message, MessageFragmenter, Reader};
++use rustls::internal::fuzzing::fuzz_fragmenter;
+ 
+-fuzz_target!(|data: &[u8]| {
+-    let mut rdr = Reader::init(data);
+-    let Ok(msg) = EncodedMessage::<Payload>::read(&mut rdr) else {
+-        return;
+-    };
+-
+-    let Ok(msg) = Message::try_from(&msg) else {
+-        return;
+-    };
+-
+-    let mut frg = MessageFragmenter::default();
+-    frg.set_max_fragment_size(Some(32))
+-        .unwrap();
+-    for msg in frg.fragment_message(&EncodedMessage::<Payload>::from(msg)) {
+-        Message::try_from(&EncodedMessage {
+-            typ: msg.typ,
+-            version: msg.version,
+-            payload: Payload::Owned(msg.payload.to_vec()),
+-        })
+-        .ok();
+-    }
+-});
++fuzz_target!(|data: &[u8]| fuzz_fragmenter(data));
+diff --git a/fuzz/fuzzers/message.rs b/fuzz/fuzzers/message.rs
+index 6220e297..e16795a7 100644
+--- a/fuzz/fuzzers/message.rs
++++ b/fuzz/fuzzers/message.rs
+@@ -3,20 +3,6 @@
+ extern crate libfuzzer_sys;
+ extern crate rustls;
+ 
+-use rustls::crypto::cipher::{EncodedMessage, Payload};
+-use rustls::internal::msgs::{Message, Reader};
++use rustls::internal::fuzzing::fuzz_message;
+ 
+-fuzz_target!(|data: &[u8]| {
+-    let mut rdr = Reader::init(data);
+-    if let Ok(m) = EncodedMessage::<Payload>::read(&mut rdr) {
+-        let Ok(msg) = Message::try_from(&m) else {
+-            return;
+-        };
+-        //println!("msg = {:#?}", m);
+-        let enc = EncodedMessage::<Payload>::from(msg)
+-            .into_unencrypted_opaque()
+-            .encode();
+-        //println!("data = {:?}", &data[..rdr.used()]);
+-        assert_eq!(enc, data[..rdr.used()]);
+-    }
+-});
++fuzz_target!(|data: &[u8]| fuzz_message(data));
+diff --git a/fuzz/fuzzers/persist.rs b/fuzz/fuzzers/persist.rs
+index fc2e16c7..cd5c7e17 100644
+--- a/fuzz/fuzzers/persist.rs
++++ b/fuzz/fuzzers/persist.rs
+@@ -3,17 +3,6 @@
+ extern crate libfuzzer_sys;
+ extern crate rustls;
+ 
+-use rustls::internal::msgs::{Codec, Reader, ServerSessionValue};
++use rustls::internal::fuzzing::fuzz_server_session_value;
+ 
+-fn try_type<T>(data: &[u8])
+-where
+-    T: for<'a> Codec<'a>,
+-{
+-    let mut rdr = Reader::init(data);
+-
+-    let _ = T::read(&mut rdr);
+-}
+-
+-fuzz_target!(|data: &[u8]| {
+-    try_type::<ServerSessionValue>(data);
+-});
++fuzz_target!(|data: &[u8]| fuzz_server_session_value(data));
+diff --git a/rustls-test/src/lib.rs b/rustls-test/src/lib.rs
+index f160e535..0145f161 100644
+--- a/rustls-test/src/lib.rs
++++ b/rustls-test/src/lib.rs
+@@ -23,7 +23,6 @@ use rustls::crypto::{
+ };
+ use rustls::enums::{CertificateType, ContentType, ProtocolVersion};
+ use rustls::error::{CertificateError, Error};
+-use rustls::internal::msgs::{Codec, Message, Reader};
+ use rustls::pki_types::pem::PemObject;
+ use rustls::pki_types::{
+     CertificateDer, CertificateRevocationListDer, DnsName, PrivateKeyDer, PrivatePkcs8KeyDer,
+@@ -253,7 +252,7 @@ pub enum Altered {
+ 
+ pub fn transfer_altered<F>(left: &mut Connection, filter: F, right: &mut Connection) -> usize
+ where
+-    F: Fn(&mut Message<'_>) -> Altered,
++    F: Fn(&mut EncodedMessage<Vec<u8>>) -> Altered,
+ {
+     let mut buf = [0u8; 262144];
+     let mut total = 0;
+@@ -268,24 +267,37 @@ where
+             return total;
+         }
+ 
+-        let mut reader = Reader::init(&buf[..sz]);
+-        while reader.any_left() {
+-            // this is a bit of a falsehood: we don't know whether message
+-            // is encrypted.  it is quite unlikely that a genuine encrypted
+-            // message can be decoded by `Message::try_from`.
+-            let plain = EncodedMessage::<Payload<'_>>::read(&mut reader)
+-                .unwrap()
+-                .into_owned();
+-
+-            let message_enc = match Message::try_from(&plain) {
+-                Ok(mut message) => match filter(&mut message) {
+-                    Altered::InPlace => EncodedMessage::<Payload<'static>>::from(message)
+-                        .into_unencrypted_opaque()
+-                        .encode(),
+-                    Altered::Raw(data) => data,
+-                },
+-                // pass through encrypted/undecodable messages
+-                Err(_) => plain.into_unencrypted_opaque().encode(),
++        let mut offset = 0;
++        while offset < sz {
++            assert!(
++                offset + 5 <= sz,
++                "incomplete TLS record header at offset {offset}"
++            );
++
++            let typ = ContentType::from(buf[offset]);
++            let version =
++                ProtocolVersion::from(u16::from_be_bytes([buf[offset + 1], buf[offset + 2]]));
++            let payload_len = u16::from_be_bytes([buf[offset + 3], buf[offset + 4]]) as usize;
++
++            assert!(
++                offset + 5 + payload_len <= sz,
++                "incomplete TLS record payload at offset {offset}"
++            );
++
++            let payload = buf[offset + 5..offset + 5 + payload_len].to_vec();
++            offset += 5 + payload_len;
++
++            let mut encoded = EncodedMessage {
++                typ,
++                version,
++                payload,
++            };
++
++            let message_enc = match filter(&mut encoded) {
++                Altered::InPlace => {
++                    encoding::message_framing(encoded.typ, encoded.version, encoded.payload.clone())
++                }
++                Altered::Raw(data) => data,
+             };
+ 
+             let message_enc_reader: &mut dyn io::Read = &mut &message_enc[..];
+@@ -866,8 +878,8 @@ pub fn do_handshake_until_error(
+ 
+ pub fn do_handshake_altered(
+     client: ClientConnection,
+-    alter_server_message: impl Fn(&mut Message<'_>) -> Altered,
+-    alter_client_message: impl Fn(&mut Message<'_>) -> Altered,
++    alter_server_message: impl Fn(&mut EncodedMessage<Vec<u8>>) -> Altered,
++    alter_client_message: impl Fn(&mut EncodedMessage<Vec<u8>>) -> Altered,
+     server: ServerConnection,
+ ) -> Result<(), ErrorFromPeer> {
+     let mut client: Connection = Connection::Client(client);
+@@ -1439,18 +1451,19 @@ impl RawTls {
+     pub fn receive_and_decrypt(
+         &mut self,
+         peer: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
+-        f: impl Fn(Message<'_>),
++        f: impl Fn(EncodedMessage<&[u8]>),
+     ) {
+         let mut data = vec![];
+         peer.write_tls(&mut io::Cursor::new(&mut data))
+             .unwrap();
+ 
+-        let mut reader = Reader::init(&data);
+-        let typ = ContentType::read(&mut reader).unwrap();
+-        let version = ProtocolVersion::read(&mut reader).unwrap();
+-        let len = u16::read(&mut reader).unwrap();
++        // Parse TLS record header: 1 byte type, 2 bytes version, 2 bytes length
++        assert!(data.len() >= 5, "incomplete TLS record header");
++        let typ = ContentType::from(data[0]);
++        let version = ProtocolVersion::from(u16::from_be_bytes([data[1], data[2]]));
++        let len = u16::from_be_bytes([data[3], data[4]]) as usize;
+         let left = &mut data[5..];
+-        assert_eq!(len as usize, left.len());
++        assert_eq!(len, left.len());
+ 
+         let inbound = EncodedMessage {
+             typ,
+@@ -1458,13 +1471,12 @@ impl RawTls {
+             payload: InboundOpaque(left),
+         };
+ 
+-        let plain = self
++        let msg = self
+             .decrypter
+             .decrypt(inbound, self.dec_seq)
+             .unwrap();
+         self.dec_seq += 1;
+ 
+-        let msg = Message::try_from(&plain).unwrap();
+         println!("receive_and_decrypt: {msg:?}");
+ 
+         f(msg);
+diff --git a/rustls/src/crypto/cipher/messages.rs b/rustls/src/crypto/cipher/messages.rs
+index 8487507e..d2459e3f 100644
+--- a/rustls/src/crypto/cipher/messages.rs
++++ b/rustls/src/crypto/cipher/messages.rs
+@@ -35,7 +35,7 @@ impl<'a> EncodedMessage<Payload<'a>> {
+     ///
+     /// `MessageError` allows callers to distinguish between valid prefixes (might
+     /// become valid if we read more data) and invalid data.
+-    pub fn read(r: &mut Reader<'a>) -> Result<Self, MessageError> {
++    pub(crate) fn read(r: &mut Reader<'a>) -> Result<Self, MessageError> {
+         let (typ, version, len) = read_opaque_message_header(r)?;
+ 
+         let content = r
+diff --git a/rustls/src/lib.rs b/rustls/src/lib.rs
+index 9feab4e2..d93fee4b 100644
+--- a/rustls/src/lib.rs
++++ b/rustls/src/lib.rs
+@@ -401,16 +401,7 @@ mod webpki;
+ /// The contents of this section DO NOT form part of the stable interface.
+ #[doc(hidden)]
+ pub mod internal {
+-    /// Low-level TLS message parsing and encoding functions.
+-    pub mod msgs {
+-        pub use crate::msgs::{
+-            Codec, Message, MessageFragmenter, MessagePayload, Reader, ServerSessionValue,
+-        };
+-    }
+-
+-    pub mod fuzzing {
+-        pub use crate::msgs::fuzz_deframer;
+-    }
++    pub use crate::msgs::fuzzing;
+ }
+ 
+ /// Unbuffered connection API
+diff --git a/rustls/src/msgs/codec.rs b/rustls/src/msgs/codec.rs
+index 9ff54978..82976964 100644
+--- a/rustls/src/msgs/codec.rs
++++ b/rustls/src/msgs/codec.rs
+@@ -12,7 +12,7 @@ use crate::error::InvalidMessage;
+ /// A new reader for a sub section of the buffer can be created
+ /// using the `sub` function or a section of a certain length can
+ /// be obtained using the `take` function
+-pub struct Reader<'a> {
++pub(crate) struct Reader<'a> {
+     /// The underlying buffer storing the readers content
+     buffer: &'a [u8],
+     /// Stores the current reading position for the buffer
+@@ -22,7 +22,7 @@ pub struct Reader<'a> {
+ impl<'a> Reader<'a> {
+     /// Creates a new Reader of the provided `bytes` slice with
+     /// the initial cursor position of zero.
+-    pub fn init(bytes: &'a [u8]) -> Self {
++    pub(crate) fn init(bytes: &'a [u8]) -> Self {
+         Reader {
+             buffer: bytes,
+             cursor: 0,
+@@ -32,7 +32,7 @@ impl<'a> Reader<'a> {
+     /// Attempts to create a new Reader on a sub section of this
+     /// readers bytes by taking a slice of the provided `length`
+     /// will return None if there is not enough bytes
+-    pub fn sub(&mut self, length: usize) -> Result<Self, InvalidMessage> {
++    pub(crate) fn sub(&mut self, length: usize) -> Result<Self, InvalidMessage> {
+         match self.take(length) {
+             Some(bytes) => Ok(Reader::init(bytes)),
+             None => Err(InvalidMessage::MessageTooShort),
+@@ -43,7 +43,7 @@ impl<'a> Reader<'a> {
+     /// that appear after the cursor position.
+     ///
+     /// Moves the cursor to the end of the buffer length.
+-    pub fn rest(&mut self) -> &'a [u8] {
++    pub(crate) fn rest(&mut self) -> &'a [u8] {
+         let rest = &self.buffer[self.cursor..];
+         self.cursor = self.buffer.len();
+         rest
+@@ -53,7 +53,7 @@ impl<'a> Reader<'a> {
+     /// cursor position of `length` if there is not enough
+     /// bytes remaining after the cursor to take the length
+     /// then None is returned instead.
+-    pub fn take(&mut self, length: usize) -> Option<&'a [u8]> {
++    pub(crate) fn take(&mut self, length: usize) -> Option<&'a [u8]> {
+         if self.left() < length {
+             return None;
+         }
+@@ -64,11 +64,11 @@ impl<'a> Reader<'a> {
+ 
+     /// Used to check whether the reader has any content left
+     /// after the cursor (cursor has not reached end of buffer)
+-    pub fn any_left(&self) -> bool {
++    pub(crate) fn any_left(&self) -> bool {
+         self.cursor < self.buffer.len()
+     }
+ 
+-    pub fn expect_empty(&self, name: &'static str) -> Result<(), InvalidMessage> {
++    pub(crate) fn expect_empty(&self, name: &'static str) -> Result<(), InvalidMessage> {
+         match self.any_left() {
+             true => Err(InvalidMessage::TrailingData(name)),
+             false => Ok(()),
+@@ -77,20 +77,20 @@ impl<'a> Reader<'a> {
+ 
+     /// Returns the cursor position which is also the number
+     /// of bytes that have been read from the buffer.
+-    pub fn used(&self) -> usize {
++    pub(crate) fn used(&self) -> usize {
+         self.cursor
+     }
+ 
+     /// Returns the number of bytes that are still able to be
+     /// read (The number of remaining takes)
+-    pub fn left(&self) -> usize {
++    pub(crate) fn left(&self) -> usize {
+         self.buffer.len() - self.cursor
+     }
+ }
+ 
+ /// Trait for implementing encoding and decoding functionality
+ /// on something.
+-pub trait Codec<'a>: Debug + Sized {
++pub(crate) trait Codec<'a>: Debug + Sized {
+     /// Function for encoding itself by appending itself to
+     /// the provided vec of bytes.
+     fn encode(&self, bytes: &mut Vec<u8>);
+diff --git a/rustls/src/msgs/fragmenter.rs b/rustls/src/msgs/fragmenter.rs
+index 717113b0..743a98e6 100644
+--- a/rustls/src/msgs/fragmenter.rs
++++ b/rustls/src/msgs/fragmenter.rs
+@@ -6,7 +6,7 @@ pub(crate) const MAX_FRAGMENT_LEN: usize = 16384;
+ pub(crate) const PACKET_OVERHEAD: usize = 1 + 2 + 2;
+ pub(crate) const MAX_FRAGMENT_SIZE: usize = MAX_FRAGMENT_LEN + PACKET_OVERHEAD;
+ 
+-pub struct MessageFragmenter {
++pub(crate) struct MessageFragmenter {
+     max_frag: usize,
+ }
+ 
+@@ -26,7 +26,7 @@ impl MessageFragmenter {
+     /// Return an iterator across those messages.
+     ///
+     /// Payloads are borrowed from `msg`.
+-    pub fn fragment_message<'a>(
++    pub(crate) fn fragment_message<'a>(
+         &self,
+         msg: &'a EncodedMessage<Payload<'_>>,
+     ) -> impl Iterator<Item = EncodedMessage<OutboundPlain<'a>>> + 'a {
+@@ -61,7 +61,10 @@ impl MessageFragmenter {
+     /// A `max_fragment_size` of `None` sets the highest allowable fragment size.
+     ///
+     /// Returns BadMaxFragmentSize if the size is smaller than 32 or larger than 16389.
+-    pub fn set_max_fragment_size(&mut self, max_fragment_size: Option<usize>) -> Result<(), Error> {
++    pub(crate) fn set_max_fragment_size(
++        &mut self,
++        max_fragment_size: Option<usize>,
++    ) -> Result<(), Error> {
+         self.max_frag = match max_fragment_size {
+             Some(sz @ 32..=MAX_FRAGMENT_SIZE) => sz - PACKET_OVERHEAD,
+             None => MAX_FRAGMENT_LEN,
+diff --git a/rustls/src/msgs/mod.rs b/rustls/src/msgs/mod.rs
+index 3c467504..43429b89 100644
+--- a/rustls/src/msgs/mod.rs
++++ b/rustls/src/msgs/mod.rs
+@@ -53,12 +53,12 @@ pub(crate) use client_hello::{
+ };
+ 
+ mod codec;
+-pub(crate) use codec::{CERTIFICATE_MAX_SIZE_LIMIT, ListLength, TlsListElement, put_u16, put_u64};
+-pub use codec::{Codec, Reader};
++pub(crate) use codec::{
++    CERTIFICATE_MAX_SIZE_LIMIT, Codec, ListLength, Reader, TlsListElement, put_u16, put_u64,
++};
+ use codec::{LengthPrefixedBuffer, U24};
+ 
+ mod deframer;
+-pub use deframer::fuzz_deframer;
+ pub(crate) use deframer::{
+     BufferProgress, DeframerIter, DeframerSliceBuffer, DeframerVecBuffer, Delocator,
+     HandshakeAlignedProof, HandshakeDeframer, Locator,
+@@ -74,8 +74,7 @@ pub(crate) use enums::{
+ };
+ 
+ mod fragmenter;
+-pub(crate) use fragmenter::MAX_FRAGMENT_LEN;
+-pub use fragmenter::MessageFragmenter;
++pub(crate) use fragmenter::{MAX_FRAGMENT_LEN, MessageFragmenter};
+ 
+ #[macro_use]
+ mod handshake;
+@@ -94,10 +93,9 @@ pub(crate) use handshake::{
+ pub(crate) use handshake::{EcParameters, ServerEcdhParams};
+ 
+ mod persist;
+-pub use persist::ServerSessionValue;
+ pub(crate) use persist::{
+-    ClientSessionCommon, CommonServerSessionValue, Retrieved, Tls12ServerSessionValue,
+-    Tls13ServerSessionValue,
++    ClientSessionCommon, CommonServerSessionValue, Retrieved, ServerSessionValue,
++    Tls12ServerSessionValue, Tls13ServerSessionValue,
+ };
+ 
+ mod server_hello;
+@@ -108,16 +106,68 @@ pub(crate) use server_hello::{
+ #[cfg(test)]
+ mod handshake_test;
+ 
++pub mod fuzzing {
++    pub use super::deframer::fuzz_deframer;
++    use super::{
++        Codec, EncodedMessage, Message, MessageFragmenter, Payload, Reader, ServerSessionValue,
++    };
++
++    pub fn fuzz_fragmenter(data: &[u8]) {
++        let mut rdr = Reader::init(data);
++        let Ok(msg) = EncodedMessage::<Payload<'_>>::read(&mut rdr) else {
++            return;
++        };
++
++        let Ok(msg) = Message::try_from(&msg) else {
++            return;
++        };
++
++        let mut frg = MessageFragmenter::default();
++        frg.set_max_fragment_size(Some(32))
++            .unwrap();
++        for msg in frg.fragment_message(&EncodedMessage::<Payload<'_>>::from(msg)) {
++            Message::try_from(&EncodedMessage {
++                typ: msg.typ,
++                version: msg.version,
++                payload: Payload::Owned(msg.payload.to_vec()),
++            })
++            .ok();
++        }
++    }
++
++    pub fn fuzz_message(data: &[u8]) {
++        let mut rdr = Reader::init(data);
++        let Ok(m) = EncodedMessage::<Payload<'_>>::read(&mut rdr) else {
++            return;
++        };
++
++        let Ok(msg) = Message::try_from(&m) else {
++            return;
++        };
++
++        //println!("msg = {:#?}", m);
++        let enc = EncodedMessage::<Payload<'_>>::from(msg)
++            .into_unencrypted_opaque()
++            .encode();
++        //println!("data = {:?}", &data[..rdr.used()]);
++        assert_eq!(enc, data[..rdr.used()]);
++    }
++
++    pub fn fuzz_server_session_value(data: &[u8]) {
++        let mut rdr = Reader::init(data);
++        let _ = ServerSessionValue::read(&mut rdr);
++    }
++}
++
+ /// A message with decoded payload
+-#[expect(clippy::exhaustive_structs)]
+ #[derive(Debug)]
+-pub struct Message<'a> {
++pub(crate) struct Message<'a> {
+     pub version: ProtocolVersion,
+     pub payload: MessagePayload<'a>,
+ }
+ 
+ impl Message<'_> {
+-    pub fn build_alert(level: AlertLevel, desc: AlertDescription) -> Self {
++    pub(crate) fn build_alert(level: AlertLevel, desc: AlertDescription) -> Self {
+         Self {
+             version: ProtocolVersion::TLSv1_2,
+             payload: MessagePayload::Alert(AlertMessagePayload {
+@@ -127,7 +177,7 @@ impl Message<'_> {
+         }
+     }
+ 
+-    pub fn build_key_update_notify() -> Self {
++    pub(crate) fn build_key_update_notify() -> Self {
+         Self {
+             version: ProtocolVersion::TLSv1_3,
+             payload: MessagePayload::handshake(HandshakeMessagePayload(
+@@ -136,7 +186,7 @@ impl Message<'_> {
+         }
+     }
+ 
+-    pub fn build_key_update_request() -> Self {
++    pub(crate) fn build_key_update_request() -> Self {
+         Self {
+             version: ProtocolVersion::TLSv1_3,
+             payload: MessagePayload::handshake(HandshakeMessagePayload(
+@@ -228,7 +278,7 @@ pub(crate) fn read_opaque_message_header(
+ 
+ #[non_exhaustive]
+ #[derive(Debug)]
+-pub enum MessagePayload<'a> {
++pub(crate) enum MessagePayload<'a> {
+     Alert(AlertMessagePayload),
+     // one handshake message, parsed
+     Handshake {
+@@ -327,7 +377,7 @@ impl From<Message<'_>> for EncodedMessage<Payload<'_>> {
+ }
+ 
+ #[derive(Debug)]
+-pub struct HandshakeMessagePayload<'a>(pub(crate) HandshakePayload<'a>);
++pub(crate) struct HandshakeMessagePayload<'a>(pub(crate) HandshakePayload<'a>);
+ 
+ impl<'a> Codec<'a> for HandshakeMessagePayload<'a> {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+@@ -615,7 +665,7 @@ impl HandshakePayload<'_> {
+ }
+ 
+ #[derive(Debug)]
+-pub struct AlertMessagePayload {
++pub(crate) struct AlertMessagePayload {
+     pub level: AlertLevel,
+     pub description: AlertDescription,
+ }
+@@ -635,7 +685,7 @@ impl Codec<'_> for AlertMessagePayload {
+ }
+ 
+ #[derive(Debug)]
+-pub struct ChangeCipherSpecPayload;
++pub(crate) struct ChangeCipherSpecPayload;
+ 
+ impl Codec<'_> for ChangeCipherSpecPayload {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+diff --git a/rustls/src/msgs/persist.rs b/rustls/src/msgs/persist.rs
+index 48f74979..6bb6ff17 100644
+--- a/rustls/src/msgs/persist.rs
++++ b/rustls/src/msgs/persist.rs
+@@ -108,7 +108,7 @@ static MAX_FRESHNESS_SKEW_MS: u32 = 60 * 1000;
+ // --- Server types ---
+ #[non_exhaustive]
+ #[derive(Debug)]
+-pub enum ServerSessionValue {
++pub(crate) enum ServerSessionValue {
+     Tls12(Tls12ServerSessionValue),
+     Tls13(Tls13ServerSessionValue),
+ }
+@@ -137,7 +137,7 @@ impl Codec<'_> for ServerSessionValue {
+ }
+ 
+ #[derive(Debug)]
+-pub struct Tls12ServerSessionValue {
++pub(crate) struct Tls12ServerSessionValue {
+     pub(crate) common: CommonServerSessionValue,
+     pub(crate) master_secret: Zeroizing<[u8; 48]>,
+     pub(crate) extended_ms: bool,
+@@ -188,7 +188,7 @@ impl From<Tls12ServerSessionValue> for ServerSessionValue {
+ }
+ 
+ #[derive(Debug)]
+-pub struct Tls13ServerSessionValue {
++pub(crate) struct Tls13ServerSessionValue {
+     pub(crate) common: CommonServerSessionValue,
+     pub(crate) secret: Zeroizing<SizedPayload<'static, u8>>,
+     pub(crate) age_obfuscation_offset: u32,

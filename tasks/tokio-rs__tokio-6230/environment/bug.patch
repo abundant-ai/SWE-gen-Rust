@@ -1,0 +1,193 @@
+diff --git a/README.md b/README.md
+index 00979b4d..a9e34875 100644
+--- a/README.md
++++ b/README.md
+@@ -56,7 +56,7 @@ Make sure you activated the full features of the tokio crate on Cargo.toml:
+ 
+ ```toml
+ [dependencies]
+-tokio = { version = "1.35.1", features = ["full"] }
++tokio = { version = "1.35.0", features = ["full"] }
+ ```
+ Then, on your main.rs:
+ 
+diff --git a/tokio/CHANGELOG.md b/tokio/CHANGELOG.md
+index ad9a74b0..7a0ccde4 100644
+--- a/tokio/CHANGELOG.md
++++ b/tokio/CHANGELOG.md
+@@ -1,13 +1,3 @@
+-# 1.35.1 (December 19, 2023)
+-
+-This is a forward part of a change that was backported to 1.25.3.
+-
+-### Fixed
+-
+-- io: add budgeting to `tokio::runtime::io::registration::async_io` ([#6221])
+-
+-[#6221]: https://github.com/tokio-rs/tokio/pull/6221
+-
+ # 1.35.0 (December 8th, 2023)
+ 
+ ### Added
+@@ -163,16 +153,6 @@ This is a forward part of a change that was backported to 1.25.3.
+ [#6056]: https://github.com/tokio-rs/tokio/pull/6056
+ [#6058]: https://github.com/tokio-rs/tokio/pull/6058
+ 
+-# 1.32.1 (December 19, 2023)
+-
+-This is a forward part of a change that was backported to 1.25.3.
+-
+-### Fixed
+-
+-- io: add budgeting to `tokio::runtime::io::registration::async_io` ([#6221])
+-
+-[#6221]: https://github.com/tokio-rs/tokio/pull/6221
+-
+ # 1.32.0 (August 16, 2023)
+ 
+ ### Fixed
+@@ -535,13 +515,6 @@ This release bumps the MSRV of Tokio to 1.56. ([#5559])
+ [#5513]: https://github.com/tokio-rs/tokio/pull/5513
+ [#5517]: https://github.com/tokio-rs/tokio/pull/5517
+ 
+-# 1.25.3 (December 17th, 2023)
+-
+-### Fixed
+-- io: add budgeting to `tokio::runtime::io::registration::async_io` ([#6221])
+-
+-[#6221]: https://github.com/tokio-rs/tokio/pull/6221
+-
+ # 1.25.2 (September 22, 2023)
+ 
+ Forward ports 1.20.6 changes.
+diff --git a/tokio/Cargo.toml b/tokio/Cargo.toml
+index 05157cdb..17d5673a 100644
+--- a/tokio/Cargo.toml
++++ b/tokio/Cargo.toml
+@@ -6,7 +6,7 @@ name = "tokio"
+ #   - README.md
+ # - Update CHANGELOG.md.
+ # - Create "v1.x.y" git tag.
+-version = "1.35.1"
++version = "1.35.0"
+ edition = "2021"
+ rust-version = "1.63"
+ authors = ["Tokio Contributors <team@tokio.rs>"]
+diff --git a/tokio/README.md b/tokio/README.md
+index 00979b4d..a9e34875 100644
+--- a/tokio/README.md
++++ b/tokio/README.md
+@@ -56,7 +56,7 @@ Make sure you activated the full features of the tokio crate on Cargo.toml:
+ 
+ ```toml
+ [dependencies]
+-tokio = { version = "1.35.1", features = ["full"] }
++tokio = { version = "1.35.0", features = ["full"] }
+ ```
+ Then, on your main.rs:
+ 
+diff --git a/tokio/src/runtime/io/registration.rs b/tokio/src/runtime/io/registration.rs
+index dc596108..75958986 100644
+--- a/tokio/src/runtime/io/registration.rs
++++ b/tokio/src/runtime/io/registration.rs
+@@ -219,16 +219,11 @@ impl Registration {
+         loop {
+             let event = self.readiness(interest).await?;
+ 
+-            let coop = crate::future::poll_fn(crate::runtime::coop::poll_proceed).await;
+-
+             match f() {
+                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                     self.clear_readiness(event);
+                 }
+-                x => {
+-                    coop.made_progress();
+-                    return x;
+-                }
++                x => return x,
+             }
+         }
+     }
+diff --git a/tokio/tests/coop_budger.rs b/tokio/tests/coop_budger.rs
+deleted file mode 100644
+index 0c4cc7e6..00000000
+--- a/tokio/tests/coop_budger.rs
++++ /dev/null
+@@ -1,77 +0,0 @@
+-#![warn(rust_2018_idioms)]
+-#![cfg(all(feature = "full", target_os = "linux"))]
+-
+-use std::sync::atomic::{AtomicUsize, Ordering};
+-use std::sync::Arc;
+-use tokio::net::UdpSocket;
+-
+-/// Ensure that UDP sockets have functional budgeting
+-///
+-/// # Design
+-/// Two sockets communicate by spamming packets from one to the other.
+-///
+-/// In Linux, this packet will be slammed through the entire network stack and into the receiver's buffer during the
+-/// send system call because we are using the loopback interface.
+-/// This happens because the softirq chain invoked on send when using the loopback interface covers virtually the
+-/// entirety of the lifecycle of a packet within the kernel network stack.
+-///
+-/// As a result, neither socket will ever encounter an EWOULDBLOCK, and the only way for these to yield during the loop
+-/// is through budgeting.
+-///
+-/// A second task runs in the background and increments a counter before yielding, allowing us to know how many times sockets yielded.
+-/// Since we are both sending and receiving, that should happen once per 64 packets, because budgets are of size 128
+-/// and there are two budget events per packet, a send and a recv.
+-#[tokio::test]
+-async fn coop_budget_udp_send_recv() {
+-    const BUDGET: usize = 128;
+-    const N_ITERATIONS: usize = 1024;
+-
+-    const PACKET: &[u8] = b"Hello, world";
+-    const PACKET_LEN: usize = 12;
+-
+-    assert_eq!(
+-        PACKET_LEN,
+-        PACKET.len(),
+-        "Defect in test, programmer can't do math"
+-    );
+-
+-    // bind each socket to a dynamic port, forcing IPv4 addressing on the localhost interface
+-    let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+-    let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+-
+-    tx.connect(rx.local_addr().unwrap()).await.unwrap();
+-    rx.connect(tx.local_addr().unwrap()).await.unwrap();
+-
+-    let tracker = Arc::new(AtomicUsize::default());
+-
+-    let tracker_clone = Arc::clone(&tracker);
+-
+-    tokio::task::yield_now().await;
+-
+-    tokio::spawn(async move {
+-        loop {
+-            tracker_clone.fetch_add(1, Ordering::SeqCst);
+-
+-            tokio::task::yield_now().await;
+-        }
+-    });
+-
+-    for _ in 0..N_ITERATIONS {
+-        tx.send(PACKET).await.unwrap();
+-
+-        let mut tmp = [0; PACKET_LEN];
+-
+-        // ensure that we aren't somehow accumulating other
+-        assert_eq!(
+-            PACKET_LEN,
+-            rx.recv(&mut tmp).await.unwrap(),
+-            "Defect in test case, received unexpected result from socket"
+-        );
+-        assert_eq!(
+-            PACKET, &tmp,
+-            "Defect in test case, received unexpected result from socket"
+-        );
+-    }
+-
+-    assert_eq!(N_ITERATIONS / (BUDGET / 2), tracker.load(Ordering::SeqCst));
+-}

@@ -1,0 +1,314 @@
+diff --git a/rustls/src/conn/unbuffered.rs b/rustls/src/conn/unbuffered.rs
+index 59c5a51f..e3fe4f6e 100644
+--- a/rustls/src/conn/unbuffered.rs
++++ b/rustls/src/conn/unbuffered.rs
+@@ -19,7 +19,7 @@ impl UnbufferedConnectionCommon<ClientConnectionData> {
+         &'c mut self,
+         incoming_tls: &'i mut [u8],
+     ) -> UnbufferedStatus<'c, 'i, ClientConnectionData> {
+-        self.process_tls_records_common(incoming_tls, |_| false, |_, _| unreachable!())
++        self.process_tls_records_common(incoming_tls, |_| None, |_, _, ()| unreachable!())
+     }
+ }
+ 
+@@ -32,39 +32,36 @@ impl UnbufferedConnectionCommon<ServerConnectionData> {
+     ) -> UnbufferedStatus<'c, 'i, ServerConnectionData> {
+         self.process_tls_records_common(
+             incoming_tls,
+-            |conn| conn.peek_early_data().is_some(),
+-            |conn, incoming_tls| ReadEarlyData::new(conn, incoming_tls).into(),
++            |conn| conn.pop_early_data(),
++            |conn, incoming_tls, chunk| ReadEarlyData::new(conn, incoming_tls, chunk).into(),
+         )
+     }
+ }
+ 
+ impl<Data> UnbufferedConnectionCommon<Data> {
+-    fn process_tls_records_common<'c, 'i>(
++    fn process_tls_records_common<'c, 'i, T>(
+         &'c mut self,
+         incoming_tls: &'i mut [u8],
+-        mut early_data_available: impl FnMut(&mut Self) -> bool,
+-        early_data_state: impl FnOnce(&'c mut Self, &'i mut [u8]) -> ConnectionState<'c, 'i, Data>,
++        mut check: impl FnMut(&mut Self) -> Option<T>,
++        execute: impl FnOnce(&'c mut Self, &'i mut [u8], T) -> ConnectionState<'c, 'i, Data>,
+     ) -> UnbufferedStatus<'c, 'i, Data> {
+         let mut buffer = DeframerSliceBuffer::new(incoming_tls);
+         let mut buffer_progress = self.core.hs_deframer.progress();
+ 
+         let (discard, state) = loop {
+-            if early_data_available(self) {
+-                break (
+-                    buffer.pending_discard(),
+-                    early_data_state(self, incoming_tls),
+-                );
++            if let Some(value) = check(self) {
++                break (buffer.pending_discard(), execute(self, incoming_tls, value));
+             }
+ 
+-            if !self
++            if let Some(chunk) = self
+                 .core
+                 .common_state
+                 .received_plaintext
+-                .is_empty()
++                .pop()
+             {
+                 break (
+                     buffer.pending_discard(),
+-                    ReadTraffic::new(self, incoming_tls).into(),
++                    ReadTraffic::new(self, incoming_tls, chunk).into(),
+                 );
+             }
+ 
+@@ -319,97 +316,101 @@ impl<Data> fmt::Debug for ConnectionState<'_, '_, Data> {
+ 
+ /// Application data is available
+ pub struct ReadTraffic<'c, 'i, Data> {
+-    conn: &'c mut UnbufferedConnectionCommon<Data>,
++    _conn: &'c mut UnbufferedConnectionCommon<Data>,
+     // for forwards compatibility; to support in-place decryption in the future
+     _incoming_tls: &'i mut [u8],
+-
+-    // owner of the latest chunk obtained in `next_record`, as borrowed by
+-    // `AppDataRecord`
+-    chunk: Option<Vec<u8>>,
++    chunk: Vec<u8>,
++    taken: bool,
+ }
+ 
+ impl<'c, 'i, Data> ReadTraffic<'c, 'i, Data> {
+-    fn new(conn: &'c mut UnbufferedConnectionCommon<Data>, _incoming_tls: &'i mut [u8]) -> Self {
++    fn new(
++        _conn: &'c mut UnbufferedConnectionCommon<Data>,
++        _incoming_tls: &'i mut [u8],
++        chunk: Vec<u8>,
++    ) -> Self {
+         Self {
+-            conn,
++            _conn,
+             _incoming_tls,
+-            chunk: None,
++            chunk,
++            taken: false,
+         }
+     }
+ 
+     /// Decrypts and returns the next available app-data record
+     // TODO deprecate in favor of `Iterator` implementation, which requires in-place decryption
+     pub fn next_record(&mut self) -> Option<Result<AppDataRecord<'_>, Error>> {
+-        self.chunk = self
+-            .conn
+-            .core
+-            .common_state
+-            .received_plaintext
+-            .pop();
+-        self.chunk.as_ref().map(|chunk| {
+-            Ok(AppDataRecord {
++        if self.taken {
++            None
++        } else {
++            self.taken = true;
++            Some(Ok(AppDataRecord {
+                 discard: 0,
+-                payload: chunk,
+-            })
+-        })
++                payload: &self.chunk,
++            }))
++        }
+     }
+ 
+     /// Returns the payload size of the next app-data record *without* decrypting it
+     ///
+     /// Returns `None` if there are no more app-data records
+     pub fn peek_len(&self) -> Option<NonZeroUsize> {
+-        self.conn
+-            .core
+-            .common_state
+-            .received_plaintext
+-            .peek()
+-            .and_then(|ch| NonZeroUsize::new(ch.len()))
++        if self.taken {
++            None
++        } else {
++            NonZeroUsize::new(self.chunk.len())
++        }
+     }
+ }
+ 
+ /// Early application-data is available.
+ pub struct ReadEarlyData<'c, 'i, Data> {
+-    conn: &'c mut UnbufferedConnectionCommon<Data>,
+-
++    _conn: &'c mut UnbufferedConnectionCommon<Data>,
+     // for forwards compatibility; to support in-place decryption in the future
+     _incoming_tls: &'i mut [u8],
+-
+-    // owner of the latest chunk obtained in `next_record`, as borrowed by
+-    // `AppDataRecord`
+-    chunk: Option<Vec<u8>>,
++    chunk: Vec<u8>,
++    taken: bool,
+ }
+ 
+-impl<'c, 'i> ReadEarlyData<'c, 'i, ServerConnectionData> {
++impl<'c, 'i, Data> ReadEarlyData<'c, 'i, Data> {
+     fn new(
+-        conn: &'c mut UnbufferedConnectionCommon<ServerConnectionData>,
++        _conn: &'c mut UnbufferedConnectionCommon<Data>,
+         _incoming_tls: &'i mut [u8],
++        chunk: Vec<u8>,
+     ) -> Self {
+         Self {
+-            conn,
++            _conn,
+             _incoming_tls,
+-            chunk: None,
++            chunk,
++            taken: false,
+         }
+     }
++}
+ 
++impl ReadEarlyData<'_, '_, ServerConnectionData> {
+     /// decrypts and returns the next available app-data record
+     // TODO deprecate in favor of `Iterator` implementation, which requires in-place decryption
+     pub fn next_record(&mut self) -> Option<Result<AppDataRecord<'_>, Error>> {
+-        self.chunk = self.conn.pop_early_data();
+-        self.chunk.as_ref().map(|chunk| {
+-            Ok(AppDataRecord {
++        if self.taken {
++            None
++        } else {
++            self.taken = true;
++            Some(Ok(AppDataRecord {
+                 discard: 0,
+-                payload: chunk,
+-            })
+-        })
++                payload: &self.chunk,
++            }))
++        }
+     }
+ 
+     /// returns the payload size of the next app-data record *without* decrypting it
+     ///
+     /// returns `None` if there are no more app-data records
+     pub fn peek_len(&self) -> Option<NonZeroUsize> {
+-        self.conn
+-            .peek_early_data()
+-            .and_then(|ch| NonZeroUsize::new(ch.len()))
++        if self.taken {
++            None
++        } else {
++            NonZeroUsize::new(self.chunk.len())
++        }
+     }
+ }
+ 
+diff --git a/rustls/src/server/server_conn.rs b/rustls/src/server/server_conn.rs
+index 8108701e..0541ee0a 100644
+--- a/rustls/src/server/server_conn.rs
++++ b/rustls/src/server/server_conn.rs
+@@ -918,10 +918,6 @@ impl UnbufferedConnectionCommon<ServerConnectionData> {
+     pub(crate) fn pop_early_data(&mut self) -> Option<Vec<u8>> {
+         self.core.data.early_data.pop()
+     }
+-
+-    pub(crate) fn peek_early_data(&self) -> Option<&[u8]> {
+-        self.core.data.early_data.peek()
+-    }
+ }
+ 
+ /// Represents a `ClientHello` message received through the [`Acceptor`].
+@@ -1062,13 +1058,6 @@ impl EarlyDataState {
+         matches!(self, Self::Rejected)
+     }
+ 
+-    fn peek(&self) -> Option<&[u8]> {
+-        match self {
+-            Self::Accepted { received, .. } => received.peek(),
+-            _ => None,
+-        }
+-    }
+-
+     fn pop(&mut self) -> Option<Vec<u8>> {
+         match self {
+             Self::Accepted { received, .. } => received.pop(),
+diff --git a/rustls/src/vecbuf.rs b/rustls/src/vecbuf.rs
+index ddc150d5..1343db5f 100644
+--- a/rustls/src/vecbuf.rs
++++ b/rustls/src/vecbuf.rs
+@@ -113,13 +113,6 @@ impl ChunkVecBuffer {
+ 
+         Ok(())
+     }
+-
+-    /// Inspect the first chunk from this object.
+-    pub(crate) fn peek(&self) -> Option<&[u8]> {
+-        self.chunks
+-            .front()
+-            .map(|ch| ch.as_slice())
+-    }
+ }
+ 
+ #[cfg(feature = "std")]
+diff --git a/rustls/tests/unbuffered.rs b/rustls/tests/unbuffered.rs
+index 850f149b..4ceb3472 100644
+--- a/rustls/tests/unbuffered.rs
++++ b/rustls/tests/unbuffered.rs
+@@ -919,53 +919,6 @@ fn rejects_junk() {
+     confirm_transmit_tls_data(server.process_tls_records(&mut []));
+ }
+ 
+-#[test]
+-fn read_traffic_not_consumed_too_early() {
+-    let mut outcome = handshake(&rustls::version::TLS13);
+-    let mut client = outcome.client.take().unwrap();
+-    let mut server = outcome.server.take().unwrap();
+-
+-    let mut client_to_server_buf = Buffer::default();
+-    write_traffic(client.process_tls_records(&mut []), |mut wt| {
+-        encrypt(&mut wt, b"hello", &mut client_to_server_buf)
+-    });
+-
+-    // if we just peek, we are presented the same data again
+-    let (_, discard) = read_traffic(
+-        server.process_tls_records(client_to_server_buf.filled()),
+-        |rt| assert_eq!(rt.peek_len(), NonZeroUsize::new(5)),
+-    );
+-    assert!(discard > 0);
+-    client_to_server_buf.discard(discard);
+-
+-    // ditto
+-    let (_, discard) = read_traffic(
+-        server.process_tls_records(client_to_server_buf.filled()),
+-        |rt| assert_eq!(rt.peek_len(), NonZeroUsize::new(5)),
+-    );
+-    assert_eq!(discard, 0);
+-
+-    // now consume
+-    let (data, discard) = read_traffic(
+-        server.process_tls_records(client_to_server_buf.filled()),
+-        |mut rt| {
+-            rt.next_record()
+-                .unwrap()
+-                .unwrap()
+-                .payload
+-                .to_vec()
+-        },
+-    );
+-    assert_eq!(discard, 0);
+-    assert_eq!(data, b"hello");
+-
+-    // server is now idle
+-    write_traffic(
+-        server.process_tls_records(client_to_server_buf.filled()),
+-        |_| (),
+-    );
+-}
+-
+ fn write_traffic<T: SideData, R, F: FnMut(WriteTraffic<T>) -> R>(
+     status: UnbufferedStatus<'_, '_, T>,
+     mut f: F,

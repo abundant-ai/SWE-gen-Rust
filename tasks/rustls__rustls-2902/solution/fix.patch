@@ -1,0 +1,514 @@
+diff --git a/openssl-tests/src/early_exporter.rs b/openssl-tests/src/early_exporter.rs
+index 80f8cc27..c52d595d 100644
+--- a/openssl-tests/src/early_exporter.rs
++++ b/openssl-tests/src/early_exporter.rs
+@@ -9,6 +9,7 @@ use rustls::crypto::Identity;
+ use rustls::pki_types::pem::PemObject;
+ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+ use rustls_aws_lc_rs as provider;
++use rustls_util::complete_io;
+ 
+ use crate::utils::verify_openssl3_available;
+ 
+@@ -67,9 +68,7 @@ fn test_early_exporter() {
+                 .write_all(&message)
+                 .unwrap();
+ 
+-            server
+-                .complete_io(&mut tcp_stream)
+-                .unwrap();
++            complete_io(&mut tcp_stream, &mut server).unwrap();
+ 
+             tcp_stream.flush().unwrap();
+         }
+diff --git a/openssl-tests/src/ffdhe_kx_with_openssl.rs b/openssl-tests/src/ffdhe_kx_with_openssl.rs
+index 8b003b53..95487be5 100644
+--- a/openssl-tests/src/ffdhe_kx_with_openssl.rs
++++ b/openssl-tests/src/ffdhe_kx_with_openssl.rs
+@@ -10,6 +10,7 @@ use rustls::pki_types::pem::PemObject;
+ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+ use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection};
+ use rustls_aws_lc_rs as provider;
++use rustls_util::complete_io;
+ 
+ use crate::ffdhe::{self, FFDHE2048_GROUP};
+ use crate::utils::verify_openssl3_available;
+@@ -41,9 +42,8 @@ fn test_rustls_server_with_ffdhe_kx(provider: CryptoProvider, iters: usize) {
+                 .writer()
+                 .write_all(message.as_bytes())
+                 .unwrap();
+-            server
+-                .complete_io(&mut tcp_stream)
+-                .unwrap();
++
++            complete_io(&mut tcp_stream, &mut server).unwrap();
+             tcp_stream.flush().unwrap();
+         }
+     });
+@@ -140,9 +140,8 @@ fn test_rustls_client_with_ffdhe_kx(iters: usize) {
+             .writer()
+             .write_all(message.as_bytes())
+             .unwrap();
+-        client
+-            .complete_io(&mut tcp_stream)
+-            .unwrap();
++
++        complete_io(&mut tcp_stream, &mut client).unwrap();
+         client.send_close_notify();
+         client
+             .write_tls(&mut tcp_stream)
+diff --git a/openssl-tests/src/raw_key_openssl_interop.rs b/openssl-tests/src/raw_key_openssl_interop.rs
+index 280446e3..eb0f34f9 100644
+--- a/openssl-tests/src/raw_key_openssl_interop.rs
++++ b/openssl-tests/src/raw_key_openssl_interop.rs
+@@ -163,6 +163,7 @@ mod server {
+     };
+     use rustls::{DistinguishedName, ServerConfig, ServerConnection};
+     use rustls_aws_lc_rs as provider;
++    use rustls_util::complete_io;
+ 
+     /// Build a `ServerConfig` with the given server private key and a client public key to trust.
+     pub(super) fn make_config(server_private_key: &str, client_pub_key: &str) -> ServerConfig {
+@@ -207,11 +208,11 @@ mod server {
+         let (mut stream, _) = listener.accept()?;
+ 
+         let mut conn = ServerConnection::new(Arc::new(config)).unwrap();
+-        conn.complete_io(&mut stream)?;
++        complete_io(&mut stream, &mut conn)?;
+ 
+         conn.writer()
+             .write_all(b"Hello from the server")?;
+-        conn.complete_io(&mut stream)?;
++        complete_io(&mut stream, &mut conn)?;
+ 
+         let mut buf = [0; 128];
+ 
+@@ -219,7 +220,7 @@ mod server {
+             match conn.reader().read(&mut buf) {
+                 Ok(len) => {
+                     conn.send_close_notify();
+-                    conn.complete_io(&mut stream)?;
++                    complete_io(&mut stream, &mut conn)?;
+                     return Ok(String::from_utf8_lossy(&buf[..len]).to_string());
+                 }
+                 Err(err) if err.kind() == ErrorKind::WouldBlock => {
+diff --git a/provider-example/examples/server.rs b/provider-example/examples/server.rs
+index a43e71b7..41160a3d 100644
+--- a/provider-example/examples/server.rs
++++ b/provider-example/examples/server.rs
+@@ -5,7 +5,7 @@ use rustls::ServerConfig;
+ use rustls::crypto::Identity;
+ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+ use rustls::server::Acceptor;
+-use rustls_util::KeyLogFile;
++use rustls_util::{KeyLogFile, complete_io};
+ 
+ fn main() {
+     env_logger::init();
+@@ -39,11 +39,11 @@ fn main() {
+                 // Note: do not use `unwrap()` on IO in real programs!
+                 conn.writer().write_all(msg).unwrap();
+                 conn.write_tls(&mut stream).unwrap();
+-                conn.complete_io(&mut stream).unwrap();
++                complete_io(&mut stream, &mut conn).unwrap();
+ 
+                 conn.send_close_notify();
+                 conn.write_tls(&mut stream).unwrap();
+-                conn.complete_io(&mut stream).unwrap();
++                complete_io(&mut stream, &mut conn).unwrap();
+             }
+             Err((err, _)) => {
+                 eprintln!("{err}");
+diff --git a/rustls-util/src/lib.rs b/rustls-util/src/lib.rs
+index 80e33ee7..edd02b04 100644
+--- a/rustls-util/src/lib.rs
++++ b/rustls-util/src/lib.rs
+@@ -1,5 +1,140 @@
++use std::io;
++
+ mod key_log_file;
+ pub use key_log_file::KeyLogFile;
++use rustls::{ConnectionCommon, SideData};
+ 
+ mod stream;
+ pub use crate::stream::{Stream, StreamOwned};
++
++/// This function uses `io` to complete any outstanding IO for
++/// the connection.
++///
++/// This is a convenience function which solely uses other parts
++/// of the public API.
++///
++/// What this means depends on the connection  state:
++///
++/// - If the connection [`is_handshaking()`], then IO is performed until
++///   the handshake is complete.
++/// - Otherwise, if [`wants_write()`] is true, [`write_tls()`] is invoked
++///   until it is all written.
++/// - Otherwise, if [`wants_read()`] is true, [`read_tls()`] is invoked
++///   once.
++///
++/// The return value is the number of bytes read from and written
++/// to `io`, respectively. Once both `read()` and `write()` yield `WouldBlock`,
++/// this function will propagate the error.
++///
++/// Errors from TLS record handling (i.e., from [`process_new_packets()`])
++/// are wrapped in an `io::ErrorKind::InvalidData`-kind error.
++///
++/// [`is_handshaking()`]: rustls::CommonState::is_handshaking
++/// [`wants_read()`]: rustls::CommonState::wants_read
++/// [`wants_write()`]: rustls::CommonState::wants_write
++/// [`write_tls()`]: rustls::ConnectionCommon::write_tls
++/// [`read_tls()`]: rustls::ConnectionCommon::read_tls
++/// [`process_new_packets()`]: rustls::ConnectionCommon::process_new_packets
++pub fn complete_io<S: SideData>(
++    io: &mut (impl io::Read + io::Write),
++    conn: &mut ConnectionCommon<S>,
++) -> Result<(usize, usize), io::Error> {
++    let mut eof = false;
++    let mut wrlen = 0;
++    let mut rdlen = 0;
++    loop {
++        let (mut blocked_write, mut blocked_read) = (None, None);
++        let until_handshaked = conn.is_handshaking();
++
++        if !conn.wants_write() && !conn.wants_read() {
++            // We will make no further progress.
++            return Ok((rdlen, wrlen));
++        }
++
++        while conn.wants_write() {
++            match conn.write_tls(io) {
++                Ok(0) => {
++                    io.flush()?;
++                    return Ok((rdlen, wrlen)); // EOF.
++                }
++                Ok(n) => wrlen += n,
++                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
++                    blocked_write = Some(err);
++                    break;
++                }
++                Err(err) => return Err(err),
++            }
++        }
++        if wrlen > 0 {
++            io.flush()?;
++        }
++
++        if !until_handshaked && wrlen > 0 {
++            return Ok((rdlen, wrlen));
++        }
++
++        // If we want to write, but are WouldBlocked by the underlying IO, *and*
++        // have no desire to read; that is everything.
++        if let (Some(_), false) = (&blocked_write, conn.wants_read()) {
++            return match wrlen {
++                0 => Err(blocked_write.unwrap()),
++                _ => Ok((rdlen, wrlen)),
++            };
++        }
++
++        while !eof && conn.wants_read() {
++            let read_size = match conn.read_tls(io) {
++                Ok(0) => {
++                    eof = true;
++                    Some(0)
++                }
++                Ok(n) => {
++                    rdlen += n;
++                    Some(n)
++                }
++                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
++                    blocked_read = Some(err);
++                    break;
++                }
++                Err(err) if err.kind() == io::ErrorKind::Interrupted => None, // nothing to do
++                Err(err) => return Err(err),
++            };
++            if read_size.is_some() {
++                break;
++            }
++        }
++
++        if let Err(e) = conn.process_new_packets() {
++            // In case we have an alert to send describing this error, try a last-gasp
++            // write -- but don't predate the primary error.
++            let _ignored = conn.write_tls(io);
++            let _ignored = io.flush();
++            return Err(io::Error::new(io::ErrorKind::InvalidData, e));
++        };
++
++        // If we want to read, but are WouldBlocked by the underlying IO, *and*
++        // have no desire to write; that is everything.
++        if let (Some(_), false) = (&blocked_read, conn.wants_write()) {
++            return match rdlen {
++                0 => Err(blocked_read.unwrap()),
++                _ => Ok((rdlen, wrlen)),
++            };
++        }
++
++        // if we're doing IO until handshaked, and we believe we've finished handshaking,
++        // but process_new_packets() has queued TLS data to send, loop around again to write
++        // the queued messages.
++        if until_handshaked && !conn.is_handshaking() && conn.wants_write() {
++            continue;
++        }
++
++        let blocked = blocked_write.zip(blocked_read);
++        match (eof, until_handshaked, conn.is_handshaking(), blocked) {
++            (_, true, false, _) => return Ok((rdlen, wrlen)),
++            (_, _, _, Some((e, _))) if rdlen == 0 && wrlen == 0 => return Err(e),
++            (_, false, _, _) => return Ok((rdlen, wrlen)),
++            (true, true, true, _) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
++            _ => {}
++        }
++    }
++}
+diff --git a/rustls-util/src/stream.rs b/rustls-util/src/stream.rs
+index 3f0f586f..6c56afe4 100644
+--- a/rustls-util/src/stream.rs
++++ b/rustls-util/src/stream.rs
+@@ -3,12 +3,16 @@ use std::io::{BufRead, IoSlice, Read, Result, Write};
+ 
+ use rustls::{ConnectionCommon, SideData};
+ 
++use crate::complete_io;
++
+ /// This type implements `io::Read` and `io::Write`, encapsulating
+ /// a Connection `C` and an underlying transport `T`, such as a socket.
+ ///
+-/// Relies on [`ConnectionCommon::complete_io()`] to perform the necessary I/O.
++/// Relies on [`complete_io()`] to perform the necessary I/O.
+ ///
+ /// This allows you to use a rustls Connection like a normal stream.
++///
++/// [`complete_io()`]: crate::complete_io()
+ #[expect(clippy::exhaustive_structs)]
+ #[derive(Debug)]
+ pub struct Stream<'a, C: 'a + ?Sized, T: 'a + Read + Write + ?Sized> {
+@@ -35,11 +39,11 @@ where
+     /// If we have data to write, write it all.
+     fn complete_prior_io(&mut self) -> Result<()> {
+         if self.conn.is_handshaking() {
+-            self.conn.complete_io(self.sock)?;
++            complete_io(self.sock, self.conn)?;
+         }
+ 
+         if self.conn.wants_write() {
+-            self.conn.complete_io(self.sock)?;
++            complete_io(self.sock, self.conn)?;
+         }
+ 
+         Ok(())
+@@ -53,7 +57,7 @@ where
+         // needed to get more plaintext, which we must do if EOF has not been
+         // hit.
+         while self.conn.wants_read() {
+-            if self.conn.complete_io(self.sock)?.0 == 0 {
++            if complete_io(self.sock, self.conn)?.0 == 0 {
+                 break;
+             }
+         }
+@@ -117,7 +121,7 @@ where
+         // Try to write the underlying transport here, but don't let
+         // any errors mask the fact we've consumed `len` bytes.
+         // Callers will learn of permanent errors on the next call.
+-        let _ = self.conn.complete_io(self.sock);
++        let _ = complete_io(self.sock, self.conn);
+ 
+         Ok(len)
+     }
+@@ -133,7 +137,7 @@ where
+         // Try to write the underlying transport here, but don't let
+         // any errors mask the fact we've consumed `len` bytes.
+         // Callers will learn of permanent errors on the next call.
+-        let _ = self.conn.complete_io(self.sock);
++        let _ = complete_io(self.sock, self.conn);
+ 
+         Ok(len)
+     }
+@@ -143,7 +147,7 @@ where
+ 
+         self.conn.writer().flush()?;
+         if self.conn.wants_write() {
+-            self.conn.complete_io(self.sock)?;
++            complete_io(self.sock, self.conn)?;
+         }
+         Ok(())
+     }
+@@ -152,9 +156,11 @@ where
+ /// This type implements `io::Read` and `io::Write`, encapsulating
+ /// and owning a Connection `C` and an underlying transport `T`, such as a socket.
+ ///
+-/// Relies on [`ConnectionCommon::complete_io()`] to perform the necessary I/O.
++/// Relies on [`complete_io()`] to perform the necessary I/O.
+ ///
+ /// This allows you to use a rustls Connection like a normal stream.
++///
++/// [`complete_io()`]: crate::complete_io()
+ #[expect(clippy::exhaustive_structs)]
+ #[derive(Debug)]
+ pub struct StreamOwned<C: Sized, T: Read + Write + Sized> {
+diff --git a/rustls/src/conn/mod.rs b/rustls/src/conn/mod.rs
+index e1c5b78f..56b11e7e 100644
+--- a/rustls/src/conn/mod.rs
++++ b/rustls/src/conn/mod.rs
+@@ -105,19 +105,6 @@ mod connection {
+             }
+         }
+ 
+-        /// This function uses `io` to complete any outstanding IO for this connection.
+-        ///
+-        /// See [`ConnectionCommon::complete_io()`] for more information.
+-        pub fn complete_io(
+-            &mut self,
+-            io: &mut (impl Read + io::Write),
+-        ) -> Result<(usize, usize), io::Error> {
+-            match self {
+-                Self::Client(conn) => conn.complete_io(io),
+-                Self::Server(conn) => conn.complete_io(io),
+-            }
+-        }
+-
+         /// Extract secrets, so they can be used when configuring kTLS, for example.
+         /// Should be used with care as it exposes secret key material.
+         pub fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
+@@ -640,138 +627,6 @@ impl<Side: SideData> ConnectionCommon<Side> {
+         Writer::new(self)
+     }
+ 
+-    /// This function uses `io` to complete any outstanding IO for
+-    /// this connection.
+-    ///
+-    /// This is a convenience function which solely uses other parts
+-    /// of the public API.
+-    ///
+-    /// What this means depends on the connection  state:
+-    ///
+-    /// - If the connection [`is_handshaking`], then IO is performed until
+-    ///   the handshake is complete.
+-    /// - Otherwise, if [`wants_write`] is true, [`write_tls`] is invoked
+-    ///   until it is all written.
+-    /// - Otherwise, if [`wants_read`] is true, [`read_tls`] is invoked
+-    ///   once.
+-    ///
+-    /// The return value is the number of bytes read from and written
+-    /// to `io`, respectively. Once both `read()` and `write()` yield `WouldBlock`,
+-    /// this function will propagate the error.
+-    ///
+-    /// Errors from TLS record handling (i.e., from [`process_new_packets`])
+-    /// are wrapped in an `io::ErrorKind::InvalidData`-kind error.
+-    ///
+-    /// [`is_handshaking`]: CommonState::is_handshaking
+-    /// [`wants_read`]: CommonState::wants_read
+-    /// [`wants_write`]: CommonState::wants_write
+-    /// [`write_tls`]: ConnectionCommon::write_tls
+-    /// [`read_tls`]: ConnectionCommon::read_tls
+-    /// [`process_new_packets`]: ConnectionCommon::process_new_packets
+-    pub fn complete_io(
+-        &mut self,
+-        io: &mut (impl io::Read + io::Write),
+-    ) -> Result<(usize, usize), io::Error> {
+-        let mut eof = false;
+-        let mut wrlen = 0;
+-        let mut rdlen = 0;
+-        loop {
+-            let (mut blocked_write, mut blocked_read) = (None, None);
+-            let until_handshaked = self.is_handshaking();
+-
+-            if !self.wants_write() && !self.wants_read() {
+-                // We will make no further progress.
+-                return Ok((rdlen, wrlen));
+-            }
+-
+-            while self.wants_write() {
+-                match self.write_tls(io) {
+-                    Ok(0) => {
+-                        io.flush()?;
+-                        return Ok((rdlen, wrlen)); // EOF.
+-                    }
+-                    Ok(n) => wrlen += n,
+-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+-                        blocked_write = Some(err);
+-                        break;
+-                    }
+-                    Err(err) => return Err(err),
+-                }
+-            }
+-            if wrlen > 0 {
+-                io.flush()?;
+-            }
+-
+-            if !until_handshaked && wrlen > 0 {
+-                return Ok((rdlen, wrlen));
+-            }
+-
+-            // If we want to write, but are WouldBlocked by the underlying IO, *and*
+-            // have no desire to read; that is everything.
+-            if let (Some(_), false) = (&blocked_write, self.wants_read()) {
+-                return match wrlen {
+-                    0 => Err(blocked_write.unwrap()),
+-                    _ => Ok((rdlen, wrlen)),
+-                };
+-            }
+-
+-            while !eof && self.wants_read() {
+-                let read_size = match self.read_tls(io) {
+-                    Ok(0) => {
+-                        eof = true;
+-                        Some(0)
+-                    }
+-                    Ok(n) => {
+-                        rdlen += n;
+-                        Some(n)
+-                    }
+-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+-                        blocked_read = Some(err);
+-                        break;
+-                    }
+-                    Err(err) if err.kind() == io::ErrorKind::Interrupted => None, // nothing to do
+-                    Err(err) => return Err(err),
+-                };
+-                if read_size.is_some() {
+-                    break;
+-                }
+-            }
+-
+-            if let Err(e) = self.process_new_packets() {
+-                // In case we have an alert to send describing this error, try a last-gasp
+-                // write -- but don't predate the primary error.
+-                let _ignored = self.write_tls(io);
+-                let _ignored = io.flush();
+-                return Err(io::Error::new(io::ErrorKind::InvalidData, e));
+-            };
+-
+-            // If we want to read, but are WouldBlocked by the underlying IO, *and*
+-            // have no desire to write; that is everything.
+-            if let (Some(_), false) = (&blocked_read, self.wants_write()) {
+-                return match rdlen {
+-                    0 => Err(blocked_read.unwrap()),
+-                    _ => Ok((rdlen, wrlen)),
+-                };
+-            }
+-
+-            // if we're doing IO until handshaked, and we believe we've finished handshaking,
+-            // but process_new_packets() has queued TLS data to send, loop around again to write
+-            // the queued messages.
+-            if until_handshaked && !self.is_handshaking() && self.wants_write() {
+-                continue;
+-            }
+-
+-            let blocked = blocked_write.zip(blocked_read);
+-            match (eof, until_handshaked, self.is_handshaking(), blocked) {
+-                (_, true, false, _) => return Ok((rdlen, wrlen)),
+-                (_, _, _, Some((e, _))) if rdlen == 0 && wrlen == 0 => return Err(e),
+-                (_, false, _, _) => return Ok((rdlen, wrlen)),
+-                (true, true, true, _) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+-                _ => {}
+-            }
+-        }
+-    }
+-
+     /// Extract the first handshake message.
+     ///
+     /// This is a shortcut to the `process_new_packets()` -> `process_msg()` ->

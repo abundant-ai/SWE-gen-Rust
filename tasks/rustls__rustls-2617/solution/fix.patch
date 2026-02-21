@@ -1,0 +1,367 @@
+diff --git a/rustls/src/lib.rs b/rustls/src/lib.rs
+index f8a4d0b8..7eb335a3 100644
+--- a/rustls/src/lib.rs
++++ b/rustls/src/lib.rs
+@@ -615,7 +615,7 @@ pub mod server {
+     pub use handy::ServerSessionMemoryCache;
+     pub use handy::{AlwaysResolvesServerRawPublicKeys, NoServerSessionStorage};
+     pub use server_conn::{
+-        Accepted, ClientHello, ProducesTickets, ResolvesServerCert, ServerConfig,
++        Accepted, ClientHello, InvalidSniPolicy, ProducesTickets, ResolvesServerCert, ServerConfig,
+         ServerConnectionData, StoresServerSessions, UnbufferedServerConnection,
+     };
+     #[cfg(feature = "std")]
+diff --git a/rustls/src/msgs/handshake.rs b/rustls/src/msgs/handshake.rs
+index aaf5948e..9a672bf6 100644
+--- a/rustls/src/msgs/handshake.rs
++++ b/rustls/src/msgs/handshake.rs
+@@ -284,6 +284,16 @@ impl ServerNamePayload<'_> {
+     const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
+         empty_error: InvalidMessage::IllegalEmptyList("ServerNames"),
+     };
++
++    /// Get the `DnsName` out of this `ServerNamePayload` if it contains one.
++    /// The returned `DnsName` will be normalized (converted to lowercase).
++    pub(crate) fn to_dns_name_normalized(&self) -> Option<DnsName<'static>> {
++        match self {
++            Self::SingleDnsName(dns_name) => Some(dns_name.to_lowercase_owned()),
++            Self::IpAddress => None,
++            Self::Invalid => None,
++        }
++    }
+ }
+ 
+ /// Simplified encoding/decoding for a `ServerName` extension payload to/from `DnsName`
+@@ -341,9 +351,7 @@ impl<'a> Codec<'a> for ServerNamePayload<'a> {
+                 }
+ 
+                 HostNamePayload::IpAddress(_invalid) => {
+-                    warn!(
+-                        "Illegal SNI extension: ignoring IP address presented as hostname ({_invalid:?})"
+-                    );
++                    warn!("Illegal SNI extension: IP address presented as hostname ({_invalid:?})");
+                     Some(Self::IpAddress)
+                 }
+ 
+diff --git a/rustls/src/server/builder.rs b/rustls/src/server/builder.rs
+index f56097f7..13ff0fba 100644
+--- a/rustls/src/server/builder.rs
++++ b/rustls/src/server/builder.rs
+@@ -3,6 +3,7 @@ use core::marker::PhantomData;
+ 
+ use pki_types::{CertificateDer, PrivateKeyDer};
+ 
++use super::server_conn::InvalidSniPolicy;
+ use super::{ResolvesServerCert, ServerConfig, handy};
+ use crate::builder::{ConfigBuilder, WantsVerifier};
+ use crate::error::Error;
+@@ -122,6 +123,7 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
+             cert_compressors: compress::default_cert_compressors().to_vec(),
+             cert_compression_cache: Arc::new(compress::CompressionCache::default()),
+             cert_decompressors: compress::default_cert_decompressors().to_vec(),
++            invalid_sni_policy: InvalidSniPolicy::default(),
+         })
+     }
+ }
+diff --git a/rustls/src/server/handy.rs b/rustls/src/server/handy.rs
+index e038e40b..ce6d851a 100644
+--- a/rustls/src/server/handy.rs
++++ b/rustls/src/server/handy.rs
+@@ -260,6 +260,8 @@ mod sni_resolver {
+ 
+     #[cfg(test)]
+     mod tests {
++        use alloc::borrow::Cow;
++
+         use super::*;
+         use crate::server::ResolvesServerCert;
+ 
+@@ -269,7 +271,7 @@ mod sni_resolver {
+             assert!(
+                 rscsni
+                     .resolve(&ClientHello {
+-                        server_name: &None,
++                        server_name: None,
+                         signature_schemes: &[],
+                         alpn: None,
+                         server_cert_types: None,
+@@ -291,7 +293,7 @@ mod sni_resolver {
+             assert!(
+                 rscsni
+                     .resolve(&ClientHello {
+-                        server_name: &Some(name),
++                        server_name: Some(Cow::Borrowed(&name)),
+                         signature_schemes: &[],
+                         alpn: None,
+                         server_cert_types: None,
+diff --git a/rustls/src/server/hs.rs b/rustls/src/server/hs.rs
+index cde4fdd9..e9e5dcb8 100644
+--- a/rustls/src/server/hs.rs
++++ b/rustls/src/server/hs.rs
+@@ -1,4 +1,4 @@
+-use alloc::borrow::ToOwned;
++use alloc::borrow::{Cow, ToOwned};
+ use alloc::boxed::Box;
+ use alloc::vec::Vec;
+ 
+@@ -287,6 +287,15 @@ impl ExpectClientHello {
+             .config
+             .supports_version(ProtocolVersion::TLSv1_2);
+ 
++        cx.data.sni = self
++            .config
++            .invalid_sni_policy
++            .accept(client_hello.server_name.as_ref())
++            .map_err(|e| {
++                cx.common
++                    .send_fatal_alert(AlertDescription::IllegalParameter, e)
++            })?;
++
+         // Are we doing TLS1.3?
+         let version = if let Some(versions) = &client_hello.supported_versions {
+             if versions.tls13 && tls13_enabled {
+@@ -354,7 +363,7 @@ impl ExpectClientHello {
+         // Choose a certificate.
+         let certkey = {
+             let client_hello = ClientHello {
+-                server_name: &cx.data.sni,
++                server_name: cx.data.sni.as_ref().map(Cow::Borrowed),
+                 signature_schemes: &sig_schemes,
+                 alpn: client_hello.protocols.as_ref(),
+                 client_cert_types: client_hello
+@@ -639,8 +648,6 @@ impl State<ServerConnectionData> for ExpectClientHello {
+ /// doesn't depend on a `ServerConfig` being available and extract everything needed to build a
+ /// [`ClientHello`] value for a [`ResolvesServerCert`].
+ ///
+-/// Note that this will modify `data.sni` even if config or certificate resolution fail.
+-///
+ /// [`ResolvesServerCert`]: crate::server::ResolvesServerCert
+ pub(super) fn process_client_hello<'m>(
+     m: &'m Message<'m>,
+@@ -664,40 +671,16 @@ pub(super) fn process_client_hello<'m>(
+     // No handshake messages should follow this one in this flight.
+     cx.common.check_aligned_handshake()?;
+ 
+-    // Extract and validate the SNI DNS name, if any, before giving it to
+-    // the cert resolver. In particular, if it is invalid then we should
+-    // send an Illegal Parameter alert instead of the Internal Error alert
+-    // (or whatever) that we'd send if this were checked later or in a
+-    // different way.
+-    //
+-    // [RFC6066][] specifies that literal IP addresses are illegal in
+-    // `ServerName`s with a `name_type` of `host_name`.
+-    //
+-    // Some clients incorrectly send such extensions: we choose to
+-    // successfully parse these (into `ServerNamePayload::IpAddress`)
+-    // but then act like the client sent no `server_name` extension.
+-    //
+-    // [RFC6066]: https://datatracker.ietf.org/doc/html/rfc6066#section-3
+-    let sni = match &client_hello.server_name {
+-        Some(ServerNamePayload::SingleDnsName(dns_name)) => Some(dns_name.to_lowercase_owned()),
+-        Some(ServerNamePayload::IpAddress) => None,
+-        Some(ServerNamePayload::Invalid) => {
+-            return Err(cx.common.send_fatal_alert(
+-                AlertDescription::IllegalParameter,
+-                PeerMisbehaved::ServerNameMustContainOneHostName,
+-            ));
++    if done_retry {
++        let ch_sni = client_hello
++            .server_name
++            .as_ref()
++            .and_then(ServerNamePayload::to_dns_name_normalized);
++        if cx.data.sni != ch_sni {
++            return Err(PeerMisbehaved::ServerNameDifferedOnRetry.into());
+         }
+-        None => None,
+-    };
+-
+-    // save only the first SNI
+-    if let (Some(sni), false) = (&sni, done_retry) {
+-        // Save the SNI into the session.
+-        // The SNI hostname is immutable once set.
+-        assert!(cx.data.sni.is_none());
+-        cx.data.sni = Some(sni.clone());
+-    } else if cx.data.sni != sni {
+-        return Err(PeerMisbehaved::ServerNameDifferedOnRetry.into());
++    } else {
++        assert!(cx.data.sni.is_none())
+     }
+ 
+     let sig_schemes = client_hello
+diff --git a/rustls/src/server/server_conn.rs b/rustls/src/server/server_conn.rs
+index 1162b179..86413593 100644
+--- a/rustls/src/server/server_conn.rs
++++ b/rustls/src/server/server_conn.rs
+@@ -1,3 +1,4 @@
++use alloc::borrow::Cow;
+ use alloc::boxed::Box;
+ use alloc::vec::Vec;
+ use core::fmt;
+@@ -23,7 +24,9 @@ use crate::error::Error;
+ use crate::kernel::KernelConnection;
+ use crate::log::trace;
+ use crate::msgs::base::Payload;
+-use crate::msgs::handshake::{ClientHelloPayload, ProtocolName, ServerExtensionsInput};
++use crate::msgs::handshake::{
++    ClientHelloPayload, ProtocolName, ServerExtensionsInput, ServerNamePayload,
++};
+ use crate::msgs::message::Message;
+ use crate::suites::ExtractedSecrets;
+ use crate::sync::Arc;
+@@ -31,7 +34,9 @@ use crate::sync::Arc;
+ use crate::time_provider::DefaultTimeProvider;
+ use crate::time_provider::TimeProvider;
+ use crate::vecbuf::ChunkVecBuffer;
+-use crate::{DistinguishedName, KeyLog, NamedGroup, WantsVerifier, compress, sign, verify};
++use crate::{
++    DistinguishedName, KeyLog, NamedGroup, PeerMisbehaved, WantsVerifier, compress, sign, verify,
++};
+ 
+ /// A trait for the ability to store server session data.
+ ///
+@@ -133,7 +138,7 @@ pub trait ResolvesServerCert: Debug + Send + Sync {
+ /// A struct representing the received Client Hello
+ #[derive(Debug)]
+ pub struct ClientHello<'a> {
+-    pub(super) server_name: &'a Option<DnsName<'a>>,
++    pub(super) server_name: Option<Cow<'a, DnsName<'a>>>,
+     pub(super) signature_schemes: &'a [SignatureScheme],
+     pub(super) alpn: Option<&'a Vec<ProtocolName>>,
+     pub(super) server_cert_types: Option<&'a [CertificateType]>,
+@@ -151,7 +156,7 @@ impl<'a> ClientHello<'a> {
+     ///
+     /// Returns `None` if the client did not supply a SNI.
+     pub fn server_name(&self) -> Option<&DnsName<'_>> {
+-        self.server_name.as_ref()
++        self.server_name.as_deref()
+     }
+ 
+     /// Get the compatible signature schemes.
+@@ -435,6 +440,9 @@ pub struct ServerConfig {
+     ///
+     /// [RFC8779]: https://datatracker.ietf.org/doc/rfc8879/
+     pub cert_decompressors: Vec<&'static dyn compress::CertDecompressor>,
++
++    /// Policy for how an invalid Server Name Indication (SNI) value from a client is handled.
++    pub invalid_sni_policy: InvalidSniPolicy,
+ }
+ 
+ impl ServerConfig {
+@@ -533,6 +541,59 @@ impl ServerConfig {
+     }
+ }
+ 
++/// A policy describing how an invalid Server Name Indication (SNI) value from a client is handled by the server.
++///
++/// The only valid form of SNI according to relevant RFCs ([RFC6066], [RFC1035]) is
++/// non-IP-address host name, however some misconfigured clients may send a bare IP address, or
++/// another invalid value. Some servers may wish to ignore these invalid values instead of producing
++/// an error.
++///
++/// By default, Rustls will ignore invalid values that are an IP address (the most common misconfiguration)
++/// and error for all other invalid values.
++///
++/// When an SNI value is ignored, Rustls treats the client as if it sent no SNI at all.
++///
++/// [RFC1035]: https://datatracker.ietf.org/doc/html/rfc1035#section-2.3.1
++/// [RFC6066]: https://datatracker.ietf.org/doc/html/rfc6066#section-3
++#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
++#[non_exhaustive]
++pub enum InvalidSniPolicy {
++    /// Reject all ClientHello messages that contain an invalid SNI value.
++    RejectAll,
++    /// Ignore an invalid SNI value in ClientHello messages if the value is an IP address.
++    ///
++    /// "Ignoring SNI" means accepting the ClientHello message, but acting as if the client sent no SNI.
++    #[default]
++    IgnoreIpAddresses,
++    /// Ignore all invalid SNI in ClientHello messages.
++    ///
++    /// "Ignoring SNI" means accepting the ClientHello message, but acting as if the client sent no SNI.
++    IgnoreAll,
++}
++
++impl InvalidSniPolicy {
++    /// Returns the valid SNI value, or ignores the invalid SNI value if allowed by this policy; otherwise returns
++    /// an error.
++    pub(super) fn accept(
++        &self,
++        payload: Option<&ServerNamePayload<'_>>,
++    ) -> Result<Option<DnsName<'static>>, Error> {
++        let Some(payload) = payload else {
++            return Ok(None);
++        };
++        if let Some(server_name) = payload.to_dns_name_normalized() {
++            return Ok(Some(server_name));
++        }
++        match (self, payload) {
++            (Self::IgnoreAll, _) => Ok(None),
++            (Self::IgnoreIpAddresses, ServerNamePayload::IpAddress) => Ok(None),
++            _ => Err(Error::PeerMisbehaved(
++                PeerMisbehaved::ServerNameMustContainOneHostName,
++            )),
++        }
++    }
++}
++
+ #[cfg(feature = "std")]
+ mod connection {
+     use alloc::boxed::Box;
+@@ -994,8 +1055,13 @@ impl Accepted {
+     /// Get the [`ClientHello`] for this connection.
+     pub fn client_hello(&self) -> ClientHello<'_> {
+         let payload = Self::client_hello_payload(&self.message);
++        let server_name = payload
++            .server_name
++            .as_ref()
++            .and_then(ServerNamePayload::to_dns_name_normalized)
++            .map(Cow::Owned);
+         let ch = ClientHello {
+-            server_name: &self.connection.core.data.sni,
++            server_name,
+             signature_schemes: &self.sig_schemes,
+             alpn: payload.protocols.as_ref(),
+             server_cert_types: payload
+diff --git a/rustls/src/server/test.rs b/rustls/src/server/test.rs
+index c92da0a3..a1217501 100644
+--- a/rustls/src/server/test.rs
++++ b/rustls/src/server/test.rs
+@@ -8,10 +8,10 @@ use crate::msgs::base::PayloadU16;
+ use crate::msgs::enums::{Compression, NamedGroup};
+ use crate::msgs::handshake::{
+     ClientExtensions, ClientHelloPayload, HandshakeMessagePayload, HandshakePayload, KeyShareEntry,
+-    Random, ServerNamePayload, SessionId, SupportedProtocolVersions,
++    Random, SessionId, SupportedProtocolVersions,
+ };
+ use crate::msgs::message::{Message, MessagePayload};
+-use crate::{CommonState, Error, PeerIncompatible, PeerMisbehaved, ProtocolVersion, Side};
++use crate::{CommonState, Error, PeerIncompatible, ProtocolVersion, Side};
+ 
+ #[test]
+ fn null_compression_required() {
+@@ -24,25 +24,6 @@ fn null_compression_required() {
+     );
+ }
+ 
+-#[test]
+-fn server_ignores_sni_with_ip_address() {
+-    let mut ch = minimal_client_hello();
+-    ch.extensions.server_name = Some(ServerNamePayload::IpAddress);
+-    std::println!("{:?}", ch.extensions);
+-    assert_eq!(test_process_client_hello(ch), Ok(()));
+-}
+-
+-#[test]
+-fn server_rejects_sni_with_illegal_dns_name() {
+-    let mut ch = minimal_client_hello();
+-    ch.extensions.server_name = Some(ServerNamePayload::Invalid);
+-    std::println!("{:?}", ch.extensions);
+-    assert_eq!(
+-        test_process_client_hello(ch),
+-        Err(PeerMisbehaved::ServerNameMustContainOneHostName.into())
+-    );
+-}
+-
+ fn test_process_client_hello(hello: ClientHelloPayload) -> Result<(), Error> {
+     let m = Message {
+         version: ProtocolVersion::TLSv1_2,

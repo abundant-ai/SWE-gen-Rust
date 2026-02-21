@@ -1,0 +1,188 @@
+diff --git a/bogo/src/main.rs b/bogo/src/main.rs
+index 850fce86..f72bef10 100644
+--- a/bogo/src/main.rs
++++ b/bogo/src/main.rs
+@@ -466,6 +466,10 @@ impl ServerCertVerifier for DummyServerAuth {
+     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+         self.parent.supported_verify_schemes()
+     }
++
++    fn request_ocsp_response(&self) -> bool {
++        true
++    }
+ }
+ 
+ #[derive(Debug)]
+diff --git a/openssl-tests/src/raw_key_openssl_interop.rs b/openssl-tests/src/raw_key_openssl_interop.rs
+index 78c98d55..78296ec7 100644
+--- a/openssl-tests/src/raw_key_openssl_interop.rs
++++ b/openssl-tests/src/raw_key_openssl_interop.rs
+@@ -143,6 +143,10 @@ mod client {
+             self.supported_algs.supported_schemes()
+         }
+ 
++        fn request_ocsp_response(&self) -> bool {
++            false
++        }
++
+         fn requires_raw_public_keys(&self) -> bool {
+             true
+         }
+diff --git a/rustls-test/src/lib.rs b/rustls-test/src/lib.rs
+index bdfd2433..f36779b5 100644
+--- a/rustls-test/src/lib.rs
++++ b/rustls-test/src/lib.rs
+@@ -1169,6 +1169,10 @@ impl ServerCertVerifier for MockServerVerifier {
+         self.signature_schemes.clone()
+     }
+ 
++    fn request_ocsp_response(&self) -> bool {
++        self.expected_ocsp_response.is_some()
++    }
++
+     fn requires_raw_public_keys(&self) -> bool {
+         self.requires_raw_public_keys
+     }
+diff --git a/rustls/src/client/handy.rs b/rustls/src/client/handy.rs
+index 3ad3073b..5954cfbe 100644
+--- a/rustls/src/client/handy.rs
++++ b/rustls/src/client/handy.rs
+@@ -367,6 +367,11 @@ mod tests {
+         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+             unreachable!()
+         }
++
++        #[cfg_attr(coverage_nightly, coverage(off))]
++        fn request_ocsp_response(&self) -> bool {
++            unreachable!()
++        }
+     }
+ 
+     #[derive(Debug)]
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index 1dc63ddf..acf680cb 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -279,9 +279,14 @@ fn emit_client_hello_for_retry(
+                 .supported_verify_schemes(),
+         ),
+         ClientExtension::ExtendedMasterSecretRequest,
+-        ClientExtension::CertificateStatusRequest(CertificateStatusRequest::build_ocsp()),
+     ];
+ 
++    if config.verifier.request_ocsp_response() {
++        exts.push(ClientExtension::CertificateStatusRequest(
++            CertificateStatusRequest::build_ocsp(),
++        ));
++    }
++
+     if supported_versions.tls13 {
+         if let Some(cas_extension) = config.verifier.root_hint_subjects() {
+             exts.push(ClientExtension::AuthorityNames(cas_extension.to_vec()));
+diff --git a/rustls/src/client/test.rs b/rustls/src/client/test.rs
+index c666bdd5..4b64a1ed 100644
+--- a/rustls/src/client/test.rs
++++ b/rustls/src/client/test.rs
+@@ -329,6 +329,10 @@ mod tests {
+             todo!()
+         }
+ 
++        fn request_ocsp_response(&self) -> bool {
++            false
++        }
++
+         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+             vec![SignatureScheme::ECDSA_SHA1_Legacy]
+         }
+@@ -518,6 +522,10 @@ mod tests {
+         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+             vec![SignatureScheme::RSA_PKCS1_SHA1]
+         }
++
++        fn request_ocsp_response(&self) -> bool {
++            false
++        }
+     }
+ 
+     #[derive(Debug)]
+@@ -560,6 +568,10 @@ mod tests {
+             vec![SignatureScheme::RSA_PKCS1_SHA1]
+         }
+ 
++        fn request_ocsp_response(&self) -> bool {
++            false
++        }
++
+         fn requires_raw_public_keys(&self) -> bool {
+             true
+         }
+diff --git a/rustls/src/verify.rs b/rustls/src/verify.rs
+index e4c14685..9bf4aa41 100644
+--- a/rustls/src/verify.rs
++++ b/rustls/src/verify.rs
+@@ -75,6 +75,9 @@ pub trait ServerCertVerifier: Debug + Send + Sync {
+     /// were sent as part of the server's [Certificate] message. It is in the
+     /// same order that the server sent them and may be empty.
+     ///
++    /// `ocsp_response` is empty if no OCSP response was received, and that also
++    /// covers the case where `request_ocsp_response()` returns false.
++    ///
+     /// Note that none of the certificates have been parsed yet, so it is the responsibility of
+     /// the implementer to handle invalid data. It is recommended that the implementer returns
+     /// [`Error::InvalidCertificate(CertificateError::BadEncoding)`] when these cases are encountered.
+@@ -138,6 +141,12 @@ pub trait ServerCertVerifier: Debug + Send + Sync {
+     /// This should be in priority order, with the most preferred first.
+     fn supported_verify_schemes(&self) -> Vec<SignatureScheme>;
+ 
++    /// Return true if this verifier will process stapled OCSP responses.
++    ///
++    /// This controls whether a client will ask the server for a stapled OCSP response.
++    /// There is no guarantee the server will provide one.
++    fn request_ocsp_response(&self) -> bool;
++
+     /// Returns whether this verifier requires raw public keys as defined
+     /// in [RFC 7250](https://tools.ietf.org/html/rfc7250).
+     fn requires_raw_public_keys(&self) -> bool {
+diff --git a/rustls/src/webpki/server_verifier.rs b/rustls/src/webpki/server_verifier.rs
+index 5aa92350..0fcacedc 100644
+--- a/rustls/src/webpki/server_verifier.rs
++++ b/rustls/src/webpki/server_verifier.rs
+@@ -4,7 +4,6 @@ use pki_types::{CertificateDer, CertificateRevocationListDer, ServerName, UnixTi
+ use webpki::{CertRevocationList, ExpirationPolicy, RevocationCheckDepth, UnknownStatusPolicy};
+ 
+ use crate::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
+-use crate::log::trace;
+ use crate::sync::Arc;
+ use crate::verify::{
+     DigitallySignedStruct, HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+@@ -234,7 +233,7 @@ impl ServerCertVerifier for WebPkiServerVerifier {
+         end_entity: &CertificateDer<'_>,
+         intermediates: &[CertificateDer<'_>],
+         server_name: &ServerName<'_>,
+-        ocsp_response: &[u8],
++        _ocsp_response: &[u8],
+         now: UnixTime,
+     ) -> Result<ServerCertVerified, Error> {
+         let cert = ParsedCertificate::try_from(end_entity)?;
+@@ -269,10 +268,6 @@ impl ServerCertVerifier for WebPkiServerVerifier {
+             self.supported.all,
+         )?;
+ 
+-        if !ocsp_response.is_empty() {
+-            trace!("Unvalidated OCSP response: {:?}", ocsp_response.to_vec());
+-        }
+-
+         verify_server_name(&cert, server_name)?;
+         Ok(ServerCertVerified::assertion())
+     }
+@@ -298,6 +293,10 @@ impl ServerCertVerifier for WebPkiServerVerifier {
+     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+         self.supported.supported_schemes()
+     }
++
++    fn request_ocsp_response(&self) -> bool {
++        false
++    }
+ }
+ 
+ #[cfg(test)]

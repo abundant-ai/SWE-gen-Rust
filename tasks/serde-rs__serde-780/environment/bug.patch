@@ -1,0 +1,227 @@
+diff --git a/serde_codegen_internals/src/attr.rs b/serde_codegen_internals/src/attr.rs
+index ae3af449..de5863fe 100644
+--- a/serde_codegen_internals/src/attr.rs
++++ b/serde_codegen_internals/src/attr.rs
+@@ -90,7 +90,6 @@ impl Name {
+ pub struct Item {
+     name: Name,
+     deny_unknown_fields: bool,
+-    default: bool,
+     ser_bound: Option<Vec<syn::WherePredicate>>,
+     de_bound: Option<Vec<syn::WherePredicate>>,
+     tag: EnumTag,
+@@ -134,7 +133,6 @@ impl Item {
+         let mut ser_name = Attr::none(cx, "rename");
+         let mut de_name = Attr::none(cx, "rename");
+         let mut deny_unknown_fields = BoolAttr::none(cx, "deny_unknown_fields");
+-        let mut default = BoolAttr::none(cx, "default");
+         let mut ser_bound = Attr::none(cx, "bound");
+         let mut de_bound = Attr::none(cx, "bound");
+         let mut untagged = BoolAttr::none(cx, "untagged");
+@@ -165,18 +163,6 @@ impl Item {
+                         deny_unknown_fields.set_true();
+                     }
+ 
+-                    // Parse `#[serde(default)]`
+-                    MetaItem(Word(ref name)) if name == "default" => {
+-                        match item.body {
+-                            syn::Body::Struct(_) => {
+-                                default.set_true();
+-                            }
+-                            _ => {
+-                                cx.error("#[serde(default)] can only be used on structs")
+-                            }
+-                        }
+-                    }
+-
+                     // Parse `#[serde(bound="D: Serialize")]`
+                     MetaItem(NameValue(ref name, ref lit)) if name == "bound" => {
+                         if let Ok(where_predicates) =
+@@ -295,7 +281,6 @@ impl Item {
+                 deserialize: de_name.get().unwrap_or_else(|| item.ident.to_string()),
+             },
+             deny_unknown_fields: deny_unknown_fields.get(),
+-            default: default.get(),
+             ser_bound: ser_bound.get(),
+             de_bound: de_bound.get(),
+             tag: tag,
+@@ -310,10 +295,6 @@ impl Item {
+         self.deny_unknown_fields
+     }
+ 
+-    pub fn default(&self) -> bool {
+-        self.default
+-    }
+-
+     pub fn ser_bound(&self) -> Option<&[syn::WherePredicate]> {
+         self.ser_bound.as_ref().map(|vec| &vec[..])
+     }
+diff --git a/serde_derive/src/de.rs b/serde_derive/src/de.rs
+index 52300140..d3f618f9 100644
+--- a/serde_derive/src/de.rs
++++ b/serde_derive/src/de.rs
+@@ -308,7 +308,7 @@ fn deserialize_seq(type_ident: &syn::Ident,
+     let let_values = vars.clone().zip(fields)
+         .map(|(var, field)| {
+             if field.attrs.skip_deserializing() {
+-                let default = expr_is_missing(&field.attrs, false, "");
++                let default = expr_is_missing(&field.attrs);
+                 quote! {
+                     let #var = #default;
+                 }
+@@ -1101,11 +1101,7 @@ fn deserialize_map(type_ident: &syn::Ident,
+     let extract_values = fields_names.iter()
+         .filter(|&&(field, _)| !field.attrs.skip_deserializing())
+         .map(|&(field, ref name)| {
+-            // Use the ident as field name, since the user can rename the field
+-            // in the attributes using `#[serde(rename = "name")]`, but we need
+-            // the original (in code) name of the field.
+-            let ident = field.ident.clone().expect("struct contains unnamed fields");
+-            let missing_expr = expr_is_missing(&field.attrs, item_attrs.default(), ident.as_ref());
++            let missing_expr = expr_is_missing(&field.attrs);
+ 
+             quote! {
+                 let #name = match #name {
+@@ -1119,30 +1115,18 @@ fn deserialize_map(type_ident: &syn::Ident,
+         .map(|&(field, ref name)| {
+             let ident = field.ident.clone().expect("struct contains unnamed fields");
+             let value = if field.attrs.skip_deserializing() {
+-                expr_is_missing(&field.attrs, item_attrs.default(), ident.as_ref())
++                expr_is_missing(&field.attrs)
+             } else {
+                 quote!(#name)
+             };
+             quote!(#ident: #value)
+         });
+ 
+-    let default = if item_attrs.default() {
+-        quote!(
+-            let default: #struct_path = _serde::export::Default::default();
+-        )
+-    } else {
+-        // We don't need the default value, to prevent an unused variable warning
+-        // we'll leave the line empty.
+-        quote!()
+-    };
+-
+     quote! {
+         #(#let_values)*
+ 
+         #match_keys
+ 
+-        #default
+-
+         #(#extract_values)*
+ 
+         _serde::export::Ok(#struct_path { #(#result),* })
+@@ -1200,7 +1184,7 @@ fn wrap_deserialize_with(type_ident: &syn::Ident,
+      wrapper_ty)
+ }
+ 
+-fn expr_is_missing(attrs: &attr::Field, use_default: bool, field_name: &str) -> Tokens {
++fn expr_is_missing(attrs: &attr::Field) -> Tokens {
+     match *attrs.default() {
+         attr::FieldDefault::Default => {
+             return quote!(_serde::export::Default::default());
+@@ -1211,14 +1195,6 @@ fn expr_is_missing(attrs: &attr::Field, use_default: bool, field_name: &str) ->
+         attr::FieldDefault::None => { /* below */ }
+     }
+ 
+-    if use_default {
+-        // Field name without the qoutes.
+-        let field_name = quote::Ident::new(field_name);
+-        return quote!(
+-            default.#field_name
+-        )
+-    }
+-
+     let name = attrs.name().deserialize_name();
+     match attrs.deserialize_with() {
+         None => {
+diff --git a/test_suite/tests/compile-fail/default-attribute/enum.rs b/test_suite/tests/compile-fail/default-attribute/enum.rs
+deleted file mode 100644
+index 74c5d7ca..00000000
+--- a/test_suite/tests/compile-fail/default-attribute/enum.rs
++++ /dev/null
+@@ -1,8 +0,0 @@
+-#[macro_use]
+-extern crate serde_derive;
+-
+-#[derive(Deserialize)] //~ ERROR: proc-macro derive panicked
+-#[serde(default)] //~^ HELP: #[serde(default)] can only be used on structs
+-enum E {
+-    S { f: u8 },
+-}
+diff --git a/test_suite/tests/compile-fail/default-attribute/nameless_struct_fields.rs b/test_suite/tests/compile-fail/default-attribute/nameless_struct_fields.rs
+deleted file mode 100644
+index 2e8bccc6..00000000
+--- a/test_suite/tests/compile-fail/default-attribute/nameless_struct_fields.rs
++++ /dev/null
+@@ -1,8 +0,0 @@
+-#[macro_use]
+-extern crate serde_derive;
+-
+-#[derive(Deserialize)] //~ ERROR: proc-macro derive panicked
+-#[serde(default)] //~^ HELP: #[serde(default)] can only be used on structs
+-struct T(u8, u8);
+-
+-fn main() { }
+diff --git a/test_suite/tests/test_de.rs b/test_suite/tests/test_de.rs
+index d742d684..6ae92129 100644
+--- a/test_suite/tests/test_de.rs
++++ b/test_suite/tests/test_de.rs
+@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+ use std::net;
+ use std::path::PathBuf;
+ use std::time::Duration;
+-use std::default::Default;
+ 
+ use serde::Deserialize;
+ 
+@@ -41,22 +40,6 @@ struct StructDenyUnknown {
+     b: i32,
+ }
+ 
+-#[derive(PartialEq, Debug, Deserialize)]
+-#[serde(default)]
+-struct StructDefault {
+-    a: i32,
+-    b: String,
+-}
+-
+-impl Default for StructDefault {
+-    fn default() -> StructDefault {
+-        StructDefault{
+-            a: 100,
+-            b: "default".to_string(),
+-        }
+-    }
+-}
+-
+ #[derive(PartialEq, Debug, Deserialize)]
+ struct StructSkipAll {
+     #[serde(skip_deserializing)]
+@@ -745,23 +728,6 @@ declare_tests! {
+             Token::StructEnd,
+         ],
+     }
+-    test_struct_default {
+-        StructDefault{ a: 50, b: "overwritten".to_string() } => &[
+-            Token::StructStart("StructDefault", 1),
+-                Token::StructSep,
+-                Token::Str("a"),
+-                Token::I32(50),
+-
+-                Token::StructSep,
+-                Token::Str("b"),
+-                Token::String("overwritten".to_string()),
+-            Token::StructEnd,
+-        ],
+-        StructDefault{ a: 100, b: "default".to_string() } => &[
+-            Token::StructStart("StructDefault", 0),
+-            Token::StructEnd,
+-        ],
+-    }
+     test_enum_unit {
+         Enum::Unit => &[
+             Token::EnumUnit("Enum", "Unit"),

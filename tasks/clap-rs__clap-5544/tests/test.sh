@@ -17,8 +17,12 @@ cp "/tests/clap_complete/tests/snapshots/home/static/exhaustive/zsh/zsh/_exhaust
 mkdir -p "clap_complete/tests/testsuite"
 cp "/tests/clap_complete/tests/testsuite/elvish.rs" "clap_complete/tests/testsuite/elvish.rs"
 
-# Run specific dynamic test that is removed by bug.patch
-cargo test -p clap_complete --test testsuite 'elvish::register_dynamic' -- --nocapture
+# Clean and rebuild tests to pick up the restored elvish.rs test file
+# Enable unstable-dynamic feature to include dynamic completion tests
+# In BASE state (NOP), tests will fail because dynamic Elvish implementation is missing
+# In HEAD state (Oracle), tests will pass because fix.patch restores dynamic Elvish
+cargo clean -p clap_complete
+cargo test -p clap_complete --test testsuite --features unstable-dynamic 'elvish::' --no-fail-fast -- --nocapture
 test_status=$?
 
 if [ $test_status -eq 0 ]; then

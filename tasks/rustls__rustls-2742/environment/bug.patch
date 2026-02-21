@@ -1,0 +1,290 @@
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 95382c4a..e82e3a4e 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -1035,7 +1035,7 @@ impl State<ClientConnectionData> for ExpectCompressedCertificate {
+ 
+         let mut decompress_buffer = vec![0u8; compressed_cert.uncompressed_len as usize];
+         if let Err(compress::DecompressionFailed) =
+-            decompressor.decompress(compressed_cert.compressed.as_ref(), &mut decompress_buffer)
++            decompressor.decompress(compressed_cert.compressed.0.bytes(), &mut decompress_buffer)
+         {
+             return Err(cx.common.send_fatal_alert(
+                 AlertDescription::BadCertificate,
+@@ -1057,7 +1057,8 @@ impl State<ClientConnectionData> for ExpectCompressedCertificate {
+             compressed_cert.alg,
+             compressed_cert
+                 .compressed
+-                .as_ref()
++                .0
++                .bytes()
+                 .len(),
+             compressed_cert.uncompressed_len,
+         );
+diff --git a/rustls/src/compress.rs b/rustls/src/compress.rs
+index 99a02204..2bcb0627 100644
+--- a/rustls/src/compress.rs
++++ b/rustls/src/compress.rs
+@@ -377,7 +377,7 @@ impl CompressionCache {
+             compressed: CompressedCertificatePayload {
+                 alg: algorithm,
+                 uncompressed_len,
+-                compressed: PayloadU24::from(Payload::new(compressed)),
++                compressed: PayloadU24(Payload::new(compressed)),
+             },
+         });
+ 
+@@ -410,7 +410,7 @@ impl CompressionCache {
+             compressed: CompressedCertificatePayload {
+                 alg: algorithm,
+                 uncompressed_len,
+-                compressed: PayloadU24::from(Payload::new(compressed)),
++                compressed: PayloadU24(Payload::new(compressed)),
+             },
+         }))
+     }
+diff --git a/rustls/src/msgs/base.rs b/rustls/src/msgs/base.rs
+index 5f52343b..475d0a3a 100644
+--- a/rustls/src/msgs/base.rs
++++ b/rustls/src/msgs/base.rs
+@@ -105,50 +105,29 @@ impl<'a> Codec<'a> for SubjectPublicKeyInfoDer<'a> {
+ 
+ /// An arbitrary, unknown-content, u24-length-prefixed payload
+ #[derive(Clone, Eq, PartialEq)]
+-pub(crate) struct PayloadU24<'a, C: Cardinality = MaybeEmpty>(Payload<'a>, PhantomData<C>);
++pub(crate) struct PayloadU24<'a>(pub(crate) Payload<'a>);
+ 
+-impl<C: Cardinality> PayloadU24<'_, C> {
+-    pub(crate) fn into_owned(self) -> PayloadU24<'static, C> {
+-        PayloadU24(self.0.into_owned(), PhantomData)
+-    }
+-
+-    pub(crate) fn into_vec(self) -> Vec<u8> {
+-        self.0.into_owned().into_vec()
++impl PayloadU24<'_> {
++    pub(crate) fn into_owned(self) -> PayloadU24<'static> {
++        PayloadU24(self.0.into_owned())
+     }
+ }
+ 
+-impl<'a, C: Cardinality> Codec<'a> for PayloadU24<'a, C> {
++impl<'a> Codec<'a> for PayloadU24<'a> {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+         let inner = self.0.bytes();
+-        debug_assert!(inner.len() >= C::MIN);
+         codec::u24(inner.len() as u32).encode(bytes);
+         bytes.extend_from_slice(inner);
+     }
+ 
+     fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+         let len = codec::u24::read(r)?.0 as usize;
+-        if len < C::MIN {
+-            return Err(InvalidMessage::IllegalEmptyList("PayloadU24"));
+-        }
+         let mut sub = r.sub(len)?;
+-        Ok(Self(Payload::read(&mut sub), PhantomData))
+-    }
+-}
+-
+-impl<'a, C: Cardinality> From<Payload<'a>> for PayloadU24<'a, C> {
+-    fn from(value: Payload<'a>) -> Self {
+-        debug_assert!(value.bytes().len() >= C::MIN);
+-        Self(value, PhantomData)
+-    }
+-}
+-
+-impl<C: Cardinality> AsRef<[u8]> for PayloadU24<'_, C> {
+-    fn as_ref(&self) -> &[u8] {
+-        self.0.bytes()
++        Ok(Self(Payload::read(&mut sub)))
+     }
+ }
+ 
+-impl<C: Cardinality> fmt::Debug for PayloadU24<'_, C> {
++impl fmt::Debug for PayloadU24<'_> {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         self.0.fmt(f)
+     }
+diff --git a/rustls/src/msgs/handshake.rs b/rustls/src/msgs/handshake.rs
+index 270c50d2..1212583b 100644
+--- a/rustls/src/msgs/handshake.rs
++++ b/rustls/src/msgs/handshake.rs
+@@ -1754,11 +1754,6 @@ impl<'a> CertificatePayloadTls13<'a> {
+         certs: impl Iterator<Item = CertificateDer<'a>>,
+         ocsp_response: Option<&'a [u8]>,
+     ) -> Self {
+-        let ocsp_response = match ocsp_response {
+-            Some([]) | None => None,
+-            Some(bytes) => Some(bytes),
+-        };
+-
+         Self {
+             context: PayloadU8::empty(),
+             entries: certs
+@@ -1800,7 +1795,13 @@ impl<'a> CertificatePayloadTls13<'a> {
+             .extensions
+             .status
+             .as_ref()
+-            .map(|status| status.ocsp_response.as_ref().to_vec())
++            .map(|status| {
++                status
++                    .ocsp_response
++                    .0
++                    .clone()
++                    .into_vec()
++            })
+             .unwrap_or_default()
+     }
+ 
+@@ -2403,8 +2404,7 @@ impl Codec<'_> for NewSessionTicketPayloadTls13 {
+ /// Only supports OCSP
+ #[derive(Clone, Debug)]
+ pub(crate) struct CertificateStatus<'a> {
+-    /// `opaque OCSPResponse<1..2^24-1>;`
+-    pub(crate) ocsp_response: PayloadU24<'a, NonEmpty>,
++    pub(crate) ocsp_response: PayloadU24<'a>,
+ }
+ 
+ impl<'a> Codec<'a> for CertificateStatus<'a> {
+@@ -2428,12 +2428,12 @@ impl<'a> Codec<'a> for CertificateStatus<'a> {
+ impl<'a> CertificateStatus<'a> {
+     pub(crate) fn new(ocsp: &'a [u8]) -> Self {
+         CertificateStatus {
+-            ocsp_response: PayloadU24::from(Payload::Borrowed(ocsp)),
++            ocsp_response: PayloadU24(Payload::Borrowed(ocsp)),
+         }
+     }
+ 
+     pub(crate) fn into_inner(self) -> Vec<u8> {
+-        self.ocsp_response.into_vec()
++        self.ocsp_response.0.into_vec()
+     }
+ 
+     pub(crate) fn into_owned(self) -> CertificateStatus<'static> {
+@@ -2449,8 +2449,7 @@ impl<'a> CertificateStatus<'a> {
+ pub(crate) struct CompressedCertificatePayload<'a> {
+     pub(crate) alg: CertificateCompressionAlgorithm,
+     pub(crate) uncompressed_len: u32,
+-    /// `opaque compressed_certificate_message<1..2^24-1>;`
+-    pub(crate) compressed: PayloadU24<'a, NonEmpty>,
++    pub(crate) compressed: PayloadU24<'a>,
+ }
+ 
+ impl<'a> Codec<'a> for CompressedCertificatePayload<'a> {
+@@ -2481,7 +2480,7 @@ impl CompressedCertificatePayload<'_> {
+         CompressedCertificatePayload {
+             alg: self.alg,
+             uncompressed_len: self.uncompressed_len,
+-            compressed: PayloadU24::from(Payload::Borrowed(self.compressed.as_ref())),
++            compressed: PayloadU24(Payload::Borrowed(self.compressed.0.bytes())),
+         }
+     }
+ }
+diff --git a/rustls/src/msgs/handshake_test.rs b/rustls/src/msgs/handshake_test.rs
+index b3525db9..a1d606fe 100644
+--- a/rustls/src/msgs/handshake_test.rs
++++ b/rustls/src/msgs/handshake_test.rs
+@@ -136,7 +136,7 @@ fn refuses_server_ext_with_unparsed_bytes() {
+ #[test]
+ fn refuses_certificate_ext_with_unparsed_bytes() {
+     let bytes = [
+-        0x00u8, 0x0a, 0x00, 0x05, 0x00, 0x06, 0x01, 0x00, 0x00, 0x01, 0xcc, 0x01,
++        0x00u8, 0x09, 0x00, 0x05, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x01,
+     ];
+     assert_eq!(
+         CertificateExtensions::read_bytes(&bytes).unwrap_err(),
+@@ -1060,7 +1060,7 @@ fn sample_certificate_payload_tls13() -> CertificatePayloadTls13<'static> {
+             cert: CertificateDer::from(vec![3, 4, 5]),
+             extensions: CertificateExtensions {
+                 status: Some(CertificateStatus {
+-                    ocsp_response: PayloadU24::from(Payload::new(vec![1, 2, 3])),
++                    ocsp_response: PayloadU24(Payload::new(vec![1, 2, 3])),
+                 }),
+             },
+         }],
+@@ -1071,7 +1071,7 @@ fn sample_compressed_certificate() -> CompressedCertificatePayload<'static> {
+     CompressedCertificatePayload {
+         alg: CertificateCompressionAlgorithm::Brotli,
+         uncompressed_len: 123,
+-        compressed: PayloadU24::from(Payload::new(vec![1, 2, 3])),
++        compressed: PayloadU24(Payload::new(vec![1, 2, 3])),
+     }
+ }
+ 
+@@ -1147,7 +1147,7 @@ fn sample_encrypted_extensions() -> Box<ServerExtensions<'static>> {
+ 
+ fn sample_certificate_status() -> CertificateStatus<'static> {
+     CertificateStatus {
+-        ocsp_response: PayloadU24::from(Payload::new(vec![1, 2, 3])),
++        ocsp_response: PayloadU24(Payload::new(vec![1, 2, 3])),
+     }
+ }
+ 
+diff --git a/rustls/src/msgs/message_test.rs b/rustls/src/msgs/message_test.rs
+index 8125fb61..965a3572 100644
+--- a/rustls/src/msgs/message_test.rs
++++ b/rustls/src/msgs/message_test.rs
+@@ -110,10 +110,7 @@ fn debug_payload() {
+     );
+     assert_eq!(
+         "01020304",
+-        format!(
+-            "{:?}",
+-            PayloadU24::<'static, NonEmpty>::from(Payload::new(vec![1, 2, 3, 4]))
+-        )
++        format!("{:?}", PayloadU24(Payload::new(vec![1, 2, 3, 4])))
+     );
+ }
+ 
+diff --git a/rustls/src/server/hs.rs b/rustls/src/server/hs.rs
+index 766b69a2..6ec4bce9 100644
+--- a/rustls/src/server/hs.rs
++++ b/rustls/src/server/hs.rs
+@@ -133,7 +133,7 @@ impl ExtensionProcessing {
+                 .certificate_status_request
+                 .is_some()
+         {
+-            if let (Some([_, ..]), false) = (ocsp_response, cx.common.is_tls13()) {
++            if ocsp_response.is_some() && !cx.common.is_tls13() {
+                 // Only TLS1.2 sends confirmation in ServerHello
+                 self.extensions
+                     .certificate_status_request_ack = Some(());
+diff --git a/rustls/src/server/tls12.rs b/rustls/src/server/tls12.rs
+index 394aee9f..3b496878 100644
+--- a/rustls/src/server/tls12.rs
++++ b/rustls/src/server/tls12.rs
+@@ -211,9 +211,8 @@ mod client_hello {
+                 st.extra_exts,
+             )?;
+             emit_certificate(&mut flight, &credentials);
+-            match ocsp_response {
+-                None | Some([]) => {}
+-                Some(response) => emit_cert_status(&mut flight, response),
++            if let Some(ocsp_response) = ocsp_response {
++                emit_cert_status(&mut flight, ocsp_response);
+             }
+             let server_kx = emit_server_kx(&mut flight, kx_group, credentials.signer, &randoms)?;
+             let doing_client_auth = emit_certificate_req(&mut flight, &st.config)?;
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index eaf034d1..e1156783 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -962,7 +962,7 @@ impl State<ServerConnectionData> for ExpectCompressedCertificate {
+ 
+         let mut decompress_buffer = vec![0u8; compressed_cert.uncompressed_len as usize];
+         if let Err(compress::DecompressionFailed) =
+-            decompressor.decompress(compressed_cert.compressed.as_ref(), &mut decompress_buffer)
++            decompressor.decompress(compressed_cert.compressed.0.bytes(), &mut decompress_buffer)
+         {
+             return Err(cx.common.send_fatal_alert(
+                 AlertDescription::BadCertificate,
+@@ -984,7 +984,8 @@ impl State<ServerConnectionData> for ExpectCompressedCertificate {
+             compressed_cert.alg,
+             compressed_cert
+                 .compressed
+-                .as_ref()
++                .0
++                .bytes()
+                 .len(),
+             compressed_cert.uncompressed_len,
+         );

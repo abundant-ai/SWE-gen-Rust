@@ -1,0 +1,345 @@
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index 6d2097f4..9c4e3920 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -27,12 +27,12 @@ use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
+ use crate::hash_hs::HandshakeHashBuffer;
+ use crate::log::{debug, trace};
+ use crate::msgs::base::Payload;
+-use crate::msgs::enums::{Compression, ECPointFormat, ExtensionType, PskKeyExchangeMode};
++use crate::msgs::enums::{Compression, ExtensionType};
+ use crate::msgs::handshake::{
+     CertificateStatusRequest, ClientExtensions, ClientExtensionsInput, ClientHelloPayload,
+     ClientSessionTicket, EncryptedClientHello, HandshakeMessagePayload, HandshakePayload,
+-    HelloRetryRequest, KeyShareEntry, ProtocolName, Random, ServerNamePayload, SessionId,
+-    SupportedProtocolVersions, TransportParameters,
++    HelloRetryRequest, KeyShareEntry, ProtocolName, PskKeyExchangeModes, Random, ServerNamePayload,
++    SessionId, SupportedEcPointFormats, SupportedProtocolVersions, TransportParameters,
+ };
+ use crate::msgs::message::{Message, MessagePayload};
+ use crate::msgs::persist;
+@@ -309,7 +309,7 @@ fn emit_client_hello_for_retry(
+         .iter()
+         .any(|skxg| skxg.name().key_exchange_algorithm() == KeyExchangeAlgorithm::ECDHE)
+     {
+-        exts.ec_point_formats = Some(ECPointFormat::SUPPORTED.to_vec());
++        exts.ec_point_formats = Some(SupportedEcPointFormats::default());
+     }
+ 
+     exts.server_name = match (ech_state.as_ref(), config.enable_sni) {
+@@ -365,8 +365,10 @@ fn emit_client_hello_for_retry(
+     if supported_versions.tls13 {
+         // We could support PSK_KE here too. Such connections don't
+         // have forward secrecy, and are similar to TLS1.2 resumption.
+-        let psk_modes = vec![PskKeyExchangeMode::PSK_DHE_KE];
+-        exts.preshared_key_modes = Some(psk_modes);
++        exts.preshared_key_modes = Some(PskKeyExchangeModes {
++            psk: false,
++            psk_dhe: true,
++        });
+     }
+ 
+     input.hello.offered_cert_compression =
+@@ -806,7 +808,7 @@ impl State<ClientConnectionData> for ExpectServerHello {
+         // If ECPointFormats extension is supplied by the server, it must contain
+         // Uncompressed.  But it's allowed to be omitted.
+         if let Some(point_fmts) = &server_hello.ec_point_formats {
+-            if !point_fmts.contains(&ECPointFormat::Uncompressed) {
++            if !point_fmts.uncompressed {
+                 return Err(cx.common.send_fatal_alert(
+                     AlertDescription::HandshakeFailure,
+                     PeerMisbehaved::ServerHelloMustOfferUncompressedEcPoints,
+diff --git a/rustls/src/msgs/codec.rs b/rustls/src/msgs/codec.rs
+index 567fb520..bd62cd3a 100644
+--- a/rustls/src/msgs/codec.rs
++++ b/rustls/src/msgs/codec.rs
+@@ -1,5 +1,6 @@
+ use alloc::vec::Vec;
+ use core::fmt::Debug;
++use core::marker::PhantomData;
+ 
+ use crate::error::InvalidMessage;
+ 
+@@ -225,17 +226,46 @@ impl<'a, T: Codec<'a> + TlsListElement + Debug> Codec<'a> for Vec<T> {
+     }
+ 
+     fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+-        let len = T::SIZE_LEN.read(r)?;
+-        let mut sub = r.sub(len)?;
+         let mut ret = Self::new();
+-        while sub.any_left() {
+-            ret.push(T::read(&mut sub)?);
++        for item in TlsListIter::<T>::new(r)? {
++            ret.push(item?);
+         }
+ 
+         Ok(ret)
+     }
+ }
+ 
++/// An iterator over a vector of `TlsListElements`.
++///
++/// All uses _MUST_ exhaust the iterator, as errors may be delayed
++/// until the last element.
++pub(crate) struct TlsListIter<'a, T: Codec<'a> + TlsListElement + Debug> {
++    sub: Reader<'a>,
++    _t: PhantomData<T>,
++}
++
++impl<'a, T: Codec<'a> + TlsListElement + Debug> TlsListIter<'a, T> {
++    pub(crate) fn new(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
++        let len = T::SIZE_LEN.read(r)?;
++        let sub = r.sub(len)?;
++        Ok(Self {
++            sub,
++            _t: PhantomData,
++        })
++    }
++}
++
++impl<'a, T: Codec<'a> + TlsListElement + Debug> Iterator for TlsListIter<'a, T> {
++    type Item = Result<T, InvalidMessage>;
++
++    fn next(&mut self) -> Option<Self::Item> {
++        match self.sub.any_left() {
++            true => Some(T::read(&mut self.sub)),
++            false => None,
++        }
++    }
++}
++
+ impl Codec<'_> for () {
+     fn encode(&self, _: &mut Vec<u8>) {}
+ 
+diff --git a/rustls/src/msgs/enums.rs b/rustls/src/msgs/enums.rs
+index 0be5c7f6..75b16326 100644
+--- a/rustls/src/msgs/enums.rs
++++ b/rustls/src/msgs/enums.rs
+@@ -253,10 +253,6 @@ enum_builder! {
+     }
+ }
+ 
+-impl ECPointFormat {
+-    pub(crate) const SUPPORTED: [Self; 1] = [Self::Uncompressed];
+-}
+-
+ enum_builder! {
+     /// The `HeartbeatMode` TLS protocol enum.  Values in this enum are taken
+     /// from the various RFCs covering TLS, and are listed by IANA.
+diff --git a/rustls/src/msgs/handshake.rs b/rustls/src/msgs/handshake.rs
+index 5912e589..fd28ba1e 100644
+--- a/rustls/src/msgs/handshake.rs
++++ b/rustls/src/msgs/handshake.rs
+@@ -21,7 +21,9 @@ use crate::error::InvalidMessage;
+ use crate::ffdhe_groups::FfdheGroup;
+ use crate::log::warn;
+ use crate::msgs::base::{MaybeEmpty, NonEmpty, Payload, PayloadU8, PayloadU16, PayloadU24};
+-use crate::msgs::codec::{self, Codec, LengthPrefixedBuffer, ListLength, Reader, TlsListElement};
++use crate::msgs::codec::{
++    self, Codec, LengthPrefixedBuffer, ListLength, Reader, TlsListElement, TlsListIter,
++};
+ use crate::msgs::enums::{
+     CertificateStatusType, ClientCertificateType, Compression, ECCurveType, ECPointFormat,
+     EchVersion, ExtensionType, HpkeAead, HpkeKdf, HpkeKem, KeyUpdateRequest, NamedGroup,
+@@ -207,6 +209,39 @@ impl UnknownExtension {
+     }
+ }
+ 
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct SupportedEcPointFormats {
++    pub(crate) uncompressed: bool,
++}
++
++impl Codec<'_> for SupportedEcPointFormats {
++    fn encode(&self, bytes: &mut Vec<u8>) {
++        let inner = LengthPrefixedBuffer::new(ECPointFormat::SIZE_LEN, bytes);
++
++        if self.uncompressed {
++            ECPointFormat::Uncompressed.encode(inner.buf);
++        }
++    }
++
++    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
++        let mut uncompressed = false;
++
++        for pf in TlsListIter::<ECPointFormat>::new(r)? {
++            if let ECPointFormat::Uncompressed = pf? {
++                uncompressed = true;
++            }
++        }
++
++        Ok(Self { uncompressed })
++    }
++}
++
++impl Default for SupportedEcPointFormats {
++    fn default() -> Self {
++        Self { uncompressed: true }
++    }
++}
++
+ /// RFC8422: `ECPointFormat ec_point_format_list<1..2^8-1>`
+ impl TlsListElement for ECPointFormat {
+     const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
+@@ -608,6 +643,39 @@ impl CertificateStatusRequest {
+ // ---
+ 
+ /// RFC8446: `PskKeyExchangeMode ke_modes<1..255>;`
++#[derive(Clone, Copy, Debug, Default)]
++pub(crate) struct PskKeyExchangeModes {
++    pub(crate) psk_dhe: bool,
++    pub(crate) psk: bool,
++}
++
++impl Codec<'_> for PskKeyExchangeModes {
++    fn encode(&self, bytes: &mut Vec<u8>) {
++        let inner = LengthPrefixedBuffer::new(PskKeyExchangeMode::SIZE_LEN, bytes);
++        if self.psk_dhe {
++            PskKeyExchangeMode::PSK_DHE_KE.encode(inner.buf);
++        }
++        if self.psk {
++            PskKeyExchangeMode::PSK_KE.encode(inner.buf);
++        }
++    }
++
++    fn read(reader: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
++        let mut psk_dhe = false;
++        let mut psk = false;
++
++        for ke in TlsListIter::<PskKeyExchangeMode>::new(reader)? {
++            match ke? {
++                PskKeyExchangeMode::PSK_DHE_KE => psk_dhe = true,
++                PskKeyExchangeMode::PSK_KE => psk = true,
++                _ => continue,
++            };
++        }
++
++        Ok(Self { psk_dhe, psk })
++    }
++}
++
+ impl TlsListElement for PskKeyExchangeMode {
+     const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
+         empty_error: InvalidMessage::IllegalEmptyList("PskKeyExchangeModes"),
+@@ -661,14 +729,11 @@ impl Codec<'_> for SupportedProtocolVersions {
+     }
+ 
+     fn read(reader: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+-        let len = Self::LIST_LENGTH.read(reader)?;
+-        let mut sub = reader.sub(len)?;
+-
+         let mut tls12 = false;
+         let mut tls13 = false;
+ 
+-        while sub.any_left() {
+-            match ProtocolVersion::read(&mut sub)? {
++        for pv in TlsListIter::<ProtocolVersion>::new(reader)? {
++            match pv? {
+                 ProtocolVersion::TLSv1_3 => tls13 = true,
+                 ProtocolVersion::TLSv1_2 => tls12 = true,
+                 _ => continue,
+@@ -785,7 +850,7 @@ extension_struct! {
+ 
+         /// Supported EC point formats (RFC4492)
+         ExtensionType::ECPointFormats =>
+-            pub(crate) ec_point_formats: Option<Vec<ECPointFormat>>,
++            pub(crate) ec_point_formats: Option<SupportedEcPointFormats>,
+ 
+         /// Supported signature schemes (RFC5246/RFC8446)
+         ExtensionType::SignatureAlgorithms =>
+@@ -833,7 +898,7 @@ extension_struct! {
+ 
+         /// Offered preshared key modes (RFC8446)
+         ExtensionType::PSKKeyExchangeModes =>
+-            pub(crate) preshared_key_modes: Option<Vec<PskKeyExchangeMode>>,
++            pub(crate) preshared_key_modes: Option<PskKeyExchangeModes>,
+ 
+         /// Certificate authority names (RFC8446)
+         ExtensionType::CertificateAuthorities =>
+@@ -1070,7 +1135,7 @@ extension_struct! {
+     pub(crate) struct ServerExtensions<'a> {
+         /// Supported EC point formats (RFC4492)
+         ExtensionType::ECPointFormats =>
+-            pub(crate) ec_point_formats: Option<Vec<ECPointFormat>>,
++            pub(crate) ec_point_formats: Option<SupportedEcPointFormats>,
+ 
+         /// Server name indication acknowledgement (RFC6066)
+         ExtensionType::ServerName =>
+diff --git a/rustls/src/server/tls12.rs b/rustls/src/server/tls12.rs
+index 5b50d7d3..d3dfa5c8 100644
+--- a/rustls/src/server/tls12.rs
++++ b/rustls/src/server/tls12.rs
+@@ -40,7 +40,7 @@ mod client_hello {
+     use crate::common_state::KxState;
+     use crate::crypto::SupportedKxGroup;
+     use crate::enums::SignatureScheme;
+-    use crate::msgs::enums::{ClientCertificateType, Compression, ECPointFormat};
++    use crate::msgs::enums::{ClientCertificateType, Compression};
+     use crate::msgs::handshake::{
+         CertificateRequestPayload, CertificateStatus, ClientHelloPayload, ClientSessionTicket,
+         Random, ServerExtensionsInput, ServerHelloPayload, ServerKeyExchange,
+@@ -90,14 +90,13 @@ mod client_hello {
+             // it means that only the uncompressed point format is
+             // supported"
+             // - <https://datatracker.ietf.org/doc/html/rfc8422#section-5.1.2>
+-            let ecpoints_ext = client_hello
++            let supported_ec_point_formats = client_hello
+                 .ec_point_formats
+-                .as_deref()
+-                .unwrap_or(&[ECPointFormat::Uncompressed]);
++                .unwrap_or_default();
+ 
+-            trace!("ecpoints {ecpoints_ext:?}");
++            trace!("ecpoints {supported_ec_point_formats:?}");
+ 
+-            if !ecpoints_ext.contains(&ECPointFormat::Uncompressed) {
++            if !supported_ec_point_formats.uncompressed {
+                 return Err(cx.common.send_fatal_alert(
+                     AlertDescription::IllegalParameter,
+                     PeerIncompatible::UncompressedEcPointsRequired,
+@@ -173,19 +172,6 @@ mod client_hello {
+                 ));
+             }
+ 
+-            let ecpoint = ECPointFormat::SUPPORTED
+-                .iter()
+-                .find(|format| ecpoints_ext.contains(format))
+-                .cloned()
+-                .ok_or_else(|| {
+-                    cx.common.send_fatal_alert(
+-                        AlertDescription::HandshakeFailure,
+-                        PeerIncompatible::NoEcPointFormatsInCommon,
+-                    )
+-                })?;
+-
+-            debug_assert_eq!(ecpoint, ECPointFormat::Uncompressed);
+-
+             let mut ocsp_response = server_key.get_ocsp();
+ 
+             // If we're not offered a ticket or a potential session ID, allocate a session ID.
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index 7782fefb..bc5d5387 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -44,7 +44,7 @@ mod client_hello {
+     use crate::enums::SignatureScheme;
+     use crate::msgs::base::{Payload, PayloadU8};
+     use crate::msgs::ccs::ChangeCipherSpecPayload;
+-    use crate::msgs::enums::{Compression, NamedGroup, PskKeyExchangeMode};
++    use crate::msgs::enums::{Compression, NamedGroup};
+     use crate::msgs::handshake::{
+         CertificatePayloadTls13, CertificateRequestExtensions, CertificateRequestPayloadTls13,
+         ClientHelloPayload, HelloRetryRequest, HelloRetryRequestExtensions, KeyShareEntry, Random,
+@@ -319,10 +319,10 @@ mod client_hello {
+             if !client_hello
+                 .preshared_key_modes
+                 .as_ref()
+-                .map(|offer| offer.contains(&PskKeyExchangeMode::PSK_DHE_KE))
++                .map(|offer| offer.psk_dhe)
+                 .unwrap_or_default()
+             {
+-                debug!("Client unwilling to resume, DHE_KE not offered");
++                debug!("Client unwilling to resume, PSK_DHE_KE not offered");
+                 self.send_tickets = 0;
+                 chosen_psk_index = None;
+                 resumedata = None;

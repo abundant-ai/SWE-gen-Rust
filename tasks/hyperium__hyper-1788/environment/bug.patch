@@ -1,0 +1,319 @@
+diff --git a/src/error.rs b/src/error.rs
+index 24d0d657..5bb75a34 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -5,7 +5,6 @@ use std::io;
+ 
+ use httparse;
+ use http;
+-use h2;
+ 
+ /// Result type often returned from methods that can have hyper `Error`s.
+ pub type Result<T> = ::std::result::Result<T, Error>;
+@@ -138,8 +137,10 @@ impl Error {
+         self.inner.kind == Kind::Connect
+     }
+ 
+-    #[doc(hidden)]
+-    #[cfg_attr(error_source, deprecated(note = "use Error::source instead"))]
++    /// Returns the error's cause.
++    ///
++    /// This is identical to `Error::cause` except that it provides extra
++    /// bounds required to be able to downcast the error.
+     pub fn cause2(&self) -> Option<&(StdError + 'static + Sync + Send)> {
+         self.inner.cause.as_ref().map(|e| &**e)
+     }
+@@ -162,45 +163,6 @@ impl Error {
+         &self.inner.kind
+     }
+ 
+-    #[cfg(not(error_source))]
+-    pub(crate) fn h2_reason(&self) -> h2::Reason {
+-        // Since we don't have access to `Error::source`, we can only
+-        // look so far...
+-        let mut cause = self.cause2();
+-        while let Some(err) = cause {
+-            if let Some(h2_err) = err.downcast_ref::<h2::Error>() {
+-                return h2_err
+-                    .reason()
+-                    .unwrap_or(h2::Reason::INTERNAL_ERROR);
+-            }
+-
+-            cause = err
+-                .downcast_ref::<Error>()
+-                .and_then(Error::cause2);
+-        }
+-
+-        // else
+-        h2::Reason::INTERNAL_ERROR
+-    }
+-
+-    #[cfg(error_source)]
+-    pub(crate) fn h2_reason(&self) -> h2::Reason {
+-        // Find an h2::Reason somewhere in the cause stack, if it exists,
+-        // otherwise assume an INTERNAL_ERROR.
+-        let mut cause = self.source();
+-        while let Some(err) = cause {
+-            if let Some(h2_err) = err.downcast_ref::<h2::Error>() {
+-                return h2_err
+-                    .reason()
+-                    .unwrap_or(h2::Reason::INTERNAL_ERROR);
+-            }
+-            cause = err.source();
+-        }
+-
+-        // else
+-        h2::Reason::INTERNAL_ERROR
+-    }
+-
+     pub(crate) fn new_canceled<E: Into<Cause>>(cause: Option<E>) -> Error {
+         Error::new(Kind::Canceled, cause.map(Into::into))
+     }
+@@ -438,25 +400,4 @@ impl AssertSendSync for Error {}
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::*;
+-
+-    #[test]
+-    fn h2_reason_unknown() {
+-        let closed = Error::new_closed();
+-        assert_eq!(closed.h2_reason(), h2::Reason::INTERNAL_ERROR);
+-    }
+-
+-    #[test]
+-    fn h2_reason_one_level() {
+-        let body_err = Error::new_user_body(h2::Error::from(h2::Reason::ENHANCE_YOUR_CALM));
+-        assert_eq!(body_err.h2_reason(), h2::Reason::ENHANCE_YOUR_CALM);
+-    }
+-
+-    #[test]
+-    fn h2_reason_nested() {
+-        let recvd = Error::new_h2(h2::Error::from(h2::Reason::HTTP_1_1_REQUIRED));
+-        // Suppose a user were proxying the received error
+-        let svc_err = Error::new_user_service(recvd);
+-        assert_eq!(svc_err.h2_reason(), h2::Reason::HTTP_1_1_REQUIRED);
+-    }
+ }
+diff --git a/src/proto/h2/mod.rs b/src/proto/h2/mod.rs
+index ff702561..072799d8 100644
+--- a/src/proto/h2/mod.rs
++++ b/src/proto/h2/mod.rs
+@@ -1,6 +1,6 @@
+ use bytes::Buf;
+ use futures::{Async, Future, Poll};
+-use h2::{SendStream};
++use h2::{Reason, SendStream};
+ use http::header::{
+     HeaderName, CONNECTION, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION, TE, TRAILER,
+     TRANSFER_ENCODING, UPGRADE,
+@@ -91,10 +91,10 @@ where
+         }
+     }
+ 
+-    fn on_user_err(&mut self, err: S::Error) -> ::Error {
++    fn on_err(&mut self, err: S::Error) -> ::Error {
+         let err = ::Error::new_user_body(err);
+-        debug!("send body user stream error: {}", err);
+-        self.body_tx.send_reset(err.h2_reason());
++        trace!("send body user stream error: {}", err);
++        self.body_tx.send_reset(Reason::INTERNAL_ERROR);
+         err
+     }
+ 
+@@ -138,7 +138,7 @@ where
+                     }
+                 }
+ 
+-                match try_ready!(self.stream.poll_data().map_err(|e| self.on_user_err(e))) {
++                match try_ready!(self.stream.poll_data().map_err(|e| self.on_err(e))) {
+                     Some(chunk) => {
+                         let is_eos = self.stream.is_end_stream();
+                         trace!(
+@@ -175,7 +175,7 @@ where
+                     return Err(::Error::new_body_write(::h2::Error::from(reason)));
+                 }
+ 
+-                match try_ready!(self.stream.poll_trailers().map_err(|e| self.on_user_err(e))) {
++                match try_ready!(self.stream.poll_trailers().map_err(|e| self.on_err(e))) {
+                     Some(trailers) => {
+                         self.body_tx
+                             .send_trailers(trailers)
+diff --git a/src/proto/h2/server.rs b/src/proto/h2/server.rs
+index 16b91661..ac170944 100644
+--- a/src/proto/h2/server.rs
++++ b/src/proto/h2/server.rs
+@@ -211,7 +211,7 @@ where
+                         Err(e) => {
+                             let err = ::Error::new_user_service(e);
+                             warn!("http2 service errored: {}", err);
+-                            self.reply.send_reset(err.h2_reason());
++                            self.reply.send_reset(Reason::INTERNAL_ERROR);
+                             return Err(err);
+                         },
+                     };
+@@ -232,7 +232,7 @@ where
+                             match self.reply.send_response(res, $eos) {
+                                 Ok(tx) => tx,
+                                 Err(e) => {
+-                                    debug!("send response error: {}", e);
++                                    trace!("send response error: {}", e);
+                                     self.reply.send_reset(Reason::INTERNAL_ERROR);
+                                     return Err(::Error::new_h2(e));
+                                 }
+diff --git a/tests/server.rs b/tests/server.rs
+index ea8b79b5..923510ee 100644
+--- a/tests/server.rs
++++ b/tests/server.rs
+@@ -1,7 +1,6 @@
+ #![deny(warnings)]
+ extern crate http;
+ extern crate hyper;
+-extern crate h2;
+ #[macro_use]
+ extern crate futures;
+ extern crate futures_timer;
+@@ -1563,73 +1562,6 @@ fn http1_only() {
+     })).unwrap_err();
+ }
+ 
+-#[test]
+-fn http2_service_error_sends_reset_reason() {
+-    use std::error::Error;
+-    let server = serve();
+-    let addr_str = format!("http://{}", server.addr());
+-
+-    server
+-        .reply()
+-        .error(h2::Error::from(h2::Reason::INADEQUATE_SECURITY));
+-
+-    let mut rt = Runtime::new().expect("runtime new");
+-
+-    let err = rt.block_on(hyper::rt::lazy(move || {
+-        let client = Client::builder()
+-            .http2_only(true)
+-            .build_http::<hyper::Body>();
+-        let uri = addr_str.parse().expect("server addr should parse");
+-
+-        client.get(uri)
+-    })).unwrap_err();
+-
+-    let h2_err = err
+-        .source()
+-        .unwrap()
+-        .downcast_ref::<h2::Error>()
+-        .unwrap();
+-
+-    assert_eq!(h2_err.reason(), Some(h2::Reason::INADEQUATE_SECURITY));
+-}
+-
+-#[test]
+-fn http2_body_user_error_sends_reset_reason() {
+-    use std::error::Error;
+-    let server = serve();
+-    let addr_str = format!("http://{}", server.addr());
+-
+-    let b = ::futures::stream::once::<String, h2::Error>(Err(
+-        h2::Error::from(h2::Reason::INADEQUATE_SECURITY)
+-    ));
+-    let b = hyper::Body::wrap_stream(b);
+-
+-    server
+-        .reply()
+-        .body_stream(b);
+-
+-    let mut rt = Runtime::new().expect("runtime new");
+-
+-    let err = rt.block_on(hyper::rt::lazy(move || {
+-        let client = Client::builder()
+-            .http2_only(true)
+-            .build_http::<hyper::Body>();
+-        let uri = addr_str.parse().expect("server addr should parse");
+-
+-        client
+-            .get(uri)
+-            .and_then(|res| res.into_body().concat2())
+-    })).unwrap_err();
+-
+-    let h2_err = err
+-        .source()
+-        .unwrap()
+-        .downcast_ref::<h2::Error>()
+-        .unwrap();
+-
+-    assert_eq!(h2_err.reason(), Some(h2::Reason::INADEQUATE_SECURITY));
+-}
+-
+ // -------------------------------------------------
+ // the Server that is used to run all the tests with
+ // -------------------------------------------------
+@@ -1677,8 +1609,6 @@ impl Serve {
+     }
+ }
+ 
+-type BoxError = Box<::std::error::Error + Send + Sync>;
+-
+ struct ReplyBuilder<'a> {
+     tx: &'a spmc::Sender<Reply>,
+ }
+@@ -1705,13 +1635,10 @@ impl<'a> ReplyBuilder<'a> {
+         self.tx.send(Reply::Body(body.as_ref().to_vec().into())).unwrap();
+     }
+ 
+-    fn body_stream(self, body: Body) {
++    fn body_stream(self, body: Body)
++    {
+         self.tx.send(Reply::Body(body)).unwrap();
+     }
+-
+-    fn error<E: Into<BoxError>>(self, err: E) {
+-        self.tx.send(Reply::Error(err.into())).unwrap();
+-    }
+ }
+ 
+ impl<'a> Drop for ReplyBuilder<'a> {
+@@ -1739,7 +1666,6 @@ enum Reply {
+     Version(hyper::Version),
+     Header(HeaderName, HeaderValue),
+     Body(hyper::Body),
+-    Error(BoxError),
+     End,
+ }
+ 
+@@ -1751,7 +1677,7 @@ enum Msg {
+ }
+ 
+ impl TestService {
+-    fn call(&self, req: Request<Body>) -> Box<Future<Item=Response<Body>, Error=BoxError> + Send> {
++    fn call(&self, req: Request<Body>) -> Box<Future<Item=Response<Body>, Error=hyper::Error> + Send> {
+         let tx1 = self.tx.clone();
+         let tx2 = self.tx.clone();
+         let replies = self.reply.clone();
+@@ -1765,12 +1691,12 @@ impl TestService {
+             };
+             tx2.send(msg).unwrap();
+             Ok(())
+-        }).and_then(move |_| {
++        }).map(move |_| {
+             TestService::build_reply(replies)
+         }))
+     }
+ 
+-    fn build_reply(replies: spmc::Receiver<Reply>) -> Result<Response<Body>, BoxError> {
++    fn build_reply(replies: spmc::Receiver<Reply>) -> Response<Body> {
+         let mut res = Response::new(Body::empty());
+         while let Ok(reply) = replies.try_recv() {
+             match reply {
+@@ -1786,11 +1712,10 @@ impl TestService {
+                 Reply::Body(body) => {
+                     *res.body_mut() = body;
+                 },
+-                Reply::Error(err) => return Err(err),
+                 Reply::End => break,
+             }
+         }
+-        Ok(res)
++        res
+     }
+ }
+ 

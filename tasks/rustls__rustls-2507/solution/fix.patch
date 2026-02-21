@@ -1,0 +1,214 @@
+diff --git a/bogo/src/main.rs b/bogo/src/main.rs
+index 5ad74eb5..7c40b1cf 100644
+--- a/bogo/src/main.rs
++++ b/bogo/src/main.rs
+@@ -339,7 +339,7 @@ fn decode_hex(hex: &str) -> Vec<u8> {
+ #[derive(Debug)]
+ struct DummyClientAuth {
+     mandatory: bool,
+-    root_hint_subjects: Vec<DistinguishedName>,
++    root_hint_subjects: Arc<Vec<DistinguishedName>>,
+     parent: Arc<dyn ClientCertVerifier>,
+ }
+ 
+@@ -347,7 +347,7 @@ impl DummyClientAuth {
+     fn new(
+         trusted_cert_file: &str,
+         mandatory: bool,
+-        root_hint_subjects: Vec<DistinguishedName>,
++        root_hint_subjects: Arc<Vec<DistinguishedName>>,
+     ) -> Self {
+         Self {
+             mandatory,
+@@ -373,8 +373,8 @@ impl ClientCertVerifier for DummyClientAuth {
+         self.mandatory
+     }
+ 
+-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+-        &self.root_hint_subjects
++    fn root_hint_subjects(&self) -> Arc<Vec<DistinguishedName>> {
++        self.root_hint_subjects.clone()
+     }
+ 
+     fn verify_client_cert(
+@@ -625,7 +625,7 @@ fn make_server_cfg(opts: &Options) -> Arc<ServerConfig> {
+             Arc::new(DummyClientAuth::new(
+                 &opts.trusted_cert_file,
+                 opts.require_any_client_cert,
+-                opts.root_hint_subjects.clone(),
++                Arc::new(opts.root_hint_subjects.clone()),
+             ))
+         } else {
+             WebPkiClientVerifier::no_client_auth()
+diff --git a/openssl-tests/src/raw_key_openssl_interop.rs b/openssl-tests/src/raw_key_openssl_interop.rs
+index a6d8b50a..38def3df 100644
+--- a/openssl-tests/src/raw_key_openssl_interop.rs
++++ b/openssl-tests/src/raw_key_openssl_interop.rs
+@@ -257,8 +257,8 @@ mod server {
+     }
+ 
+     impl ClientCertVerifier for SimpleRpkClientCertVerifier {
+-        fn root_hint_subjects(&self) -> &[DistinguishedName] {
+-            &[]
++        fn root_hint_subjects(&self) -> Arc<Vec<DistinguishedName>> {
++            Arc::new(Vec::new())
+         }
+ 
+         fn verify_client_cert(
+diff --git a/rustls-test/src/lib.rs b/rustls-test/src/lib.rs
+index 696e039a..e6ae7455 100644
+--- a/rustls-test/src/lib.rs
++++ b/rustls-test/src/lib.rs
+@@ -1250,7 +1250,7 @@ impl Default for MockServerVerifier {
+ #[derive(Debug)]
+ pub struct MockClientVerifier {
+     pub verified: fn() -> Result<ClientCertVerified, Error>,
+-    pub subjects: Vec<DistinguishedName>,
++    pub subjects: Arc<Vec<DistinguishedName>>,
+     pub mandatory: bool,
+     pub offered_schemes: Option<Vec<SignatureScheme>>,
+     expect_raw_public_keys: bool,
+@@ -1269,7 +1269,7 @@ impl MockClientVerifier {
+                 .build()
+                 .unwrap(),
+             verified,
+-            subjects: get_client_root_store(kt).subjects(),
++            subjects: Arc::new(get_client_root_store(kt).subjects()),
+             mandatory: true,
+             offered_schemes: None,
+             expect_raw_public_keys: false,
+@@ -1283,8 +1283,8 @@ impl ClientCertVerifier for MockClientVerifier {
+         self.mandatory
+     }
+ 
+-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+-        &self.subjects
++    fn root_hint_subjects(&self) -> Arc<Vec<DistinguishedName>> {
++        self.subjects.clone()
+     }
+ 
+     fn verify_client_cert(
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index 1efef9b0..1dc63ddf 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -284,7 +284,7 @@ fn emit_client_hello_for_retry(
+ 
+     if supported_versions.tls13 {
+         if let Some(cas_extension) = config.verifier.root_hint_subjects() {
+-            exts.push(ClientExtension::AuthorityNames(cas_extension.to_owned()));
++            exts.push(ClientExtension::AuthorityNames(cas_extension.to_vec()));
+         }
+     }
+ 
+diff --git a/rustls/src/client/test.rs b/rustls/src/client/test.rs
+index 1f1066d5..10b56454 100644
+--- a/rustls/src/client/test.rs
++++ b/rustls/src/client/test.rs
+@@ -176,7 +176,9 @@ mod tests {
+     #[test]
+     fn cas_extension_in_client_hello_if_server_verifier_requests_it() {
+         let cas_sending_server_verifier =
+-            ServerVerifierWithAuthorityNames(vec![DistinguishedName::from(b"hello".to_vec())]);
++            ServerVerifierWithAuthorityNames(Arc::new(vec![DistinguishedName::from(
++                b"hello".to_vec(),
++            )]));
+ 
+         for (protocol_version, cas_extension_expected) in
+             [(&version::TLS12, false), (&version::TLS13, true)]
+@@ -474,11 +476,11 @@ mod tests {
+     }
+ 
+     #[derive(Clone, Debug)]
+-    struct ServerVerifierWithAuthorityNames(Vec<DistinguishedName>);
++    struct ServerVerifierWithAuthorityNames(Arc<Vec<DistinguishedName>>);
+ 
+     impl ServerCertVerifier for ServerVerifierWithAuthorityNames {
+-        fn root_hint_subjects(&self) -> Option<&[DistinguishedName]> {
+-            Some(self.0.as_slice())
++        fn root_hint_subjects(&self) -> Option<Arc<Vec<DistinguishedName>>> {
++            Some(self.0.clone())
+         }
+ 
+         #[cfg_attr(coverage_nightly, coverage(off))]
+diff --git a/rustls/src/verify.rs b/rustls/src/verify.rs
+index ce07e3a0..271ad9d4 100644
+--- a/rustls/src/verify.rs
++++ b/rustls/src/verify.rs
+@@ -8,6 +8,7 @@ use crate::error::{Error, InvalidMessage};
+ use crate::msgs::base::PayloadU16;
+ use crate::msgs::codec::{Codec, Reader};
+ use crate::msgs::handshake::DistinguishedName;
++use crate::sync::Arc;
+ 
+ // Marker types.  These are used to bind the fact some verification
+ // (certificate chain or handshake signature) has taken place into
+@@ -149,7 +150,7 @@ pub trait ServerCertVerifier: Debug + Send + Sync {
+     /// Note that this is only applicable to TLS 1.3.
+     ///
+     /// [`certificate_authorities`]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.4
+-    fn root_hint_subjects(&self) -> Option<&[DistinguishedName]> {
++    fn root_hint_subjects(&self) -> Option<Arc<Vec<DistinguishedName>>> {
+         None
+     }
+ }
+@@ -199,7 +200,7 @@ pub trait ClientCertVerifier: Debug + Send + Sync {
+     /// [RFC 5280 A.1]: https://www.rfc-editor.org/rfc/rfc5280#appendix-A.1
+     /// [`CertificateRequest`]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.3.2
+     /// [`certificate_authorities`]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.4
+-    fn root_hint_subjects(&self) -> &[DistinguishedName];
++    fn root_hint_subjects(&self) -> Arc<Vec<DistinguishedName>>;
+ 
+     /// Verify the end-entity certificate `end_entity` is valid, acceptable,
+     /// and chains to at least one of the trust anchors trusted by
+@@ -287,7 +288,7 @@ impl ClientCertVerifier for NoClientAuth {
+         false
+     }
+ 
+-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
++    fn root_hint_subjects(&self) -> Arc<Vec<DistinguishedName>> {
+         unimplemented!();
+     }
+ 
+diff --git a/rustls/src/webpki/client_verifier.rs b/rustls/src/webpki/client_verifier.rs
+index 698855df..50377667 100644
+--- a/rustls/src/webpki/client_verifier.rs
++++ b/rustls/src/webpki/client_verifier.rs
+@@ -176,7 +176,7 @@ impl ClientCertVerifierBuilder {
+ 
+         Ok(Arc::new(WebPkiClientVerifier::new(
+             self.roots,
+-            self.root_hint_subjects,
++            Arc::new(self.root_hint_subjects),
+             parse_crls(self.crls)?,
+             self.revocation_check_depth,
+             self.unknown_revocation_policy,
+@@ -251,7 +251,7 @@ impl ClientCertVerifierBuilder {
+ #[derive(Debug)]
+ pub struct WebPkiClientVerifier {
+     roots: Arc<RootCertStore>,
+-    root_hint_subjects: Vec<DistinguishedName>,
++    root_hint_subjects: Arc<Vec<DistinguishedName>>,
+     crls: Vec<CertRevocationList<'static>>,
+     revocation_check_depth: RevocationCheckDepth,
+     unknown_revocation_policy: UnknownStatusPolicy,
+@@ -320,7 +320,7 @@ impl WebPkiClientVerifier {
+     /// * `supported_algs` specifies which signature verification algorithms should be used.
+     pub(crate) fn new(
+         roots: Arc<RootCertStore>,
+-        root_hint_subjects: Vec<DistinguishedName>,
++        root_hint_subjects: Arc<Vec<DistinguishedName>>,
+         crls: Vec<CertRevocationList<'static>>,
+         revocation_check_depth: RevocationCheckDepth,
+         unknown_revocation_policy: UnknownStatusPolicy,
+@@ -353,8 +353,8 @@ impl ClientCertVerifier for WebPkiClientVerifier {
+         }
+     }
+ 
+-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+-        &self.root_hint_subjects
++    fn root_hint_subjects(&self) -> Arc<Vec<DistinguishedName>> {
++        self.root_hint_subjects.clone()
+     }
+ 
+     fn verify_client_cert(

@@ -1,0 +1,338 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 27b49b6c..ac8a7471 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -18,11 +18,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+ - Secondary device attributes escape (`CSI > 0 c`)
+ - Support for colon separated SGR 38/48
+ - New Ctrl+C binding to cancel search and leave vi mode
++- Escapes for double underlines (`CSI 4 : 2 m`) and underline reset (`CSI 4 : 0 m`)
+ 
+ ### Changed
+ 
+ - Cursors are now inverted when their fixed color is similar to the cell's background
+ - Use working directory of active process instead of shell for SpawnNewInstance action
++- Fallback to normal underline for unsupported underline types in `CSI 4 : ? m` escapes
+ 
+ ### Fixed
+ 
+diff --git a/alacritty/src/renderer/rects.rs b/alacritty/src/renderer/rects.rs
+index 5cd856ab..e8bd867f 100644
+--- a/alacritty/src/renderer/rects.rs
++++ b/alacritty/src/renderer/rects.rs
+@@ -2,7 +2,7 @@ use std::collections::HashMap;
+ 
+ use crossfont::Metrics;
+ 
+-use alacritty_terminal::index::{Column, Point};
++use alacritty_terminal::index::{Line, Point};
+ use alacritty_terminal::term::cell::Flags;
+ use alacritty_terminal::term::color::Rgb;
+ use alacritty_terminal::term::{RenderableCell, SizeInfo};
+@@ -35,51 +35,91 @@ impl RenderLine {
+         let mut rects = Vec::new();
+ 
+         let mut start = self.start;
+-        while start.line < self.end.line {
+-            let mut end = start;
+-            end.col = size.cols() - 1;
+-            rects.push(Self::create_rect(metrics, size, flag, start, end, self.color));
++        for line in start.line.0..=self.end.line.0 {
++            let mut end = Point::new(Line(line), self.end.col);
++            if line != self.end.line.0 {
++                end.col = size.cols() - 1;
++            }
+ 
+-            start.col = Column(0);
+-            start.line += 1;
+-        }
++            Self::push_rects(&mut rects, metrics, size, flag, start, end, self.color);
+ 
+-        rects.push(Self::create_rect(metrics, size, flag, start, self.end, self.color));
++            start.col.0 = 0;
++        }
+ 
+         rects
+     }
+ 
+-    fn create_rect(
++    /// Push all rects required to draw the cell's line.
++    fn push_rects(
++        rects: &mut Vec<RenderRect>,
+         metrics: &Metrics,
+         size: &SizeInfo,
+         flag: Flags,
+         start: Point,
+         end: Point,
+         color: Rgb,
+-    ) -> RenderRect {
+-        let start_x = start.col.0 as f32 * size.cell_width;
+-        let end_x = (end.col.0 + 1) as f32 * size.cell_width;
+-        let width = end_x - start_x;
+-
+-        let (position, mut height) = match flag {
++    ) {
++        let (position, thickness) = match flag {
++            Flags::DOUBLE_UNDERLINE => {
++                // Position underlines so each one has 50% of descent available.
++                let top_pos = 0.25 * metrics.descent;
++                let bottom_pos = 0.75 * metrics.descent;
++
++                rects.push(Self::create_rect(
++                    size,
++                    metrics.descent,
++                    start,
++                    end,
++                    top_pos,
++                    metrics.underline_thickness,
++                    color,
++                ));
++
++                (bottom_pos, metrics.underline_thickness)
++            },
+             Flags::UNDERLINE => (metrics.underline_position, metrics.underline_thickness),
+             Flags::STRIKEOUT => (metrics.strikeout_position, metrics.strikeout_thickness),
+             _ => unimplemented!("Invalid flag for cell line drawing specified"),
+         };
+ 
++        rects.push(Self::create_rect(
++            size,
++            metrics.descent,
++            start,
++            end,
++            position,
++            thickness,
++            color,
++        ));
++    }
++
++    /// Create a line's rect at a position relative to the baseline.
++    fn create_rect(
++        size: &SizeInfo,
++        descent: f32,
++        start: Point,
++        end: Point,
++        position: f32,
++        mut thickness: f32,
++        color: Rgb,
++    ) -> RenderRect {
++        let start_x = start.col.0 as f32 * size.cell_width;
++        let end_x = (end.col.0 + 1) as f32 * size.cell_width;
++        let width = end_x - start_x;
++
+         // Make sure lines are always visible.
+-        height = height.max(1.);
++        thickness = thickness.max(1.);
+ 
+         let line_bottom = (start.line.0 as f32 + 1.) * size.cell_height;
+-        let baseline = line_bottom + metrics.descent;
++        let baseline = line_bottom + descent;
+ 
+-        let mut y = (baseline - position - height / 2.).ceil();
+-        let max_y = line_bottom - height;
++        let mut y = (baseline - position - thickness / 2.).ceil();
++        let max_y = line_bottom - thickness;
+         if y > max_y {
+             y = max_y;
+         }
+ 
+-        RenderRect::new(start_x + size.padding_x, y + size.padding_y, width, height, color, 1.)
++        RenderRect::new(start_x + size.padding_x, y + size.padding_y, width, thickness, color, 1.)
+     }
+ }
+ 
+@@ -90,10 +130,12 @@ pub struct RenderLines {
+ }
+ 
+ impl RenderLines {
++    #[inline]
+     pub fn new() -> Self {
+         Self::default()
+     }
+ 
++    #[inline]
+     pub fn rects(&self, metrics: &Metrics, size: &SizeInfo) -> Vec<RenderRect> {
+         self.inner
+             .iter()
+@@ -105,32 +147,38 @@ impl RenderLines {
+     }
+ 
+     /// Update the stored lines with the next cell info.
++    #[inline]
+     pub fn update(&mut self, cell: RenderableCell) {
+-        for flag in &[Flags::UNDERLINE, Flags::STRIKEOUT] {
+-            if !cell.flags.contains(*flag) {
+-                continue;
+-            }
++        self.update_flag(cell, Flags::UNDERLINE);
++        self.update_flag(cell, Flags::DOUBLE_UNDERLINE);
++        self.update_flag(cell, Flags::STRIKEOUT);
++    }
+ 
+-            // Check if there's an active line.
+-            if let Some(line) = self.inner.get_mut(flag).and_then(|lines| lines.last_mut()) {
+-                if cell.fg == line.color
+-                    && cell.column == line.end.col + 1
+-                    && cell.line == line.end.line
+-                {
+-                    // Update the length of the line.
+-                    line.end = cell.into();
+-                    continue;
+-                }
+-            }
++    /// Update the lines for a specific flag.
++    fn update_flag(&mut self, cell: RenderableCell, flag: Flags) {
++        if !cell.flags.contains(flag) {
++            return;
++        }
+ 
+-            // Start new line if there currently is none.
+-            let line = RenderLine { start: cell.into(), end: cell.into(), color: cell.fg };
+-            match self.inner.get_mut(flag) {
+-                Some(lines) => lines.push(line),
+-                None => {
+-                    self.inner.insert(*flag, vec![line]);
+-                },
++        // Check if there's an active line.
++        if let Some(line) = self.inner.get_mut(&flag).and_then(|lines| lines.last_mut()) {
++            if cell.fg == line.color
++                && cell.column == line.end.col + 1
++                && cell.line == line.end.line
++            {
++                // Update the length of the line.
++                line.end = cell.into();
++                return;
+             }
+         }
++
++        // Start new line if there currently is none.
++        let line = RenderLine { start: cell.into(), end: cell.into(), color: cell.fg };
++        match self.inner.get_mut(&flag) {
++            Some(lines) => lines.push(line),
++            None => {
++                self.inner.insert(flag, vec![line]);
++            },
++        }
+     }
+ }
+diff --git a/alacritty_terminal/src/ansi.rs b/alacritty_terminal/src/ansi.rs
+index dd2012de..8f1cf07f 100644
+--- a/alacritty_terminal/src/ansi.rs
++++ b/alacritty_terminal/src/ansi.rs
+@@ -618,6 +618,8 @@ pub enum Attr {
+     Italic,
+     /// Underline text.
+     Underline,
++    /// Underlined twice.
++    DoubleUnderline,
+     /// Blink cursor slowly.
+     BlinkSlow,
+     /// Blink cursor fast.
+@@ -634,7 +636,7 @@ pub enum Attr {
+     CancelBoldDim,
+     /// Cancel italic.
+     CancelItalic,
+-    /// Cancel underline.
++    /// Cancel all underlines.
+     CancelUnderline,
+     /// Cancel blink.
+     CancelBlink,
+@@ -1151,7 +1153,9 @@ fn attrs_from_sgr_parameters(params: &mut ParamsIter) -> Vec<Option<Attr>> {
+             [1] => Some(Attr::Bold),
+             [2] => Some(Attr::Dim),
+             [3] => Some(Attr::Italic),
+-            [4] => Some(Attr::Underline),
++            [4, 0] => Some(Attr::CancelUnderline),
++            [4, 2] => Some(Attr::DoubleUnderline),
++            [4, ..] => Some(Attr::Underline),
+             [5] => Some(Attr::BlinkSlow),
+             [6] => Some(Attr::BlinkFast),
+             [7] => Some(Attr::Reverse),
+diff --git a/alacritty_terminal/src/term/cell.rs b/alacritty_terminal/src/term/cell.rs
+index 3fdd8cea..ee95fcba 100644
+--- a/alacritty_terminal/src/term/cell.rs
++++ b/alacritty_terminal/src/term/cell.rs
+@@ -12,19 +12,20 @@ pub const MAX_ZEROWIDTH_CHARS: usize = 5;
+ bitflags! {
+     #[derive(Serialize, Deserialize)]
+     pub struct Flags: u16 {
+-        const INVERSE                   = 0b000_0000_0001;
+-        const BOLD                      = 0b000_0000_0010;
+-        const ITALIC                    = 0b000_0000_0100;
+-        const BOLD_ITALIC               = 0b000_0000_0110;
+-        const UNDERLINE                 = 0b000_0000_1000;
+-        const WRAPLINE                  = 0b000_0001_0000;
+-        const WIDE_CHAR                 = 0b000_0010_0000;
+-        const WIDE_CHAR_SPACER          = 0b000_0100_0000;
+-        const DIM                       = 0b000_1000_0000;
+-        const DIM_BOLD                  = 0b000_1000_0010;
+-        const HIDDEN                    = 0b001_0000_0000;
+-        const STRIKEOUT                 = 0b010_0000_0000;
+-        const LEADING_WIDE_CHAR_SPACER  = 0b100_0000_0000;
++        const INVERSE                   = 0b0000_0000_0000_0001;
++        const BOLD                      = 0b0000_0000_0000_0010;
++        const ITALIC                    = 0b0000_0000_0000_0100;
++        const BOLD_ITALIC               = 0b0000_0000_0000_0110;
++        const UNDERLINE                 = 0b0000_0000_0000_1000;
++        const WRAPLINE                  = 0b0000_0000_0001_0000;
++        const WIDE_CHAR                 = 0b0000_0000_0010_0000;
++        const WIDE_CHAR_SPACER          = 0b0000_0000_0100_0000;
++        const DIM                       = 0b0000_0000_1000_0000;
++        const DIM_BOLD                  = 0b0000_0000_1000_0010;
++        const HIDDEN                    = 0b0000_0001_0000_0000;
++        const STRIKEOUT                 = 0b0000_0010_0000_0000;
++        const LEADING_WIDE_CHAR_SPACER  = 0b0000_0100_0000_0000;
++        const DOUBLE_UNDERLINE          = 0b0000_1000_0000_0000;
+     }
+ }
+ 
+@@ -58,6 +59,7 @@ impl GridCell for Cell {
+             && !self.flags.intersects(
+                 Flags::INVERSE
+                     | Flags::UNDERLINE
++                    | Flags::DOUBLE_UNDERLINE
+                     | Flags::STRIKEOUT
+                     | Flags::WRAPLINE
+                     | Flags::WIDE_CHAR_SPACER
+diff --git a/alacritty_terminal/src/term/mod.rs b/alacritty_terminal/src/term/mod.rs
+index 7a409e2e..993e6918 100644
+--- a/alacritty_terminal/src/term/mod.rs
++++ b/alacritty_terminal/src/term/mod.rs
+@@ -311,7 +311,7 @@ impl RenderableCell {
+ 
+     fn is_empty(&self) -> bool {
+         self.bg_alpha == 0.
+-            && !self.flags.intersects(Flags::UNDERLINE | Flags::STRIKEOUT)
++            && !self.flags.intersects(Flags::UNDERLINE | Flags::STRIKEOUT | Flags::DOUBLE_UNDERLINE)
+             && self.inner == RenderableCellContent::Chars([' '; cell::MAX_ZEROWIDTH_CHARS + 1])
+     }
+ 
+@@ -2017,8 +2017,17 @@ impl<T: EventListener> Handler for Term<T> {
+             Attr::CancelBoldDim => cursor.template.flags.remove(Flags::BOLD | Flags::DIM),
+             Attr::Italic => cursor.template.flags.insert(Flags::ITALIC),
+             Attr::CancelItalic => cursor.template.flags.remove(Flags::ITALIC),
+-            Attr::Underline => cursor.template.flags.insert(Flags::UNDERLINE),
+-            Attr::CancelUnderline => cursor.template.flags.remove(Flags::UNDERLINE),
++            Attr::Underline => {
++                cursor.template.flags.remove(Flags::DOUBLE_UNDERLINE);
++                cursor.template.flags.insert(Flags::UNDERLINE);
++            },
++            Attr::DoubleUnderline => {
++                cursor.template.flags.remove(Flags::UNDERLINE);
++                cursor.template.flags.insert(Flags::DOUBLE_UNDERLINE);
++            },
++            Attr::CancelUnderline => {
++                cursor.template.flags.remove(Flags::UNDERLINE | Flags::DOUBLE_UNDERLINE);
++            },
+             Attr::Hidden => cursor.template.flags.insert(Flags::HIDDEN),
+             Attr::CancelHidden => cursor.template.flags.remove(Flags::HIDDEN),
+             Attr::Strike => cursor.template.flags.insert(Flags::STRIKEOUT),
+diff --git a/extra/alacritty.info b/extra/alacritty.info
+index efbaed53..256efa9f 100644
+--- a/extra/alacritty.info
++++ b/extra/alacritty.info
+@@ -106,3 +106,4 @@ alacritty+common|base fragment for alacritty,
+     Cr=\E]112\007, Cs=\E]12;%p1%s\007,
+     Ms=\E]52;%p1%s;%p2%s\007, Se=\E[0 q, Ss=\E[%p1%d q,
+     hs, dsl=\E]2;\007, fsl=^G, tsl=\E]2;,
++    Smulx=\E[4\:%p1%dm,

@@ -1,0 +1,195 @@
+diff --git a/tower-buffer/Cargo.toml b/tower-buffer/Cargo.toml
+index c0134eb..e503d88 100644
+--- a/tower-buffer/Cargo.toml
++++ b/tower-buffer/Cargo.toml
+@@ -5,11 +5,11 @@ authors = ["Carl Lerche <me@carllerche.com>"]
+ publish = false
+ 
+ [dependencies]
+-futures = "0.1.25"
++futures = "0.1"
+ tower-service = "0.2.0"
+ tower-layer = { version = "0.1", path = "../tower-layer" }
+-tokio-executor = "0.1.7"
+-tokio-sync = "0.1.0"
++tokio-executor = "0.1"
++tokio-sync = "0.1"
+ 
+ [dev-dependencies]
+ tower-mock = { version = "0.1", path = "../tower-mock" }
+diff --git a/tower-buffer/src/lib.rs b/tower-buffer/src/lib.rs
+index ba11b2c..40fbe97 100644
+--- a/tower-buffer/src/lib.rs
++++ b/tower-buffer/src/lib.rs
+@@ -62,7 +62,7 @@ impl<E> BufferLayer<E> {
+     where
+         S: Service<Request>,
+         S::Error: Into<Error>,
+-        E: WorkerExecutor<S, Request> + Clone,
++        E: WorkerExecutor<S, Request>,
+     {
+         BufferLayer { bound, executor }
+     }
+@@ -72,7 +72,7 @@ impl<E, S, Request> Layer<S, Request> for BufferLayer<E>
+ where
+     S: Service<Request>,
+     S::Error: Into<Error>,
+-    E: WorkerExecutor<S, Request> + Clone,
++    E: WorkerExecutor<S, Request>,
+ {
+     type Response = S::Response;
+     type Error = Error;
+@@ -80,7 +80,7 @@ where
+     type Service = Buffer<S, Request>;
+ 
+     fn layer(&self, service: S) -> Result<Self::Service, Self::LayerError> {
+-        Buffer::with_executor(service, self.bound, &mut self.executor.clone())
++        Buffer::with_executor(service, self.bound, &self.executor)
+     }
+ }
+ 
+@@ -103,7 +103,7 @@ where
+         T::Error: Send + Sync,
+         Request: Send + 'static,
+     {
+-        Self::with_executor(service, bound, &mut DefaultExecutor::current())
++        Self::with_executor(service, bound, &DefaultExecutor::current())
+     }
+ 
+     /// Creates a new `Buffer` wrapping `service`.
+@@ -114,7 +114,7 @@ where
+     ///
+     /// `bound` gives the maximal number of requests that can be queued for the service before
+     /// backpressure is applied to callers.
+-    pub fn with_executor<E>(service: T, bound: usize, executor: &mut E) -> Result<Self, Error>
++    pub fn with_executor<E>(service: T, bound: usize, executor: &E) -> Result<Self, Error>
+     where
+         E: WorkerExecutor<T, Request>,
+     {
+diff --git a/tower-buffer/src/worker.rs b/tower-buffer/src/worker.rs
+index 1fff09b..c83816b 100644
+--- a/tower-buffer/src/worker.rs
++++ b/tower-buffer/src/worker.rs
+@@ -1,8 +1,8 @@
+ use error::{Closed, Error, ServiceError, SpawnError};
++use futures::future::Executor;
+ use futures::{Async, Future, Poll, Stream};
+ use message::Message;
+ use std::sync::{Arc, Mutex};
+-use tokio_executor::TypedExecutor;
+ use tokio_sync::mpsc;
+ use tower_service::Service;
+ 
+@@ -33,14 +33,14 @@ pub(crate) struct Handle {
+ 
+ /// This trait allows you to use either Tokio's threaded runtime's executor or the `current_thread`
+ /// runtime's executor depending on if `T` is `Send` or `!Send`.
+-pub trait WorkerExecutor<T, Request>: TypedExecutor<Worker<T, Request>>
++pub trait WorkerExecutor<T, Request>: Executor<Worker<T, Request>>
+ where
+     T: Service<Request>,
+     T::Error: Into<Error>,
+ {
+ }
+ 
+-impl<T, Request, E: TypedExecutor<Worker<T, Request>>> WorkerExecutor<T, Request> for E
++impl<T, Request, E: Executor<Worker<T, Request>>> WorkerExecutor<T, Request> for E
+ where
+     T: Service<Request>,
+     T::Error: Into<Error>,
+@@ -55,7 +55,7 @@ where
+     pub(crate) fn spawn<E>(
+         service: T,
+         rx: mpsc::Receiver<Message<Request, T::Future>>,
+-        executor: &mut E,
++        executor: &E,
+     ) -> Result<Handle, Error>
+     where
+         E: WorkerExecutor<T, Request>,
+@@ -73,7 +73,7 @@ where
+             handle: handle.clone(),
+         };
+ 
+-        match executor.spawn(worker) {
++        match executor.execute(worker) {
+             Ok(()) => Ok(handle),
+             Err(_) => Err(SpawnError::new().into()),
+         }
+diff --git a/tower-buffer/tests/buffer.rs b/tower-buffer/tests/buffer.rs
+index 75af636..905a257 100644
+--- a/tower-buffer/tests/buffer.rs
++++ b/tower-buffer/tests/buffer.rs
+@@ -1,11 +1,9 @@
+ extern crate futures;
+-extern crate tokio_executor;
+ extern crate tower_buffer;
+ extern crate tower_mock;
+ extern crate tower_service;
+ 
+ use futures::prelude::*;
+-use tokio_executor::{SpawnError, TypedExecutor};
+ use tower_buffer::*;
+ use tower_service::*;
+ 
+@@ -115,9 +113,9 @@ fn poll_ready_when_worker_is_dropped_early() {
+     let (service, _handle) = Mock::new();
+ 
+     // drop that worker right on the floor!
+-    let mut exec = ExecFn(drop);
++    let exec = ExecFn(drop);
+ 
+-    let mut service = Buffer::with_executor(service, 1, &mut exec).unwrap();
++    let mut service = Buffer::with_executor(service, 1, &exec).unwrap();
+ 
+     with_task(|| {
+         service
+@@ -132,9 +130,9 @@ fn response_future_when_worker_is_dropped_early() {
+ 
+     // hold the worker in a cell until we want to drop it later
+     let cell = RefCell::new(None);
+-    let mut exec = ExecFn(|fut| *cell.borrow_mut() = Some(fut));
++    let exec = ExecFn(|fut| *cell.borrow_mut() = Some(fut));
+ 
+-    let mut service = Buffer::with_executor(service, 1, &mut exec).unwrap();
++    let mut service = Buffer::with_executor(service, 1, &exec).unwrap();
+ 
+     // keep the request in the worker
+     handle.allow(0);
+@@ -151,11 +149,11 @@ type Handle = tower_mock::Handle<&'static str, &'static str>;
+ 
+ struct Exec;
+ 
+-impl<F> TypedExecutor<F> for Exec
++impl<F> futures::future::Executor<F> for Exec
+ where
+     F: Future<Item = (), Error = ()> + Send + 'static,
+ {
+-    fn spawn(&mut self, fut: F) -> Result<(), SpawnError> {
++    fn execute(&self, fut: F) -> Result<(), futures::future::ExecuteError<F>> {
+         thread::spawn(move || {
+             fut.wait().unwrap();
+         });
+@@ -165,12 +163,12 @@ where
+ 
+ struct ExecFn<Func>(Func);
+ 
+-impl<Func, F> TypedExecutor<F> for ExecFn<Func>
++impl<Func, F> futures::future::Executor<F> for ExecFn<Func>
+ where
+     Func: Fn(F),
+     F: Future<Item = (), Error = ()> + Send + 'static,
+ {
+-    fn spawn(&mut self, fut: F) -> Result<(), SpawnError> {
++    fn execute(&self, fut: F) -> Result<(), futures::future::ExecuteError<F>> {
+         (self.0)(fut);
+         Ok(())
+     }
+@@ -179,7 +177,7 @@ where
+ fn new_service() -> (Buffer<Mock, &'static str>, Handle) {
+     let (service, handle) = Mock::new();
+     // bound is >0 here because clears_canceled_requests needs multiple outstanding requests
+-    let service = Buffer::with_executor(service, 10, &mut Exec).unwrap();
++    let service = Buffer::with_executor(service, 10, &Exec).unwrap();
+     (service, handle)
+ }
+ 

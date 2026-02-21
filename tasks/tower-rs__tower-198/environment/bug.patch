@@ -1,0 +1,849 @@
+diff --git a/tower-service-util/Cargo.toml b/tower-service-util/Cargo.toml
+index a378e24..623c55c 100644
+--- a/tower-service-util/Cargo.toml
++++ b/tower-service-util/Cargo.toml
+@@ -26,8 +26,3 @@ either = { version = "1.5.1", optional = true }
+ futures = "0.1.23"
+ tower-service = "0.2.0"
+ tokio-io = { version = "0.1.12", optional = true }
+-
+-[dev-dependencies]
+-tokio-mock-task = "0.1"
+-tower = { version = "0.1.0", path = "../tower" }
+-tower-mock = { version = "0.1.0", path = "../tower-mock" }
+diff --git a/tower-service-util/src/call_all/common.rs b/tower-service-util/src/call_all/common.rs
+deleted file mode 100644
+index a9cde5c..0000000
+--- a/tower-service-util/src/call_all/common.rs
++++ /dev/null
+@@ -1,99 +0,0 @@
+-use super::Error;
+-use futures::{try_ready, Async, Future, Poll, Stream};
+-use tower_service::Service;
+-
+-/// TODO: Dox
+-#[derive(Debug)]
+-pub(crate) struct CallAll<Svc, S, Q> {
+-    service: Svc,
+-    stream: S,
+-    queue: Q,
+-    eof: bool,
+-}
+-
+-pub(crate) trait Drive<T: Future> {
+-    fn is_empty(&self) -> bool;
+-
+-    fn push(&mut self, future: T);
+-
+-    fn poll(&mut self) -> Poll<Option<T::Item>, T::Error>;
+-}
+-
+-impl<Svc, S, Q> CallAll<Svc, S, Q>
+-where
+-    Svc: Service<S::Item>,
+-    Svc::Error: Into<Error>,
+-    S: Stream,
+-    S::Error: Into<Error>,
+-    Q: Drive<Svc::Future>,
+-{
+-    pub(crate) fn new(service: Svc, stream: S, queue: Q) -> CallAll<Svc, S, Q> {
+-        CallAll {
+-            service,
+-            stream,
+-            queue,
+-            eof: false,
+-        }
+-    }
+-
+-    /// Extract the wrapped `Service`.
+-    pub(crate) fn into_inner(self) -> Svc {
+-        self.service
+-    }
+-
+-    pub(crate) fn unordered(self) -> super::CallAllUnordered<Svc, S> {
+-        assert!(self.queue.is_empty() && !self.eof);
+-
+-        super::CallAllUnordered::new(self.service, self.stream)
+-    }
+-}
+-
+-impl<Svc, S, Q> Stream for CallAll<Svc, S, Q>
+-where
+-    Svc: Service<S::Item>,
+-    Svc::Error: Into<Error>,
+-    S: Stream,
+-    S::Error: Into<Error>,
+-    Q: Drive<Svc::Future>,
+-{
+-    type Item = Svc::Response;
+-    type Error = Error;
+-
+-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+-        loop {
+-            let res = self.queue.poll().map_err(Into::into);
+-
+-            // First, see if we have any responses to yield
+-            if let Async::Ready(Some(rsp)) = res? {
+-                return Ok(Async::Ready(Some(rsp)));
+-            }
+-
+-            // If there are no more requests coming, check if we're done
+-            if self.eof {
+-                if self.queue.is_empty() {
+-                    return Ok(Async::Ready(None));
+-                } else {
+-                    return Ok(Async::NotReady);
+-                }
+-            }
+-
+-            // Then, see that the service is ready for another request
+-            try_ready!(self.service.poll_ready().map_err(Into::into));
+-
+-            // If it is, gather the next request (if there is one)
+-            match self.stream.poll().map_err(Into::into)? {
+-                Async::Ready(Some(req)) => {
+-                    self.queue.push(self.service.call(req));
+-                }
+-                Async::Ready(None) => {
+-                    // We're all done once any outstanding requests have completed
+-                    self.eof = true;
+-                }
+-                Async::NotReady => {
+-                    // TODO: We probably want to "release" the slot we reserved in Svc here.
+-                    // It may be a while until we get around to actually using it.
+-                }
+-            }
+-        }
+-    }
+-}
+diff --git a/tower-service-util/src/call_all/mod.rs b/tower-service-util/src/call_all/mod.rs
+deleted file mode 100644
+index 9cc8cd1..0000000
+--- a/tower-service-util/src/call_all/mod.rs
++++ /dev/null
+@@ -1,10 +0,0 @@
+-//! `Stream<Item = Request>` + `Service<Request>` => `Stream<Item = Response>`.
+-
+-mod common;
+-mod ordered;
+-mod unordered;
+-
+-pub use self::ordered::CallAll;
+-pub use self::unordered::CallAllUnordered;
+-
+-type Error = Box<::std::error::Error + Send + Sync>;
+diff --git a/tower-service-util/src/call_all/ordered.rs b/tower-service-util/src/call_all/ordered.rs
+deleted file mode 100644
+index 497f797..0000000
+--- a/tower-service-util/src/call_all/ordered.rs
++++ /dev/null
+@@ -1,150 +0,0 @@
+-//! `Stream<Item = Request>` + `Service<Request>` => `Stream<Item = Response>`.
+-
+-use super::{common, Error};
+-use futures::stream::FuturesOrdered;
+-use futures::{Future, Poll, Stream};
+-use tower_service::Service;
+-
+-/// This is a `futures::Stream` of responses resulting from calling the wrapped `tower::Service`
+-/// for each request received on the wrapped `Stream`.
+-///
+-/// ```rust
+-/// # extern crate futures;
+-/// # extern crate tower_service;
+-/// # extern crate tokio_mock_task;
+-/// # extern crate tower;
+-/// # use futures::future::{ok, FutureResult};
+-/// # use futures::{Async, Poll};
+-/// # use std::cell::Cell;
+-/// # use std::error::Error;
+-/// # use std::rc::Rc;
+-/// #
+-/// use futures::Stream;
+-/// use tower_service::Service;
+-/// use tower::ServiceExt;
+-///
+-/// // First, we need to have a Service to process our requests.
+-/// #[derive(Debug, Eq, PartialEq)]
+-/// struct FirstLetter;
+-/// impl Service<&'static str> for FirstLetter {
+-///      type Response = &'static str;
+-///      type Error = Box<Error + Send + Sync>;
+-///      type Future = FutureResult<Self::Response, Self::Error>;
+-///
+-///      fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+-///          Ok(Async::Ready(()))
+-///      }
+-///
+-///      fn call(&mut self, req: &'static str) -> Self::Future {
+-///          ok(&req[..1])
+-///      }
+-/// }
+-///
+-/// # fn main() {
+-/// # let mut mock = tokio_mock_task::MockTask::new();
+-/// // Next, we need a Stream of requests.
+-/// let (reqs, rx) = futures::unsync::mpsc::unbounded();
+-/// // Note that we have to help Rust out here by telling it what error type to use.
+-/// // Specifically, it has to be From<Service::Error> + From<Stream::Error>.
+-/// let rsps = FirstLetter.call_all(rx.map_err(|_| "boom"));
+-///
+-/// // Now, let's send a few requests and then check that we get the corresponding responses.
+-/// reqs.unbounded_send("one");
+-/// reqs.unbounded_send("two");
+-/// reqs.unbounded_send("three");
+-/// drop(reqs);
+-///
+-/// // We then loop over the response Strem that we get back from call_all.
+-/// # // a little bit of trickery here since we don't have an executor
+-/// # /*
+-/// let mut iter = rsps.wait();
+-/// # */
+-/// # let mut iter = mock.enter(|| rsps.wait());
+-/// # for (i, rsp) in (&mut iter).enumerate() {
+-///     // Since we used .wait(), each response is a Result.
+-///     match (i + 1, rsp.unwrap()) {
+-///         (1, "o") |
+-///         (2, "t") |
+-///         (3, "t") => {}
+-///         (n, i) => {
+-///             unreachable!("{}. response was '{}'", n, i);
+-///         }
+-///     }
+-/// }
+-///
+-/// // And at the end, we can get the Service back when there are no more requests.
+-/// let rsps = iter.into_inner();
+-/// assert_eq!(rsps.into_inner(), FirstLetter);
+-/// # }
+-/// ```
+-#[derive(Debug)]
+-pub struct CallAll<Svc, S>
+-where
+-    Svc: Service<S::Item>,
+-    S: Stream,
+-{
+-    inner: common::CallAll<Svc, S, FuturesOrdered<Svc::Future>>,
+-}
+-
+-impl<Svc, S> CallAll<Svc, S>
+-where
+-    Svc: Service<S::Item>,
+-    Svc::Error: Into<Error>,
+-    S: Stream,
+-    S::Error: Into<Error>,
+-{
+-    /// Create new `CallAll` combinator.
+-    ///
+-    /// Each request yielded by `stread` is passed to `svc`, and the resulting responses are
+-    /// yielded in the same order by the implementation of `Stream` for `CallAll`.
+-    pub fn new(service: Svc, stream: S) -> CallAll<Svc, S> {
+-        CallAll {
+-            inner: common::CallAll::new(service, stream, FuturesOrdered::new()),
+-        }
+-    }
+-
+-    /// Extract the wrapped `Service`.
+-    pub fn into_inner(self) -> Svc {
+-        self.inner.into_inner()
+-    }
+-
+-    /// Return responses as they are ready, regardless of the initial order.
+-    ///
+-    /// This function must be called before the stream is polled.
+-    ///
+-    /// # Panics
+-    ///
+-    /// Panics if `poll` was called.
+-    pub fn unordered(self) -> super::CallAllUnordered<Svc, S> {
+-        self.inner.unordered()
+-    }
+-}
+-
+-impl<Svc, S> Stream for CallAll<Svc, S>
+-where
+-    Svc: Service<S::Item>,
+-    Svc::Error: Into<Error>,
+-    S: Stream,
+-    S::Error: Into<Error>,
+-{
+-    type Item = Svc::Response;
+-    type Error = Error;
+-
+-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+-        self.inner.poll()
+-    }
+-}
+-
+-impl<T: Future> common::Drive<T> for FuturesOrdered<T> {
+-    fn is_empty(&self) -> bool {
+-        FuturesOrdered::is_empty(self)
+-    }
+-
+-    fn push(&mut self, future: T) {
+-        FuturesOrdered::push(self, future)
+-    }
+-
+-    fn poll(&mut self) -> Poll<Option<T::Item>, T::Error> {
+-        Stream::poll(self)
+-    }
+-}
+diff --git a/tower-service-util/src/call_all/unordered.rs b/tower-service-util/src/call_all/unordered.rs
+deleted file mode 100644
+index 99f5910..0000000
+--- a/tower-service-util/src/call_all/unordered.rs
++++ /dev/null
+@@ -1,72 +0,0 @@
+-//! `Stream<Item = Request>` + `Service<Request>` => `Stream<Item = Response>`.
+-
+-use super::{common, Error};
+-use futures::stream::FuturesUnordered;
+-use futures::{Future, Poll, Stream};
+-use tower_service::Service;
+-
+-/// A stream of responses received from the inner service in received order.
+-///
+-/// Similar to `CallAll` except, instead of yielding responses in request order,
+-/// responses are returned as they are available.
+-#[derive(Debug)]
+-pub struct CallAllUnordered<Svc, S>
+-where
+-    Svc: Service<S::Item>,
+-    S: Stream,
+-{
+-    inner: common::CallAll<Svc, S, FuturesUnordered<Svc::Future>>,
+-}
+-
+-impl<Svc, S> CallAllUnordered<Svc, S>
+-where
+-    Svc: Service<S::Item>,
+-    Svc::Error: Into<Error>,
+-    S: Stream,
+-    S::Error: Into<Error>,
+-{
+-    /// Create new `CallAllUnordered` combinator.
+-    ///
+-    /// Each request yielded by `stread` is passed to `svc`, and the resulting responses are
+-    /// yielded in the same order by the implementation of `Stream` for
+-    /// `CallAllUnordered`.
+-    pub fn new(service: Svc, stream: S) -> CallAllUnordered<Svc, S> {
+-        CallAllUnordered {
+-            inner: common::CallAll::new(service, stream, FuturesUnordered::new()),
+-        }
+-    }
+-
+-    /// Extract the wrapped `Service`.
+-    pub fn into_inner(self) -> Svc {
+-        self.inner.into_inner()
+-    }
+-}
+-
+-impl<Svc, S> Stream for CallAllUnordered<Svc, S>
+-where
+-    Svc: Service<S::Item>,
+-    Svc::Error: Into<Error>,
+-    S: Stream,
+-    S::Error: Into<Error>,
+-{
+-    type Item = Svc::Response;
+-    type Error = Error;
+-
+-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+-        self.inner.poll()
+-    }
+-}
+-
+-impl<T: Future> common::Drive<T> for FuturesUnordered<T> {
+-    fn is_empty(&self) -> bool {
+-        FuturesUnordered::is_empty(self)
+-    }
+-
+-    fn push(&mut self, future: T) {
+-        FuturesUnordered::push(self, future)
+-    }
+-
+-    fn poll(&mut self) -> Poll<Option<T::Item>, T::Error> {
+-        Stream::poll(self)
+-    }
+-}
+diff --git a/tower-service-util/src/lib.rs b/tower-service-util/src/lib.rs
+index a9f88b8..e8afc53 100644
+--- a/tower-service-util/src/lib.rs
++++ b/tower-service-util/src/lib.rs
+@@ -8,7 +8,6 @@ extern crate tokio_io;
+ extern crate tower_service;
+ 
+ mod boxed;
+-mod call_all;
+ #[cfg(feature = "either")]
+ mod either;
+ #[cfg(feature = "io")]
+@@ -19,7 +18,6 @@ mod sealed;
+ mod service_fn;
+ 
+ pub use crate::boxed::{BoxService, UnsyncBoxService};
+-pub use crate::call_all::{CallAll, CallAllUnordered};
+ #[cfg(feature = "either")]
+ pub use crate::either::EitherService;
+ #[cfg(feature = "io")]
+diff --git a/tower-service-util/tests/call_all.rs b/tower-service-util/tests/call_all.rs
+deleted file mode 100644
+index 9e1dba2..0000000
+--- a/tower-service-util/tests/call_all.rs
++++ /dev/null
+@@ -1,152 +0,0 @@
+-extern crate futures;
+-extern crate tokio_mock_task;
+-extern crate tower;
+-extern crate tower_mock;
+-extern crate tower_service;
+-extern crate tower_service_util;
+-
+-use futures::future::{ok, FutureResult};
+-use futures::stream;
+-use futures::{Async, Poll, Stream};
+-use std::cell::Cell;
+-use std::rc::Rc;
+-use tower::ServiceExt;
+-use tower_mock::*;
+-use tower_service::*;
+-
+-type Error = Box<::std::error::Error + Send + Sync>;
+-
+-#[derive(Debug, Eq, PartialEq)]
+-struct Srv {
+-    admit: Rc<Cell<bool>>,
+-    count: Rc<Cell<usize>>,
+-}
+-impl Service<&'static str> for Srv {
+-    type Response = &'static str;
+-    type Error = Error;
+-    type Future = FutureResult<Self::Response, Error>;
+-
+-    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+-        if !self.admit.get() {
+-            return Ok(Async::NotReady);
+-        }
+-
+-        self.admit.set(false);
+-        Ok(Async::Ready(()))
+-    }
+-
+-    fn call(&mut self, req: &'static str) -> Self::Future {
+-        self.count.set(self.count.get() + 1);
+-        ok(req)
+-    }
+-}
+-
+-macro_rules! assert_ready {
+-    ($e:expr) => {{
+-        match $e {
+-            Ok(futures::Async::Ready(v)) => v,
+-            Ok(_) => panic!("not ready"),
+-            Err(e) => panic!("error = {:?}", e),
+-        }
+-    }};
+-}
+-
+-macro_rules! assert_not_ready {
+-    ($e:expr) => {{
+-        match $e {
+-            Ok(futures::Async::NotReady) => {}
+-            Ok(futures::Async::Ready(v)) => panic!("ready; value = {:?}", v),
+-            Err(e) => panic!("error = {:?}", e),
+-        }
+-    }};
+-}
+-
+-#[test]
+-fn ordered() {
+-    let mut mock = tokio_mock_task::MockTask::new();
+-
+-    let admit = Rc::new(Cell::new(false));
+-    let count = Rc::new(Cell::new(0));
+-    let srv = Srv {
+-        count: count.clone(),
+-        admit: admit.clone(),
+-    };
+-    let (tx, rx) = futures::unsync::mpsc::unbounded();
+-    let mut ca = srv.call_all(rx.map_err(|_| "nope"));
+-
+-    assert_not_ready!(mock.enter(|| ca.poll()));
+-    tx.unbounded_send("one").unwrap();
+-    mock.is_notified();
+-    assert_not_ready!(mock.enter(|| ca.poll()));
+-    admit.set(true);
+-    let v = assert_ready!(mock.enter(|| ca.poll()));
+-    assert_eq!(v, Some("one"));
+-    assert_not_ready!(mock.enter(|| ca.poll()));
+-    admit.set(true);
+-    tx.unbounded_send("two").unwrap();
+-    mock.is_notified();
+-    tx.unbounded_send("three").unwrap();
+-    let v = assert_ready!(mock.enter(|| ca.poll()));
+-    assert_eq!(v, Some("two"));
+-    assert_not_ready!(mock.enter(|| ca.poll()));
+-    admit.set(true);
+-    let v = assert_ready!(mock.enter(|| ca.poll()));
+-    assert_eq!(v, Some("three"));
+-    admit.set(true);
+-    assert_not_ready!(mock.enter(|| ca.poll()));
+-    admit.set(true);
+-    tx.unbounded_send("four").unwrap();
+-    mock.is_notified();
+-    let v = assert_ready!(mock.enter(|| ca.poll()));
+-    assert_eq!(v, Some("four"));
+-    assert_not_ready!(mock.enter(|| ca.poll()));
+-
+-    // need to be ready since impl doesn't know it'll get EOF
+-    admit.set(true);
+-
+-    // When we drop the request stream, CallAll should return None.
+-    drop(tx);
+-    mock.is_notified();
+-    let v = assert_ready!(mock.enter(|| ca.poll()));
+-    assert!(v.is_none());
+-    assert_eq!(count.get(), 4);
+-
+-    // We should also be able to recover the wrapped Service.
+-    assert_eq!(
+-        ca.into_inner(),
+-        Srv {
+-            count: count.clone(),
+-            admit
+-        }
+-    );
+-}
+-
+-#[test]
+-fn unordered() {
+-    let (mock, mut handle) = Mock::<_, &'static str>::new();
+-    let mut task = tokio_mock_task::MockTask::new();
+-    let requests = stream::iter_ok::<_, Error>(&["one", "two"]);
+-
+-    let mut svc = mock.call_all(requests).unordered();
+-    assert_not_ready!(task.enter(|| svc.poll()));
+-
+-    let (req1, resp1) = handle.next_request().unwrap().into_parts();
+-    let (req2, resp2) = handle.next_request().unwrap().into_parts();
+-
+-    assert_eq!(req1, &"one");
+-    assert_eq!(req2, &"two");
+-
+-    resp2.respond("resp 1");
+-
+-    let v = assert_ready!(task.enter(|| svc.poll()));
+-    assert_eq!(v, Some("resp 1"));
+-    assert_not_ready!(task.enter(|| svc.poll()));
+-
+-    resp1.respond("resp 2");
+-
+-    let v = assert_ready!(task.enter(|| svc.poll()));
+-    assert_eq!(v, Some("resp 2"));
+-
+-    let v = assert_ready!(task.enter(|| svc.poll()));
+-    assert!(v.is_none());
+-}
+diff --git a/tower/src/ext/call_all.rs b/tower/src/ext/call_all.rs
+new file mode 100644
+index 0000000..9816027
+--- /dev/null
++++ b/tower/src/ext/call_all.rs
+@@ -0,0 +1,250 @@
++//! `Stream<Item = Request>` + `Service<Request>` => `Stream<Item = Response>`.
++
++use futures::stream::FuturesOrdered;
++use futures::{try_ready, Async, Poll, Stream};
++use std::marker::PhantomData;
++use tower_service::Service;
++
++/// This is a `futures::Stream` of responses resulting from calling the wrapped `tower::Service`
++/// for each request received on the wrapped `Stream`.
++///
++/// ```rust
++/// # extern crate futures;
++/// # extern crate tower_service;
++/// # extern crate tokio_mock_task;
++/// # extern crate tower;
++/// # use futures::future::{ok, FutureResult};
++/// # use futures::{Async, Poll};
++/// # use std::cell::Cell;
++/// # use std::rc::Rc;
++/// #
++/// use futures::Stream;
++/// use tower_service::Service;
++/// use tower::ServiceExt;
++///
++/// // First, we need to have a Service to process our requests.
++/// #[derive(Debug, Eq, PartialEq)]
++/// struct FirstLetter;
++/// impl Service<&'static str> for FirstLetter {
++///      type Response = &'static str;
++///      type Error = ();
++///      type Future = FutureResult<Self::Response, ()>;
++///
++///      fn poll_ready(&mut self) -> Poll<(), Self::Error> {
++///          Ok(Async::Ready(()))
++///      }
++///
++///      fn call(&mut self, req: &'static str) -> Self::Future {
++///          ok(&req[..1])
++///      }
++/// }
++///
++/// # fn main() {
++/// # let mut mock = tokio_mock_task::MockTask::new();
++/// // Next, we need a Stream of requests.
++/// let (reqs, rx) = futures::unsync::mpsc::unbounded();
++/// // Note that we have to help Rust out here by telling it what error type to use.
++/// // Specifically, it has to be From<Service::Error> + From<Stream::Error>.
++/// let rsps = FirstLetter.call_all::<_, ()>(rx);
++///
++/// // Now, let's send a few requests and then check that we get the corresponding responses.
++/// reqs.unbounded_send("one");
++/// reqs.unbounded_send("two");
++/// reqs.unbounded_send("three");
++/// drop(reqs);
++///
++/// // We then loop over the response Strem that we get back from call_all.
++/// # // a little bit of trickery here since we don't have an executor
++/// # /*
++/// let mut iter = rsps.wait();
++/// # */
++/// # let mut iter = mock.enter(|| rsps.wait());
++/// # for (i, rsp) in (&mut iter).enumerate() {
++///     // Since we used .wait(), each response is a Result.
++///     match (i + 1, rsp.unwrap()) {
++///         (1, "o") |
++///         (2, "t") |
++///         (3, "t") => {}
++///         (n, i) => {
++///             unreachable!("{}. response was '{}'", n, i);
++///         }
++///     }
++/// }
++///
++/// // And at the end, we can get the Service back when there are no more requests.
++/// let rsps = iter.into_inner();
++/// assert_eq!(rsps.into_inner(), FirstLetter);
++/// # }
++/// ```
++#[derive(Debug)]
++pub struct CallAll<Svc, S, E>
++where
++    Svc: Service<S::Item>,
++    S: Stream,
++{
++    svc: Svc,
++    stream: S,
++    responses: FuturesOrdered<Svc::Future>,
++    eof: bool,
++    error: PhantomData<E>,
++}
++
++impl<Svc, S, E> CallAll<Svc, S, E>
++where
++    Svc: Service<S::Item>,
++    S: Stream,
++{
++    /// Create new `CallAll` combinator.
++    ///
++    /// Each request yielded by `stread` is passed to `svc`, and the resulting responses are
++    /// yielded in the same order by the implementation of `Stream` for `CallAll`.
++    pub fn new(svc: Svc, stream: S) -> CallAll<Svc, S, E> {
++        CallAll {
++            svc: svc,
++            stream,
++            responses: FuturesOrdered::new(),
++            eof: false,
++            error: PhantomData,
++        }
++    }
++
++    /// Extract the wrapped `Service`.
++    pub fn into_inner(self) -> Svc {
++        self.svc
++    }
++}
++
++impl<Svc, S, E> Stream for CallAll<Svc, S, E>
++where
++    Svc: Service<S::Item>,
++    S: Stream,
++    E: From<Svc::Error>,
++    E: From<S::Error>,
++{
++    type Item = Svc::Response;
++    type Error = E;
++    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
++        loop {
++            // First, see if we have any responses to yield
++            if let Async::Ready(Some(rsp)) = self.responses.poll()? {
++                return Ok(Async::Ready(Some(rsp)));
++            }
++
++            // If there are no more requests coming, check if we're done
++            if self.eof {
++                if self.responses.is_empty() {
++                    return Ok(Async::Ready(None));
++                } else {
++                    return Ok(Async::NotReady);
++                }
++            }
++
++            // Then, see that the service is ready for another request
++            try_ready!(self.svc.poll_ready());
++
++            // If it is, gather the next request (if there is one)
++            match self.stream.poll()? {
++                Async::Ready(Some(req)) => {
++                    self.responses.push(self.svc.call(req));
++                }
++                Async::Ready(None) => {
++                    // We're all done once any outstanding requests have completed
++                    self.eof = true;
++                }
++                Async::NotReady => {
++                    // TODO: We probably want to "release" the slot we reserved in Svc here.
++                    // It may be a while until we get around to actually using it.
++                }
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use futures::future::{ok, FutureResult};
++    use futures::{Async, Poll, Stream};
++    use std::cell::Cell;
++    use std::rc::Rc;
++    use ServiceExt;
++
++    #[derive(Debug, Eq, PartialEq)]
++    struct Srv {
++        admit: Rc<Cell<bool>>,
++        count: Rc<Cell<usize>>,
++    }
++    impl Service<&'static str> for Srv {
++        type Response = &'static str;
++        type Error = ();
++        type Future = FutureResult<Self::Response, ()>;
++
++        fn poll_ready(&mut self) -> Poll<(), Self::Error> {
++            if !self.admit.get() {
++                return Ok(Async::NotReady);
++            }
++
++            self.admit.set(false);
++            Ok(Async::Ready(()))
++        }
++
++        fn call(&mut self, req: &'static str) -> Self::Future {
++            self.count.set(self.count.get() + 1);
++            ok(req)
++        }
++    }
++
++    #[test]
++    fn test_in_order() {
++        let mut mock = tokio_mock_task::MockTask::new();
++
++        let admit = Rc::new(Cell::new(false));
++        let count = Rc::new(Cell::new(0));
++        let srv = Srv {
++            count: count.clone(),
++            admit: admit.clone(),
++        };
++        let (tx, rx) = futures::unsync::mpsc::unbounded();
++        let mut ca = srv.call_all::<_, ()>(rx);
++
++        assert_eq!(mock.enter(|| ca.poll()), Ok(Async::NotReady));
++        tx.unbounded_send("one").unwrap();
++        mock.is_notified();
++        assert_eq!(mock.enter(|| ca.poll()), Ok(Async::NotReady)); // service not admitting
++        admit.set(true);
++        assert_eq!(mock.enter(|| ca.poll()), Ok(Async::Ready(Some("one"))));
++        assert_eq!(mock.enter(|| ca.poll()), Ok(Async::NotReady));
++        admit.set(true);
++        tx.unbounded_send("two").unwrap();
++        mock.is_notified();
++        tx.unbounded_send("three").unwrap();
++        assert_eq!(mock.enter(|| ca.poll()), Ok(Async::Ready(Some("two"))));
++        assert_eq!(mock.enter(|| ca.poll()), Ok(Async::NotReady)); // not yet admitted
++        admit.set(true);
++        assert_eq!(mock.enter(|| ca.poll()), Ok(Async::Ready(Some("three"))));
++        admit.set(true);
++        assert_eq!(mock.enter(|| ca.poll()), Ok(Async::NotReady)); // allowed to admit, but nothing there
++        admit.set(true);
++        tx.unbounded_send("four").unwrap();
++        mock.is_notified();
++        assert_eq!(mock.enter(|| ca.poll()), Ok(Async::Ready(Some("four"))));
++        assert_eq!(mock.enter(|| ca.poll()), Ok(Async::NotReady));
++        admit.set(true); // need to be ready since impl doesn't know it'll get EOF
++
++        // When we drop the request stream, CallAll should return None.
++        drop(tx);
++        mock.is_notified();
++        assert_eq!(mock.enter(|| ca.poll()), Ok(Async::Ready(None)));
++        assert_eq!(mock.enter(|| ca.poll()), Ok(Async::Ready(None)));
++        assert_eq!(count.get(), 4);
++
++        // We should also be able to recover the wrapped Service.
++        assert_eq!(
++            ca.into_inner(),
++            Srv {
++                count: count.clone(),
++                admit
++            }
++        );
++    }
++}
+diff --git a/tower/src/ext/mod.rs b/tower/src/ext/mod.rs
+index d7b19b8..5ff81df 100644
+--- a/tower/src/ext/mod.rs
++++ b/tower/src/ext/mod.rs
+@@ -2,10 +2,10 @@
+ 
+ use futures::{IntoFuture, Stream};
+ use tower_service::Service;
+-use tower_service_util::CallAll;
+ 
+ mod and_then;
+ mod apply;
++mod call_all;
+ mod from_err;
+ mod map;
+ mod map_err;
+@@ -15,6 +15,7 @@ mod then;
+ 
+ pub use self::and_then::AndThen;
+ pub use self::apply::Apply;
++pub use self::call_all::CallAll;
+ pub use self::from_err::FromErr;
+ pub use self::map::Map;
+ pub use self::map_err::MapErr;
+@@ -24,8 +25,6 @@ pub use self::then::Then;
+ 
+ impl<T: ?Sized, Request> ServiceExt<Request> for T where T: Service<Request> {}
+ 
+-type Error = Box<::std::error::Error + Send + Sync>;
+-
+ /// An extension trait for `Service`s that provides a variety of convenient
+ /// adapters
+ pub trait ServiceExt<Request>: Service<Request> {
+@@ -134,12 +133,10 @@ pub trait ServiceExt<Request>: Service<Request> {
+     ///
+     /// This is essentially `Stream<Item = Request>` + `Self` => `Stream<Item = Response>`. See the
+     /// documentation for [`CallAll`](struct.CallAll.html) for details.
+-    fn call_all<S>(self, reqs: S) -> CallAll<Self, S>
++    fn call_all<S, E>(self, reqs: S) -> CallAll<Self, S, E>
+     where
+         Self: Sized,
+-        Self::Error: Into<Error>,
+         S: Stream<Item = Request>,
+-        S::Error: Into<Error>,
+     {
+         CallAll::new(self, reqs)
+     }

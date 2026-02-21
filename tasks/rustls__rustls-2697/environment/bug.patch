@@ -1,0 +1,473 @@
+diff --git a/bogo/src/main.rs b/bogo/src/main.rs
+index 4c94a025..2bf12e9f 100644
+--- a/bogo/src/main.rs
++++ b/bogo/src/main.rs
+@@ -33,8 +33,8 @@ use rustls::client::danger::{
+     HandshakeSignatureValid, PeerVerified, ServerIdentity, ServerVerifier,
+ };
+ use rustls::client::{
+-    ClientConfig, ClientConnection, CredentialRequest, EchConfig, EchGreaseConfig, EchMode,
+-    EchStatus, Resumption, Tls12Resumption, WebPkiServerVerifier,
++    ClientConfig, ClientConnection, EchConfig, EchGreaseConfig, EchMode, EchStatus, Resumption,
++    Tls12Resumption, WebPkiServerVerifier,
+ };
+ use rustls::crypto::aws_lc_rs::hpke;
+ use rustls::crypto::hpke::{Hpke, HpkePublicKey};
+@@ -585,17 +585,20 @@ impl MultipleClientCredentialResolver {
+ }
+ 
+ impl client::ResolvesClientCert for MultipleClientCredentialResolver {
+-    fn resolve(&self, server_hello: &CredentialRequest<'_>) -> Option<CertifiedSigner> {
++    fn resolve(
++        &self,
++        _negotiated_type: CertificateType,
++        root_hint_subjects: &[&[u8]],
++        sig_schemes: &[SignatureScheme],
++    ) -> Option<CertifiedSigner> {
+         // `sig_schemes` is in server preference order, so respect that.
+-        let sig_schemes = server_hello.signature_schemes();
+-        let root_hint_subjects = server_hello.root_hint_subjects();
+         for sig_scheme in sig_schemes.iter().copied() {
+             for (i, cert) in self.additional.iter().enumerate() {
+                 // if the server sends any issuer hints, respect them
+                 if cert.must_match_issuer
+                     && !root_hint_subjects
+                         .iter()
+-                        .any(|dn| dn.as_ref() == cert.issuer_dn.as_ref())
++                        .any(|dn| *dn == cert.issuer_dn.as_ref())
+                 {
+                     continue;
+                 }
+diff --git a/rustls-test/src/lib.rs b/rustls-test/src/lib.rs
+index 2ba4cf34..4de768a3 100644
+--- a/rustls-test/src/lib.rs
++++ b/rustls-test/src/lib.rs
+@@ -472,9 +472,9 @@ impl KeyType {
+         .unwrap()
+     }
+ 
+-    pub fn ca_distinguished_name(&self) -> DistinguishedName {
++    pub fn ca_distinguished_name(&self) -> &'static [u8] {
+         match self {
+-            Self::Rsa2048 => &b"0\x1f1\x1d0\x1b\x06\x03U\x04\x03\x0c\x14ponytown RSA 2048 CA"[..],
++            Self::Rsa2048 => b"0\x1f1\x1d0\x1b\x06\x03U\x04\x03\x0c\x14ponytown RSA 2048 CA",
+             Self::Rsa3072 => b"0\x1f1\x1d0\x1b\x06\x03U\x04\x03\x0c\x14ponytown RSA 3072 CA",
+             Self::Rsa4096 => b"0\x1f1\x1d0\x1b\x06\x03U\x04\x03\x0c\x14ponytown RSA 4096 CA",
+             Self::EcdsaP256 => b"0\x211\x1f0\x1d\x06\x03U\x04\x03\x0c\x16ponytown ECDSA p256 CA",
+@@ -482,8 +482,6 @@ impl KeyType {
+             Self::EcdsaP521 => b"0\x211\x1f0\x1d\x06\x03U\x04\x03\x0c\x16ponytown ECDSA p521 CA",
+             Self::Ed25519 => b"0\x1c1\x1a0\x18\x06\x03U\x04\x03\x0c\x11ponytown EdDSA CA",
+         }
+-        .to_vec()
+-        .into()
+     }
+ 
+     pub fn client_root_store(&self) -> Arc<RootCertStore> {
+diff --git a/rustls/src/client/client_conn.rs b/rustls/src/client/client_conn.rs
+index 84ffce91..f562dcdd 100644
+--- a/rustls/src/client/client_conn.rs
++++ b/rustls/src/client/client_conn.rs
+@@ -11,8 +11,6 @@ use crate::builder::ConfigBuilder;
+ use crate::client::{EchMode, EchStatus};
+ use crate::common_state::{CommonState, Protocol, Side};
+ use crate::conn::{ConnectionCore, UnbufferedConnectionCommon};
+-#[cfg(doc)]
+-use crate::crypto;
+ use crate::crypto::{CryptoProvider, SupportedKxGroup};
+ use crate::enums::{CertificateType, CipherSuite, ProtocolVersion, SignatureScheme};
+ use crate::error::Error;
+@@ -28,7 +26,9 @@ use crate::sync::Arc;
+ use crate::time_provider::DefaultTimeProvider;
+ use crate::time_provider::TimeProvider;
+ use crate::unbuffered::{EncryptError, TransmitTlsData};
+-use crate::{DistinguishedName, KeyLog, WantsVerifier, compress, verify};
++#[cfg(doc)]
++use crate::{DistinguishedName, crypto};
++use crate::{KeyLog, WantsVerifier, compress, verify};
+ 
+ /// A trait for the ability to store client session data, so that sessions
+ /// can be resumed in future connections.
+@@ -97,6 +97,17 @@ pub trait ClientSessionStore: fmt::Debug + Send + Sync {
+ pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
+     /// Resolve a client certificate chain/private key to use as the client's identity.
+     ///
++    /// `root_hint_subjects` is an optional list of certificate authority
++    /// subject distinguished names that the client can use to help
++    /// decide on a client certificate the server is likely to accept. If
++    /// the list is empty, the client should send whatever certificate it
++    /// has. The hints are expected to be DER-encoded X.500 distinguished names,
++    /// per [RFC 5280 A.1]. See [`DistinguishedName`] for more information
++    /// on decoding with external crates like `x509-parser`.
++    ///
++    /// `sigschemes` is the list of the [`SignatureScheme`]s the server
++    /// supports.
++    ///
+     /// The `CertifiedSigner` returned from this method contains a certificate chain and a
+     /// one-time-use [`Signer`] wrapping the private key. This is usually obtained via a
+     /// [`CertifiedKey`], on which an implementation can call [`CertifiedKey::signer()`].
+@@ -112,7 +123,12 @@ pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
+     /// [`CertifiedKey`]: crate::sign::CertifiedKey
+     /// [`CertifiedKey::signer()`]: crate::sign::CertifiedKey::signer
+     /// [`Signer`]: crate::sign::Signer
+-    fn resolve(&self, server_hello: &CredentialRequest<'_>) -> Option<CertifiedSigner>;
++    fn resolve(
++        &self,
++        negotiated_type: CertificateType,
++        root_hint_subjects: &[&[u8]],
++        sigschemes: &[SignatureScheme],
++    ) -> Option<CertifiedSigner>;
+ 
+     /// Returns which [`CertificateType`]s this resolver supports.
+     ///
+@@ -123,43 +139,6 @@ pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
+     fn supported_certificate_types(&self) -> &'static [CertificateType];
+ }
+ 
+-/// Context from the server to inform client credential selection.
+-pub struct CredentialRequest<'a> {
+-    pub(super) negotiated_type: CertificateType,
+-    pub(super) root_hint_subjects: &'a [DistinguishedName],
+-    pub(super) signature_schemes: &'a [SignatureScheme],
+-}
+-
+-impl CredentialRequest<'_> {
+-    /// List of certificate authority subject distinguished names provided by the server.
+-    ///
+-    /// If the list is empty, the client should send whatever certificate it has. The hints
+-    /// are expected to be DER-encoded X.500 distinguished names, per [RFC 5280 A.1]. Note that
+-    /// the encoding comes from the server and has not been validated by rustls.
+-    ///
+-    /// See [`DistinguishedName`] for more information on decoding with external crates like
+-    /// `x509-parser`.
+-    ///
+-    /// [`DistinguishedName`]: crate::DistinguishedName
+-    pub fn root_hint_subjects(&self) -> &[DistinguishedName] {
+-        self.root_hint_subjects
+-    }
+-
+-    /// Get the compatible signature schemes.
+-    pub fn signature_schemes(&self) -> &[SignatureScheme] {
+-        self.signature_schemes
+-    }
+-
+-    /// The negotiated certificate type.
+-    ///
+-    /// If the server does not support [RFC 7250], this will be `CertificateType::X509`.
+-    ///
+-    /// [RFC 7250]: https://tools.ietf.org/html/rfc7250
+-    pub fn negotiated_type(&self) -> CertificateType {
+-        self.negotiated_type
+-    }
+-}
+-
+ /// Common configuration for (typically) all connections made by a program.
+ ///
+ /// Making one of these is cheap, though one of the inputs may be expensive: gathering trust roots
+diff --git a/rustls/src/client/common.rs b/rustls/src/client/common.rs
+index ff193d6a..71bcf666 100644
+--- a/rustls/src/client/common.rs
++++ b/rustls/src/client/common.rs
+@@ -1,6 +1,6 @@
+ use alloc::vec::Vec;
+ 
+-use super::{CredentialRequest, ResolvesClientCert};
++use super::ResolvesClientCert;
+ use crate::compress;
+ use crate::enums::{CertificateType, SignatureScheme};
+ use crate::log::{debug, trace};
+@@ -90,18 +90,18 @@ impl ClientAuthDetails {
+     pub(super) fn resolve(
+         negotiated_type: CertificateType,
+         resolver: &dyn ResolvesClientCert,
+-        root_hint_subjects: Option<&[DistinguishedName]>,
+-        signature_schemes: &[SignatureScheme],
++        canames: Option<&[DistinguishedName]>,
++        sigschemes: &[SignatureScheme],
+         auth_context_tls13: Option<Vec<u8>>,
+         compressor: Option<&'static dyn compress::CertCompressor>,
+     ) -> Self {
+-        let server_hello = CredentialRequest {
+-            negotiated_type,
+-            signature_schemes,
+-            root_hint_subjects: root_hint_subjects.unwrap_or_default(),
+-        };
++        let acceptable_issuers = canames
++            .unwrap_or_default()
++            .iter()
++            .map(|p| p.as_ref())
++            .collect::<Vec<&[u8]>>();
+ 
+-        if let Some(signer) = resolver.resolve(&server_hello) {
++        if let Some(signer) = resolver.resolve(negotiated_type, &acceptable_issuers, sigschemes) {
+             debug!("Attempting client auth");
+             return Self::Verify {
+                 signer,
+diff --git a/rustls/src/client/handy.rs b/rustls/src/client/handy.rs
+index 744cbd78..92526067 100644
+--- a/rustls/src/client/handy.rs
++++ b/rustls/src/client/handy.rs
+@@ -1,7 +1,6 @@
+ use pki_types::ServerName;
+ 
+-use super::CredentialRequest;
+-use crate::enums::CertificateType;
++use crate::enums::{CertificateType, SignatureScheme};
+ use crate::msgs::persist;
+ use crate::sign::CertifiedSigner;
+ use crate::{NamedGroup, client, sign};
+@@ -189,7 +188,12 @@ pub use cache::ClientSessionMemoryCache;
+ pub(super) struct FailResolveClientCert {}
+ 
+ impl client::ResolvesClientCert for FailResolveClientCert {
+-    fn resolve(&self, _: &CredentialRequest<'_>) -> Option<CertifiedSigner> {
++    fn resolve(
++        &self,
++        _negotiated_type: CertificateType,
++        _root_hint_subjects: &[&[u8]],
++        _sigschemes: &[SignatureScheme],
++    ) -> Option<CertifiedSigner> {
+         None
+     }
+ 
+@@ -213,11 +217,14 @@ impl AlwaysResolvesClientRawPublicKeys {
+ }
+ 
+ impl client::ResolvesClientCert for AlwaysResolvesClientRawPublicKeys {
+-    fn resolve(&self, server_hello: &CredentialRequest<'_>) -> Option<CertifiedSigner> {
+-        match server_hello.negotiated_type() {
+-            CertificateType::RawPublicKey => self
+-                .0
+-                .signer(server_hello.signature_schemes()),
++    fn resolve(
++        &self,
++        negotiated_type: CertificateType,
++        _root_hint_subjects: &[&[u8]],
++        sig_schemes: &[SignatureScheme],
++    ) -> Option<CertifiedSigner> {
++        match negotiated_type {
++            CertificateType::RawPublicKey => self.0.signer(sig_schemes),
+             _ => None,
+         }
+     }
+@@ -237,7 +244,7 @@ mod tests {
+     use super::NoClientSessionStorage;
+     use super::provider::cipher_suite;
+     use crate::client::danger::{HandshakeSignatureValid, PeerVerified, ServerVerifier};
+-    use crate::client::{ClientSessionStore, CredentialRequest, ResolvesClientCert};
++    use crate::client::{ClientSessionStore, ResolvesClientCert};
+     use crate::enums::{CertificateType, SignatureScheme};
+     use crate::error::Error;
+     use crate::msgs::base::PayloadU16;
+@@ -348,7 +355,12 @@ mod tests {
+ 
+     impl ResolvesClientCert for DummyResolvesClientCert {
+         #[cfg_attr(coverage_nightly, coverage(off))]
+-        fn resolve(&self, _: &CredentialRequest<'_>) -> Option<CertifiedSigner> {
++        fn resolve(
++            &self,
++            _negotiated_type: CertificateType,
++            _root_hint_subjects: &[&[u8]],
++            _sigschemes: &[SignatureScheme],
++        ) -> Option<CertifiedSigner> {
+             unreachable!()
+         }
+ 
+diff --git a/rustls/src/crypto/signer.rs b/rustls/src/crypto/signer.rs
+index 6714ad6b..bd1c933d 100644
+--- a/rustls/src/crypto/signer.rs
++++ b/rustls/src/crypto/signer.rs
+@@ -5,7 +5,7 @@ use core::fmt::Debug;
+ use pki_types::{AlgorithmIdentifier, CertificateDer, PrivateKeyDer, SubjectPublicKeyInfoDer};
+ 
+ use super::CryptoProvider;
+-use crate::client::{CredentialRequest, ResolvesClientCert};
++use crate::client::ResolvesClientCert;
+ use crate::enums::{CertificateType, SignatureAlgorithm, SignatureScheme};
+ use crate::error::{ApiMisuse, Error, InconsistentKeys, PeerIncompatible};
+ use crate::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
+@@ -87,11 +87,14 @@ impl From<CertifiedKey> for SingleCertAndKey {
+ }
+ 
+ impl ResolvesClientCert for SingleCertAndKey {
+-    fn resolve(&self, server_hello: &CredentialRequest<'_>) -> Option<CertifiedSigner> {
+-        match server_hello.negotiated_type() {
+-            CertificateType::X509 => self
+-                .0
+-                .signer(server_hello.signature_schemes()),
++    fn resolve(
++        &self,
++        negotiated_type: CertificateType,
++        _root_hint_subjects: &[&[u8]],
++        sig_schemes: &[SignatureScheme],
++    ) -> Option<CertifiedSigner> {
++        match negotiated_type {
++            CertificateType::X509 => self.0.signer(sig_schemes),
+             _ => None,
+         }
+     }
+diff --git a/rustls/src/lib.rs b/rustls/src/lib.rs
+index 9913a0f9..bc707be4 100644
+--- a/rustls/src/lib.rs
++++ b/rustls/src/lib.rs
+@@ -566,7 +566,7 @@ pub mod client {
+ 
+     pub use builder::WantsClientCert;
+     pub use client_conn::{
+-        ClientConfig, ClientConnectionData, ClientSessionStore, CredentialRequest, EarlyDataError,
++        ClientConfig, ClientConnectionData, ClientSessionStore, EarlyDataError,
+         MayEncryptEarlyData, ResolvesClientCert, Resumption, Tls12Resumption,
+         UnbufferedClientConnection,
+     };
+diff --git a/rustls/src/msgs/handshake.rs b/rustls/src/msgs/handshake.rs
+index e1dc0249..669c8122 100644
+--- a/rustls/src/msgs/handshake.rs
++++ b/rustls/src/msgs/handshake.rs
+@@ -2151,12 +2151,6 @@ impl DistinguishedName {
+     }
+ }
+ 
+-impl PartialEq for DistinguishedName {
+-    fn eq(&self, other: &Self) -> bool {
+-        self.0.0 == other.0.0
+-    }
+-}
+-
+ /// RFC8446: `DistinguishedName authorities<3..2^16-1>;` however,
+ /// RFC5246: `DistinguishedName certificate_authorities<0..2^16-1>;`
+ impl TlsListElement for DistinguishedName {
+diff --git a/rustls/tests/resolve.rs b/rustls/tests/resolve.rs
+index 7077fdb1..81ac31af 100644
+--- a/rustls/tests/resolve.rs
++++ b/rustls/tests/resolve.rs
+@@ -6,7 +6,7 @@ use std::sync::Arc;
+ use std::sync::atomic::{AtomicUsize, Ordering};
+ 
+ use pki_types::{CertificateDer, DnsName};
+-use rustls::client::{CredentialRequest, ResolvesClientCert};
++use rustls::client::ResolvesClientCert;
+ use rustls::server::{ClientHello, ResolvesServerCert, ResolvesServerCertUsingSni};
+ use rustls::sign::{CertifiedKey, CertifiedSigner};
+ use rustls::{
+@@ -235,14 +235,14 @@ impl ResolvesServerCert for ServerCheckNoSni {
+ struct ClientCheckCertResolve {
+     query_count: AtomicUsize,
+     expect_queries: usize,
+-    expect_root_hint_subjects: Vec<DistinguishedName>,
++    expect_root_hint_subjects: Vec<Vec<u8>>,
+     expect_sigschemes: Vec<SignatureScheme>,
+ }
+ 
+ impl ClientCheckCertResolve {
+     fn new(
+         expect_queries: usize,
+-        expect_root_hint_subjects: Vec<DistinguishedName>,
++        expect_root_hint_subjects: Vec<Vec<u8>>,
+         expect_sigschemes: Vec<SignatureScheme>,
+     ) -> Self {
+         Self {
+@@ -264,22 +264,21 @@ impl Drop for ClientCheckCertResolve {
+ }
+ 
+ impl ResolvesClientCert for ClientCheckCertResolve {
+-    fn resolve(&self, server_hello: &CredentialRequest<'_>) -> Option<CertifiedSigner> {
++    fn resolve(
++        &self,
++        _negotiated_type: CertificateType,
++        root_hint_subjects: &[&[u8]],
++        sigschemes: &[SignatureScheme],
++    ) -> Option<CertifiedSigner> {
+         self.query_count
+             .fetch_add(1, Ordering::SeqCst);
+ 
+-        if server_hello
+-            .signature_schemes()
+-            .is_empty()
+-        {
++        if sigschemes.is_empty() {
+             panic!("no signature schemes shared by server");
+         }
+ 
+-        assert_eq!(server_hello.signature_schemes(), self.expect_sigschemes);
+-        assert_eq!(
+-            server_hello.root_hint_subjects(),
+-            &self.expect_root_hint_subjects
+-        );
++        assert_eq!(sigschemes, self.expect_sigschemes);
++        assert_eq!(root_hint_subjects, self.expect_root_hint_subjects);
+ 
+         None
+     }
+@@ -292,7 +291,7 @@ impl ResolvesClientCert for ClientCheckCertResolve {
+ fn test_client_cert_resolve(
+     key_type: KeyType,
+     server_config: Arc<ServerConfig>,
+-    expected_root_hint_subjects: Vec<DistinguishedName>,
++    expected_root_hint_subjects: Vec<Vec<u8>>,
+ ) {
+     for (version, version_provider) in [
+         (ProtocolVersion::TLSv1_3, &provider::DEFAULT_TLS13_PROVIDER),
+@@ -358,7 +357,11 @@ fn client_cert_resolve_default() {
+ 
+         // In a default configuration we expect that the verifier's trust anchors are used
+         // for the hint subjects.
+-        let expected_root_hint_subjects = vec![key_type.ca_distinguished_name()];
++        let expected_root_hint_subjects = vec![
++            key_type
++                .ca_distinguished_name()
++                .to_vec(),
++        ];
+ 
+         test_client_cert_resolve(*key_type, server_config, expected_root_hint_subjects);
+     }
+@@ -384,15 +387,18 @@ fn client_cert_resolve_server_added_hint() {
+     // Test that a server can add an extra subject above/beyond those found in its trust store
+     // and the client cert resolver gets the expected arguments.
+     let provider = provider::DEFAULT_PROVIDER;
+-    let extra_name = DistinguishedName::from(
+-        b"0\x1a1\x180\x16\x06\x03U\x04\x03\x0c\x0fponyland IDK CA".to_vec(),
+-    );
++    let extra_name = b"0\x1a1\x180\x16\x06\x03U\x04\x03\x0c\x0fponyland IDK CA".to_vec();
+     for key_type in KeyType::all_for_provider(&provider) {
+-        let expected_hint_subjects = vec![key_type.ca_distinguished_name(), extra_name.clone()];
++        let expected_hint_subjects = vec![
++            key_type
++                .ca_distinguished_name()
++                .to_vec(),
++            extra_name.clone(),
++        ];
+         // Create a verifier that adds the extra_name as a hint subject in addition to the ones
+         // from the root cert store.
+         let verifier = webpki_client_verifier_builder(key_type.client_root_store(), &provider)
+-            .add_root_hint_subjects([extra_name.clone()].into_iter());
++            .add_root_hint_subjects([DistinguishedName::from(extra_name.clone())].into_iter());
+         let server_config = make_server_config_with_client_verifier(*key_type, verifier, &provider);
+         test_client_cert_resolve(*key_type, server_config.into(), expected_hint_subjects);
+     }
+diff --git a/rustls/tests/server_cert_verifier.rs b/rustls/tests/server_cert_verifier.rs
+index 886bc366..efa7b3a0 100644
+--- a/rustls/tests/server_cert_verifier.rs
++++ b/rustls/tests/server_cert_verifier.rs
+@@ -208,7 +208,9 @@ fn client_can_request_certain_trusted_cas() {
+             .iter()
+             .map(|kt| {
+                 (
+-                    kt.ca_distinguished_name(),
++                    kt.ca_distinguished_name()
++                        .to_vec()
++                        .into(),
+                     kt.certified_key_with_cert_chain(&provider)
+                         .unwrap(),
+                 )
+@@ -237,7 +239,11 @@ fn client_can_request_certain_trusted_cas() {
+ 
+         let cas_sending_server_verifier = Arc::new(ServerVerifierWithCasExt {
+             verifier: server_verifier.clone(),
+-            ca_names: Arc::from(vec![key_type.ca_distinguished_name()]),
++            ca_names: Arc::from(vec![DistinguishedName::from(
++                key_type
++                    .ca_distinguished_name()
++                    .to_vec(),
++            )]),
+         });
+ 
+         let cas_sending_client_config =

@@ -1,0 +1,233 @@
+diff --git a/tower-buffer/src/error.rs b/tower-buffer/src/error.rs
+index 394b279..804e11f 100644
+--- a/tower-buffer/src/error.rs
++++ b/tower-buffer/src/error.rs
+@@ -6,10 +6,15 @@ use std::sync::Arc;
+ /// An error produced by a `Service` wrapped by a `Buffer`
+ #[derive(Debug)]
+ pub struct ServiceError {
+-    method: &'static str,
+     inner: Arc<Error>,
+ }
+ 
++/// An error when the buffer's worker closes unexpectedly.
++#[derive(Debug)]
++pub struct Closed {
++    _p: (),
++}
++
+ /// Error produced when spawning the worker fails
+ #[derive(Debug)]
+ pub struct SpawnError<T> {
+@@ -22,15 +27,14 @@ pub(crate) type Error = Box<::std::error::Error + Send + Sync>;
+ // ===== impl ServiceError =====
+ 
+ impl ServiceError {
+-    pub(crate) fn new(method: &'static str, inner: Error) -> ServiceError {
++    pub(crate) fn new(inner: Error) -> ServiceError {
+         let inner = Arc::new(inner);
+-        ServiceError { method, inner }
++        ServiceError { inner }
+     }
+ 
+     /// Private to avoid exposing `Clone` trait as part of the public API
+     pub(crate) fn clone(&self) -> ServiceError {
+         ServiceError {
+-            method: self.method,
+             inner: self.inner.clone(),
+         }
+     }
+@@ -38,7 +42,7 @@ impl ServiceError {
+ 
+ impl fmt::Display for ServiceError {
+     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+-        write!(fmt, "Service::{} failed: {}", self.method, self.inner)
++        write!(fmt, "buffered service failed: {}", self.inner)
+     }
+ }
+ 
+@@ -48,6 +52,22 @@ impl std::error::Error for ServiceError {
+     }
+ }
+ 
++// ===== impl Closed =====
++
++impl Closed {
++    pub(crate) fn new() -> Self {
++        Closed { _p: () }
++    }
++}
++
++impl fmt::Display for Closed {
++    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
++        fmt.write_str("buffer's worker closed unexpectedly")
++    }
++}
++
++impl std::error::Error for Closed {}
++
+ // ===== impl SpawnError =====
+ 
+ impl<T> SpawnError<T> {
+diff --git a/tower-buffer/src/future.rs b/tower-buffer/src/future.rs
+index 060e918..004119d 100644
+--- a/tower-buffer/src/future.rs
++++ b/tower-buffer/src/future.rs
+@@ -1,6 +1,6 @@
+ //! Future types
+ 
+-use error::{Error, ServiceError};
++use error::{Closed, Error};
+ use futures::{Async, Future, Poll};
+ use message;
+ 
+@@ -10,7 +10,7 @@ pub struct ResponseFuture<T> {
+ }
+ 
+ enum ResponseState<T> {
+-    Failed(ServiceError),
++    Failed(Option<Error>),
+     Rx(message::Rx<T>),
+     Poll(T),
+ }
+@@ -26,9 +26,9 @@ where
+         }
+     }
+ 
+-    pub(crate) fn failed(err: ServiceError) -> Self {
++    pub(crate) fn failed(err: Error) -> Self {
+         ResponseFuture {
+-            state: ResponseState::Failed(err),
++            state: ResponseState::Failed(Some(err)),
+         }
+     }
+ }
+@@ -48,16 +48,14 @@ where
+             let fut;
+ 
+             match self.state {
+-                Failed(ref e) => {
+-                    return Err(e.clone().into());
++                Failed(ref mut e) => {
++                    return Err(e.take().expect("polled after error"));
+                 }
+                 Rx(ref mut rx) => match rx.poll() {
+                     Ok(Async::Ready(Ok(f))) => fut = f,
+                     Ok(Async::Ready(Err(e))) => return Err(e.into()),
+                     Ok(Async::NotReady) => return Ok(Async::NotReady),
+-                    Err(_) => unreachable!(
+-                        "Worker exited without sending error to all outstanding requests."
+-                    ),
++                    Err(_) => return Err(Closed::new().into()),
+                 },
+                 Poll(ref mut fut) => {
+                     return fut.poll().map_err(Into::into);
+diff --git a/tower-buffer/src/lib.rs b/tower-buffer/src/lib.rs
+index c27fa58..7a87330 100644
+--- a/tower-buffer/src/lib.rs
++++ b/tower-buffer/src/lib.rs
+@@ -140,7 +140,7 @@ where
+         // If the inner service has errored, then we error here.
+         self.tx
+             .poll_ready()
+-            .map_err(move |_| self.worker.get_error_on_closed().into())
++            .map_err(|_| self.worker.get_error_on_closed())
+     }
+ 
+     fn call(&mut self, request: Request) -> Self::Future {
+diff --git a/tower-buffer/src/worker.rs b/tower-buffer/src/worker.rs
+index dfd6ae9..23b9742 100644
+--- a/tower-buffer/src/worker.rs
++++ b/tower-buffer/src/worker.rs
+@@ -1,4 +1,4 @@
+-use error::{Error, ServiceError};
++use error::{Closed, Error, ServiceError};
+ use futures::future::Executor;
+ use futures::{Async, Future, Poll, Stream};
+ use message::Message;
+@@ -106,8 +106,8 @@ where
+         Ok(Async::Ready(None))
+     }
+ 
+-    fn failed(&mut self, method: &'static str, error: T::Error) {
+-        // The underlying service failed when we called `method` on it with the given `error`. We
++    fn failed(&mut self, error: T::Error) {
++        // The underlying service failed when we called `poll_ready` on it with the given `error`. We
+         // need to communicate this to all the `Buffer` handles. To do so, we wrap up the error in
+         // an `Arc`, send that `Arc<E>` to all pending requests, and store it so that subsequent
+         // requests will also fail with the same error.
+@@ -119,7 +119,7 @@ where
+         // request. We do this by *first* exposing the error, *then* closing the channel used to
+         // send more requests (so the client will see the error when the send fails), and *then*
+         // sending the error to all outstanding requests.
+-        let error = ServiceError::new(method, error.into());
++        let error = ServiceError::new(error.into());
+ 
+         let mut inner = self.handle.inner.lock().unwrap();
+ 
+@@ -154,8 +154,8 @@ where
+         }
+ 
+         loop {
+-            match self.poll_next_msg()? {
+-                Async::Ready(Some(msg)) => {
++            match try_ready!(self.poll_next_msg()) {
++                Some(msg) => {
+                     if let Some(ref failed) = self.failed {
+                         let _ = msg.tx.send(Err(failed.clone()));
+                         continue;
+@@ -171,7 +171,6 @@ where
+                             // An error means the request had been canceled in-between
+                             // our calls, the response future will just be dropped.
+                             let _ = msg.tx.send(Ok(response));
+-                            continue;
+                         }
+                         Ok(Async::NotReady) => {
+                             // Put out current message back in its slot.
+@@ -179,7 +178,7 @@ where
+                             return Ok(Async::NotReady);
+                         }
+                         Err(e) => {
+-                            self.failed("poll_ready", e);
++                            self.failed(e);
+                             let _ = msg.tx.send(Err(self
+                                 .failed
+                                 .as_ref()
+@@ -188,33 +187,24 @@ where
+                         }
+                     }
+                 }
+-                Async::Ready(None) => {
++                None => {
+                     // No more more requests _ever_.
+                     self.finish = true;
+                     return Ok(Async::Ready(()));
+                 }
+-                Async::NotReady if self.failed.is_some() => {
+-                    // No need to poll the service as it has already failed.
+-                    return Ok(Async::NotReady);
+-                }
+-                Async::NotReady => {
+-                    // We don't have any new requests to enqueue.
+-                    // So we yield.
+-                    return Ok(Async::NotReady);
+-                }
+             }
+         }
+     }
+ }
+ 
+ impl Handle {
+-    pub(crate) fn get_error_on_closed(&self) -> ServiceError {
++    pub(crate) fn get_error_on_closed(&self) -> Error {
+         self.inner
+             .lock()
+             .unwrap()
+             .as_ref()
+-            .expect("Worker exited, but did not set error.")
+-            .clone()
++            .map(|svc_err| svc_err.clone().into())
++            .unwrap_or_else(|| Closed::new().into())
+     }
+ }
+ 

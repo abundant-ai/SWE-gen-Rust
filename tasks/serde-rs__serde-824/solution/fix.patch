@@ -1,0 +1,240 @@
+diff --git a/appveyor.yml b/appveyor.yml
+new file mode 100644
+index 00000000..f720b046
+--- /dev/null
++++ b/appveyor.yml
+@@ -0,0 +1,17 @@
++environment:
++  matrix:
++    - APPVEYOR_RUST_CHANNEL: stable
++    - APPVEYOR_RUST_CHANNEL: nightly
++
++install:
++  # Install rust, x86_64-pc-windows-msvc host
++  - appveyor DownloadFile https://win.rustup.rs/ -FileName rustup-init.exe
++  - rustup-init.exe -y --default-host x86_64-pc-windows-msvc --default-toolchain %APPVEYOR_RUST_CHANNEL%
++  - set PATH=C:\msys64\usr\bin;%PATH%;C:\Users\appveyor\.cargo\bin
++  - rustc -vV
++  - cargo -vV
++
++build: false
++
++test_script:
++  - sh -c 'PATH=`rustc --print sysroot`/bin:$PATH ./travis.sh'
+diff --git a/serde/src/de/impls.rs b/serde/src/de/impls.rs
+index 35f3cdf2..7bffab32 100644
+--- a/serde/src/de/impls.rs
++++ b/serde/src/de/impls.rs
+@@ -26,7 +26,7 @@ use std::net;
+ use std::path;
+ use core::str;
+ #[cfg(feature = "std")]
+-use std::ffi::CString;
++use std::ffi::{CString, OsString};
+ #[cfg(all(feature = "std", feature="unstable"))]
+ use std::ffi::CStr;
+ 
+@@ -910,6 +910,7 @@ impl Visitor for PathBufVisitor {
+     }
+ }
+ 
++
+ #[cfg(feature = "std")]
+ impl Deserialize for path::PathBuf {
+     fn deserialize<D>(deserializer: D) -> Result<path::PathBuf, D::Error>
+@@ -921,6 +922,110 @@ impl Deserialize for path::PathBuf {
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+ 
++#[cfg(all(feature = "std", any(unix, windows)))]
++enum OsStringKind {
++    Unix,
++    Windows,
++}
++
++#[cfg(all(feature = "std", any(unix, windows)))]
++static OSSTR_VARIANTS: &'static [&'static str] = &["Unix", "Windows"];
++
++#[cfg(all(feature = "std", any(unix, windows)))]
++impl Deserialize for OsStringKind {
++    fn deserialize<D>(deserializer: D) -> Result<OsStringKind, D::Error>
++        where D: Deserializer
++    {
++        struct KindVisitor;
++
++        impl Visitor for KindVisitor {
++            type Value = OsStringKind;
++
++            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
++                formatter.write_str("`Unix` or `Windows`")
++            }
++
++            fn visit_u32<E>(self, value: u32) -> Result<OsStringKind, E>
++                where E: Error,
++            {
++                match value {
++                    0 => Ok(OsStringKind::Unix),
++                    1 => Ok(OsStringKind::Windows),
++                    _ => Err(Error::invalid_value(Unexpected::Unsigned(value as u64), &self))
++                }
++            }
++
++            fn visit_str<E>(self, value: &str) -> Result<OsStringKind, E>
++                where E: Error,
++            {
++                match value {
++                    "Unix" => Ok(OsStringKind::Unix),
++                    "Windows" => Ok(OsStringKind::Windows),
++                    _ => Err(Error::unknown_variant(value, OSSTR_VARIANTS)),
++                }
++            }
++
++            fn visit_bytes<E>(self, value: &[u8]) -> Result<OsStringKind, E>
++                where E: Error,
++            {
++                match value {
++                    b"Unix" => Ok(OsStringKind::Unix),
++                    b"Windows" => Ok(OsStringKind::Windows),
++                    _ => {
++                        match str::from_utf8(value) {
++                            Ok(value) => Err(Error::unknown_variant(value, OSSTR_VARIANTS)),
++                            Err(_) => {
++                                Err(Error::invalid_value(Unexpected::Bytes(value), &self))
++                            }
++                        }
++                    }
++                }
++            }
++        }
++
++        deserializer.deserialize(KindVisitor)
++    }
++}
++
++#[cfg(all(feature = "std", any(unix, windows)))]
++struct OsStringVisitor;
++
++#[cfg(all(feature = "std", any(unix, windows)))]
++impl Visitor for OsStringVisitor {
++    type Value = OsString;
++
++    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
++        formatter.write_str("os string")
++    }
++
++    #[cfg(unix)]
++    fn visit_enum<V>(self, visitor: V) -> Result<OsString, V::Error>
++        where V: EnumVisitor,
++    {
++        use std::os::unix::ffi::OsStringExt;
++
++        match try!(visitor.visit_variant()) {
++            (OsStringKind::Unix, variant) => {
++                variant.visit_newtype().map(OsString::from_vec)
++            }
++            (OsStringKind::Windows, _) => {
++                Err(Error::custom("cannot deserialize windows os string on unix"))
++            }
++        }
++    }
++}
++
++#[cfg(all(feature = "std", any(unix, windows)))]
++impl Deserialize for OsString {
++    fn deserialize<D>(deserializer: D) -> Result<OsString, D::Error>
++        where D: Deserializer
++    {
++        deserializer.deserialize_enum("OsString", OSSTR_VARIANTS, OsStringVisitor)
++    }
++}
++
++///////////////////////////////////////////////////////////////////////////////
++
+ #[cfg(any(feature = "std", feature = "alloc"))]
+ impl<T: Deserialize> Deserialize for Box<T> {
+     fn deserialize<D>(deserializer: D) -> Result<Box<T>, D::Error>
+diff --git a/serde/src/ser/impls.rs b/serde/src/ser/impls.rs
+index 53ac7bf0..4f817760 100644
+--- a/serde/src/ser/impls.rs
++++ b/serde/src/ser/impls.rs
+@@ -20,7 +20,7 @@ use core::ops;
+ #[cfg(feature = "std")]
+ use std::path;
+ #[cfg(feature = "std")]
+-use std::ffi::{CString, CStr};
++use std::ffi::{CString, CStr, OsString, OsStr};
+ #[cfg(feature = "std")]
+ use std::rc::Rc;
+ #[cfg(all(feature = "alloc", not(feature = "std")))]
+@@ -714,6 +714,41 @@ impl Serialize for path::PathBuf {
+     }
+ }
+ 
++#[cfg(all(feature = "std", any(unix, windows)))]
++impl Serialize for OsStr {
++    #[cfg(unix)]
++    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
++        where S: Serializer
++    {
++        use std::os::unix::ffi::OsStrExt;
++        serializer.serialize_newtype_variant("OsString",
++                                             0,
++                                             "Unix",
++                                             self.as_bytes())
++    }
++    #[cfg(windows)]
++    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
++        where S: Serializer
++    {
++        use std::os::windows::ffi::OsStrExt;
++        let val = self.encode_wide().collect::<Vec<_>>();
++        serializer.serialize_newtype_variant("OsString",
++                                             1,
++                                             "Windows",
++                                             &val)
++    }
++}
++
++#[cfg(all(feature = "std", any(unix, windows)))]
++#[cfg(feature = "std")]
++impl Serialize for OsString {
++    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
++        where S: Serializer
++    {
++        self.as_os_str().serialize(serializer)
++    }
++}
++
+ #[cfg(feature = "unstable")]
+ impl<T> Serialize for NonZero<T>
+     where T: Serialize + Zeroable
+diff --git a/test_suite/no_std/src/main.rs b/test_suite/no_std/src/main.rs
+index 6639b5cc..a4469819 100644
+--- a/test_suite/no_std/src/main.rs
++++ b/test_suite/no_std/src/main.rs
+@@ -1,7 +1,8 @@
+-#![feature(lang_items, start, libc)]
++#![feature(lang_items, start, libc, compiler_builtins_lib)]
+ #![no_std]
+ 
+ extern crate libc;
++extern crate compiler_builtins;
+ 
+ #[start]
+ fn start(_argc: isize, _argv: *const *const u8) -> isize {
+diff --git a/travis.sh b/travis.sh
+index d2e1a998..d5f62d28 100755
+--- a/travis.sh
++++ b/travis.sh
+@@ -10,6 +10,11 @@ channel() {
+             pwd
+             (set -x; cargo "$@")
+         fi
++    elif [ -n "${APPVEYOR}" ]; then
++        if [ "${APPVEYOR_RUST_CHANNEL}" = "${CHANNEL}" ]; then
++            pwd
++            (set -x; cargo "$@")
++        fi
+     else
+         pwd
+         (set -x; cargo "+${CHANNEL}" "$@")

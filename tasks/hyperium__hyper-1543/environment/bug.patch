@@ -1,0 +1,172 @@
+diff --git a/src/body/body.rs b/src/body/body.rs
+index 71c180f0..87cf0874 100644
+--- a/src/body/body.rs
++++ b/src/body/body.rs
+@@ -11,6 +11,7 @@ use common::Never;
+ use super::{Chunk, Payload};
+ use super::internal::{FullDataArg, FullDataRet};
+ 
++
+ type BodySender = mpsc::Sender<Result<Chunk, ::Error>>;
+ 
+ /// A stream of `Chunk`s, used when receiving bodies.
+@@ -35,7 +36,7 @@ pub struct Body {
+ enum Kind {
+     Once(Option<Chunk>),
+     Chan {
+-        abort_rx: oneshot::Receiver<()>,
++        _close_tx: oneshot::Sender<()>,
+         rx: mpsc::Receiver<Result<Chunk, ::Error>>,
+     },
+     H2(h2::RecvStream),
+@@ -60,7 +61,7 @@ enum DelayEof {
+ #[must_use = "Sender does nothing unless sent on"]
+ #[derive(Debug)]
+ pub struct Sender {
+-    abort_tx: oneshot::Sender<()>,
++    close_rx: oneshot::Receiver<()>,
+     tx: BodySender,
+ }
+ 
+@@ -86,14 +87,14 @@ impl Body {
+     #[inline]
+     pub fn channel() -> (Sender, Body) {
+         let (tx, rx) = mpsc::channel(0);
+-        let (abort_tx, abort_rx) = oneshot::channel();
++        let (close_tx, close_rx) = oneshot::channel();
+ 
+         let tx = Sender {
+-            abort_tx: abort_tx,
++            close_rx: close_rx,
+             tx: tx,
+         };
+         let rx = Body::new(Kind::Chan {
+-            abort_rx: abort_rx,
++            _close_tx: close_tx,
+             rx: rx,
+         });
+ 
+@@ -188,17 +189,11 @@ impl Body {
+     fn poll_inner(&mut self) -> Poll<Option<Chunk>, ::Error> {
+         match self.kind {
+             Kind::Once(ref mut val) => Ok(Async::Ready(val.take())),
+-            Kind::Chan { ref mut rx, ref mut abort_rx } => {
+-                if let Ok(Async::Ready(())) = abort_rx.poll() {
+-                    return Err(::Error::new_body_write("body write aborted"));
+-                }
+-
+-                match rx.poll().expect("mpsc cannot error") {
+-                    Async::Ready(Some(Ok(chunk))) => Ok(Async::Ready(Some(chunk))),
+-                    Async::Ready(Some(Err(err))) => Err(err),
+-                    Async::Ready(None) => Ok(Async::Ready(None)),
+-                    Async::NotReady => Ok(Async::NotReady),
+-                }
++            Kind::Chan { ref mut rx, .. } => match rx.poll().expect("mpsc cannot error") {
++                Async::Ready(Some(Ok(chunk))) => Ok(Async::Ready(Some(chunk))),
++                Async::Ready(Some(Err(err))) => Err(err),
++                Async::Ready(None) => Ok(Async::Ready(None)),
++                Async::NotReady => Ok(Async::NotReady),
+             },
+             Kind::H2(ref mut h2) => {
+                 h2.poll()
+@@ -288,7 +283,7 @@ impl fmt::Debug for Body {
+ impl Sender {
+     /// Check to see if this `Sender` can send more data.
+     pub fn poll_ready(&mut self) -> Poll<(), ::Error> {
+-        match self.abort_tx.poll_cancel() {
++        match self.close_rx.poll() {
+             Ok(Async::Ready(())) | Err(_) => return Err(::Error::new_closed()),
+             Ok(Async::NotReady) => (),
+         }
+@@ -308,11 +303,6 @@ impl Sender {
+             .map_err(|err| err.into_inner().expect("just sent Ok"))
+     }
+ 
+-    /// Aborts the body in an abnormal fashion.
+-    pub fn abort(self) {
+-        let _ = self.abort_tx.send(());
+-    }
+-
+     pub(crate) fn send_error(&mut self, err: ::Error) {
+         let _ = self.tx.try_send(Err(err));
+     }
+diff --git a/src/error.rs b/src/error.rs
+index 0eb064f2..f1326e2d 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -265,7 +265,7 @@ impl StdError for Error {
+             Kind::NewService => "calling user's new_service failed",
+             Kind::Service => "error from user's server service",
+             Kind::Body => "error reading a body from connection",
+-            Kind::BodyWrite => "error writing a body to connection",
++            Kind::BodyWrite => "error write a body to connection",
+             Kind::BodyUser => "error from user's Payload stream",
+             Kind::Shutdown => "error shutting down connection",
+             Kind::Http2 => "http2 general error",
+diff --git a/tests/client.rs b/tests/client.rs
+index bd5958a7..3436ca7e 100644
+--- a/tests/client.rs
++++ b/tests/client.rs
+@@ -1373,7 +1373,7 @@ mod conn {
+     use tokio::net::TcpStream;
+     use tokio_io::{AsyncRead, AsyncWrite};
+ 
+-    use hyper::{self, Request, Body, Method};
++    use hyper::{self, Request};
+     use hyper::client::conn;
+ 
+     use super::{s, tcp_connect, FutureHyperExt};
+@@ -1424,53 +1424,6 @@ mod conn {
+         res.join(rx).map(|r| r.0).wait().unwrap();
+     }
+ 
+-    #[test]
+-    fn aborted_body_isnt_completed() {
+-        let _ = ::pretty_env_logger::try_init();
+-        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+-        let addr = server.local_addr().unwrap();
+-        let mut runtime = Runtime::new().unwrap();
+-
+-        let (tx, rx) = oneshot::channel();
+-        let server = thread::spawn(move || {
+-            let mut sock = server.accept().unwrap().0;
+-            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+-            sock.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+-            let expected = "POST / HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n";
+-            let mut buf = vec![0; expected.len()];
+-            sock.read_exact(&mut buf).expect("read 1");
+-            assert_eq!(s(&buf), expected);
+-
+-            let _ = tx.send(());
+-
+-            assert_eq!(sock.read(&mut buf).expect("read 2"), 0);
+-        });
+-
+-        let tcp = tcp_connect(&addr).wait().unwrap();
+-
+-        let (mut client, conn) = conn::handshake(tcp).wait().unwrap();
+-
+-        runtime.spawn(conn.map(|_| ()).map_err(|e| panic!("conn error: {}", e)));
+-
+-        let (mut sender, body) = Body::channel();
+-        let sender = thread::spawn(move || {
+-            sender.send_data("hello".into()).ok().unwrap();
+-            rx.wait().unwrap();
+-            sender.abort();
+-        });
+-
+-        let req = Request::builder()
+-            .method(Method::POST)
+-            .uri("/")
+-            .body(body)
+-            .unwrap();
+-        let res = client.send_request(req);
+-        res.wait().unwrap_err();
+-
+-        server.join().expect("server thread panicked");
+-        sender.join().expect("sender thread panicked");
+-    }
+-
+     #[test]
+     fn uri_absolute_form() {
+         let server = TcpListener::bind("127.0.0.1:0").unwrap();

@@ -1,0 +1,207 @@
+diff --git a/README.md b/README.md
+index 3c136b84..31b97bc1 100644
+--- a/README.md
++++ b/README.md
+@@ -356,8 +356,11 @@ impl serde::Serialize for i32 {
+ ```
+ 
+ As you can see it's pretty simple. More complex types like `BTreeMap` need to
+-use a multi-step process (init, elements, end) in order to walk through the
+-type:
++pass a
++[MapVisitor](http://serde-rs.github.io/serde/serde/serde/ser/trait.MapVisitor.html)
++to the
++[Serializer](http://serde-rs.github.io/serde/serde/serde/ser/trait.Serializer.html)
++in order to walk through the type:
+ 
+ ```rust,ignore
+ impl<K, V> Serialize for BTreeMap<K, V>
+@@ -368,17 +371,55 @@ impl<K, V> Serialize for BTreeMap<K, V>
+     fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error>
+         where S: Serializer,
+     {
+-        let mut state = try!(serializer.serialize_map(Some(self.len())));
+-        for (k, v) in self {
+-            try!(serializer.serialize_map_elt(&mut state, k, v));
++        serializer.serialize_map(MapIteratorVisitor::new(self.iter(), Some(self.len())))
++    }
++}
++
++pub struct MapIteratorVisitor<Iter> {
++    iter: Iter,
++    len: Option<usize>,
++}
++
++impl<K, V, Iter> MapIteratorVisitor<Iter>
++    where Iter: Iterator<Item=(K, V)>
++{
++    #[inline]
++    pub fn new(iter: Iter, len: Option<usize>) -> MapIteratorVisitor<Iter> {
++        MapIteratorVisitor {
++            iter: iter,
++            len: len,
++        }
++    }
++}
++
++impl<K, V, I> MapVisitor for MapIteratorVisitor<I>
++    where K: Serialize,
++          V: Serialize,
++          I: Iterator<Item=(K, V)>,
++{
++    #[inline]
++    fn visit<S>(&mut self, serializer: &mut S) -> Result<Option<()>, S::Error>
++        where S: Serializer,
++    {
++        match self.iter.next() {
++            Some((key, value)) => {
++                let value = try!(serializer.serialize_map_elt(key, value));
++                Ok(Some(value))
++            }
++            None => Ok(None)
+         }
+-        serializer.serialize_map_end(state)
++    }
++
++    #[inline]
++    fn len(&self) -> Option<usize> {
++        self.len
+     }
+ }
+ ```
+ 
+ Serializing structs follow this same pattern. In fact, structs are represented
+-as a named map, with a known length.
++as a named map. Its visitor uses a simple state machine to iterate through all
++the fields:
+ 
+ ```rust
+ extern crate serde;
+@@ -393,10 +434,35 @@ impl serde::Serialize for Point {
+     fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error>
+         where S: serde::Serializer
+     {
+-        let mut state = try!(serializer.serialize_struct("Point", 2));
+-        try!(serializer.serialize_struct_elt(&mut state, "x", &self.x));
+-        try!(serializer.serialize_struct_elt(&mut state, "y", &self.y));
+-        serializer.serialize_struct_end(state)
++        serializer.serialize_struct("Point", PointMapVisitor {
++            value: self,
++            state: 0,
++        })
++    }
++}
++
++struct PointMapVisitor<'a> {
++    value: &'a Point,
++    state: u8,
++}
++
++impl<'a> serde::ser::MapVisitor for PointMapVisitor<'a> {
++    fn visit<S>(&mut self, serializer: &mut S) -> Result<Option<()>, S::Error>
++        where S: serde::Serializer
++    {
++        match self.state {
++            0 => {
++                self.state += 1;
++                Ok(Some(try!(serializer.serialize_struct_elt("x", &self.value.x))))
++            }
++            1 => {
++                self.state += 1;
++                Ok(Some(try!(serializer.serialize_struct_elt("y", &self.value.y))))
++            }
++            _ => {
++                Ok(None)
++            }
++        }
+     }
+ }
+ 
+diff --git a/serde_macros/Cargo.toml b/serde_macros/Cargo.toml
+index 4791f416..aafbfe05 100644
+--- a/serde_macros/Cargo.toml
++++ b/serde_macros/Cargo.toml
+@@ -8,29 +8,17 @@ repository = "https://github.com/serde-rs/serde"
+ documentation = "https://github.com/serde-rs/serde"
+ keywords = ["serde", "serialization"]
+ include = ["Cargo.toml", "src/**/*.rs"]
+-build = "build.rs"
+ 
+ [lib]
+ name = "serde_macros"
+ plugin = true
+ 
+ [features]
+-unstable-testing = [
+-    "clippy",
+-    "skeptic",
+-    "serde_json",
+-    "serde/unstable-testing",
+-    "serde_codegen/unstable-testing"
+-]
+-
+-[build-dependencies]
+-skeptic = { version = "^0.6.0", optional = true }
++unstable-testing = ["clippy", "serde/unstable-testing", "serde_codegen/unstable-testing"]
+ 
+ [dependencies]
+ clippy = { version = "^0.*", optional = true }
+ serde_codegen = { version = "=0.8.0", default-features = false, features = ["unstable"] }
+-skeptic = { version = "^0.6.0", optional = true }
+-serde_json = { version = "0.8.0", optional = true }
+ 
+ [dev-dependencies]
+ clippy = "^0.*"
+@@ -44,10 +32,6 @@ serde_test = "0.8.0"
+ name = "test"
+ path = "tests/test.rs"
+ 
+-[[test]]
+-name = "skeptic"
+-path = "tests/skeptic.rs"
+-
+ [[bench]]
+ name = "bench"
+ path = "benches/bench.rs"
+diff --git a/serde_macros/build.rs b/serde_macros/build.rs
+deleted file mode 100644
+index 0f545500..00000000
+--- a/serde_macros/build.rs
++++ /dev/null
+@@ -1,18 +0,0 @@
+-#[cfg(feature = "unstable-testing")]
+-mod inner {
+-    extern crate skeptic;
+-
+-    pub fn main() {
+-        println!("cargo:rerun-if-changed=../README.md");
+-        skeptic::generate_doc_tests(&["../README.md"]);
+-    }
+-}
+-
+-#[cfg(not(feature = "unstable-testing"))]
+-mod inner {
+-    pub fn main() {}
+-}
+-
+-fn main() {
+-    inner::main()
+-}
+diff --git a/serde_macros/tests/skeptic.rs b/serde_macros/tests/skeptic.rs
+deleted file mode 100644
+index 47e632d0..00000000
+--- a/serde_macros/tests/skeptic.rs
++++ /dev/null
+@@ -1,3 +0,0 @@
+-#![cfg(feature = "unstable-testing")]
+-
+-include!(concat!(env!("OUT_DIR"), "/skeptic-tests.rs"));
+diff --git a/serde_macros/tests/test.rs b/serde_macros/tests/test.rs
+index 94d8338b..e0462787 100644
+--- a/serde_macros/tests/test.rs
++++ b/serde_macros/tests/test.rs
+@@ -6,4 +6,3 @@ extern crate test;
+ include!("../../testing/tests/test.rs.in");
+ 
+ mod compile_tests;
+-mod skeptic;

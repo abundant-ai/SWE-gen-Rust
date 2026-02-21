@@ -1,0 +1,241 @@
+diff --git a/rustls/src/client/client_conn.rs b/rustls/src/client/client_conn.rs
+index e2706c76..c7effea1 100644
+--- a/rustls/src/client/client_conn.rs
++++ b/rustls/src/client/client_conn.rs
+@@ -18,7 +18,7 @@ use crate::log::trace;
+ use crate::msgs::enums::NamedGroup;
+ use crate::msgs::handshake::ClientExtension;
+ use crate::msgs::persist;
+-use crate::suites::{ExtractedSecrets, SupportedCipherSuite};
++use crate::suites::SupportedCipherSuite;
+ use crate::sync::Arc;
+ #[cfg(feature = "std")]
+ use crate::time_provider::DefaultTimeProvider;
+@@ -847,12 +847,6 @@ impl UnbufferedClientConnection {
+             inner: ConnectionCore::for_client(config, name, Vec::new(), Protocol::Tcp)?.into(),
+         })
+     }
+-
+-    /// Extract secrets, so they can be used when configuring kTLS, for example.
+-    /// Should be used with care as it exposes secret key material.
+-    pub fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
+-        self.inner.dangerous_extract_secrets()
+-    }
+ }
+ 
+ impl Deref for UnbufferedClientConnection {
+diff --git a/rustls/src/conn.rs b/rustls/src/conn.rs
+index 92512a72..426d3770 100644
+--- a/rustls/src/conn.rs
++++ b/rustls/src/conn.rs
+@@ -467,7 +467,18 @@ impl<Data> ConnectionCommon<Data> {
+     /// Extract secrets, so they can be used when configuring kTLS, for example.
+     /// Should be used with care as it exposes secret key material.
+     pub fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
+-        self.core.dangerous_extract_secrets()
++        if !self.enable_secret_extraction {
++            return Err(Error::General("Secret extraction is disabled".into()));
++        }
++
++        let st = self.core.state?;
++
++        let record_layer = self.core.common_state.record_layer;
++        let PartiallyExtractedSecrets { tx, rx } = st.extract_secrets()?;
++        Ok(ExtractedSecrets {
++            tx: (record_layer.write_seq(), tx),
++            rx: (record_layer.read_seq(), rx),
++        })
+     }
+ 
+     /// Sets a limit on the internal buffers used to buffer
+@@ -813,14 +824,6 @@ impl<Data> From<ConnectionCore<Data>> for UnbufferedConnectionCommon<Data> {
+     }
+ }
+ 
+-impl<Data> UnbufferedConnectionCommon<Data> {
+-    /// Extract secrets, so they can be used when configuring kTLS, for example.
+-    /// Should be used with care as it exposes secret key material.
+-    pub fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
+-        self.core.dangerous_extract_secrets()
+-    }
+-}
+-
+ impl<T> Deref for UnbufferedConnectionCommon<T> {
+     type Target = CommonState;
+ 
+@@ -1158,24 +1161,6 @@ impl<Data> ConnectionCore<Data> {
+             .process_main_protocol(msg, state, &mut self.data, sendable_plaintext)
+     }
+ 
+-    pub(crate) fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
+-        if !self
+-            .common_state
+-            .enable_secret_extraction
+-        {
+-            return Err(Error::General("Secret extraction is disabled".into()));
+-        }
+-
+-        let st = self.state?;
+-
+-        let record_layer = self.common_state.record_layer;
+-        let PartiallyExtractedSecrets { tx, rx } = st.extract_secrets()?;
+-        Ok(ExtractedSecrets {
+-            tx: (record_layer.write_seq(), tx),
+-            rx: (record_layer.read_seq(), rx),
+-        })
+-    }
+-
+     pub(crate) fn export_keying_material<T: AsMut<[u8]>>(
+         &self,
+         mut output: T,
+diff --git a/rustls/src/server/server_conn.rs b/rustls/src/server/server_conn.rs
+index 902f56fb..bb790da8 100644
+--- a/rustls/src/server/server_conn.rs
++++ b/rustls/src/server/server_conn.rs
+@@ -25,7 +25,6 @@ use crate::msgs::base::Payload;
+ use crate::msgs::enums::CertificateType;
+ use crate::msgs::handshake::{ClientHelloPayload, ProtocolName, ServerExtension};
+ use crate::msgs::message::Message;
+-use crate::suites::ExtractedSecrets;
+ use crate::sync::Arc;
+ #[cfg(feature = "std")]
+ use crate::time_provider::DefaultTimeProvider;
+@@ -892,12 +891,6 @@ impl UnbufferedServerConnection {
+             )?),
+         })
+     }
+-
+-    /// Extract secrets, so they can be used when configuring kTLS, for example.
+-    /// Should be used with care as it exposes secret key material.
+-    pub fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
+-        self.inner.dangerous_extract_secrets()
+-    }
+ }
+ 
+ impl Deref for UnbufferedServerConnection {
+diff --git a/rustls/tests/unbuffered.rs b/rustls/tests/unbuffered.rs
+index a255a847..e37030b5 100644
+--- a/rustls/tests/unbuffered.rs
++++ b/rustls/tests/unbuffered.rs
+@@ -3,7 +3,6 @@
+ use std::num::NonZeroUsize;
+ 
+ use rustls::client::{ClientConnectionData, EarlyDataError, UnbufferedClientConnection};
+-use rustls::crypto::CryptoProvider;
+ use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
+ use rustls::unbuffered::{
+     ConnectionState, EncodeError, EncryptError, InsufficientSizeError, ReadTraffic,
+@@ -11,15 +10,13 @@ use rustls::unbuffered::{
+ };
+ use rustls::version::TLS13;
+ use rustls::{
+-    AlertDescription, CertificateError, ClientConfig, ConnectionTrafficSecrets, Error,
+-    InvalidMessage, ServerConfig, SideData,
++    AlertDescription, CertificateError, ClientConfig, Error, InvalidMessage, ServerConfig, SideData,
+ };
+ 
+ use super::*;
+ 
+ mod common;
+ use common::*;
+-use provider::cipher_suite;
+ 
+ const MAX_ITERATIONS: usize = 100;
+ 
+@@ -1414,96 +1411,6 @@ fn server_receives_incorrect_first_handshake_message() {
+     };
+ }
+ 
+-/// Test that secrets can be extracted and used for encryption/decryption.
+-#[test]
+-fn test_secret_extraction_enabled() {
+-    // Normally, secret extraction would be used to configure kTLS (TLS offload
+-    // to the kernel). We want this test to run on any platform, though, so
+-    // instead we just compare secrets for equality.
+-
+-    // TLS 1.2 and 1.3 have different mechanisms for key exchange and handshake,
+-    // and secrets are stored/extracted differently, so we want to test them both.
+-    // We support 3 different AEAD algorithms (AES-128-GCM mode, AES-256-GCM, and
+-    // Chacha20Poly1305), so that's 2*3 = 6 combinations to test.
+-    let kt = KeyType::Rsa2048;
+-    for suite in [
+-        cipher_suite::TLS13_AES_128_GCM_SHA256,
+-        cipher_suite::TLS13_AES_256_GCM_SHA384,
+-        #[cfg(not(feature = "fips"))]
+-        cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+-        cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+-        cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+-        #[cfg(not(feature = "fips"))]
+-        cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+-    ] {
+-        let version = suite.version();
+-        println!("Testing suite {:?}", suite.suite().as_str());
+-
+-        // Only offer the cipher suite (and protocol version) that we're testing
+-        let mut server_config = ServerConfig::builder_with_provider(
+-            CryptoProvider {
+-                cipher_suites: vec![suite],
+-                ..provider::default_provider()
+-            }
+-            .into(),
+-        )
+-        .with_protocol_versions(&[version])
+-        .unwrap()
+-        .with_no_client_auth()
+-        .with_single_cert(kt.get_chain(), kt.get_key())
+-        .unwrap();
+-        // Opt into secret extraction from both sides
+-        server_config.enable_secret_extraction = true;
+-        let server_config = Arc::new(server_config);
+-
+-        let mut client_config = make_client_config(kt);
+-        client_config.enable_secret_extraction = true;
+-
+-        let mut outcome = run(
+-            Arc::new(client_config),
+-            &mut NO_ACTIONS.clone(),
+-            server_config.clone(),
+-            &mut NO_ACTIONS.clone(),
+-        );
+-
+-        let client = outcome.client.take().unwrap();
+-        let server = outcome.server.take().unwrap();
+-
+-        // The handshake is finished, we're now able to extract traffic secrets
+-        let client_secrets = client
+-            .dangerous_extract_secrets()
+-            .unwrap();
+-        let server_secrets = server
+-            .dangerous_extract_secrets()
+-            .unwrap();
+-
+-        // Comparing secrets for equality is something you should never have to
+-        // do in production code, so ConnectionTrafficSecrets doesn't implement
+-        // PartialEq/Eq on purpose. Instead, we have to get creative.
+-        fn explode_secrets(s: &ConnectionTrafficSecrets) -> (&[u8], &[u8]) {
+-            match s {
+-                ConnectionTrafficSecrets::Aes128Gcm { key, iv } => (key.as_ref(), iv.as_ref()),
+-                ConnectionTrafficSecrets::Aes256Gcm { key, iv } => (key.as_ref(), iv.as_ref()),
+-                ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv } => {
+-                    (key.as_ref(), iv.as_ref())
+-                }
+-                _ => panic!("unexpected secret type"),
+-            }
+-        }
+-
+-        fn assert_secrets_equal(
+-            (l_seq, l_sec): (u64, ConnectionTrafficSecrets),
+-            (r_seq, r_sec): (u64, ConnectionTrafficSecrets),
+-        ) {
+-            assert_eq!(l_seq, r_seq);
+-            assert_eq!(explode_secrets(&l_sec), explode_secrets(&r_sec));
+-        }
+-
+-        assert_secrets_equal(client_secrets.tx, server_secrets.rx);
+-        assert_secrets_equal(client_secrets.rx, server_secrets.tx);
+-    }
+-}
+-
+ const TLS12_CLIENT_TRANSCRIPT: &[&str] = &[
+     "EncodeTlsData",
+     "TransmitTlsData",

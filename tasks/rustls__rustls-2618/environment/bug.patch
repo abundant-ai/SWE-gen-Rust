@@ -1,0 +1,478 @@
+diff --git a/openssl-tests/src/early_exporter.rs b/openssl-tests/src/early_exporter.rs
+deleted file mode 100644
+index 8183e883..00000000
+--- a/openssl-tests/src/early_exporter.rs
++++ /dev/null
+@@ -1,148 +0,0 @@
+-use std::io::{Read, Write};
+-use std::net::{TcpListener, TcpStream};
+-use std::sync::Arc;
+-use std::{str, thread};
+-
+-use openssl::ssl::{SslConnector, SslMethod, SslSession, SslStream};
+-use rustls::ServerConfig;
+-use rustls::crypto::aws_lc_rs as provider;
+-use rustls::pki_types::pem::PemObject;
+-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+-
+-use crate::utils::verify_openssl3_available;
+-
+-#[test]
+-fn test_early_exporter() {
+-    verify_openssl3_available();
+-
+-    // full handshake + one resumption
+-    const ITERS: usize = 2;
+-
+-    let listener = TcpListener::bind(("localhost", 0)).unwrap();
+-    let port = listener.local_addr().unwrap().port();
+-
+-    let server_thread = thread::spawn(move || {
+-        let mut config = ServerConfig::builder_with_provider(provider::default_provider().into())
+-            .with_no_client_auth()
+-            .with_single_cert(load_certs(), load_private_key())
+-            .unwrap();
+-        config.max_early_data_size = 8192;
+-        let config = Arc::new(config);
+-
+-        for _ in 0..ITERS {
+-            let mut server = rustls::ServerConnection::new(config.clone()).unwrap();
+-            let (mut tcp_stream, _addr) = listener.accept().unwrap();
+-
+-            // read clienthello and then inspect early_data status
+-            server
+-                .read_tls(&mut tcp_stream)
+-                .unwrap();
+-            server.process_new_packets().unwrap();
+-
+-            let message = if let Some(mut early) = server.early_data() {
+-                let secret = early
+-                    .exporter()
+-                    .unwrap()
+-                    .derive(b"label", Some(b"context"), [0u8; 64])
+-                    .unwrap();
+-
+-                let mut buf = b"early data: ".to_vec();
+-                early.read_to_end(&mut buf).unwrap();
+-                buf.push(b'\n');
+-
+-                buf.extend_from_slice(b"exported: ");
+-                buf.extend_from_slice(format!("{:02x?}", secret).as_bytes());
+-                buf.push(b'\n');
+-                buf
+-            } else {
+-                b"no early data\n".to_vec()
+-            };
+-
+-            server
+-                .writer()
+-                .write_all(&message)
+-                .unwrap();
+-
+-            server
+-                .complete_io(&mut tcp_stream)
+-                .unwrap();
+-
+-            tcp_stream.flush().unwrap();
+-        }
+-    });
+-
+-    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+-    connector
+-        .set_ca_file(CA_PEM_FILE)
+-        .unwrap();
+-
+-    let connector = connector.build();
+-
+-    let mut session: Option<SslSession> = None;
+-    let mut saw_early_data_at_least_once = false;
+-
+-    for _iter in 0..ITERS {
+-        let stream = TcpStream::connect(("localhost", port)).unwrap();
+-
+-        let mut config = connector.configure().unwrap();
+-        config.set_connect_state();
+-
+-        if let Some(sess) = &session {
+-            unsafe { config.set_session(sess).unwrap() };
+-        }
+-
+-        let mut stream = SslStream::new(
+-            config
+-                .into_ssl("testserver.com")
+-                .unwrap(),
+-            stream,
+-        )
+-        .unwrap();
+-        let _ = stream.write_early_data(b"early hello");
+-
+-        stream.connect().unwrap();
+-
+-        let mut buf = Vec::new();
+-        stream.read_to_end(&mut buf).unwrap();
+-        let message = String::from_utf8(buf).unwrap();
+-
+-        let mut secret = [0u8; 64];
+-        let expected_message = match stream
+-            .ssl()
+-            .export_keying_material_early(&mut secret, "label", b"context")
+-        {
+-            Ok(_) => {
+-                saw_early_data_at_least_once = true;
+-                format!("early data: early hello\nexported: {:02x?}\n", secret)
+-            }
+-            Err(_) => "no early data\n".to_string(),
+-        };
+-
+-        assert_eq!(expected_message, message);
+-
+-        let _ = stream.shutdown();
+-
+-        session = stream
+-            .ssl()
+-            .session()
+-            .map(|sess| sess.to_owned());
+-    }
+-
+-    assert!(saw_early_data_at_least_once);
+-    server_thread.join().unwrap();
+-}
+-
+-fn load_certs() -> Vec<CertificateDer<'static>> {
+-    CertificateDer::pem_file_iter(CERT_CHAIN_FILE)
+-        .unwrap()
+-        .map(|c| c.unwrap())
+-        .collect()
+-}
+-
+-fn load_private_key() -> PrivateKeyDer<'static> {
+-    PrivateKeyDer::from_pem_file(PRIV_KEY_FILE).unwrap()
+-}
+-
+-const CERT_CHAIN_FILE: &str = "../test-ca/rsa-2048/end.fullchain";
+-const PRIV_KEY_FILE: &str = "../test-ca/rsa-2048/end.key";
+-const CA_PEM_FILE: &str = "../test-ca/rsa-2048/ca.cert";
+diff --git a/openssl-tests/src/lib.rs b/openssl-tests/src/lib.rs
+index 87631cb7..b89bf930 100644
+--- a/openssl-tests/src/lib.rs
++++ b/openssl-tests/src/lib.rs
+@@ -14,7 +14,6 @@
+     unused_qualifications
+ )]
+ 
+-mod early_exporter;
+ mod ffdhe;
+ mod ffdhe_kx_with_openssl;
+ mod raw_key_openssl_interop;
+diff --git a/rustls/src/client/client_conn.rs b/rustls/src/client/client_conn.rs
+index b15386ad..61105718 100644
+--- a/rustls/src/client/client_conn.rs
++++ b/rustls/src/client/client_conn.rs
+@@ -585,13 +585,13 @@ mod connection {
+     use pki_types::ServerName;
+ 
+     use super::{ClientConnectionData, ClientExtensionsInput};
++    use crate::ClientConfig;
+     use crate::client::EchStatus;
+     use crate::common_state::Protocol;
+     use crate::conn::{ConnectionCommon, ConnectionCore};
+     use crate::error::Error;
+     use crate::suites::ExtractedSecrets;
+     use crate::sync::Arc;
+-    use crate::{ClientConfig, KeyingMaterialExporter};
+ 
+     /// Allows writing of early data in resumed TLS 1.3 connections.
+     ///
+@@ -617,29 +617,6 @@ mod connection {
+                 .early_data
+                 .bytes_left()
+         }
+-
+-        /// Returns the "early" exporter that can derive key material for use in early data
+-        ///
+-        /// See [RFC5705][] for general details on what exporters are, and [RFC8446 S7.5][] for
+-        /// specific details on the "early" exporter.
+-        ///
+-        /// **Beware** that the early exporter requires care, as it is subject to the same
+-        /// potential for replay as early data itself.  See [RFC8446 appendix E.5.1][] for
+-        /// more detail.
+-        ///
+-        /// This function can be called at most once per connection. This function will error:
+-        /// if called more than once per connection.
+-        ///
+-        /// If you are looking for the normal exporter, this is available from
+-        /// [`ConnectionCommon::exporter()`].
+-        ///
+-        /// [RFC5705]: https://datatracker.ietf.org/doc/html/rfc5705
+-        /// [RFC8446 S7.5]: https://datatracker.ietf.org/doc/html/rfc8446#section-7.5
+-        /// [RFC8446 appendix E.5.1]: https://datatracker.ietf.org/doc/html/rfc8446#appendix-E.5.1
+-        /// [`ConnectionCommon::exporter()`]: crate::conn::ConnectionCommon::exporter()
+-        pub fn exporter(&mut self) -> Result<KeyingMaterialExporter, Error> {
+-            self.sess.core.early_exporter()
+-        }
+     }
+ 
+     impl io::Write for WriteEarlyData<'_> {
+@@ -698,7 +675,6 @@ mod connection {
+                 )?),
+             })
+         }
+-
+         /// Returns an `io::Write` implementer you can write bytes to
+         /// to send TLS1.3 early data (a.k.a. "0-RTT data") to the server.
+         ///
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 2f45e5a0..6cfae5b9 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -457,9 +457,6 @@ pub(super) fn derive_early_traffic_secret(
+         cx.common,
+     );
+ 
+-    cx.common.early_exporter =
+-        Some(early_key_schedule.early_exporter(&client_hello_hash, key_log, client_random));
+-
+     // Now the client can send encrypted early data
+     cx.common.early_traffic = true;
+     trace!("Starting early data traffic");
+diff --git a/rustls/src/common_state.rs b/rustls/src/common_state.rs
+index fc35f847..c0ab8fa1 100644
+--- a/rustls/src/common_state.rs
++++ b/rustls/src/common_state.rs
+@@ -37,7 +37,6 @@ pub struct CommonState {
+     pub(crate) kx_state: KxState,
+     pub(crate) alpn_protocol: Option<ProtocolName>,
+     pub(crate) exporter: Option<Box<dyn Exporter>>,
+-    pub(crate) early_exporter: Option<Box<dyn Exporter>>,
+     pub(crate) aligned_handshake: bool,
+     pub(crate) may_send_application_data: bool,
+     pub(crate) may_receive_application_data: bool,
+@@ -76,7 +75,6 @@ impl CommonState {
+             kx_state: KxState::default(),
+             alpn_protocol: None,
+             exporter: None,
+-            early_exporter: None,
+             aligned_handshake: true,
+             may_send_application_data: false,
+             may_receive_application_data: false,
+diff --git a/rustls/src/conn.rs b/rustls/src/conn.rs
+index 812bfb3a..5a49ed31 100644
+--- a/rustls/src/conn.rs
++++ b/rustls/src/conn.rs
+@@ -356,7 +356,7 @@ pub use connection::{Connection, Reader, Writer};
+ 
+ /// An object of this type can export keying material.
+ pub struct KeyingMaterialExporter {
+-    pub(crate) inner: Box<dyn Exporter>,
++    inner: Box<dyn Exporter>,
+ }
+ 
+ impl KeyingMaterialExporter {
+@@ -1251,13 +1251,6 @@ impl<Data> ConnectionCore<Data> {
+         }
+     }
+ 
+-    pub(crate) fn early_exporter(&mut self) -> Result<KeyingMaterialExporter, Error> {
+-        match self.common_state.early_exporter.take() {
+-            Some(inner) => Ok(KeyingMaterialExporter { inner }),
+-            None => Err(Error::General("early_exporter not available".into())),
+-        }
+-    }
+-
+     /// Trigger a `refresh_traffic_keys` if required by `CommonState`.
+     fn maybe_refresh_traffic_keys(&mut self) {
+         if mem::take(
+diff --git a/rustls/src/server/server_conn.rs b/rustls/src/server/server_conn.rs
+index 7c294c74..8d8f8296 100644
+--- a/rustls/src/server/server_conn.rs
++++ b/rustls/src/server/server_conn.rs
+@@ -543,8 +543,10 @@ mod connection {
+ 
+     use pki_types::DnsName;
+ 
+-    use super::{Accepted, Accepting, ServerConfig, ServerConnectionData, ServerExtensionsInput};
+-    use crate::KeyingMaterialExporter;
++    use super::{
++        Accepted, Accepting, EarlyDataState, ServerConfig, ServerConnectionData,
++        ServerExtensionsInput,
++    };
+     use crate::common_state::{CommonState, Context, Side};
+     use crate::conn::{ConnectionCommon, ConnectionCore};
+     use crate::error::Error;
+@@ -559,45 +561,18 @@ mod connection {
+     ///
+     /// This type implements [`io::Read`].
+     pub struct ReadEarlyData<'a> {
+-        common: &'a mut ConnectionCommon<ServerConnectionData>,
++        early_data: &'a mut EarlyDataState,
+     }
+ 
+     impl<'a> ReadEarlyData<'a> {
+-        fn new(common: &'a mut ConnectionCommon<ServerConnectionData>) -> Self {
+-            ReadEarlyData { common }
+-        }
+-
+-        /// Returns the "early" exporter that can derive key material for use in early data
+-        ///
+-        /// See [RFC5705][] for general details on what exporters are, and [RFC8446 S7.5][] for
+-        /// specific details on the "early" exporter.
+-        ///
+-        /// **Beware** that the early exporter requires care, as it is subject to the same
+-        /// potential for replay as early data itself.  See [RFC8446 appendix E.5.1][] for
+-        /// more detail.
+-        ///
+-        /// This function can be called at most once per connection. This function will error:
+-        /// if called more than once per connection.
+-        ///
+-        /// If you are looking for the normal exporter, this is available from
+-        /// [`ConnectionCommon::exporter()`].
+-        ///
+-        /// [RFC5705]: https://datatracker.ietf.org/doc/html/rfc5705
+-        /// [RFC8446 S7.5]: https://datatracker.ietf.org/doc/html/rfc8446#section-7.5
+-        /// [RFC8446 appendix E.5.1]: https://datatracker.ietf.org/doc/html/rfc8446#appendix-E.5.1
+-        /// [`ConnectionCommon::exporter()`]: crate::conn::ConnectionCommon::exporter()
+-        pub fn exporter(&mut self) -> Result<KeyingMaterialExporter, Error> {
+-            self.common.core.early_exporter()
++        fn new(early_data: &'a mut EarlyDataState) -> Self {
++            ReadEarlyData { early_data }
+         }
+     }
+ 
+     impl io::Read for ReadEarlyData<'_> {
+         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+-            self.common
+-                .core
+-                .data
+-                .early_data
+-                .read(buf)
++            self.early_data.read(buf)
+         }
+     }
+ 
+@@ -687,14 +662,9 @@ mod connection {
+         /// - The connection doesn't resume an existing session.
+         /// - The client hasn't sent a full ClientHello yet.
+         pub fn early_data(&mut self) -> Option<ReadEarlyData<'_>> {
+-            if self
+-                .inner
+-                .core
+-                .data
+-                .early_data
+-                .was_accepted()
+-            {
+-                Some(ReadEarlyData::new(&mut self.inner))
++            let data = &mut self.inner.core.data;
++            if data.early_data.was_accepted() {
++                Some(ReadEarlyData::new(&mut data.early_data))
+             } else {
+                 None
+             }
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index 3978b44f..bbcbd9be 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -572,14 +572,6 @@ mod client_hello {
+                 cx.common,
+             );
+ 
+-            if config.max_early_data_size > 0 {
+-                cx.common.early_exporter = Some(early_key_schedule.early_exporter(
+-                    &client_hello_hash,
+-                    &*config.key_log,
+-                    &randoms.client,
+-                ));
+-            }
+-
+             KeySchedulePreHandshake::from(early_key_schedule)
+         } else {
+             KeySchedulePreHandshake::new(suite)
+diff --git a/rustls/src/tls13/key_schedule.rs b/rustls/src/tls13/key_schedule.rs
+index 320c5542..9600226f 100644
+--- a/rustls/src/tls13/key_schedule.rs
++++ b/rustls/src/tls13/key_schedule.rs
+@@ -87,24 +87,6 @@ impl KeyScheduleEarly {
+         self.ks
+             .sign_verify_data(&resumption_psk_binder_key, hs_hash)
+     }
+-
+-    pub(crate) fn early_exporter(
+-        &self,
+-        hs_hash: &hash::Output,
+-        key_log: &dyn KeyLog,
+-        client_random: &[u8; 32],
+-    ) -> Box<dyn Exporter> {
+-        let early_exporter_secret = self.ks.derive_logged_secret(
+-            SecretKind::EarlyExporterMasterSecret,
+-            hs_hash.as_ref(),
+-            key_log,
+-            client_random,
+-        );
+-        Box::new(KeyScheduleExporter {
+-            ks: self.ks.inner,
+-            current_exporter_secret: early_exporter_secret,
+-        })
+-    }
+ }
+ 
+ /// The "early secret" stage of the key schedule.
+@@ -1021,7 +1003,6 @@ where
+ enum SecretKind {
+     ResumptionPskBinderKey,
+     ClientEarlyTrafficSecret,
+-    EarlyExporterMasterSecret,
+     ClientHandshakeTrafficSecret,
+     ServerHandshakeTrafficSecret,
+     ClientApplicationTrafficSecret,
+@@ -1039,7 +1020,6 @@ impl SecretKind {
+         match self {
+             ResumptionPskBinderKey => b"res binder",
+             ClientEarlyTrafficSecret => b"c e traffic",
+-            EarlyExporterMasterSecret => b"e exp master",
+             ClientHandshakeTrafficSecret => b"c hs traffic",
+             ServerHandshakeTrafficSecret => b"s hs traffic",
+             ClientApplicationTrafficSecret => b"c ap traffic",
+@@ -1058,7 +1038,6 @@ impl SecretKind {
+         use self::SecretKind::*;
+         Some(match self {
+             ClientEarlyTrafficSecret => "CLIENT_EARLY_TRAFFIC_SECRET",
+-            EarlyExporterMasterSecret => "EARLY_EXPORTER_SECRET",
+             ClientHandshakeTrafficSecret => "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+             ServerHandshakeTrafficSecret => "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+             ClientApplicationTrafficSecret => "CLIENT_TRAFFIC_SECRET_0",
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index b84c9bdc..a01ba61a 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -4627,11 +4627,6 @@ fn early_data_is_available_on_resumption() {
+             .unwrap(),
+         5
+     );
+-    let client_early_exporter = client
+-        .early_data()
+-        .unwrap()
+-        .exporter()
+-        .unwrap();
+     do_handshake(&mut client, &mut server);
+ 
+     let mut received_early_data = [0u8; 5];
+@@ -4644,20 +4639,6 @@ fn early_data_is_available_on_resumption() {
+         5
+     );
+     assert_eq!(&received_early_data[..], b"hello");
+-    let server_early_exporter = server
+-        .early_data()
+-        .unwrap()
+-        .exporter()
+-        .unwrap();
+-
+-    // check exporters agree
+-    let client_secret = client_early_exporter
+-        .derive(b"label", Some(b"context"), [0u8; 32])
+-        .unwrap();
+-    let server_secret = server_early_exporter
+-        .derive(b"label", Some(b"context"), [0u8; 32])
+-        .unwrap();
+-    assert_eq!(client_secret, server_secret);
+ }
+ 
+ #[test]

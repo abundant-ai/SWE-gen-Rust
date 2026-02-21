@@ -1,0 +1,303 @@
+diff --git a/serde/src/private/de.rs b/serde/src/private/de.rs
+index 45b383fb..270e1df8 100644
+--- a/serde/src/private/de.rs
++++ b/serde/src/private/de.rs
+@@ -16,7 +16,6 @@ use de::Unexpected;
+ #[cfg(any(feature = "std", feature = "collections"))]
+ pub use self::content::{Content, ContentRefDeserializer, ContentDeserializer,
+                         TaggedContentVisitor, TagOrContentField, TagOrContentFieldVisitor,
+-                        TagContentOtherField, TagContentOtherFieldVisitor,
+                         InternallyTaggedUnitVisitor, UntaggedUnitVisitor};
+ 
+ /// If the missing field is of type `Option<T>` then treat is as `None`,
+@@ -864,54 +863,6 @@ mod content {
+         }
+     }
+ 
+-    /// Used by generated code to deserialize an adjacently tagged enum when
+-    /// ignoring unrelated fields is allowed.
+-    ///
+-    /// Not public API.
+-    pub enum TagContentOtherField {
+-        Tag,
+-        Content,
+-        Other,
+-    }
+-
+-    /// Not public API.
+-    pub struct TagContentOtherFieldVisitor {
+-        pub tag: &'static str,
+-        pub content: &'static str,
+-    }
+-
+-    impl<'de> DeserializeSeed<'de> for TagContentOtherFieldVisitor {
+-        type Value = TagContentOtherField;
+-
+-        fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+-        where
+-            D: Deserializer<'de>,
+-        {
+-            deserializer.deserialize_str(self)
+-        }
+-    }
+-
+-    impl<'de> Visitor<'de> for TagContentOtherFieldVisitor {
+-        type Value = TagContentOtherField;
+-
+-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+-            write!(formatter, "{:?}, {:?}, or other ignored fields", self.tag, self.content)
+-        }
+-
+-        fn visit_str<E>(self, field: &str) -> Result<Self::Value, E>
+-        where
+-            E: de::Error,
+-        {
+-            if field == self.tag {
+-                Ok(TagContentOtherField::Tag)
+-            } else if field == self.content {
+-                Ok(TagContentOtherField::Content)
+-            } else {
+-                Ok(TagContentOtherField::Other)
+-            }
+-        }
+-    }
+-
+     /// Not public API
+     pub struct ContentDeserializer<E> {
+         content: Content,
+diff --git a/serde_derive/src/de.rs b/serde_derive/src/de.rs
+index 6f294f01..9827dbbe 100644
+--- a/serde_derive/src/de.rs
++++ b/serde_derive/src/de.rs
+@@ -795,19 +795,9 @@ fn deserialize_adjacently_tagged_enum(
+ 
+     let expecting = format!("adjacently tagged enum {}", params.type_name());
+     let type_name = cattrs.name().deserialize_name();
+-    let deny_unknown_fields = cattrs.deny_unknown_fields();
+-
+-    /// If unknown fields are allowed, we pick the visitor that can
+-    /// step over those. Otherwise we pick the visitor that fails on
+-    /// unknown keys.
+-    let field_visitor_ty = if deny_unknown_fields {
+-        quote! { _serde::private::de::TagOrContentFieldVisitor }
+-    } else {
+-        quote! { _serde::private::de::TagContentOtherFieldVisitor }
+-    };
+ 
+     let tag_or_content = quote! {
+-        #field_visitor_ty {
++        _serde::private::de::TagOrContentFieldVisitor {
+             tag: #tag,
+             content: #content,
+         }
+@@ -854,46 +844,9 @@ fn deserialize_adjacently_tagged_enum(
+         };
+     }
+ 
+-    /// Advance the map by one key, returning early in case of error.
+-    let next_key = quote! {
+-        try!(_serde::de::MapAccess::next_key_seed(&mut __map, #tag_or_content))
+-    };
+-
+-    /// When allowing unknown fields, we want to transparently step through keys we don't care
+-    /// about until we find `tag`, `content`, or run out of keys.
+-    let next_relevant_key = if deny_unknown_fields {
+-        next_key
+-    } else {
+-        quote! {
+-            {
+-                let mut __rk : _serde::export::Option<_serde::private::de::TagOrContentField> = _serde::export::None;
+-                while let _serde::export::Some(__k) = #next_key {
+-                    match __k {
+-                        _serde::private::de::TagContentOtherField::Other => {
+-                            try!(_serde::de::MapAccess::next_value::<_serde::de::IgnoredAny>(&mut __map));
+-                            continue;
+-                        },
+-                        _serde::private::de::TagContentOtherField::Tag => {
+-                            __rk = _serde::export::Some(_serde::private::de::TagOrContentField::Tag);
+-                            break;
+-                        }
+-                        _serde::private::de::TagContentOtherField::Content => {
+-                            __rk = _serde::export::Some(_serde::private::de::TagOrContentField::Content);
+-                            break;
+-                        }
+-                    }
+-                }
+-
+-                __rk
+-            }
+-        }
+-    };
+-
+-    /// Step through remaining keys, looking for duplicates of previously-seen keys.
+-    /// When unknown fields are denied, any key that isn't a duplicate will at this
+-    /// point immediately produce an error.
+-    let visit_remaining_keys = quote! {
+-        match #next_relevant_key {
++    let visit_third_key = quote! {
++        // Visit the third key in the map, hopefully there isn't one.
++        match try!(_serde::de::MapAccess::next_key_seed(&mut __map, #tag_or_content)) {
+             _serde::export::Some(_serde::private::de::TagOrContentField::Tag) => {
+                 _serde::export::Err(<__A::Error as _serde::de::Error>::duplicate_field(#tag))
+             }
+@@ -904,8 +857,6 @@ fn deserialize_adjacently_tagged_enum(
+         }
+     };
+ 
+-    
+-
+     quote_block! {
+         #variant_visitor
+ 
+@@ -944,14 +895,14 @@ fn deserialize_adjacently_tagged_enum(
+             fn visit_map<__A>(self, mut __map: __A) -> _serde::export::Result<Self::Value, __A::Error>
+                 where __A: _serde::de::MapAccess<'de>
+             {
+-                // Visit the first relevant key.
+-                match #next_relevant_key {
++                // Visit the first key.
++                match try!(_serde::de::MapAccess::next_key_seed(&mut __map, #tag_or_content)) {
+                     // First key is the tag.
+                     _serde::export::Some(_serde::private::de::TagOrContentField::Tag) => {
+                         // Parse the tag.
+                         let __field = try!(_serde::de::MapAccess::next_value(&mut __map));
+                         // Visit the second key.
+-                        match #next_relevant_key {
++                        match try!(_serde::de::MapAccess::next_key_seed(&mut __map, #tag_or_content)) {
+                             // Second key is a duplicate of the tag.
+                             _serde::export::Some(_serde::private::de::TagOrContentField::Tag) => {
+                                 _serde::export::Err(<__A::Error as _serde::de::Error>::duplicate_field(#tag))
+@@ -964,8 +915,8 @@ fn deserialize_adjacently_tagged_enum(
+                                         marker: _serde::export::PhantomData,
+                                         lifetime: _serde::export::PhantomData,
+                                     }));
+-                                // Visit remaining keys, looking for duplicates.
+-                                #visit_remaining_keys
++                                // Visit the third key, hopefully there isn't one.
++                                #visit_third_key
+                             }
+                             // There is no second key; might be okay if the we have a unit variant.
+                             _serde::export::None => #missing_content
+@@ -976,7 +927,7 @@ fn deserialize_adjacently_tagged_enum(
+                         // Buffer up the content.
+                         let __content = try!(_serde::de::MapAccess::next_value::<_serde::private::de::Content>(&mut __map));
+                         // Visit the second key.
+-                        match #next_relevant_key {
++                        match try!(_serde::de::MapAccess::next_key_seed(&mut __map, #tag_or_content)) {
+                             // Second key is the tag.
+                             _serde::export::Some(_serde::private::de::TagOrContentField::Tag) => {
+                                 let __deserializer = _serde::private::de::ContentDeserializer::<__A::Error>::new(__content);
+@@ -985,8 +936,8 @@ fn deserialize_adjacently_tagged_enum(
+                                     // Deserialize the buffered content now that we know the variant.
+                                     #(#variant_arms)*
+                                 });
+-                                // Visit remaining keys, looking for duplicates.
+-                                #visit_remaining_keys
++                                // Visit the third key, hopefully there isn't one.
++                                #visit_third_key
+                             }
+                             // Second key is a duplicate of the content.
+                             _serde::export::Some(_serde::private::de::TagOrContentField::Content) => {
+diff --git a/test_suite/tests/test_macros.rs b/test_suite/tests/test_macros.rs
+index 6c7e4b2a..d4144ab3 100644
+--- a/test_suite/tests/test_macros.rs
++++ b/test_suite/tests/test_macros.rs
+@@ -751,31 +751,6 @@ fn test_adjacently_tagged_enum() {
+         ],
+     );
+ 
+-    // unit with excess content (f, g, h)
+-    assert_de_tokens(
+-        &AdjacentlyTagged::Unit::<u8>,
+-        &[
+-            Token::Struct { name: "AdjacentlyTagged", len: 3 },
+-
+-            Token::Str("f"),
+-            Token::Unit,
+-
+-            Token::Str("t"),
+-            Token::Str("Unit"),
+-
+-            Token::Str("g"),
+-            Token::Unit,
+-
+-            Token::Str("c"),
+-            Token::Unit,
+-
+-            Token::Str("h"),
+-            Token::Unit,
+-
+-            Token::StructEnd,
+-        ],
+-    );
+-
+     // newtype with tag first
+     assert_tokens(
+         &AdjacentlyTagged::Newtype::<u8>(1),
+@@ -885,66 +860,6 @@ fn test_adjacently_tagged_enum() {
+     );
+ }
+ 
+-#[test]
+-fn test_adjacently_tagged_enum_deny_unknown_fields() {
+-    #[derive(Debug, PartialEq, Deserialize)]
+-    #[serde(tag = "t", content = "c", deny_unknown_fields)]
+-    enum AdjacentlyTagged {
+-        Unit,
+-    }
+-
+-    assert_de_tokens(
+-        &AdjacentlyTagged::Unit,
+-        &[
+-            Token::Struct { name: "AdjacentlyTagged", len: 2},
+-
+-            Token::Str("t"),
+-            Token::Str("Unit"),
+-
+-            Token::Str("c"),
+-            Token::Unit,
+-
+-            Token::StructEnd,
+-        ],
+-    );
+-
+-    assert_de_tokens_error::<AdjacentlyTagged>(
+-        &[
+-            Token::Struct { name: "AdjacentlyTagged", len: 3},
+-
+-            Token::Str("t"),
+-            Token::Str("Unit"),
+-
+-            Token::Str("c"),
+-            Token::Unit,
+-
+-            Token::Str("h"),
+-        ],
+-        r#"invalid value: string "h", expected "t" or "c""#
+-    );
+-
+-    assert_de_tokens_error::<AdjacentlyTagged>(
+-        &[
+-            Token::Struct { name: "AdjacentlyTagged", len: 3},
+-
+-            Token::Str("h"),
+-        ],
+-        r#"invalid value: string "h", expected "t" or "c""#
+-    );
+-
+-    assert_de_tokens_error::<AdjacentlyTagged>(
+-        &[
+-            Token::Struct { name: "AdjacentlyTagged", len: 3},
+-
+-            Token::Str("c"),
+-            Token::Unit,
+-
+-            Token::Str("h"),
+-        ],
+-        r#"invalid value: string "h", expected "t" or "c""#
+-    );
+-}
+-
+ #[test]
+ fn test_enum_in_internally_tagged_enum() {
+     #[derive(Debug, PartialEq, Serialize, Deserialize)]

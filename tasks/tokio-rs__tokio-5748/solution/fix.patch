@@ -1,0 +1,482 @@
+diff --git a/tokio/src/runtime/scheduler/current_thread.rs b/tokio/src/runtime/scheduler/current_thread.rs
+index 2cbe2973..ac859de6 100644
+--- a/tokio/src/runtime/scheduler/current_thread.rs
++++ b/tokio/src/runtime/scheduler/current_thread.rs
+@@ -2,8 +2,8 @@ use crate::future::poll_fn;
+ use crate::loom::sync::atomic::AtomicBool;
+ use crate::loom::sync::Arc;
+ use crate::runtime::driver::{self, Driver};
+-use crate::runtime::scheduler::{self, Defer};
+-use crate::runtime::task::{self, Inject, JoinHandle, OwnedTasks, Schedule, Task};
++use crate::runtime::scheduler::{self, Defer, Inject};
++use crate::runtime::task::{self, JoinHandle, OwnedTasks, Schedule, Task};
+ use crate::runtime::{blocking, context, Config, MetricsBatch, SchedulerMetrics, WorkerMetrics};
+ use crate::sync::notify::Notify;
+ use crate::util::atomic_cell::AtomicCell;
+diff --git a/tokio/src/runtime/scheduler/inject.rs b/tokio/src/runtime/scheduler/inject.rs
+new file mode 100644
+index 00000000..4b65449e
+--- /dev/null
++++ b/tokio/src/runtime/scheduler/inject.rs
+@@ -0,0 +1,292 @@
++//! Inject queue used to send wakeups to a work-stealing scheduler
++
++use crate::loom::sync::atomic::AtomicUsize;
++use crate::loom::sync::{Mutex, MutexGuard};
++use crate::runtime::task;
++
++use std::marker::PhantomData;
++use std::sync::atomic::Ordering::{Acquire, Release};
++
++/// Growable, MPMC queue used to inject new tasks into the scheduler and as an
++/// overflow queue when the local, fixed-size, array queue overflows.
++pub(crate) struct Inject<T: 'static> {
++    /// Pointers to the head and tail of the queue.
++    pointers: Mutex<Pointers>,
++
++    /// Number of pending tasks in the queue. This helps prevent unnecessary
++    /// locking in the hot path.
++    len: AtomicUsize,
++
++    _p: PhantomData<T>,
++}
++
++struct Pointers {
++    /// True if the queue is closed.
++    is_closed: bool,
++
++    /// Linked-list head.
++    head: Option<task::RawTask>,
++
++    /// Linked-list tail.
++    tail: Option<task::RawTask>,
++}
++
++pub(crate) struct Pop<'a, T: 'static> {
++    len: usize,
++    pointers: Option<MutexGuard<'a, Pointers>>,
++    _p: PhantomData<T>,
++}
++
++unsafe impl<T> Send for Inject<T> {}
++unsafe impl<T> Sync for Inject<T> {}
++
++impl<T: 'static> Inject<T> {
++    pub(crate) fn new() -> Inject<T> {
++        Inject {
++            pointers: Mutex::new(Pointers {
++                is_closed: false,
++                head: None,
++                tail: None,
++            }),
++            len: AtomicUsize::new(0),
++            _p: PhantomData,
++        }
++    }
++
++    pub(crate) fn is_empty(&self) -> bool {
++        self.len() == 0
++    }
++
++    // Kind of annoying to have to include the cfg here
++    #[cfg(any(tokio_taskdump, all(feature = "rt-multi-thread", not(tokio_wasi))))]
++    pub(crate) fn is_closed(&self) -> bool {
++        self.pointers.lock().is_closed
++    }
++
++    /// Closes the injection queue, returns `true` if the queue is open when the
++    /// transition is made.
++    pub(crate) fn close(&self) -> bool {
++        let mut p = self.pointers.lock();
++
++        if p.is_closed {
++            return false;
++        }
++
++        p.is_closed = true;
++        true
++    }
++
++    pub(crate) fn len(&self) -> usize {
++        self.len.load(Acquire)
++    }
++
++    /// Pushes a value into the queue.
++    ///
++    /// This does nothing if the queue is closed.
++    pub(crate) fn push(&self, task: task::Notified<T>) {
++        // Acquire queue lock
++        let mut p = self.pointers.lock();
++
++        if p.is_closed {
++            return;
++        }
++
++        // safety: only mutated with the lock held
++        let len = unsafe { self.len.unsync_load() };
++        let task = task.into_raw();
++
++        // The next pointer should already be null
++        debug_assert!(get_next(task).is_none());
++
++        if let Some(tail) = p.tail {
++            // safety: Holding the Notified for a task guarantees exclusive
++            // access to the `queue_next` field.
++            set_next(tail, Some(task));
++        } else {
++            p.head = Some(task);
++        }
++
++        p.tail = Some(task);
++
++        self.len.store(len + 1, Release);
++    }
++
++    pub(crate) fn pop(&self) -> Option<task::Notified<T>> {
++        self.pop_n(1).next()
++    }
++
++    pub(crate) fn pop_n(&self, n: usize) -> Pop<'_, T> {
++        use std::cmp;
++
++        // Fast path, if len == 0, then there are no values
++        if self.is_empty() {
++            return Pop {
++                len: 0,
++                pointers: None,
++                _p: PhantomData,
++            };
++        }
++
++        // Lock the queue
++        let p = self.pointers.lock();
++
++        // safety: All updates to the len atomic are guarded by the mutex. As
++        // such, a non-atomic load followed by a store is safe.
++        let len = unsafe { self.len.unsync_load() };
++
++        let n = cmp::min(n, len);
++
++        // Decrement the count.
++        self.len.store(len - n, Release);
++
++        Pop {
++            len: n,
++            pointers: Some(p),
++            _p: PhantomData,
++        }
++    }
++}
++
++cfg_rt_multi_thread! {
++    impl<T: 'static> Inject<T> {
++        /// Pushes several values into the queue.
++        #[inline]
++        pub(crate) fn push_batch<I>(&self, mut iter: I)
++        where
++            I: Iterator<Item = task::Notified<T>>,
++        {
++            let first = match iter.next() {
++                Some(first) => first.into_raw(),
++                None => return,
++            };
++
++            // Link up all the tasks.
++            let mut prev = first;
++            let mut counter = 1;
++
++            // We are going to be called with an `std::iter::Chain`, and that
++            // iterator overrides `for_each` to something that is easier for the
++            // compiler to optimize than a loop.
++            iter.for_each(|next| {
++                let next = next.into_raw();
++
++                // safety: Holding the Notified for a task guarantees exclusive
++                // access to the `queue_next` field.
++                set_next(prev, Some(next));
++                prev = next;
++                counter += 1;
++            });
++
++            // Now that the tasks are linked together, insert them into the
++            // linked list.
++            self.push_batch_inner(first, prev, counter);
++        }
++
++        /// Inserts several tasks that have been linked together into the queue.
++        ///
++        /// The provided head and tail may be be the same task. In this case, a
++        /// single task is inserted.
++        #[inline]
++        fn push_batch_inner(
++            &self,
++            batch_head: task::RawTask,
++            batch_tail: task::RawTask,
++            num: usize,
++        ) {
++            debug_assert!(get_next(batch_tail).is_none());
++
++            let mut p = self.pointers.lock();
++
++            if let Some(tail) = p.tail {
++                set_next(tail, Some(batch_head));
++            } else {
++                p.head = Some(batch_head);
++            }
++
++            p.tail = Some(batch_tail);
++
++            // Increment the count.
++            //
++            // safety: All updates to the len atomic are guarded by the mutex. As
++            // such, a non-atomic load followed by a store is safe.
++            let len = unsafe { self.len.unsync_load() };
++
++            self.len.store(len + num, Release);
++        }
++    }
++}
++
++impl<T: 'static> Drop for Inject<T> {
++    fn drop(&mut self) {
++        if !std::thread::panicking() {
++            assert!(self.pop().is_none(), "queue not empty");
++        }
++    }
++}
++
++impl<'a, T: 'static> Iterator for Pop<'a, T> {
++    type Item = task::Notified<T>;
++
++    fn next(&mut self) -> Option<Self::Item> {
++        if self.len == 0 {
++            return None;
++        }
++
++        // `pointers` is always `Some` when `len() > 0`
++        let pointers = self.pointers.as_mut().unwrap();
++        let ret = pointers.pop();
++
++        debug_assert!(ret.is_some());
++
++        self.len -= 1;
++
++        if self.len == 0 {
++            self.pointers = None;
++        }
++
++        ret
++    }
++
++    fn size_hint(&self) -> (usize, Option<usize>) {
++        (self.len, Some(self.len))
++    }
++}
++
++impl<'a, T: 'static> ExactSizeIterator for Pop<'a, T> {
++    fn len(&self) -> usize {
++        self.len
++    }
++}
++
++impl<'a, T: 'static> Drop for Pop<'a, T> {
++    fn drop(&mut self) {
++        for _ in self.by_ref() {}
++    }
++}
++
++impl Pointers {
++    fn pop<T: 'static>(&mut self) -> Option<task::Notified<T>> {
++        let task = self.head?;
++
++        self.head = get_next(task);
++
++        if self.head.is_none() {
++            self.tail = None;
++        }
++
++        set_next(task, None);
++
++        // safety: a `Notified` is pushed into the queue and now it is popped!
++        Some(unsafe { task::Notified::from_raw(task) })
++    }
++}
++
++fn get_next(task: task::RawTask) -> Option<task::RawTask> {
++    unsafe { task.get_queue_next() }
++}
++
++fn set_next(task: task::RawTask, val: Option<task::RawTask>) {
++    unsafe {
++        task.set_queue_next(val);
++    }
++}
+diff --git a/tokio/src/runtime/scheduler/mod.rs b/tokio/src/runtime/scheduler/mod.rs
+index 118e555d..93390453 100644
+--- a/tokio/src/runtime/scheduler/mod.rs
++++ b/tokio/src/runtime/scheduler/mod.rs
+@@ -4,6 +4,9 @@ cfg_rt! {
+ 
+     mod defer;
+     use defer::Defer;
++
++    mod inject;
++    pub(crate) use inject::Inject;
+ }
+ 
+ cfg_rt_multi_thread! {
+diff --git a/tokio/src/runtime/scheduler/multi_thread/queue.rs b/tokio/src/runtime/scheduler/multi_thread/queue.rs
+index 2a0ae833..c61c4de6 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/queue.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/queue.rs
+@@ -3,7 +3,8 @@
+ use crate::loom::cell::UnsafeCell;
+ use crate::loom::sync::Arc;
+ use crate::runtime::scheduler::multi_thread::Stats;
+-use crate::runtime::task::{self, Inject};
++use crate::runtime::scheduler::Inject;
++use crate::runtime::task;
+ 
+ use std::mem::{self, MaybeUninit};
+ use std::ptr;
+diff --git a/tokio/src/runtime/scheduler/multi_thread/worker.rs b/tokio/src/runtime/scheduler/multi_thread/worker.rs
+index 7b87a9c0..7b5b09f7 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/worker.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/worker.rs
+@@ -62,8 +62,8 @@ use crate::runtime::context;
+ use crate::runtime::scheduler::multi_thread::{
+     idle, queue, Counters, Handle, Idle, Parker, Stats, Unparker,
+ };
+-use crate::runtime::scheduler::Defer;
+-use crate::runtime::task::{Inject, OwnedTasks};
++use crate::runtime::scheduler::{Defer, Inject};
++use crate::runtime::task::OwnedTasks;
+ use crate::runtime::{
+     blocking, coop, driver, scheduler, task, Config, SchedulerMetrics, WorkerMetrics,
+ };
+diff --git a/tokio/src/runtime/task/mod.rs b/tokio/src/runtime/task/mod.rs
+index 8da59cb0..932552fb 100644
+--- a/tokio/src/runtime/task/mod.rs
++++ b/tokio/src/runtime/task/mod.rs
+@@ -182,9 +182,6 @@ mod id;
+ #[cfg_attr(not(tokio_unstable), allow(unreachable_pub))]
+ pub use id::{id, try_id, Id};
+ 
+-mod inject;
+-pub(super) use self::inject::Inject;
+-
+ #[cfg(feature = "rt")]
+ mod abort;
+ mod join;
+@@ -198,7 +195,7 @@ mod list;
+ pub(crate) use self::list::{LocalOwnedTasks, OwnedTasks};
+ 
+ mod raw;
+-use self::raw::RawTask;
++pub(crate) use self::raw::RawTask;
+ 
+ mod state;
+ use self::state::State;
+@@ -335,13 +332,17 @@ cfg_rt! {
+ }
+ 
+ impl<S: 'static> Task<S> {
+-    unsafe fn from_raw(ptr: NonNull<Header>) -> Task<S> {
++    unsafe fn new(raw: RawTask) -> Task<S> {
+         Task {
+-            raw: RawTask::from_raw(ptr),
++            raw,
+             _p: PhantomData,
+         }
+     }
+ 
++    unsafe fn from_raw(ptr: NonNull<Header>) -> Task<S> {
++        Task::new(RawTask::from_raw(ptr))
++    }
++
+     #[cfg(all(
+         tokio_unstable,
+         tokio_taskdump,
+@@ -369,22 +370,16 @@ impl<S: 'static> Notified<S> {
+ }
+ 
+ impl<S: 'static> Notified<S> {
+-    unsafe fn from_raw(ptr: NonNull<Header>) -> Notified<S> {
+-        Notified(Task::from_raw(ptr))
+-    }
+-}
+-
+-impl<S: 'static> Task<S> {
+-    fn into_raw(self) -> NonNull<Header> {
+-        let ret = self.raw.header_ptr();
+-        mem::forget(self);
+-        ret
++    pub(crate) unsafe fn from_raw(ptr: RawTask) -> Notified<S> {
++        Notified(Task::new(ptr))
+     }
+ }
+ 
+ impl<S: 'static> Notified<S> {
+-    fn into_raw(self) -> NonNull<Header> {
+-        self.0.into_raw()
++    pub(crate) fn into_raw(self) -> RawTask {
++        let raw = self.0.raw;
++        mem::forget(self);
++        raw
+     }
+ }
+ 
+diff --git a/tokio/src/runtime/task/raw.rs b/tokio/src/runtime/task/raw.rs
+index 72bfa3f4..80788592 100644
+--- a/tokio/src/runtime/task/raw.rs
++++ b/tokio/src/runtime/task/raw.rs
+@@ -6,7 +6,7 @@ use std::ptr::NonNull;
+ use std::task::{Poll, Waker};
+ 
+ /// Raw task handle
+-pub(in crate::runtime) struct RawTask {
++pub(crate) struct RawTask {
+     ptr: NonNull<Header>,
+ }
+ 
+@@ -240,6 +240,27 @@ impl RawTask {
+     pub(super) fn ref_inc(self) {
+         self.header().state.ref_inc();
+     }
++
++    /// Get the queue-next pointer
++    ///
++    /// This is for usage by the injection queue
++    ///
++    /// Safety: make sure only one queue uses this and access is synchronized.
++    pub(crate) unsafe fn get_queue_next(self) -> Option<RawTask> {
++        self.header()
++            .queue_next
++            .with(|ptr| *ptr)
++            .map(|p| RawTask::from_raw(p))
++    }
++
++    /// Sets the queue-next pointer
++    ///
++    /// This is for usage by the injection queue
++    ///
++    /// Safety: make sure only one queue uses this and access is synchronized.
++    pub(crate) unsafe fn set_queue_next(self, val: Option<RawTask>) {
++        self.header().set_next(val.map(|task| task.ptr));
++    }
+ }
+ 
+ impl Clone for RawTask {
+diff --git a/tokio/src/runtime/task/trace/mod.rs b/tokio/src/runtime/task/trace/mod.rs
+index 99abc754..6299d75d 100644
+--- a/tokio/src/runtime/task/trace/mod.rs
++++ b/tokio/src/runtime/task/trace/mod.rs
+@@ -1,7 +1,6 @@
+ use crate::loom::sync::Arc;
+ use crate::runtime::context;
+-use crate::runtime::scheduler::{self, current_thread};
+-use crate::runtime::task::Inject;
++use crate::runtime::scheduler::{self, current_thread, Inject};
+ 
+ use backtrace::BacktraceFrame;
+ use std::cell::Cell;
