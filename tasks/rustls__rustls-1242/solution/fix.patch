@@ -1,0 +1,261 @@
+diff --git a/rustls/examples/internal/bogo_shim.rs b/rustls/examples/internal/bogo_shim.rs
+index a3581a37..4324fba9 100644
+--- a/rustls/examples/internal/bogo_shim.rs
++++ b/rustls/examples/internal/bogo_shim.rs
+@@ -193,12 +193,12 @@ impl server::ClientCertVerifier for DummyClientAuth {
+         true
+     }
+ 
+-    fn client_auth_mandatory(&self) -> Option<bool> {
+-        Some(self.mandatory)
++    fn client_auth_mandatory(&self) -> bool {
++        self.mandatory
+     }
+ 
+-    fn client_auth_root_subjects(&self) -> Option<Vec<DistinguishedName>> {
+-        Some(Vec::new())
++    fn client_auth_root_subjects(&self) -> &[DistinguishedName] {
++        &[]
+     }
+ 
+     fn verify_client_cert(
+diff --git a/rustls/src/anchors.rs b/rustls/src/anchors.rs
+index 123562e5..98f61701 100644
+--- a/rustls/src/anchors.rs
++++ b/rustls/src/anchors.rs
+@@ -1,14 +1,12 @@
+-use crate::key;
+ #[cfg(feature = "logging")]
+ use crate::log::{debug, trace};
+-use crate::msgs::handshake::DistinguishedName;
+-use crate::x509;
++use crate::{key, DistinguishedName};
+ use crate::{CertificateError, Error};
+ 
+ /// A trust anchor, commonly known as a "Root Certificate."
+ #[derive(Debug, Clone)]
+ pub struct OwnedTrustAnchor {
+-    subject: Vec<u8>,
++    subject: DistinguishedName,
+     spki: Vec<u8>,
+     name_constraints: Option<Vec<u8>>,
+ }
+@@ -17,7 +15,7 @@ impl OwnedTrustAnchor {
+     /// Get a `webpki::TrustAnchor` by borrowing the owned elements.
+     pub(crate) fn to_trust_anchor(&self) -> webpki::TrustAnchor {
+         webpki::TrustAnchor {
+-            subject: &self.subject,
++            subject: self.subject.as_ref(),
+             spki: &self.spki,
+             name_constraints: self.name_constraints.as_deref(),
+         }
+@@ -43,7 +41,7 @@ impl OwnedTrustAnchor {
+         name_constraints: Option<impl Into<Vec<u8>>>,
+     ) -> Self {
+         Self {
+-            subject: subject.into(),
++            subject: DistinguishedName::from(subject.into()),
+             spki: spki.into(),
+             name_constraints: name_constraints.map(|x| x.into()),
+         }
+@@ -57,7 +55,7 @@ impl OwnedTrustAnchor {
+     /// use x509_parser::prelude::FromDer;
+     /// println!("{}", x509_parser::x509::X509Name::from_der(anchor.subject())?.1);
+     /// ```
+-    pub fn subject(&self) -> &[u8] {
++    pub fn subject(&self) -> &DistinguishedName {
+         &self.subject
+     }
+ }
+@@ -86,21 +84,6 @@ impl RootCertStore {
+         self.roots.len()
+     }
+ 
+-    /// Return the Subject Names for certificates in the container.
+-    #[deprecated(since = "0.20.7", note = "Use OwnedTrustAnchor::subject() instead")]
+-    pub fn subjects(&self) -> Vec<DistinguishedName> {
+-        let mut r = Vec::new();
+-
+-        for ota in &self.roots {
+-            let mut name = Vec::new();
+-            name.extend_from_slice(&ota.subject);
+-            x509::wrap_in_sequence(&mut name);
+-            r.push(DistinguishedName::from(name));
+-        }
+-
+-        r
+-    }
+-
+     /// Add a single DER-encoded certificate to the store.
+     ///
+     /// This is suitable for a small set of root certificates that are expected to parse
+diff --git a/rustls/src/server/tls12.rs b/rustls/src/server/tls12.rs
+index d460c229..007a0a26 100644
+--- a/rustls/src/server/tls12.rs
++++ b/rustls/src/server/tls12.rs
+@@ -447,14 +447,10 @@ mod client_hello {
+ 
+         let verify_schemes = client_auth.supported_verify_schemes();
+ 
+-        let names = client_auth
++        let names = config
++            .verifier
+             .client_auth_root_subjects()
+-            .ok_or_else(|| {
+-                debug!("could not determine root subjects based on SNI");
+-                cx.common
+-                    .send_fatal_alert(AlertDescription::AccessDenied);
+-                Error::General("client rejected by client_auth_root_subjects".into())
+-            })?;
++            .to_vec();
+ 
+         let cr = CertificateRequestPayload {
+             certtypes: vec![
+@@ -518,13 +514,7 @@ impl State<ServerConnectionData> for ExpectCertificate {
+         let mandatory = self
+             .config
+             .verifier
+-            .client_auth_mandatory()
+-            .ok_or_else(|| {
+-                debug!("could not determine if client auth is mandatory based on SNI");
+-                cx.common
+-                    .send_fatal_alert(AlertDescription::AccessDenied);
+-                Error::General("client rejected by client_auth_mandatory".into())
+-            })?;
++            .client_auth_mandatory();
+ 
+         trace!("certs {:?}", cert_chain);
+ 
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index 98f113ad..11aee5df 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -699,12 +699,7 @@ mod client_hello {
+         let names = config
+             .verifier
+             .client_auth_root_subjects()
+-            .ok_or_else(|| {
+-                debug!("could not determine root subjects based on SNI");
+-                cx.common
+-                    .send_fatal_alert(AlertDescription::AccessDenied);
+-                Error::General("client rejected by client_auth_root_subjects".into())
+-            })?;
++            .to_vec();
+ 
+         if !names.is_empty() {
+             cr.extensions
+@@ -892,13 +887,7 @@ impl State<ServerConnectionData> for ExpectCertificate {
+         let mandatory = self
+             .config
+             .verifier
+-            .client_auth_mandatory()
+-            .ok_or_else(|| {
+-                debug!("could not determine if client auth is mandatory based on SNI");
+-                cx.common
+-                    .send_fatal_alert(AlertDescription::AccessDenied);
+-                Error::General("client rejected by client_auth_mandatory".into())
+-            })?;
++            .client_auth_mandatory();
+ 
+         let (end_entity, intermediates) = match client_cert.split_first() {
+             None => {
+diff --git a/rustls/src/verify.rs b/rustls/src/verify.rs
+index e5cefd8a..4bafc505 100644
+--- a/rustls/src/verify.rs
++++ b/rustls/src/verify.rs
+@@ -233,11 +233,11 @@ pub trait ClientCertVerifier: Send + Sync {
+         true
+     }
+ 
+-    /// Return `Some(true)` to require a client certificate and `Some(false)` to make
+-    /// client authentication optional. Return `None` to abort the connection.
++    /// Return `true` to require a client certificate and `false` to make
++    /// client authentication optional.
+     /// Defaults to `Some(self.offer_client_auth())`.
+-    fn client_auth_mandatory(&self) -> Option<bool> {
+-        Some(self.offer_client_auth())
++    fn client_auth_mandatory(&self) -> bool {
++        self.offer_client_auth()
+     }
+ 
+     /// Returns the [Subjects] of the client authentication trust anchors to
+@@ -251,9 +251,8 @@ pub trait ClientCertVerifier: Send + Sync {
+     /// [`CertificateRequest`]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.3.2
+     /// [`certificate_authorities`]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.4
+     ///
+-    /// Return `None` to abort the connection. Return an empty `Vec` to continue
+-    /// the handshake without sending a CertificateRequest message.
+-    fn client_auth_root_subjects(&self) -> Option<Vec<DistinguishedName>>;
++    /// If the return value is empty, no CertificateRequest message will be sent.
++    fn client_auth_root_subjects(&self) -> &[DistinguishedName];
+ 
+     /// Verify the end-entity certificate `end_entity` is valid, acceptable,
+     /// and chains to at least one of the trust anchors trusted by
+@@ -540,6 +539,7 @@ fn prepare<'a, 'b>(
+ /// certificate, without any name checking.
+ pub struct AllowAnyAuthenticatedClient {
+     roots: RootCertStore,
++    subjects: Vec<DistinguishedName>,
+ }
+ 
+ impl AllowAnyAuthenticatedClient {
+@@ -547,7 +547,14 @@ impl AllowAnyAuthenticatedClient {
+     ///
+     /// `roots` is the list of trust anchors to use for certificate validation.
+     pub fn new(roots: RootCertStore) -> Self {
+-        Self { roots }
++        Self {
++            subjects: roots
++                .roots
++                .iter()
++                .map(|r| r.subject().clone())
++                .collect(),
++            roots,
++        }
+     }
+ 
+     /// Wrap this verifier in an [`Arc`] and coerce it to `dyn ClientCertVerifier`
+@@ -565,8 +572,8 @@ impl ClientCertVerifier for AllowAnyAuthenticatedClient {
+     }
+ 
+     #[allow(deprecated)]
+-    fn client_auth_root_subjects(&self) -> Option<Vec<DistinguishedName>> {
+-        Some(self.roots.subjects())
++    fn client_auth_root_subjects(&self) -> &[DistinguishedName] {
++        &self.subjects
+     }
+ 
+     fn verify_client_cert(
+@@ -604,7 +611,7 @@ impl AllowAnyAnonymousOrAuthenticatedClient {
+     /// `roots` is the list of trust anchors to use for certificate validation.
+     pub fn new(roots: RootCertStore) -> Self {
+         Self {
+-            inner: AllowAnyAuthenticatedClient { roots },
++            inner: AllowAnyAuthenticatedClient::new(roots),
+         }
+     }
+ 
+@@ -622,11 +629,11 @@ impl ClientCertVerifier for AllowAnyAnonymousOrAuthenticatedClient {
+         self.inner.offer_client_auth()
+     }
+ 
+-    fn client_auth_mandatory(&self) -> Option<bool> {
+-        Some(false)
++    fn client_auth_mandatory(&self) -> bool {
++        false
+     }
+ 
+-    fn client_auth_root_subjects(&self) -> Option<Vec<DistinguishedName>> {
++    fn client_auth_root_subjects(&self) -> &[DistinguishedName] {
+         self.inner.client_auth_root_subjects()
+     }
+ 
+@@ -676,7 +683,7 @@ impl ClientCertVerifier for NoClientAuth {
+         false
+     }
+ 
+-    fn client_auth_root_subjects(&self) -> Option<Vec<DistinguishedName>> {
++    fn client_auth_root_subjects(&self) -> &[DistinguishedName] {
+         unimplemented!();
+     }
+ 

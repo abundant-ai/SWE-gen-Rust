@@ -1,0 +1,85 @@
+diff --git a/rustls/src/client/tls12.rs b/rustls/src/client/tls12.rs
+index b3acad6c..d572ffda 100644
+--- a/rustls/src/client/tls12.rs
++++ b/rustls/src/client/tls12.rs
+@@ -1040,6 +1040,18 @@ impl State<ClientConnectionData> for ExpectFinished {
+             _fin_verified,
+         }))
+     }
++
++    // we could not decrypt the encrypted handshake message with session resumption
++    // this might mean that the ticket was invalid for some reason, so we remove it
++    // from the store to restart a session from scratch
++    fn handle_decrypt_error(&self) {
++        if self.resuming {
++            self.config
++                .resumption
++                .store
++                .remove_tls12_session(&self.server_name);
++        }
++    }
+ }
+ 
+ // -- Traffic transit state --
+diff --git a/rustls/src/common_state.rs b/rustls/src/common_state.rs
+index f738ba12..0f0f55ee 100644
+--- a/rustls/src/common_state.rs
++++ b/rustls/src/common_state.rs
+@@ -630,6 +630,8 @@ pub(crate) trait State<Data>: Send + Sync {
+     fn extract_secrets(&self) -> Result<PartiallyExtractedSecrets, Error> {
+         Err(Error::HandshakeNotComplete)
+     }
++
++    fn handle_decrypt_error(&self) {}
+ }
+ 
+ pub(crate) struct Context<'a, Data> {
+diff --git a/rustls/src/conn.rs b/rustls/src/conn.rs
+index 31c4db37..6fc35acc 100644
+--- a/rustls/src/conn.rs
++++ b/rustls/src/conn.rs
+@@ -453,7 +453,7 @@ impl<Data> ConnectionCommon<Data> {
+     pub(crate) fn first_handshake_message(&mut self) -> Result<Option<Message>, Error> {
+         match self
+             .core
+-            .deframe()?
++            .deframe(None)?
+             .map(Message::try_from)
+         {
+             Some(Ok(msg)) => Ok(Some(msg)),
+@@ -635,7 +635,7 @@ impl<Data> ConnectionCore<Data> {
+             }
+         };
+ 
+-        while let Some(msg) = self.deframe()? {
++        while let Some(msg) = self.deframe(Some(&*state))? {
+             match self.process_msg(msg, state) {
+                 Ok(new) => state = new,
+                 Err(e) => {
+@@ -650,7 +650,7 @@ impl<Data> ConnectionCore<Data> {
+     }
+ 
+     /// Pull a message out of the deframer and send any messages that need to be sent as a result.
+-    fn deframe(&mut self) -> Result<Option<PlainMessage>, Error> {
++    fn deframe(&mut self, state: Option<&dyn State<Data>>) -> Result<Option<PlainMessage>, Error> {
+         match self.message_deframer.pop(
+             &mut self.common_state.record_layer,
+             self.common_state.negotiated_version,
+@@ -690,9 +690,14 @@ impl<Data> ConnectionCore<Data> {
+             Err(err @ Error::PeerSentOversizedRecord) => Err(self
+                 .common_state
+                 .send_fatal_alert(AlertDescription::RecordOverflow, err)),
+-            Err(err @ Error::DecryptError) => Err(self
+-                .common_state
+-                .send_fatal_alert(AlertDescription::BadRecordMac, err)),
++            Err(err @ Error::DecryptError) => {
++                if let Some(state) = state {
++                    state.handle_decrypt_error();
++                }
++                Err(self
++                    .common_state
++                    .send_fatal_alert(AlertDescription::BadRecordMac, err))
++            }
+             Err(e) => Err(e),
+         }
+     }

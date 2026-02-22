@@ -1,0 +1,260 @@
+diff --git a/crates/cli/src/fuzz.rs b/crates/cli/src/fuzz.rs
+index 24c98d30..996773c6 100644
+--- a/crates/cli/src/fuzz.rs
++++ b/crates/cli/src/fuzz.rs
+@@ -163,7 +163,7 @@ pub fn fuzz_language_corpus(
+ 
+         println!("  {test_index}. {test_name}");
+ 
+-        let passed = allocations::record_checked(|| {
++        let passed = allocations::record(|| {
+             let mut log_session = None;
+             let mut parser = get_parser(&mut log_session, "log.html");
+             parser.set_language(language).unwrap();
+@@ -207,7 +207,7 @@ pub fn fuzz_language_corpus(
+ 
+         for trial in 0..options.iterations {
+             let seed = start_seed + trial;
+-            let passed = allocations::record_checked(|| {
++            let passed = allocations::record(|| {
+                 let mut rand = Rand::new(seed);
+                 let mut log_session = None;
+                 let mut parser = get_parser(&mut log_session, "log.html");
+diff --git a/crates/cli/src/fuzz/allocations.rs b/crates/cli/src/fuzz/allocations.rs
+index ca0c0860..9d7c91ab 100644
+--- a/crates/cli/src/fuzz/allocations.rs
++++ b/crates/cli/src/fuzz/allocations.rs
+@@ -40,11 +40,7 @@ extern "C" {
+     fn free(ptr: *mut c_void);
+ }
+ 
+-pub fn record<T>(f: impl FnOnce() -> T) -> T {
+-    record_checked(f).unwrap()
+-}
+-
+-pub fn record_checked<T>(f: impl FnOnce() -> T) -> Result<T, String> {
++pub fn record<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+     RECORDER.with(|recorder| {
+         recorder.enabled.store(true, SeqCst);
+         recorder.allocation_count.store(0, SeqCst);
+@@ -97,34 +93,19 @@ fn record_dealloc(ptr: *mut c_void) {
+     });
+ }
+ 
+-/// # Safety
+-///
+-/// The caller must ensure that the returned pointer is eventually
+-/// freed by calling `ts_record_free`.
+-#[must_use]
+-pub unsafe extern "C" fn ts_record_malloc(size: usize) -> *mut c_void {
++unsafe extern "C" fn ts_record_malloc(size: usize) -> *mut c_void {
+     let result = malloc(size);
+     record_alloc(result);
+     result
+ }
+ 
+-/// # Safety
+-///
+-/// The caller must ensure that the returned pointer is eventually
+-/// freed by calling `ts_record_free`.
+-#[must_use]
+-pub unsafe extern "C" fn ts_record_calloc(count: usize, size: usize) -> *mut c_void {
++unsafe extern "C" fn ts_record_calloc(count: usize, size: usize) -> *mut c_void {
+     let result = calloc(count, size);
+     record_alloc(result);
+     result
+ }
+ 
+-/// # Safety
+-///
+-/// The caller must ensure that the returned pointer is eventually
+-/// freed by calling `ts_record_free`.
+-#[must_use]
+-pub unsafe extern "C" fn ts_record_realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
++unsafe extern "C" fn ts_record_realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
+     let result = realloc(ptr, size);
+     if ptr.is_null() {
+         record_alloc(result);
+@@ -135,11 +116,7 @@ pub unsafe extern "C" fn ts_record_realloc(ptr: *mut c_void, size: usize) -> *mu
+     result
+ }
+ 
+-/// # Safety
+-///
+-/// The caller must ensure that `ptr` was allocated by a previous call
+-/// to `ts_record_malloc`, `ts_record_calloc`, or `ts_record_realloc`.
+-pub unsafe extern "C" fn ts_record_free(ptr: *mut c_void) {
++unsafe extern "C" fn ts_record_free(ptr: *mut c_void) {
+     record_dealloc(ptr);
+     free(ptr);
+ }
+diff --git a/crates/cli/src/tests/corpus_test.rs b/crates/cli/src/tests/corpus_test.rs
+index fe2e2943..1ef63b31 100644
+--- a/crates/cli/src/tests/corpus_test.rs
++++ b/crates/cli/src/tests/corpus_test.rs
+@@ -216,7 +216,8 @@ pub fn test_language_corpus(
+             }
+ 
+             true
+-        });
++        })
++        .unwrap();
+ 
+         if !passed {
+             failure_count += 1;
+@@ -311,7 +312,7 @@ pub fn test_language_corpus(
+                 }
+ 
+                 true
+-            });
++            }).unwrap();
+ 
+             if !passed {
+                 failure_count += 1;
+@@ -433,7 +434,8 @@ fn test_feature_corpus_files() {
+                         println!();
+                         false
+                     }
+-                });
++                })
++                .unwrap();
+ 
+                 if !passed {
+                     failure_count += 1;
+diff --git a/crates/cli/src/tests/helpers.rs b/crates/cli/src/tests/helpers.rs
+index 4d2e6128..298179c7 100644
+--- a/crates/cli/src/tests/helpers.rs
++++ b/crates/cli/src/tests/helpers.rs
+@@ -1,4 +1,4 @@
+-pub use crate::fuzz::allocations;
++pub mod allocations;
+ pub mod edits;
+ pub(super) mod fixtures;
+ pub(super) mod query_helpers;
+diff --git a/crates/cli/src/tests/helpers/allocations.rs b/crates/cli/src/tests/helpers/allocations.rs
+new file mode 100644
+index 00000000..dec67b11
+--- /dev/null
++++ b/crates/cli/src/tests/helpers/allocations.rs
+@@ -0,0 +1,121 @@
++use std::{
++    collections::HashMap,
++    os::raw::c_void,
++    sync::{
++        atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
++        Mutex,
++    },
++};
++
++#[ctor::ctor]
++unsafe fn initialize_allocation_recording() {
++    tree_sitter::set_allocator(
++        Some(ts_record_malloc),
++        Some(ts_record_calloc),
++        Some(ts_record_realloc),
++        Some(ts_record_free),
++    );
++}
++
++#[derive(Debug, PartialEq, Eq, Hash)]
++struct Allocation(*const c_void);
++unsafe impl Send for Allocation {}
++unsafe impl Sync for Allocation {}
++
++#[derive(Default)]
++struct AllocationRecorder {
++    enabled: AtomicBool,
++    allocation_count: AtomicUsize,
++    outstanding_allocations: Mutex<HashMap<Allocation, usize>>,
++}
++
++thread_local! {
++    static RECORDER: AllocationRecorder = AllocationRecorder::default();
++}
++
++extern "C" {
++    fn malloc(size: usize) -> *mut c_void;
++    fn calloc(count: usize, size: usize) -> *mut c_void;
++    fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void;
++    fn free(ptr: *mut c_void);
++}
++
++pub fn record<T>(f: impl FnOnce() -> T) -> T {
++    RECORDER.with(|recorder| {
++        recorder.enabled.store(true, SeqCst);
++        recorder.allocation_count.store(0, SeqCst);
++        recorder.outstanding_allocations.lock().unwrap().clear();
++    });
++
++    let value = f();
++
++    let outstanding_allocation_indices = RECORDER.with(|recorder| {
++        recorder.enabled.store(false, SeqCst);
++        recorder.allocation_count.store(0, SeqCst);
++        recorder
++            .outstanding_allocations
++            .lock()
++            .unwrap()
++            .drain()
++            .map(|e| e.1)
++            .collect::<Vec<_>>()
++    });
++    assert!(
++        outstanding_allocation_indices.is_empty(),
++        "Leaked allocation indices: {outstanding_allocation_indices:?}"
++    );
++    value
++}
++
++fn record_alloc(ptr: *mut c_void) {
++    RECORDER.with(|recorder| {
++        if recorder.enabled.load(SeqCst) {
++            let count = recorder.allocation_count.fetch_add(1, SeqCst);
++            recorder
++                .outstanding_allocations
++                .lock()
++                .unwrap()
++                .insert(Allocation(ptr), count);
++        }
++    });
++}
++
++fn record_dealloc(ptr: *mut c_void) {
++    RECORDER.with(|recorder| {
++        if recorder.enabled.load(SeqCst) {
++            recorder
++                .outstanding_allocations
++                .lock()
++                .unwrap()
++                .remove(&Allocation(ptr));
++        }
++    });
++}
++
++unsafe extern "C" fn ts_record_malloc(size: usize) -> *mut c_void {
++    let result = malloc(size);
++    record_alloc(result);
++    result
++}
++
++unsafe extern "C" fn ts_record_calloc(count: usize, size: usize) -> *mut c_void {
++    let result = calloc(count, size);
++    record_alloc(result);
++    result
++}
++
++unsafe extern "C" fn ts_record_realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
++    let result = realloc(ptr, size);
++    if ptr.is_null() {
++        record_alloc(result);
++    } else if !core::ptr::eq(ptr, result) {
++        record_dealloc(ptr);
++        record_alloc(result);
++    }
++    result
++}
++
++unsafe extern "C" fn ts_record_free(ptr: *mut c_void) {
++    record_dealloc(ptr);
++    free(ptr);
++}

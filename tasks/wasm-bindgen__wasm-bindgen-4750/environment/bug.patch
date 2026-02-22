@@ -1,0 +1,387 @@
+diff --git a/crates/macro-support/src/codegen.rs b/crates/macro-support/src/codegen.rs
+index a092c572c..9fb19c99b 100644
+--- a/crates/macro-support/src/codegen.rs
++++ b/crates/macro-support/src/codegen.rs
+@@ -381,7 +381,10 @@ impl ToTokens for ast::Struct {
+ 
+             #[automatically_derived]
+             impl #wasm_bindgen::convert::TryFromJsValue for #name {
+-                fn try_from_js_value(value: #wasm_bindgen::JsValue) -> #wasm_bindgen::__rt::core::result::Result<Self, #wasm_bindgen::JsValue> {
++                type Error = #wasm_bindgen::JsValue;
++
++                fn try_from_js_value(value: #wasm_bindgen::JsValue)
++                    -> #wasm_bindgen::__rt::core::result::Result<Self, Self::Error> {
+                     let idx = #wasm_bindgen::convert::IntoWasmAbi::into_abi(&value);
+ 
+                     #[link(wasm_import_module = "__wbindgen_placeholder__")]
+@@ -409,9 +412,6 @@ impl ToTokens for ast::Struct {
+                         }
+                     }
+                 }
+-                fn try_from_js_value_ref(value: &#wasm_bindgen::JsValue) -> #wasm_bindgen::__rt::core::option::Option<Self> {
+-                    Self::try_from_js_value(value.clone()).ok()
+-                }
+             }
+ 
+             #[automatically_derived]
+@@ -1655,13 +1655,16 @@ impl ToTokens for ast::Enum {
+ 
+             #[automatically_derived]
+             impl #wasm_bindgen::convert::TryFromJsValue for #enum_name {
+-                fn try_from_js_value_ref(value: &#wasm_bindgen::JsValue) -> #wasm_bindgen::__rt::core::option::Option<Self> {
++                type Error = #wasm_bindgen::JsValue;
++
++                fn try_from_js_value(value: #wasm_bindgen::JsValue)
++                    -> #wasm_bindgen::__rt::core::result::Result<Self, <#enum_name as #wasm_bindgen::convert::TryFromJsValue>::Error> {
+                     use #wasm_bindgen::__rt::core::convert::TryFrom;
+-                    let js = f64::try_from(value).ok()? as #underlying;
++                    let js = f64::try_from(&value)? as #underlying;
+ 
+-                    #wasm_bindgen::__rt::core::option::Option::Some(
++                    #wasm_bindgen::__rt::core::result::Result::Ok(
+                         #(#try_from_cast_clauses else)* {
+-                            return #wasm_bindgen::__rt::core::option::Option::None;
++                            return #wasm_bindgen::__rt::core::result::Result::Err(value)
+                         }
+                     )
+                 }
+diff --git a/src/cast.rs b/src/cast.rs
+index 23dfd3170..2a7d916d6 100644
+--- a/src/cast.rs
++++ b/src/cast.rs
+@@ -155,14 +155,14 @@ where
+     fn unchecked_from_js_ref(val: &JsValue) -> &Self;
+ }
+ 
+-impl<T: JsCast> TryFromJsValue for T {
+-    #[inline]
+-    fn try_from_js_value(val: JsValue) -> Result<Self, JsValue> {
+-        val.dyn_into()
+-    }
++impl<T> TryFromJsValue for T
++where
++    T: JsCast,
++{
++    type Error = JsValue;
+ 
+     #[inline]
+-    fn try_from_js_value_ref(val: &JsValue) -> Option<Self> {
+-        val.clone().dyn_into().ok()
++    fn try_from_js_value(val: JsValue) -> Result<Self, Self::Error> {
++        val.dyn_into()
+     }
+ }
+diff --git a/src/convert/impls.rs b/src/convert/impls.rs
+index 33f5c7fd4..44bd846f6 100644
+--- a/src/convert/impls.rs
++++ b/src/convert/impls.rs
+@@ -1,6 +1,7 @@
+ use alloc::boxed::Box;
+ use alloc::vec::Vec;
+ use core::char;
++use core::fmt::Debug;
+ use core::mem::{self, ManuallyDrop};
+ use core::ptr::NonNull;
+ 
+@@ -599,7 +600,10 @@ pub fn js_value_vector_into_abi<T: Into<JsValue>>(
+ /// documentation for more details.
+ pub unsafe fn js_value_vector_from_abi<T: TryFromJsValue>(
+     js: <Box<[JsValue]> as FromWasmAbi>::Abi,
+-) -> Box<[T]> {
++) -> Box<[T]>
++where
++    T::Error: Debug,
++{
+     let js_vals = <Vec<JsValue> as FromWasmAbi>::from_abi(js);
+ 
+     let mut result = Vec::with_capacity(js_vals.len());
+diff --git a/src/convert/traits.rs b/src/convert/traits.rs
+index be10d7d4a..a9761e3ab 100644
+--- a/src/convert/traits.rs
++++ b/src/convert/traits.rs
+@@ -350,11 +350,9 @@ impl<T: WasmAbi> WasmRet<T> {
+ /// stability guarantees** are provided. Use at your own risk. See its
+ /// documentation for more details.
+ pub trait TryFromJsValue: Sized {
+-    /// Performs the conversion.
+-    fn try_from_js_value(value: JsValue) -> Result<Self, JsValue> {
+-        Self::try_from_js_value_ref(&value).ok_or(value)
+-    }
++    /// The type returned in the event of a conversion error.
++    type Error;
+ 
+     /// Performs the conversion.
+-    fn try_from_js_value_ref(value: &JsValue) -> Option<Self>;
++    fn try_from_js_value(value: JsValue) -> Result<Self, Self::Error>;
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index d6f055dd7..303b4e01f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -869,8 +869,13 @@ impl TryFrom<JsValue> for String {
+ }
+ 
+ impl TryFromJsValue for String {
+-    fn try_from_js_value_ref(value: &JsValue) -> Option<Self> {
+-        value.as_string()
++    type Error = JsValue;
++
++    fn try_from_js_value(value: JsValue) -> Result<Self, Self::Error> {
++        match value.as_string() {
++            Some(s) => Ok(s),
++            None => Err(value),
++        }
+     }
+ }
+ 
+@@ -882,18 +887,29 @@ impl From<bool> for JsValue {
+ }
+ 
+ impl TryFromJsValue for bool {
+-    fn try_from_js_value_ref(value: &JsValue) -> Option<Self> {
+-        value.as_bool()
++    type Error = JsValue;
++
++    fn try_from_js_value(value: JsValue) -> Result<Self, Self::Error> {
++        match value.as_bool() {
++            Some(s) => Ok(s),
++            None => Err(value),
++        }
+     }
+ }
+ 
+ impl TryFromJsValue for char {
+-    fn try_from_js_value_ref(value: &JsValue) -> Option<Self> {
+-        let s = value.as_string()?;
+-        if s.len() == 1 {
+-            Some(s.chars().nth(0).unwrap())
+-        } else {
+-            None
++    type Error = JsValue;
++
++    fn try_from_js_value(value: JsValue) -> Result<Self, Self::Error> {
++        match value.as_string() {
++            Some(s) => {
++                if s.len() == 1 {
++                    Ok(s.chars().nth(0).unwrap())
++                } else {
++                    Err(value)
++                }
++            }
++            None => Err(value),
+         }
+     }
+ }
+@@ -946,14 +962,17 @@ impl AsRef<JsValue> for JsValue {
+ 
+ // Loosely based on toInt32 in ecma-272 for abi semantics
+ // with restriction that it only applies for numbers
+-fn to_uint_32(v: &JsValue) -> Option<u32> {
+-    v.as_f64().map(|n| {
+-        if n.is_infinite() {
+-            0
+-        } else {
+-            (n as i64) as u32
+-        }
+-    })
++fn to_uint_32(v: JsValue) -> Result<u32, JsValue> {
++    v.as_f64().map_or_else(
++        || Err(v),
++        |n| {
++            if n.is_infinite() {
++                Ok(0)
++            } else {
++                Ok((n as i64) as u32)
++            }
++        },
++    )
+ }
+ 
+ macro_rules! integers {
+@@ -974,8 +993,9 @@ macro_rules! integers {
+ 
+         // Follows semantics of https://www.w3.org/TR/wasm-js-api-2/#towebassemblyvalue
+         impl TryFromJsValue for $n {
++            type Error = JsValue;
+             #[inline]
+-            fn try_from_js_value_ref(val: &JsValue) -> Option<$n> {
++            fn try_from_js_value(val: JsValue) -> Result<$n, Self::Error> {
+                 to_uint_32(val).map(|n| n as $n)
+             }
+         }
+@@ -1001,9 +1021,10 @@ macro_rules! floats {
+         }
+ 
+         impl TryFromJsValue for $n {
++            type Error = JsValue;
+             #[inline]
+-            fn try_from_js_value_ref(val: &JsValue) -> Option<$n> {
+-                val.as_f64().map(|n| n as $n)
++            fn try_from_js_value(val: JsValue) -> Result<$n, Self::Error> {
++                val.as_f64().map_or_else(|| Err(val), |n| Ok(n as $n))
+             }
+         }
+     )*)
+@@ -1032,22 +1053,24 @@ macro_rules! big_integers {
+ 
+             #[inline]
+             fn try_from(v: JsValue) -> Result<Self, JsValue> {
+-                Self::try_from_js_value(v)
++                __wbindgen_bigint_get_as_i64(&v)
++                    // Reinterpret bits; ABI-wise this is safe to do and allows us to avoid
++                    // having separate intrinsics per signed/unsigned types.
++                    .map(|as_i64| as_i64 as Self)
++                    // Double-check that we didn't truncate the bigint to 64 bits.
++                    .filter(|as_self| v == *as_self)
++                    // Not a bigint or not in range.
++                    .ok_or(v)
+             }
+         }
+ 
+         impl TryFromJsValue for $n {
++            type Error = JsValue;
+             #[inline]
+-            fn try_from_js_value_ref(val: &JsValue) -> Option<$n> {
+-                let as_i64 = __wbindgen_bigint_get_as_i64(&val)?;
+-                // Reinterpret bits; ABI-wise this is safe to do and allows us to avoid
+-                // having separate intrinsics per signed/unsigned types.
+-                let as_self = as_i64 as $n;
+-                // Double-check that we didn't truncate the bigint to 64 bits.
+-                if val == &as_self {
+-                    Some(as_self)
+-                } else {
+-                    None
++            fn try_from_js_value(val: JsValue) -> Result<$n, JsValue> {
++                match __wbindgen_bigint_get_as_i64(&val) {
++                    Some(n) => Ok(n as $n),
++                    None => Err(val)
+                 }
+             }
+         }
+@@ -1077,22 +1100,29 @@ macro_rules! num128 {
+ 
+             #[inline]
+             fn try_from(v: JsValue) -> Result<Self, JsValue> {
+-                Self::try_from_js_value(v)
+-            }
+-        }
+-
+-        impl TryFromJsValue for $ty {
+-            // This is a non-standard Wasm bindgen conversion, supported equally
+-            fn try_from_js_value_ref(v: &JsValue) -> Option<$ty> {
+                 // Truncate the bigint to 64 bits, this will give us the lower part.
+-                // The lower part must be interpreted as unsigned in both i128 and u128.
+-                let lo = __wbindgen_bigint_get_as_i64(&v)? as u64;
++                let lo = match __wbindgen_bigint_get_as_i64(&v) {
++                    // The lower part must be interpreted as unsigned in both i128 and u128.
++                    Some(lo) => lo as u64,
++                    // Not a bigint.
++                    None => return Err(v),
++                };
+                 // Now we know it's a bigint, so we can safely use `>> 64n` without
+                 // worrying about a JS exception on type mismatch.
+                 let hi = v >> JsValue::from(64_u64);
+                 // The high part is the one we want checked against a 64-bit range.
+                 // If it fits, then our original number is in the 128-bit range.
+-                <$hi_ty>::try_from_js_value_ref(&hi).map(|hi| Self::from(hi) << 64 | Self::from(lo))
++                let hi = <$hi_ty>::try_from(hi)?;
++                Ok(Self::from(hi) << 64 | Self::from(lo))
++            }
++        }
++
++        impl TryFromJsValue for $ty {
++            type Error = JsValue;
++
++            // This is a non-standard Wasm bindgen conversion, supported equally
++            fn try_from_js_value(val: JsValue) -> Result<$ty, JsValue> {
++                <$ty as TryFrom<JsValue>>::try_from(val)
+             }
+         }
+     };
+@@ -1103,21 +1133,25 @@ num128!(i128, i64);
+ num128!(u128, u64);
+ 
+ impl TryFromJsValue for () {
+-    fn try_from_js_value_ref(value: &JsValue) -> Option<Self> {
++    type Error = JsValue;
++
++    fn try_from_js_value(value: JsValue) -> Result<Self, Self::Error> {
+         if value.is_undefined() {
+-            Some(())
++            Ok(())
+         } else {
+-            None
++            Err(value)
+         }
+     }
+ }
+ 
+ impl<T: TryFromJsValue> TryFromJsValue for Option<T> {
+-    fn try_from_js_value_ref(value: &JsValue) -> Option<Self> {
++    type Error = T::Error;
++
++    fn try_from_js_value(value: JsValue) -> Result<Self, Self::Error> {
+         if value.is_null_or_undefined() {
+-            Some(None)
++            Ok(None)
+         } else {
+-            T::try_from_js_value_ref(value).map(Some)
++            T::try_from_js_value(value).map(Some)
+         }
+     }
+ }
+@@ -1155,17 +1189,19 @@ impl From<isize> for JsValue {
+ 
+ // Follows semantics of https://www.w3.org/TR/wasm-js-api-2/#towebassemblyvalue
+ impl TryFromJsValue for isize {
++    type Error = JsValue;
+     #[inline]
+-    fn try_from_js_value_ref(val: &JsValue) -> Option<isize> {
+-        val.as_f64().map(|n| n as isize)
++    fn try_from_js_value(val: JsValue) -> Result<isize, Self::Error> {
++        val.as_f64().map_or_else(|| Err(val), |n| Ok(n as isize))
+     }
+ }
+ 
+ // Follows semantics of https://www.w3.org/TR/wasm-js-api-2/#towebassemblyvalue
+ impl TryFromJsValue for usize {
++    type Error = JsValue;
+     #[inline]
+-    fn try_from_js_value_ref(val: &JsValue) -> Option<usize> {
+-        val.as_f64().map(|n| n as usize)
++    fn try_from_js_value(val: JsValue) -> Result<usize, Self::Error> {
++        val.as_f64().map_or_else(|| Err(val), |n| Ok(n as usize))
+     }
+ }
+ 
+diff --git a/tests/wasm/try_from_js_value.rs b/tests/wasm/try_from_js_value.rs
+index 3bd72cdec..e1ea16e32 100644
+--- a/tests/wasm/try_from_js_value.rs
++++ b/tests/wasm/try_from_js_value.rs
+@@ -70,7 +70,7 @@ fn u64_try_from_js_value() {
+     assert!(u64::try_from_js_value(JsValue::TRUE).is_err());
+     assert!(u64::try_from_js_value(JsValue::from_str("45")).is_err());
+     assert!(u64::try_from_js_value(JsValue::NULL).is_err());
+-    assert!(u64::try_from_js_value(JsValue::from(-1_i64)).is_err());
++    assert_eq!(u64::try_from_js_value(JsValue::from(-1_i64)), Ok(u64::MAX));
+ }
+ 
+ #[wasm_bindgen_test]
+@@ -156,17 +156,6 @@ fn option_try_from_js_value() {
+     );
+ }
+ 
+-#[wasm_bindgen_test]
+-fn try_from_js_value_ref() {
+-    let val = JsValue::from(42_i64);
+-    assert_eq!(i64::try_from_js_value_ref(&val), Some(42_i64));
+-    assert_eq!(
+-        String::try_from_js_value_ref(&JsValue::from_str("hello")),
+-        Some("hello".to_string())
+-    );
+-    assert_eq!(bool::try_from_js_value_ref(&JsValue::TRUE), Some(true));
+-}
+-
+ #[wasm_bindgen_test]
+ fn bool_try_from_js_value() {
+     assert_eq!(bool::try_from_js_value(JsValue::TRUE), Ok(true));

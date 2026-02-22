@@ -1,0 +1,241 @@
+diff --git a/src/client.rs b/src/client.rs
+index 9e587df..2a4fffb 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -655,6 +655,9 @@ impl ClientHandle {
+         let res = match wait::timeout(fut, self.timeout.0) {
+             Ok(res) => res,
+             Err(wait::Waited::TimedOut) => return Err(::error::timedout(Some(url))),
++            Err(wait::Waited::Executor(err)) => {
++                return Err(::error::from(err).with_url(url))
++            },
+             Err(wait::Waited::Inner(err)) => {
+                 return Err(err.with_url(url));
+             },
+diff --git a/src/error.rs b/src/error.rs
+index 61ca29f..58a9510 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -2,6 +2,8 @@ use std::error::Error as StdError;
+ use std::fmt;
+ use std::io;
+ 
++use tokio_executor::EnterError;
++
+ use {StatusCode, Url};
+ 
+ /// The Errors that may occur when processing a `Request`.
+@@ -151,7 +153,8 @@ impl Error {
+             Kind::RedirectLoop |
+             Kind::Status(_) |
+             Kind::UnknownProxyScheme |
+-            Kind::Timer => None,
++            Kind::Timer |
++            Kind::BlockingClientInFutureContext => None,
+         }
+     }
+ 
+@@ -245,6 +248,8 @@ impl fmt::Debug for Error {
+     }
+ }
+ 
++static BLOCK_IN_FUTURE: &'static str = "blocking Client used inside a Future context";
++
+ impl fmt::Display for Error {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+         if let Some(ref url) = self.inner.url {
+@@ -284,6 +289,7 @@ impl fmt::Display for Error {
+             }
+             Kind::UnknownProxyScheme => f.write_str("Unknown proxy scheme"),
+             Kind::Timer => f.write_str("timer unavailable"),
++            Kind::BlockingClientInFutureContext => f.write_str(BLOCK_IN_FUTURE),
+         }
+     }
+ }
+@@ -320,6 +326,7 @@ impl StdError for Error {
+             }
+             Kind::UnknownProxyScheme => "Unknown proxy scheme",
+             Kind::Timer => "timer unavailable",
++            Kind::BlockingClientInFutureContext => BLOCK_IN_FUTURE,
+         }
+     }
+ 
+@@ -347,7 +354,8 @@ impl StdError for Error {
+             Kind::RedirectLoop |
+             Kind::Status(_) |
+             Kind::UnknownProxyScheme |
+-            Kind::Timer => None,
++            Kind::Timer |
++            Kind::BlockingClientInFutureContext => None,
+         }
+     }
+ 
+@@ -373,7 +381,8 @@ impl StdError for Error {
+             Kind::RedirectLoop |
+             Kind::Status(_) |
+             Kind::UnknownProxyScheme |
+-            Kind::Timer => None,
++            Kind::Timer |
++            Kind::BlockingClientInFutureContext => None,
+         }
+     }
+ }
+@@ -401,6 +410,7 @@ pub(crate) enum Kind {
+     Status(StatusCode),
+     UnknownProxyScheme,
+     Timer,
++    BlockingClientInFutureContext,
+ }
+ 
+ 
+@@ -472,11 +482,18 @@ where T: Into<Kind> {
+     fn from(err: ::wait::Waited<T>) -> Kind {
+         match err {
+             ::wait::Waited::TimedOut =>  io_timeout().into(),
++            ::wait::Waited::Executor(e) => e.into(),
+             ::wait::Waited::Inner(e) => e.into(),
+         }
+     }
+ }
+ 
++impl From<EnterError> for Kind {
++    fn from(_err: EnterError) -> Kind {
++        Kind::BlockingClientInFutureContext
++    }
++}
++
+ impl From<::tokio::timer::Error> for Kind {
+     fn from(_err: ::tokio::timer::Error) -> Kind {
+         Kind::Timer
+diff --git a/src/response.rs b/src/response.rs
+index b2e173f..8ffb43f 100644
+--- a/src/response.rs
++++ b/src/response.rs
+@@ -205,6 +205,7 @@ impl Response {
+         wait::timeout(self.inner.json(), self.timeout).map_err(|e| {
+             match e {
+                 wait::Waited::TimedOut => ::error::timedout(None),
++                wait::Waited::Executor(e) => ::error::from(e),
+                 wait::Waited::Inner(e) => e,
+             }
+         })
+@@ -262,6 +263,7 @@ impl Response {
+         wait::timeout(self.inner.text_with_charset(default_encoding), self.timeout).map_err(|e| {
+             match e {
+                 wait::Waited::TimedOut => ::error::timedout(None),
++                wait::Waited::Executor(e) => ::error::from(e),
+                 wait::Waited::Inner(e) => e,
+             }
+         })
+@@ -376,6 +378,7 @@ impl Stream for WaitBody {
+             Some(Err(e)) => {
+                 let req_err = match e {
+                     wait::Waited::TimedOut => ::error::timedout(None),
++                    wait::Waited::Executor(e) => ::error::from(e),
+                     wait::Waited::Inner(e) => e,
+                 };
+ 
+diff --git a/src/wait.rs b/src/wait.rs
+index f7ac207..794463f 100644
+--- a/src/wait.rs
++++ b/src/wait.rs
+@@ -1,11 +1,10 @@
+ use std::sync::Arc;
+-use std::sync::atomic::{AtomicBool, Ordering};
+ use std::thread;
+ use std::time::{Duration, Instant};
+ 
+ use futures::{Async, Future, Poll, Stream};
+ use futures::executor::{self, Notify};
+-use tokio_executor;
++use tokio_executor::{enter, EnterError};
+ 
+ pub(crate) fn timeout<F>(fut: F, timeout: Option<Duration>) -> Result<F::Item, Waited<F::Error>>
+ where
+@@ -28,6 +27,7 @@ where S: Stream {
+ #[derive(Debug)]
+ pub(crate) enum Waited<E> {
+     TimedOut,
++    Executor(EnterError),
+     Inner(E),
+ }
+ 
+@@ -69,37 +69,11 @@ impl Notify for ThreadNotify {
+     }
+ }
+ 
+-static ENTER_WARNED: AtomicBool = AtomicBool::new(false);
+-
+ fn block_on<F, U, E>(timeout: Option<Duration>, mut poll: F) -> Result<U, Waited<E>>
+ where
+     F: FnMut(&Arc<ThreadNotify>) -> Poll<U, E>,
+ {
+-    // Check we're not already inside an `Executor`,
+-    // but for now, only log a warning if so.
+-    let _entered = tokio_executor::enter().map_err(|_| {
+-        if ENTER_WARNED.swap(true, Ordering::Relaxed) {
+-            trace!("warning: blocking API used inside an async Executor");
+-        } else {
+-            // If you're here wondering why you saw this message, it's because
+-            // something used `reqwest::Client`, which is a blocking
+-            // (synchronous) API, while within the context of an asynchronous
+-            // executor. For example, some async server.
+-            //
+-            // Doing this means that while you wait for the synchronous reqwest,
+-            // your server thread will be blocked, not being able to do
+-            // anything else.
+-            //
+-            // The best way to fix it is to use the `reqwest::async::Client`
+-            // instead, and return the futures for the async Executor to run
+-            // cooperatively.
+-            //
+-            // In future versions of reqwest, this will become an Error.
+-            //
+-            // For more: https://github.com/seanmonstar/reqwest/issues/541
+-            warn!("blocking API used inside an async Executor can negatively impact perfomance");
+-        }
+-    });
++    let _entered = enter().map_err(Waited::Executor)?;
+     let deadline = timeout.map(|d| {
+         Instant::now() + d
+     });
+diff --git a/tests/async.rs b/tests/async.rs
+index 8952396..f39678f 100644
+--- a/tests/async.rs
++++ b/tests/async.rs
+@@ -354,35 +354,3 @@ fn body_stream() {
+ 
+     rt.block_on(res_future).unwrap();
+ }
+-
+-#[test]
+-fn blocking_inside_async_context() {
+-    let _ = env_logger::try_init();
+-
+-    let server = server! {
+-        request: b"\
+-            GET /enter HTTP/1.1\r\n\
+-            user-agent: $USERAGENT\r\n\
+-            accept: */*\r\n\
+-            accept-encoding: gzip\r\n\
+-            host: $HOST\r\n\
+-            \r\n\
+-            ",
+-        response: b"\
+-            HTTP/1.1 200 OK\r\n\
+-            Content-Length: 18\r\n\
+-            \r\n\
+-            Blocky McBlockface\
+-            "
+-    };
+-
+-    let mut rt = Runtime::new().expect("new rt");
+-    let url = format!("http://{}/enter", server.addr());
+-
+-    rt.block_on(futures::future::lazy(|| {
+-        let mut resp = reqwest::get(&url)?;
+-        let text = resp.text()?;
+-        assert_eq!("Blocky McBlockface", text);
+-        Ok::<_, reqwest::Error>(())
+-    })).unwrap();
+-}

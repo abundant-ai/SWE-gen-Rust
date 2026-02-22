@@ -1,0 +1,269 @@
+diff --git a/crates/ide-db/src/imports/insert_use.rs b/crates/ide-db/src/imports/insert_use.rs
+index da8525d1fb..f26952fa15 100644
+--- a/crates/ide-db/src/imports/insert_use.rs
++++ b/crates/ide-db/src/imports/insert_use.rs
+@@ -94,7 +94,7 @@ impl ImportScope {
+                     .item_list()
+                     .map(ImportScopeKind::Module)
+                     .map(|kind| ImportScope { kind, required_cfgs });
+-            } else if let Some(has_attrs) = ast::AnyHasAttrs::cast(syntax.clone()) {
++            } else if let Some(has_attrs) = ast::AnyHasAttrs::cast(syntax) {
+                 if block.is_none()
+                     && let Some(b) = ast::BlockExpr::cast(has_attrs.syntax().clone())
+                     && let Some(b) = sema.original_ast_node(b)
+@@ -105,34 +105,11 @@ impl ImportScope {
+                     .attrs()
+                     .any(|attr| attr.as_simple_call().is_some_and(|(ident, _)| ident == "cfg"))
+                 {
+-                    if let Some(b) = block.clone() {
+-                        let current_cfgs = has_attrs.attrs().filter(|attr| {
+-                            attr.as_simple_call().is_some_and(|(ident, _)| ident == "cfg")
++                    if let Some(b) = block {
++                        return Some(ImportScope {
++                            kind: ImportScopeKind::Block(b),
++                            required_cfgs,
+                         });
+-
+-                        let total_cfgs: Vec<_> =
+-                            required_cfgs.iter().cloned().chain(current_cfgs).collect();
+-
+-                        let parent = syntax.parent();
+-                        let mut can_merge = false;
+-                        if let Some(parent) = parent {
+-                            can_merge = parent.children().filter_map(ast::Use::cast).any(|u| {
+-                                let u_attrs = u.attrs().filter(|attr| {
+-                                    attr.as_simple_call().is_some_and(|(ident, _)| ident == "cfg")
+-                                });
+-                                crate::imports::merge_imports::eq_attrs(
+-                                    u_attrs,
+-                                    total_cfgs.iter().cloned(),
+-                                )
+-                            });
+-                        }
+-
+-                        if !can_merge {
+-                            return Some(ImportScope {
+-                                kind: ImportScopeKind::Block(b),
+-                                required_cfgs,
+-                            });
+-                        }
+                     }
+                     required_cfgs.extend(has_attrs.attrs().filter(|attr| {
+                         attr.as_simple_call().is_some_and(|(ident, _)| ident == "cfg")
+@@ -569,9 +546,7 @@ fn insert_use_(scope: &ImportScope, use_item: ast::Use, group_imports: bool) {
+         // skip the curly brace
+         .skip(l_curly.is_some() as usize)
+         .take_while(|child| match child {
+-            NodeOrToken::Node(node) => {
+-                is_inner_attribute(node.clone()) && ast::Item::cast(node.clone()).is_none()
+-            }
++            NodeOrToken::Node(node) => is_inner_attribute(node.clone()),
+             NodeOrToken::Token(token) => {
+                 [SyntaxKind::WHITESPACE, SyntaxKind::COMMENT, SyntaxKind::SHEBANG]
+                     .contains(&token.kind())
+@@ -692,9 +667,7 @@ fn insert_use_with_editor_(
+         // skip the curly brace
+         .skip(l_curly.is_some() as usize)
+         .take_while(|child| match child {
+-            NodeOrToken::Node(node) => {
+-                is_inner_attribute(node.clone()) && ast::Item::cast(node.clone()).is_none()
+-            }
++            NodeOrToken::Node(node) => is_inner_attribute(node.clone()),
+             NodeOrToken::Token(token) => {
+                 [SyntaxKind::WHITESPACE, SyntaxKind::COMMENT, SyntaxKind::SHEBANG]
+                     .contains(&token.kind())
+diff --git a/crates/ide-db/src/imports/insert_use/tests.rs b/crates/ide-db/src/imports/insert_use/tests.rs
+index 6c7b97458d..3350e1c3d2 100644
+--- a/crates/ide-db/src/imports/insert_use/tests.rs
++++ b/crates/ide-db/src/imports/insert_use/tests.rs
+@@ -1438,156 +1438,3 @@ fn check_guess(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected: Import
+     let file = ImportScope { kind: ImportScopeKind::File(syntax), required_cfgs: vec![] };
+     assert_eq!(super::guess_granularity_from_scope(&file), expected);
+ }
+-
+-#[test]
+-fn insert_with_existing_imports_and_cfg_module() {
+-    check(
+-        "std::fmt",
+-        r#"
+-use foo::bar;
+-
+-#[cfg(target_arch = "x86_64")]
+-pub mod api;
+-"#,
+-        r#"
+-use std::fmt;
+-
+-use foo::bar;
+-
+-#[cfg(target_arch = "x86_64")]
+-pub mod api;
+-"#,
+-        ImportGranularity::Crate,
+-    );
+-}
+-
+-#[test]
+-fn insert_before_cfg_module() {
+-    check(
+-        "std::fmt",
+-        r#"
+-#[cfg(target_arch = "x86_64")]
+-pub mod api;
+-"#,
+-        r#"
+-use std::fmt;
+-
+-#[cfg(target_arch = "x86_64")]
+-pub mod api;
+-"#,
+-        ImportGranularity::Crate,
+-    );
+-}
+-
+-fn check_merge(ra_fixture0: &str, ra_fixture1: &str, last: &str, mb: MergeBehavior) {
+-    let use0 = ast::SourceFile::parse(ra_fixture0, span::Edition::CURRENT)
+-        .tree()
+-        .syntax()
+-        .descendants()
+-        .find_map(ast::Use::cast)
+-        .unwrap();
+-
+-    let use1 = ast::SourceFile::parse(ra_fixture1, span::Edition::CURRENT)
+-        .tree()
+-        .syntax()
+-        .descendants()
+-        .find_map(ast::Use::cast)
+-        .unwrap();
+-
+-    let result = try_merge_imports(&use0, &use1, mb);
+-    assert_eq!(result.map(|u| u.to_string().trim().to_owned()), Some(last.trim().to_owned()));
+-}
+-
+-#[test]
+-fn merge_gated_imports() {
+-    check_merge(
+-        r#"#[cfg(test)] use foo::bar;"#,
+-        r#"#[cfg(test)] use foo::baz;"#,
+-        r#"#[cfg(test)] use foo::{bar, baz};"#,
+-        MergeBehavior::Crate,
+-    );
+-}
+-
+-#[test]
+-fn merge_gated_imports_with_different_values() {
+-    let use0 = ast::SourceFile::parse(r#"#[cfg(a)] use foo::bar;"#, span::Edition::CURRENT)
+-        .tree()
+-        .syntax()
+-        .descendants()
+-        .find_map(ast::Use::cast)
+-        .unwrap();
+-
+-    let use1 = ast::SourceFile::parse(r#"#[cfg(b)] use foo::baz;"#, span::Edition::CURRENT)
+-        .tree()
+-        .syntax()
+-        .descendants()
+-        .find_map(ast::Use::cast)
+-        .unwrap();
+-
+-    let result = try_merge_imports(&use0, &use1, MergeBehavior::Crate);
+-    assert_eq!(result, None);
+-}
+-
+-#[test]
+-fn merge_gated_imports_different_order() {
+-    check_merge(
+-        r#"#[cfg(a)] #[cfg(b)] use foo::bar;"#,
+-        r#"#[cfg(b)] #[cfg(a)] use foo::baz;"#,
+-        r#"#[cfg(a)] #[cfg(b)] use foo::{bar, baz};"#,
+-        MergeBehavior::Crate,
+-    );
+-}
+-
+-#[test]
+-fn merge_into_existing_cfg_import() {
+-    check(
+-        r#"foo::Foo"#,
+-        r#"
+-#[cfg(target_os = "windows")]
+-use bar::Baz;
+-
+-#[cfg(target_os = "windows")]
+-fn buzz() {
+-    Foo$0;
+-}
+-"#,
+-        r#"
+-#[cfg(target_os = "windows")]
+-use bar::Baz;
+-#[cfg(target_os = "windows")]
+-use foo::Foo;
+-
+-#[cfg(target_os = "windows")]
+-fn buzz() {
+-    Foo;
+-}
+-"#,
+-        ImportGranularity::Crate,
+-    );
+-}
+-
+-#[test]
+-fn reproduce_user_issue_missing_semicolon() {
+-    check(
+-        "std::fmt",
+-        r#"
+-use {
+-    foo
+-}
+-
+-#[cfg(target_arch = "x86_64")]
+-pub mod api;
+-"#,
+-        r#"
+-use std::fmt;
+-
+-use {
+-    foo
+-}
+-
+-#[cfg(target_arch = "x86_64")]
+-pub mod api;
+-"#,
+-        ImportGranularity::Crate,
+-    );
+-}
+diff --git a/crates/ide-db/src/imports/merge_imports.rs b/crates/ide-db/src/imports/merge_imports.rs
+index 3301719f5c..635ed7368c 100644
+--- a/crates/ide-db/src/imports/merge_imports.rs
++++ b/crates/ide-db/src/imports/merge_imports.rs
+@@ -4,7 +4,7 @@ use std::cmp::Ordering;
+ use itertools::{EitherOrBoth, Itertools};
+ use parser::T;
+ use syntax::{
+-    Direction, SyntaxElement, ToSmolStr, algo,
++    Direction, SyntaxElement, algo,
+     ast::{
+         self, AstNode, HasAttrs, HasName, HasVisibility, PathSegmentKind, edit_in_place::Removable,
+         make,
+@@ -691,12 +691,14 @@ pub fn eq_attrs(
+     attrs0: impl Iterator<Item = ast::Attr>,
+     attrs1: impl Iterator<Item = ast::Attr>,
+ ) -> bool {
+-    let mut attrs0: Vec<_> = attrs0.map(|attr| attr.syntax().text().to_smolstr()).collect();
+-    let mut attrs1: Vec<_> = attrs1.map(|attr| attr.syntax().text().to_smolstr()).collect();
+-    attrs0.sort_unstable();
+-    attrs1.sort_unstable();
+-
+-    attrs0 == attrs1
++    // FIXME order of attributes should not matter
++    let attrs0 = attrs0
++        .flat_map(|attr| attr.syntax().descendants_with_tokens())
++        .flat_map(|it| it.into_token());
++    let attrs1 = attrs1
++        .flat_map(|attr| attr.syntax().descendants_with_tokens())
++        .flat_map(|it| it.into_token());
++    stdx::iter_eq_by(attrs0, attrs1, |tok, tok2| tok.text() == tok2.text())
+ }
+ 
+ fn path_is_self(path: &ast::Path) -> bool {

@@ -1,0 +1,1030 @@
+diff --git a/clap_derive/src/derives/args.rs b/clap_derive/src/derives/args.rs
+index f14ac09d..5313c1db 100644
+--- a/clap_derive/src/derives/args.rs
++++ b/clap_derive/src/derives/args.rs
+@@ -157,40 +157,56 @@ pub fn gen_augment(
+     parent_item: &Item,
+     override_required: bool,
+ ) -> TokenStream {
+-    let mut subcommand_specified = false;
++    let mut subcmds = fields.iter().filter_map(|(field, item)| {
++        let kind = item.kind();
++        if let Kind::Subcommand(ty) = &*kind {
++            let subcmd_type = match (**ty, sub_type(&field.ty)) {
++                (Ty::Option, Some(sub_type)) => sub_type,
++                _ => &field.ty,
++            };
++            let required = if **ty == Ty::Option {
++                quote!()
++            } else {
++                quote_spanned! { kind.span()=>
++                    let #app_var = #app_var
++                        .subcommand_required(true)
++                        .arg_required_else_help(true);
++                }
++            };
++
++            let span = field.span();
++            let ts = if override_required {
++                quote! {
++                    let #app_var = <#subcmd_type as clap::Subcommand>::augment_subcommands_for_update( #app_var );
++                }
++            } else{
++                quote! {
++                    let #app_var = <#subcmd_type as clap::Subcommand>::augment_subcommands( #app_var );
++                    #required
++                }
++            };
++            Some((span, ts))
++        } else {
++            None
++        }
++    });
++    let subcmd = subcmds.next().map(|(_, ts)| ts);
++    if let Some((span, _)) = subcmds.next() {
++        abort!(
++            span,
++            "multiple subcommand sets are not allowed, that's the second"
++        );
++    }
++
+     let args = fields.iter().filter_map(|(field, item)| {
+         let kind = item.kind();
+         match &*kind {
+             Kind::Command(_)
+-            | Kind::Value
++            | Kind::Value(_)
++            | Kind::Subcommand(_)
+             | Kind::Skip(_, _)
+             | Kind::FromGlobal(_)
+             | Kind::ExternalSubcommand => None,
+-            Kind::Subcommand(ty) => {
+-                if subcommand_specified {
+-                    abort!(field.span(), "`#[command(subcommand)]` can only be used once per container");
+-                }
+-                subcommand_specified = true;
+-
+-                let subcmd_type = match (**ty, sub_type(&field.ty)) {
+-                    (Ty::Option, Some(sub_type)) => sub_type,
+-                    _ => &field.ty,
+-                };
+-                let implicit_methods = if **ty == Ty::Option || override_required {
+-                    quote!()
+-                } else {
+-                    quote_spanned! { kind.span()=>
+-                        .subcommand_required(true)
+-                        .arg_required_else_help(true)
+-                    }
+-                };
+-
+-                Some(quote! {
+-                    let #app_var = <#subcmd_type as clap::Subcommand>::augment_subcommands( #app_var );
+-                    let #app_var = #app_var
+-                        #implicit_methods;
+-                })
+-            }
+             Kind::Flatten => {
+                 let ty = &field.ty;
+                 let old_heading_var = format_ident!("__clap_old_heading");
+@@ -199,18 +215,14 @@ pub fn gen_augment(
+                 if override_required {
+                     Some(quote_spanned! { kind.span()=>
+                         let #old_heading_var = #app_var.get_next_help_heading().map(|s| clap::builder::Str::from(s.to_owned()));
+-                        let #app_var = #app_var
+-                            #next_help_heading
+-                            #next_display_order;
++                        let #app_var = #app_var #next_help_heading #next_display_order;
+                         let #app_var = <#ty as clap::Args>::augment_args_for_update(#app_var);
+                         let #app_var = #app_var.next_help_heading(clap::builder::Resettable::from(#old_heading_var));
+                     })
+                 } else {
+                     Some(quote_spanned! { kind.span()=>
+                         let #old_heading_var = #app_var.get_next_help_heading().map(|s| clap::builder::Str::from(s.to_owned()));
+-                        let #app_var = #app_var
+-                            #next_help_heading
+-                            #next_display_order;
++                        let #app_var = #app_var #next_help_heading #next_display_order;
+                         let #app_var = <#ty as clap::Args>::augment_args(#app_var);
+                         let #app_var = #app_var.next_help_heading(clap::builder::Resettable::from(#old_heading_var));
+                     })
+@@ -287,7 +299,7 @@ pub fn gen_augment(
+                 };
+ 
+                 let id = item.id();
+-                let explicit_methods = item.field_methods();
++                let explicit_methods = item.field_methods(true);
+                 let deprecations = if !override_required {
+                     item.deprecations()
+                 } else {
+@@ -322,6 +334,7 @@ pub fn gen_augment(
+         #deprecations
+         let #app_var = #app_var #initial_app_methods;
+         #( #args )*
++        #subcmd
+         #app_var #final_app_methods
+     }}
+ }
+@@ -333,7 +346,7 @@ pub fn gen_constructor(fields: &[(&Field, Item)]) -> TokenStream {
+         let arg_matches = format_ident!("__clap_arg_matches");
+         match &*kind {
+             Kind::Command(_)
+-            | Kind::Value
++            | Kind::Value(_)
+             | Kind::ExternalSubcommand => {
+                 abort! { kind.span(),
+                     "`{}` cannot be used with `arg`",
+@@ -357,22 +370,13 @@ pub fn gen_constructor(fields: &[(&Field, Item)]) -> TokenStream {
+                             }
+                         }
+                     },
+-                    Ty::Vec |
+-                    Ty::Other => {
++                    _ => {
+                         quote_spanned! { kind.span()=>
+                             #field_name: {
+                                 <#subcmd_type as clap::FromArgMatches>::from_arg_matches_mut(#arg_matches)?
+                             }
+                         }
+                     },
+-                    Ty::OptionOption |
+-                    Ty::OptionVec => {
+-                        abort!(
+-                            ty.span(),
+-                            "{} types are not supported for subcommand",
+-                            ty.as_str()
+-                        );
+-                    }
+                 }
+             }
+ 
+@@ -413,7 +417,7 @@ pub fn gen_updater(fields: &[(&Field, Item)], use_self: bool) -> TokenStream {
+ 
+         match &*kind {
+             Kind::Command(_)
+-            | Kind::Value
++            | Kind::Value(_)
+             | Kind::ExternalSubcommand => {
+                 abort! { kind.span(),
+                     "`{}` cannot be used with `arg`",
+diff --git a/clap_derive/src/derives/subcommand.rs b/clap_derive/src/derives/subcommand.rs
+index d55b669f..07ec6de1 100644
+--- a/clap_derive/src/derives/subcommand.rs
++++ b/clap_derive/src/derives/subcommand.rs
+@@ -137,10 +137,7 @@ fn gen_augment(
+             let kind = item.kind();
+ 
+             match &*kind {
+-                Kind::Skip(_, _) |
+-                Kind::Arg(_) |
+-                Kind::FromGlobal(_) |
+-                Kind::Value => None,
++                Kind::Skip(_, _) => None,
+ 
+                 Kind::ExternalSubcommand => {
+                     let ty = match variant.fields {
+@@ -158,17 +155,19 @@ fn gen_augment(
+                     } else {
+                         quote!()
+                     };
+-                    let subty = subty_if_name(ty, "Vec").unwrap_or_else(|| {
+-                        abort!(
++                    let subcommand = match subty_if_name(ty, "Vec") {
++                        Some(subty) => {
++                            quote_spanned! { kind.span()=>
++                                #deprecations
++                                let #app_var = #app_var.external_subcommand_value_parser(clap::value_parser!(#subty));
++                            }
++                        }
++
++                        None => abort!(
+                             ty.span(),
+                             "The type must be `Vec<_>` \
+                              to be used with `external_subcommand`."
+-                        )
+-                    });
+-                    let subcommand = quote_spanned! { kind.span()=>
+-                        #deprecations
+-                        let #app_var = #app_var
+-                            .external_subcommand_value_parser(clap::value_parser!(#subty));
++                        ),
+                     };
+                     Some(subcommand)
+                 }
+@@ -188,9 +187,7 @@ fn gen_augment(
+                             quote! {
+                                 #deprecations
+                                 let #old_heading_var = #app_var.get_next_help_heading().map(|s| clap::builder::Str::from(s.to_owned()));
+-                                let #app_var = #app_var
+-                                    #next_help_heading
+-                                    #next_display_order;
++                                let #app_var = #app_var #next_help_heading #next_display_order;
+                                 let #app_var = <#ty as clap::Subcommand>::augment_subcommands_for_update(#app_var);
+                                 let #app_var = #app_var.next_help_heading(clap::builder::Resettable::from(#old_heading_var));
+                             }
+@@ -198,9 +195,7 @@ fn gen_augment(
+                             quote! {
+                                 #deprecations
+                                 let #old_heading_var = #app_var.get_next_help_heading().map(|s| clap::builder::Str::from(s.to_owned()));
+-                                let #app_var = #app_var
+-                                    #next_help_heading
+-                                    #next_display_order;
++                                let #app_var = #app_var #next_help_heading #next_display_order;
+                                 let #app_var = <#ty as clap::Subcommand>::augment_subcommands(#app_var);
+                                 let #app_var = #app_var.next_help_heading(clap::builder::Resettable::from(#old_heading_var));
+                             }
+@@ -264,7 +259,7 @@ fn gen_augment(
+                     Some(subcommand)
+                 }
+ 
+-                Kind::Command(_) => {
++                _ => {
+                     let subcommand_var = Ident::new("__clap_subcommand", Span::call_site());
+                     let sub_augment = match variant.fields {
+                         Named(ref fields) => {
+diff --git a/clap_derive/src/derives/value_enum.rs b/clap_derive/src/derives/value_enum.rs
+index a1411d02..c3184c03 100644
+--- a/clap_derive/src/derives/value_enum.rs
++++ b/clap_derive/src/derives/value_enum.rs
+@@ -42,7 +42,7 @@ pub fn derive_value_enum(input: &DeriveInput) -> TokenStream {
+ }
+ 
+ pub fn gen_for_enum(item: &Item, item_name: &Ident, variants: &[(&Variant, Item)]) -> TokenStream {
+-    if !matches!(&*item.kind(), Kind::Value) {
++    if !matches!(&*item.kind(), Kind::Value(_)) {
+         abort! { item.kind().span(),
+             "`{}` cannot be used with `value`",
+             item.kind().name(),
+@@ -84,7 +84,7 @@ fn lits(variants: &[(&Variant, Item)]) -> Vec<(TokenStream, Ident)> {
+                 if !matches!(variant.fields, Fields::Unit) {
+                     abort!(variant.span(), "`#[derive(ValueEnum)]` only supports unit variants. Non-unit variants must be skipped");
+                 }
+-                let fields = item.field_methods();
++                let fields = item.field_methods(false);
+                 let deprecations = item.deprecations();
+                 let name = item.cased_name();
+                 Some((
+diff --git a/clap_derive/src/item.rs b/clap_derive/src/item.rs
+index e08e8ad4..21e02412 100644
+--- a/clap_derive/src/item.rs
++++ b/clap_derive/src/item.rs
+@@ -54,58 +54,42 @@ pub struct Item {
+ 
+ impl Item {
+     pub fn from_args_struct(input: &DeriveInput, name: Name) -> Self {
+-        let span = input.ident.span();
++        let span = Span::call_site();
+         let attrs = &input.attrs;
+-        let argument_casing = Sp::new(DEFAULT_CASING, span);
+-        let env_casing = Sp::new(DEFAULT_ENV_CASING, span);
++        let argument_casing = Sp::call_site(DEFAULT_CASING);
++        let env_casing = Sp::call_site(DEFAULT_ENV_CASING);
+         let kind = Sp::new(Kind::Command(Sp::new(Ty::Other, span)), span);
+-
+-        let mut res = Self::new(name, None, argument_casing, env_casing, kind);
+-        let parsed_attrs = ClapAttr::parse_all(attrs);
+-        res.infer_kind(&parsed_attrs);
+-        res.push_attrs(&parsed_attrs);
+-        res.push_doc_comment(attrs, "about", true);
+-
+-        res
++        Self::from_struct(attrs, name, argument_casing, env_casing, kind)
+     }
+ 
+     pub fn from_subcommand_enum(input: &DeriveInput, name: Name) -> Self {
+-        let span = input.ident.span();
++        let span = Span::call_site();
+         let attrs = &input.attrs;
+-        let argument_casing = Sp::new(DEFAULT_CASING, span);
+-        let env_casing = Sp::new(DEFAULT_ENV_CASING, span);
++        let argument_casing = Sp::call_site(DEFAULT_CASING);
++        let env_casing = Sp::call_site(DEFAULT_ENV_CASING);
+         let kind = Sp::new(Kind::Command(Sp::new(Ty::Other, span)), span);
+-
+-        let mut res = Self::new(name, None, argument_casing, env_casing, kind);
+-        let parsed_attrs = ClapAttr::parse_all(attrs);
+-        res.infer_kind(&parsed_attrs);
+-        res.push_attrs(&parsed_attrs);
+-        res.push_doc_comment(attrs, "about", true);
+-
+-        res
++        Self::from_struct(attrs, name, argument_casing, env_casing, kind)
+     }
+ 
+     pub fn from_value_enum(input: &DeriveInput, name: Name) -> Self {
+-        let span = input.ident.span();
++        let span = Span::call_site();
+         let attrs = &input.attrs;
+-        let argument_casing = Sp::new(DEFAULT_CASING, span);
+-        let env_casing = Sp::new(DEFAULT_ENV_CASING, span);
+-        let kind = Sp::new(Kind::Value, span);
++        let argument_casing = Sp::call_site(DEFAULT_CASING);
++        let env_casing = Sp::call_site(DEFAULT_ENV_CASING);
++        let kind = Sp::new(Kind::Value(Sp::new(Ty::Other, span)), span);
++        Self::from_struct(attrs, name, argument_casing, env_casing, kind)
++    }
+ 
++    fn from_struct(
++        attrs: &[Attribute],
++        name: Name,
++        argument_casing: Sp<CasingStyle>,
++        env_casing: Sp<CasingStyle>,
++        kind: Sp<Kind>,
++    ) -> Self {
+         let mut res = Self::new(name, None, argument_casing, env_casing, kind);
+-        let parsed_attrs = ClapAttr::parse_all(attrs);
+-        res.infer_kind(&parsed_attrs);
+-        res.push_attrs(&parsed_attrs);
+-        // Ignoring `push_doc_comment` as there is no top-level clap builder to add documentation
+-        // to
+-
+-        if res.has_explicit_methods() {
+-            abort!(
+-                res.methods[0].name.span(),
+-                "{} doesn't exist for `ValueEnum` enums",
+-                res.methods[0].name
+-            );
+-        }
++        res.push_attrs(attrs);
++        res.push_doc_comment(attrs, "about");
+ 
+         res
+     }
+@@ -117,22 +101,10 @@ impl Item {
+     ) -> Self {
+         let name = variant.ident.clone();
+         let span = variant.span();
+-        let ty = match variant.fields {
+-            syn::Fields::Unnamed(syn::FieldsUnnamed { ref unnamed, .. }) if unnamed.len() == 1 => {
+-                Ty::from_syn_ty(&unnamed[0].ty)
+-            }
+-            syn::Fields::Named(_) | syn::Fields::Unnamed(..) | syn::Fields::Unit => {
+-                Sp::new(Ty::Other, span)
+-            }
+-        };
+-        let kind = Sp::new(Kind::Command(ty), span);
++        let kind = Sp::new(Kind::Command(Sp::new(Ty::Other, span)), span);
+         let mut res = Self::new(Name::Derived(name), None, struct_casing, env_casing, kind);
+-        let parsed_attrs = ClapAttr::parse_all(&variant.attrs);
+-        res.infer_kind(&parsed_attrs);
+-        res.push_attrs(&parsed_attrs);
+-        if matches!(&*res.kind, Kind::Command(_)) {
+-            res.push_doc_comment(&variant.attrs, "about", true);
+-        }
++        res.push_attrs(&variant.attrs);
++        res.push_doc_comment(&variant.attrs, "about");
+ 
+         match &*res.kind {
+             Kind::Flatten => {
+@@ -142,14 +114,54 @@ impl Item {
+                         "methods are not allowed for flattened entry"
+                     );
+                 }
++
++                // ignore doc comments
++                res.doc_comment = vec![];
+             }
+ 
+-            Kind::Subcommand(_)
+-            | Kind::ExternalSubcommand
++            Kind::Subcommand(_) => {
++                use syn::Fields::*;
++                use syn::FieldsUnnamed;
++                let field_ty = match variant.fields {
++                    Named(_) => {
++                        abort!(variant.span(), "structs are not allowed for subcommand");
++                    }
++                    Unit => abort!(variant.span(), "unit-type is not allowed for subcommand"),
++                    Unnamed(FieldsUnnamed { ref unnamed, .. }) if unnamed.len() == 1 => {
++                        &unnamed[0].ty
++                    }
++                    Unnamed(..) => {
++                        abort!(
++                            variant,
++                            "non single-typed tuple is not allowed for subcommand"
++                        )
++                    }
++                };
++                let ty = Ty::from_syn_ty(field_ty);
++                match *ty {
++                    Ty::OptionOption => {
++                        abort!(
++                            field_ty,
++                            "Option<Option<T>> type is not allowed for subcommand"
++                        );
++                    }
++                    Ty::OptionVec => {
++                        abort!(
++                            field_ty,
++                            "Option<Vec<T>> type is not allowed for subcommand"
++                        );
++                    }
++                    _ => (),
++                }
++
++                res.kind = Sp::new(Kind::Subcommand(ty), res.kind.span());
++            }
++
++            Kind::ExternalSubcommand
+             | Kind::FromGlobal(_)
+             | Kind::Skip(_, _)
+             | Kind::Command(_)
+-            | Kind::Value
++            | Kind::Value(_)
+             | Kind::Arg(_) => (),
+         }
+ 
+@@ -162,7 +174,7 @@ impl Item {
+         env_casing: Sp<CasingStyle>,
+     ) -> Self {
+         let span = variant.span();
+-        let kind = Sp::new(Kind::Value, span);
++        let kind = Sp::new(Kind::Value(Sp::new(Ty::Other, span)), span);
+         let mut res = Self::new(
+             Name::Derived(variant.ident.clone()),
+             None,
+@@ -170,12 +182,8 @@ impl Item {
+             env_casing,
+             kind,
+         );
+-        let parsed_attrs = ClapAttr::parse_all(&variant.attrs);
+-        res.infer_kind(&parsed_attrs);
+-        res.push_attrs(&parsed_attrs);
+-        if matches!(&*res.kind, Kind::Value) {
+-            res.push_doc_comment(&variant.attrs, "help", false);
+-        }
++        res.push_attrs(&variant.attrs);
++        res.push_doc_comment(&variant.attrs, "help");
+ 
+         res
+     }
+@@ -187,8 +195,7 @@ impl Item {
+     ) -> Self {
+         let name = field.ident.clone().unwrap();
+         let span = field.span();
+-        let ty = Ty::from_syn_ty(&field.ty);
+-        let kind = Sp::new(Kind::Arg(ty), span);
++        let kind = Sp::new(Kind::Arg(Sp::new(Ty::Other, span)), span);
+         let mut res = Self::new(
+             Name::Derived(name),
+             Some(field.ty.clone()),
+@@ -196,12 +203,8 @@ impl Item {
+             env_casing,
+             kind,
+         );
+-        let parsed_attrs = ClapAttr::parse_all(&field.attrs);
+-        res.infer_kind(&parsed_attrs);
+-        res.push_attrs(&parsed_attrs);
+-        if matches!(&*res.kind, Kind::Arg(_)) {
+-            res.push_doc_comment(&field.attrs, "help", true);
+-        }
++        res.push_attrs(&field.attrs);
++        res.push_doc_comment(&field.attrs, "help");
+ 
+         match &*res.kind {
+             Kind::Flatten => {
+@@ -211,6 +214,9 @@ impl Item {
+                         "methods are not allowed for flattened entry"
+                     );
+                 }
++
++                // ignore doc comments
++                res.doc_comment = vec![];
+             }
+ 
+             Kind::Subcommand(_) => {
+@@ -220,13 +226,77 @@ impl Item {
+                         "methods in attributes are not allowed for subcommand"
+                     );
+                 }
++
++                let ty = Ty::from_syn_ty(&field.ty);
++                match *ty {
++                    Ty::OptionOption => {
++                        abort!(
++                            field.ty,
++                            "Option<Option<T>> type is not allowed for subcommand"
++                        );
++                    }
++                    Ty::OptionVec => {
++                        abort!(
++                            field.ty,
++                            "Option<Vec<T>> type is not allowed for subcommand"
++                        );
++                    }
++                    _ => (),
++                }
++
++                res.kind = Sp::new(Kind::Subcommand(ty), res.kind.span());
+             }
+-            Kind::Skip(_, _)
+-            | Kind::FromGlobal(_)
+-            | Kind::Arg(_)
+-            | Kind::Command(_)
+-            | Kind::Value
+-            | Kind::ExternalSubcommand => {}
++            Kind::Skip(_, _) => {
++                if res.has_explicit_methods() {
++                    abort!(
++                        res.kind.span(),
++                        "methods are not allowed for skipped fields"
++                    );
++                }
++            }
++            Kind::FromGlobal(orig_ty) => {
++                let ty = Ty::from_syn_ty(&field.ty);
++                res.kind = Sp::new(Kind::FromGlobal(ty), orig_ty.span());
++            }
++            Kind::Arg(_) => {
++                let ty = Ty::from_syn_ty(&field.ty);
++
++                match *ty {
++                    Ty::Option => {
++                        if let Some(m) = res.find_default_method() {
++                            abort!(m.name, "default_value is meaningless for Option")
++                        }
++                    }
++                    Ty::OptionOption => {
++                        if res.is_positional() {
++                            abort!(
++                                field.ty,
++                                "Option<Option<T>> type is meaningless for positional argument"
++                            )
++                        }
++                    }
++                    Ty::OptionVec => {
++                        if res.is_positional() {
++                            abort!(
++                                field.ty,
++                                "Option<Vec<T>> type is meaningless for positional argument"
++                            )
++                        }
++                    }
++
++                    _ => (),
++                }
++                res.kind = Sp::new(
++                    Kind::Arg(ty),
++                    field
++                        .ident
++                        .as_ref()
++                        .map(|i| i.span())
++                        .unwrap_or_else(|| field.ty.span()),
++                );
++            }
++
++            Kind::Command(_) | Kind::Value(_) | Kind::ExternalSubcommand => {}
+         }
+ 
+         res
+@@ -306,8 +376,10 @@ impl Item {
+         }
+     }
+ 
+-    fn infer_kind(&mut self, attrs: &[ClapAttr]) {
+-        for attr in attrs {
++    fn push_attrs(&mut self, attrs: &[Attribute]) {
++        let parsed = ClapAttr::parse_all(attrs);
++
++        for attr in &parsed {
+             if let Some(AttrValue::Call(_)) = &attr.value {
+                 continue;
+             }
+@@ -318,11 +390,7 @@ impl Item {
+                         let expr = attr.value_or_abort();
+                         abort!(expr, "attribute `{}` does not accept a value", attr.name);
+                     }
+-                    let ty = self
+-                        .kind()
+-                        .ty()
+-                        .cloned()
+-                        .unwrap_or_else(|| Sp::new(Ty::Other, self.kind.span()));
++                    let ty = Sp::call_site(Ty::Other);
+                     let kind = Sp::new(Kind::FromGlobal(ty), attr.name.clone().span());
+                     Some(kind)
+                 }
+@@ -331,11 +399,7 @@ impl Item {
+                         let expr = attr.value_or_abort();
+                         abort!(expr, "attribute `{}` does not accept a value", attr.name);
+                     }
+-                    let ty = self
+-                        .kind()
+-                        .ty()
+-                        .cloned()
+-                        .unwrap_or_else(|| Sp::new(Ty::Other, self.kind.span()));
++                    let ty = Sp::call_site(Ty::Other);
+                     let kind = Sp::new(Kind::Subcommand(ty), attr.name.clone().span());
+                     Some(kind)
+                 }
+@@ -370,10 +434,8 @@ impl Item {
+                 self.set_kind(kind);
+             }
+         }
+-    }
+ 
+-    fn push_attrs(&mut self, attrs: &[ClapAttr]) {
+-        for attr in attrs {
++        for attr in &parsed {
+             let actual_attr_kind = *attr.kind.get();
+             let expected_attr_kind = self.kind.attr_kind();
+             match (actual_attr_kind, expected_attr_kind) {
+@@ -514,7 +576,7 @@ impl Item {
+                         quote!(<#ty as ::std::default::Default>::default())
+                     };
+ 
+-                    let val = if attrs
++                    let val = if parsed
+                         .iter()
+                         .any(|a| a.magic == Some(MagicAttrName::ValueEnum))
+                     {
+@@ -566,7 +628,7 @@ impl Item {
+ 
+                     // Use `Borrow<#inner_type>` so we accept `&Vec<#inner_type>` and
+                     // `Vec<#inner_type>`.
+-                    let val = if attrs
++                    let val = if parsed
+                         .iter()
+                         .any(|a| a.magic == Some(MagicAttrName::ValueEnum))
+                     {
+@@ -629,7 +691,7 @@ impl Item {
+                         quote!(<#ty as ::std::default::Default>::default())
+                     };
+ 
+-                    let val = if attrs
++                    let val = if parsed
+                         .iter()
+                         .any(|a| a.magic == Some(MagicAttrName::ValueEnum))
+                     {
+@@ -681,7 +743,7 @@ impl Item {
+ 
+                     // Use `Borrow<#inner_type>` so we accept `&Vec<#inner_type>` and
+                     // `Vec<#inner_type>`.
+-                    let val = if attrs
++                    let val = if parsed
+                         .iter()
+                         .any(|a| a.magic == Some(MagicAttrName::ValueEnum))
+                     {
+@@ -785,27 +847,9 @@ impl Item {
+                 }
+             }
+         }
+-
+-        if self.has_explicit_methods() {
+-            if let Kind::Skip(_, attr) = &*self.kind {
+-                abort!(
+-                    self.methods[0].name.span(),
+-                    "`{}` cannot be used with `#[{}(skip)]",
+-                    self.methods[0].name,
+-                    attr.as_str(),
+-                );
+-            }
+-            if let Kind::FromGlobal(_) = &*self.kind {
+-                abort!(
+-                    self.methods[0].name.span(),
+-                    "`{}` cannot be used with `#[arg(from_global)]",
+-                    self.methods[0].name,
+-                );
+-            }
+-        }
+     }
+ 
+-    fn push_doc_comment(&mut self, attrs: &[Attribute], name: &str, supports_long_help: bool) {
++    fn push_doc_comment(&mut self, attrs: &[Attribute], name: &str) {
+         use syn::Lit::*;
+         use syn::Meta::*;
+ 
+@@ -823,11 +867,7 @@ impl Item {
+             })
+             .collect();
+ 
+-        let (short, long) = process_doc_comment(comment_parts, name, !self.verbatim_doc_comment);
+-        self.doc_comment.extend(short);
+-        if supports_long_help {
+-            self.doc_comment.extend(long);
+-        }
++        self.doc_comment = process_doc_comment(comment_parts, name, !self.verbatim_doc_comment);
+     }
+ 
+     fn set_kind(&mut self, kind: Sp<Kind>) {
+@@ -840,7 +880,7 @@ impl Item {
+             | (Kind::Command(_), Kind::Flatten)
+             | (Kind::Command(_), Kind::Skip(_, _))
+             | (Kind::Command(_), Kind::ExternalSubcommand)
+-            | (Kind::Value, Kind::Skip(_, _)) => {
++            | (Kind::Value(_), Kind::Skip(_, _)) => {
+                 self.kind = kind;
+             }
+ 
+@@ -876,10 +916,21 @@ impl Item {
+     }
+ 
+     /// generate methods on top of a field
+-    pub fn field_methods(&self) -> proc_macro2::TokenStream {
++    pub fn field_methods(&self, supports_long_help: bool) -> proc_macro2::TokenStream {
+         let methods = &self.methods;
+-        let doc_comment = &self.doc_comment;
+-        quote!( #(#doc_comment)* #(#methods)* )
++        match supports_long_help {
++            true => {
++                let doc_comment = &self.doc_comment;
++                quote!( #(#doc_comment)* #(#methods)* )
++            }
++            false => {
++                let doc_comment = self
++                    .doc_comment
++                    .iter()
++                    .filter(|mth| mth.name != "long_help");
++                quote!( #(#doc_comment)* #(#methods)* )
++            }
++        }
+     }
+ 
+     pub fn deprecations(&self) -> proc_macro2::TokenStream {
+@@ -1069,7 +1120,7 @@ fn default_action(field_type: &Type, span: Span) -> Method {
+ pub enum Kind {
+     Arg(Sp<Ty>),
+     Command(Sp<Ty>),
+-    Value,
++    Value(Sp<Ty>),
+     FromGlobal(Sp<Ty>),
+     Subcommand(Sp<Ty>),
+     Flatten,
+@@ -1082,7 +1133,7 @@ impl Kind {
+         match self {
+             Self::Arg(_) => "arg",
+             Self::Command(_) => "command",
+-            Self::Value => "value",
++            Self::Value(_) => "value",
+             Self::FromGlobal(_) => "from_global",
+             Self::Subcommand(_) => "subcommand",
+             Self::Flatten => "flatten",
+@@ -1095,7 +1146,7 @@ impl Kind {
+         match self {
+             Self::Arg(_) => AttrKind::Arg,
+             Self::Command(_) => AttrKind::Command,
+-            Self::Value => AttrKind::Value,
++            Self::Value(_) => AttrKind::Value,
+             Self::FromGlobal(_) => AttrKind::Arg,
+             Self::Subcommand(_) => AttrKind::Command,
+             Self::Flatten => AttrKind::Command,
+@@ -1103,15 +1154,6 @@ impl Kind {
+             Self::ExternalSubcommand => AttrKind::Command,
+         }
+     }
+-
+-    pub fn ty(&self) -> Option<&Sp<Ty>> {
+-        match self {
+-            Self::Arg(ty) | Self::Command(ty) | Self::FromGlobal(ty) | Self::Subcommand(ty) => {
+-                Some(ty)
+-            }
+-            Self::Value | Self::Flatten | Self::Skip(_, _) | Self::ExternalSubcommand => None,
+-        }
+-    }
+ }
+ 
+ #[derive(Clone)]
+diff --git a/clap_derive/src/utils/doc_comments.rs b/clap_derive/src/utils/doc_comments.rs
+index 0da1f3b0..a815874c 100644
+--- a/clap_derive/src/utils/doc_comments.rs
++++ b/clap_derive/src/utils/doc_comments.rs
+@@ -8,11 +8,7 @@ use crate::item::Method;
+ use quote::{format_ident, quote};
+ use std::iter;
+ 
+-pub fn process_doc_comment(
+-    lines: Vec<String>,
+-    name: &str,
+-    preprocess: bool,
+-) -> (Option<Method>, Option<Method>) {
++pub fn process_doc_comment(lines: Vec<String>, name: &str, preprocess: bool) -> Vec<Method> {
+     // multiline comments (`/** ... */`) may have LFs (`\n`) in them,
+     // we need to split so we could handle the lines correctly
+     //
+@@ -35,7 +31,7 @@ pub fn process_doc_comment(
+     }
+ 
+     if lines.is_empty() {
+-        return (None, None);
++        return vec![];
+     }
+ 
+     let short_name = format_ident!("{}", name);
+@@ -53,10 +49,10 @@ pub fn process_doc_comment(
+             (short, long)
+         };
+ 
+-        (
+-            Some(Method::new(short_name, quote!(#short))),
+-            Some(Method::new(long_name, quote!(#long))),
+-        )
++        vec![
++            Method::new(short_name, quote!(#short)),
++            Method::new(long_name, quote!(#long)),
++        ]
+     } else {
+         let short = if preprocess {
+             let s = merge_lines(&lines);
+@@ -65,10 +61,10 @@ pub fn process_doc_comment(
+             lines.join("\n")
+         };
+ 
+-        (
+-            Some(Method::new(short_name, quote!(#short))),
+-            Some(Method::new(long_name, quote!(None))),
+-        )
++        vec![
++            Method::new(short_name, quote!(#short)),
++            Method::new(long_name, quote!(None)),
++        ]
+     }
+ }
+ 
+diff --git a/clap_derive/src/utils/spanned.rs b/clap_derive/src/utils/spanned.rs
+index 339a654e..e064b53f 100644
+--- a/clap_derive/src/utils/spanned.rs
++++ b/clap_derive/src/utils/spanned.rs
+@@ -16,6 +16,13 @@ impl<T> Sp<T> {
+         Sp { val, span }
+     }
+ 
++    pub fn call_site(val: T) -> Self {
++        Sp {
++            val,
++            span: Span::call_site(),
++        }
++    }
++
+     pub fn get(&self) -> &T {
+         &self.val
+     }
+diff --git a/clap_derive/src/utils/ty.rs b/clap_derive/src/utils/ty.rs
+index a540e5f6..517f564e 100644
+--- a/clap_derive/src/utils/ty.rs
++++ b/clap_derive/src/utils/ty.rs
+@@ -35,16 +35,6 @@ impl Ty {
+             t(Other)
+         }
+     }
+-
+-    pub fn as_str(&self) -> &'static str {
+-        match self {
+-            Self::Vec => "Vec<T>",
+-            Self::Option => "Option<T>",
+-            Self::OptionOption => "Option<Option<T>>",
+-            Self::OptionVec => "Option<Vec<T>>",
+-            Self::Other => "...other...",
+-        }
+-    }
+ }
+ 
+ pub fn inner_type(field_ty: &syn::Type) -> &syn::Type {
+diff --git a/tests/derive_ui/opt_opt_nonpositional.rs b/tests/derive_ui/opt_opt_nonpositional.rs
+new file mode 100644
+index 00000000..af018ab9
+--- /dev/null
++++ b/tests/derive_ui/opt_opt_nonpositional.rs
+@@ -0,0 +1,20 @@
++// Copyright 2018 Guillaume Pinot (@TeXitoi) <texitoi@texitoi.eu>
++//
++// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
++// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
++// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
++// option. This file may not be copied, modified, or distributed
++// except according to those terms.
++
++use clap::Parser;
++
++#[derive(Parser, Debug)]
++#[command(name = "basic")]
++struct Opt {
++    n: Option<Option<u32>>,
++}
++
++fn main() {
++    let opt = Opt::parse();
++    println!("{:?}", opt);
++}
+diff --git a/tests/derive_ui/opt_opt_nonpositional.stderr b/tests/derive_ui/opt_opt_nonpositional.stderr
+new file mode 100644
+index 00000000..cb9f1728
+--- /dev/null
++++ b/tests/derive_ui/opt_opt_nonpositional.stderr
+@@ -0,0 +1,5 @@
++error: Option<Option<T>> type is meaningless for positional argument
++  --> $DIR/opt_opt_nonpositional.rs:14:8
++   |
++14 |     n: Option<Option<u32>>,
++   |        ^^^^^^^^^^^^^^^^^^^
+diff --git a/tests/derive_ui/opt_vec_nonpositional.rs b/tests/derive_ui/opt_vec_nonpositional.rs
+new file mode 100644
+index 00000000..169c5761
+--- /dev/null
++++ b/tests/derive_ui/opt_vec_nonpositional.rs
+@@ -0,0 +1,20 @@
++// Copyright 2018 Guillaume Pinot (@TeXitoi) <texitoi@texitoi.eu>
++//
++// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
++// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
++// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
++// option. This file may not be copied, modified, or distributed
++// except according to those terms.
++
++use clap::Parser;
++
++#[derive(Parser, Debug)]
++#[command(name = "basic")]
++struct Opt {
++    n: Option<Vec<u32>>,
++}
++
++fn main() {
++    let opt = Opt::parse();
++    println!("{:?}", opt);
++}
+diff --git a/tests/derive_ui/opt_vec_nonpositional.stderr b/tests/derive_ui/opt_vec_nonpositional.stderr
+new file mode 100644
+index 00000000..c6b343f9
+--- /dev/null
++++ b/tests/derive_ui/opt_vec_nonpositional.stderr
+@@ -0,0 +1,5 @@
++error: Option<Vec<T>> type is meaningless for positional argument
++  --> $DIR/opt_vec_nonpositional.rs:14:8
++   |
++14 |     n: Option<Vec<u32>>,
++   |        ^^^^^^^^^^^^^^^^
+diff --git a/tests/derive_ui/option_default_value.rs b/tests/derive_ui/option_default_value.rs
+new file mode 100644
+index 00000000..72a6f07e
+--- /dev/null
++++ b/tests/derive_ui/option_default_value.rs
+@@ -0,0 +1,21 @@
++// Copyright 2018 Guillaume Pinot (@TeXitoi) <texitoi@texitoi.eu>
++//
++// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
++// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
++// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
++// option. This file may not be copied, modified, or distributed
++// except according to those terms.
++
++use clap::Parser;
++
++#[derive(Parser, Debug)]
++#[command(name = "basic")]
++struct Opt {
++    #[arg(short, default_value = 1)]
++    n: Option<u32>,
++}
++
++fn main() {
++    let opt = Opt::parse();
++    println!("{:?}", opt);
++}
+diff --git a/tests/derive_ui/option_default_value.stderr b/tests/derive_ui/option_default_value.stderr
+new file mode 100644
+index 00000000..38ee3296
+--- /dev/null
++++ b/tests/derive_ui/option_default_value.stderr
+@@ -0,0 +1,5 @@
++error: default_value is meaningless for Option
++  --> tests/derive_ui/option_default_value.rs:14:18
++   |
++14 |     #[arg(short, default_value = 1)]
++   |                  ^^^^^^^^^^^^^
+diff --git a/tests/derive_ui/skip_with_other_options.stderr b/tests/derive_ui/skip_with_other_options.stderr
+index dc15f44c..c7db5f4d 100644
+--- a/tests/derive_ui/skip_with_other_options.stderr
++++ b/tests/derive_ui/skip_with_other_options.stderr
+@@ -1,5 +1,5 @@
+-error: `long` cannot be used with `#[arg(skip)]
+- --> tests/derive_ui/skip_with_other_options.rs:8:17
++error: methods are not allowed for skipped fields
++ --> tests/derive_ui/skip_with_other_options.rs:8:11
+   |
+ 8 |     #[arg(skip, long)]
+-  |                 ^^^^
++  |           ^^^^
+diff --git a/tests/derive_ui/subcommand_opt_opt.stderr b/tests/derive_ui/subcommand_opt_opt.stderr
+index b1df1744..1b4eaf8e 100644
+--- a/tests/derive_ui/subcommand_opt_opt.stderr
++++ b/tests/derive_ui/subcommand_opt_opt.stderr
+@@ -1,5 +1,5 @@
+-error: Option<Option<T>> types are not supported for subcommand
+-  --> tests/derive_ui/subcommand_opt_opt.rs:17:10
++error: Option<Option<T>> type is not allowed for subcommand
++  --> $DIR/subcommand_opt_opt.rs:17:10
+    |
+ 17 |     cmd: Option<Option<Command>>,
+-   |          ^^^^^^
++   |          ^^^^^^^^^^^^^^^^^^^^^^^
+diff --git a/tests/derive_ui/subcommand_opt_vec.stderr b/tests/derive_ui/subcommand_opt_vec.stderr
+index f1457674..6cd19157 100644
+--- a/tests/derive_ui/subcommand_opt_vec.stderr
++++ b/tests/derive_ui/subcommand_opt_vec.stderr
+@@ -1,5 +1,5 @@
+-error: Option<Vec<T>> types are not supported for subcommand
+-  --> tests/derive_ui/subcommand_opt_vec.rs:17:10
++error: Option<Vec<T>> type is not allowed for subcommand
++  --> $DIR/subcommand_opt_vec.rs:17:10
+    |
+ 17 |     cmd: Option<Vec<Command>>,
+-   |          ^^^^^^
++   |          ^^^^^^^^^^^^^^^^^^^^

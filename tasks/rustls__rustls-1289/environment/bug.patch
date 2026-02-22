@@ -1,0 +1,241 @@
+diff --git a/README.md b/README.md
+index c9c20e38..fd4574dd 100644
+--- a/README.md
++++ b/README.md
+@@ -20,13 +20,7 @@ If you'd like to help out, please see [CONTRIBUTING.md](CONTRIBUTING.md).
+ 
+ ## Release history
+ 
+-* Release 0.21.1 (2023-05-01)
+-  - Remove `warn`-level logging from code paths that also return a `rustls::Error` with
+-    the same information.
+-  - Bug fix: ensure `ConnectionCommon::complete_io` flushes pending writes.
+-  - Bug fix: correct encoding of acceptable issuer subjects when rustls operates as a server
+-    requesting client authentication.  This was a regression introduced in 0.21.0.
+-* Release 0.21.0 (2023-03-29)
++* Current release: 0.21.0 (2023-03-29)
+   - Support for connecting to peers named with IP addresses.  This means
+     rustls now depends on a fork of webpki - `rustls-webpki` - with a suitably
+     extended API.
+diff --git a/rustls/Cargo.toml b/rustls/Cargo.toml
+index bc59f1bb..175f328a 100644
+--- a/rustls/Cargo.toml
++++ b/rustls/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "rustls"
+-version = "0.21.1"
++version = "0.21.0"
+ edition = "2021"
+ rust-version = "1.57"
+ license = "Apache-2.0 OR ISC OR MIT"
+diff --git a/rustls/src/anchors.rs b/rustls/src/anchors.rs
+index 1ea9d512..5b4136ea 100644
+--- a/rustls/src/anchors.rs
++++ b/rustls/src/anchors.rs
+@@ -1,14 +1,12 @@
+ #[cfg(feature = "logging")]
+ use crate::log::{debug, trace};
+-use crate::x509;
+ use crate::{key, DistinguishedName};
+ use crate::{CertificateError, Error};
+ 
+ /// A trust anchor, commonly known as a "Root Certificate."
+ #[derive(Debug, Clone)]
+ pub struct OwnedTrustAnchor {
+-    subject_dn_header_len: usize,
+-    subject_dn: DistinguishedName,
++    subject: DistinguishedName,
+     spki: Vec<u8>,
+     name_constraints: Option<Vec<u8>>,
+ }
+@@ -17,7 +15,7 @@ impl OwnedTrustAnchor {
+     /// Get a `webpki::TrustAnchor` by borrowing the owned elements.
+     pub(crate) fn to_trust_anchor(&self) -> webpki::TrustAnchor {
+         webpki::TrustAnchor {
+-            subject: &self.subject_dn.as_ref()[self.subject_dn_header_len..],
++            subject: self.subject.as_ref(),
+             spki: &self.spki,
+             name_constraints: self.name_constraints.as_deref(),
+         }
+@@ -27,8 +25,7 @@ impl OwnedTrustAnchor {
+     ///
+     /// All inputs are DER-encoded.
+     ///
+-    /// `subject` is the [Subject] field of the trust anchor *without* the outer SEQUENCE
+-    /// encoding.
++    /// `subject` is the [Subject] field of the trust anchor.
+     ///
+     /// `spki` is the [SubjectPublicKeyInfo] field of the trust anchor.
+     ///
+@@ -43,22 +40,14 @@ impl OwnedTrustAnchor {
+         spki: impl Into<Vec<u8>>,
+         name_constraints: Option<impl Into<Vec<u8>>>,
+     ) -> Self {
+-        let (subject_dn, subject_dn_header_len) = {
+-            let mut subject = subject.into();
+-            let before_len = subject.len();
+-            x509::wrap_in_sequence(&mut subject);
+-            let header_len = subject.len().saturating_sub(before_len);
+-            (DistinguishedName::from(subject), header_len)
+-        };
+         Self {
+-            subject_dn_header_len,
+-            subject_dn,
++            subject: DistinguishedName::from(subject.into()),
+             spki: spki.into(),
+             name_constraints: name_constraints.map(|x| x.into()),
+         }
+     }
+ 
+-    /// Return the subject field including its outer SEQUENCE encoding.
++    /// Return the subject field.
+     ///
+     /// This can be decoded using [x509-parser's FromDer trait](https://docs.rs/x509-parser/latest/x509_parser/prelude/trait.FromDer.html).
+     ///
+@@ -67,7 +56,7 @@ impl OwnedTrustAnchor {
+     /// println!("{}", x509_parser::x509::X509Name::from_der(anchor.subject())?.1);
+     /// ```
+     pub fn subject(&self) -> &DistinguishedName {
+-        &self.subject_dn
++        &self.subject
+     }
+ }
+ 
+@@ -156,20 +145,3 @@ impl RootCertStore {
+         (valid_count, invalid_count)
+     }
+ }
+-
+-mod tests {
+-    #[test]
+-    fn ownedtrustanchor_subject_is_correctly_encoding_dn() {
+-        let subject = b"subject".to_owned();
+-        let ota = super::OwnedTrustAnchor::from_subject_spki_name_constraints(
+-            subject,
+-            b"".to_owned(),
+-            None::<Vec<u8>>,
+-        );
+-        let expected_prefix = vec![ring::io::der::Tag::Sequence as u8, subject.len() as u8];
+-        assert_eq!(
+-            ota.subject().as_ref(),
+-            [expected_prefix, subject.to_vec()].concat()
+-        );
+-    }
+-}
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index b9a6c38e..3cf285d0 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -885,21 +885,13 @@ fn client_checks_server_certificate_with_given_name() {
+ struct ClientCheckCertResolve {
+     query_count: AtomicUsize,
+     expect_queries: usize,
+-    expect_issuers: Vec<Vec<u8>>,
+-    expect_sigschemes: Vec<SignatureScheme>,
+ }
+ 
+ impl ClientCheckCertResolve {
+-    fn new(
+-        expect_queries: usize,
+-        expect_issuers: Vec<Vec<u8>>,
+-        expect_sigschemes: Vec<SignatureScheme>,
+-    ) -> Self {
++    fn new(expect_queries: usize) -> Self {
+         Self {
+             query_count: AtomicUsize::new(0),
+             expect_queries,
+-            expect_issuers,
+-            expect_sigschemes,
+         }
+     }
+ }
+@@ -930,9 +922,6 @@ impl ResolvesClientCert for ClientCheckCertResolve {
+             panic!("no signature schemes shared by server");
+         }
+ 
+-        assert_eq!(acceptable_issuers, self.expect_issuers);
+-        assert_eq!(sigschemes, self.expect_sigschemes);
+-
+         None
+     }
+ 
+@@ -946,53 +935,9 @@ fn client_cert_resolve() {
+     for kt in ALL_KEY_TYPES.iter() {
+         let server_config = Arc::new(make_server_config_with_mandatory_client_auth(*kt));
+ 
+-        let expected_issuers = match *kt {
+-            KeyType::Rsa => vec![
+-                b"0,1*0(\x06\x03U\x04\x03\x0c!ponytown RSA level 2 intermediate".to_vec(),
+-                b"0\x1a1\x180\x16\x06\x03U\x04\x03\x0c\x0fponytown RSA CA".to_vec(),
+-            ],
+-            KeyType::Ecdsa => vec![
+-                b"0.1,0*\x06\x03U\x04\x03\x0c#ponytown ECDSA level 2 intermediate".to_vec(),
+-                b"0\x1c1\x1a0\x18\x06\x03U\x04\x03\x0c\x11ponytown ECDSA CA".to_vec(),
+-            ],
+-            KeyType::Ed25519 => vec![
+-                b"0.1,0*\x06\x03U\x04\x03\x0c#ponytown EdDSA level 2 intermediate".to_vec(),
+-                b"0\x1c1\x1a0\x18\x06\x03U\x04\x03\x0c\x11ponytown EdDSA CA".to_vec(),
+-            ],
+-        };
+-
+         for version in rustls::ALL_VERSIONS {
+-            let expected_sigschemes = match version.version {
+-                ProtocolVersion::TLSv1_2 => vec![
+-                    SignatureScheme::ECDSA_NISTP384_SHA384,
+-                    SignatureScheme::ECDSA_NISTP256_SHA256,
+-                    SignatureScheme::ED25519,
+-                    SignatureScheme::RSA_PSS_SHA512,
+-                    SignatureScheme::RSA_PSS_SHA384,
+-                    SignatureScheme::RSA_PSS_SHA256,
+-                    SignatureScheme::RSA_PKCS1_SHA512,
+-                    SignatureScheme::RSA_PKCS1_SHA384,
+-                    SignatureScheme::RSA_PKCS1_SHA256,
+-                ],
+-                ProtocolVersion::TLSv1_3 => vec![
+-                    SignatureScheme::ECDSA_NISTP384_SHA384,
+-                    SignatureScheme::ECDSA_NISTP256_SHA256,
+-                    SignatureScheme::ED25519,
+-                    SignatureScheme::RSA_PSS_SHA512,
+-                    SignatureScheme::RSA_PSS_SHA384,
+-                    SignatureScheme::RSA_PSS_SHA256,
+-                ],
+-                _ => unreachable!(),
+-            };
+-
+-            println!("{:?} {:?}:", version.version, *kt);
+-
+             let mut client_config = make_client_config_with_versions(*kt, &[version]);
+-            client_config.client_auth_cert_resolver = Arc::new(ClientCheckCertResolve::new(
+-                1,
+-                expected_issuers.clone(),
+-                expected_sigschemes,
+-            ));
++            client_config.client_auth_cert_resolver = Arc::new(ClientCheckCertResolve::new(1));
+ 
+             let (mut client, mut server) =
+                 make_pair_for_arc_configs(&Arc::new(client_config), &server_config);
+diff --git a/rustls/tests/common/mod.rs b/rustls/tests/common/mod.rs
+index 96804fe4..6d93bf45 100644
+--- a/rustls/tests/common/mod.rs
++++ b/rustls/tests/common/mod.rs
+@@ -176,7 +176,7 @@ where
+     total
+ }
+ 
+-#[derive(Clone, Copy, Debug, PartialEq)]
++#[derive(Clone, Copy, PartialEq)]
+ pub enum KeyType {
+     Rsa,
+     Ecdsa,
+@@ -271,9 +271,7 @@ pub fn make_server_config_with_kx_groups(
+ }
+ 
+ pub fn get_client_root_store(kt: KeyType) -> RootCertStore {
+-    let mut roots = kt.get_chain();
+-    // drop server cert
+-    roots.drain(0..1);
++    let roots = kt.get_chain();
+     let mut client_auth_roots = RootCertStore::empty();
+     for root in roots {
+         client_auth_roots.add(&root).unwrap();

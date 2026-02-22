@@ -1,0 +1,253 @@
+diff --git a/provider-example/src/hpke.rs b/provider-example/src/hpke.rs
+index f446b3e4..d7183a51 100644
+--- a/provider-example/src/hpke.rs
++++ b/provider-example/src/hpke.rs
+@@ -8,19 +8,18 @@ use hpke_rs_crypto::types::{AeadAlgorithm, KdfAlgorithm, KemAlgorithm};
+ use hpke_rs_crypto::HpkeCrypto;
+ use hpke_rs_rust_crypto::HpkeRustCrypto;
+ use rustls::crypto::hpke::{
+-    EncapsulatedSecret, Hpke, HpkeOpener, HpkePrivateKey, HpkeProvider, HpkePublicKey, HpkeSealer,
+-    HpkeSuite,
++    EncapsulatedSecret, Hpke, HpkePrivateKey, HpkeProvider, HpkePublicKey, HpkeSuite,
+ };
+ use rustls::{Error, OtherError};
+ 
+ pub static HPKE_PROVIDER: &'static dyn HpkeProvider = &HpkeRsProvider {};
+ 
+-/// A Rustls HPKE provider backed by hpke-rs and the RustCrypto backend.
++/// A Rustls HPKE provider backed by hpke-rs.
+ #[derive(Debug)]
+ struct HpkeRsProvider {}
+ 
+ impl HpkeProvider for HpkeRsProvider {
+-    fn start(&self, suite: &HpkeSuite) -> Result<Box<dyn Hpke + 'static>, Error> {
++    fn start(&self, suite: &HpkeSuite) -> Result<Box<dyn Hpke>, Error> {
+         Ok(Box::new(HpkeRs(hpke_rs::Hpke::new(
+             hpke_rs::Mode::Base,
+             KemAlgorithm::try_from(suite.kem.get_u16()).map_err(other_err)?,
+@@ -55,12 +54,12 @@ impl Debug for HpkeRs {
+ impl Hpke for HpkeRs {
+     fn seal(
+         &mut self,
++        pk_r: &HpkePublicKey,
+         info: &[u8],
+         aad: &[u8],
+         plaintext: &[u8],
+-        pub_key: &HpkePublicKey,
+     ) -> Result<(EncapsulatedSecret, Vec<u8>), Error> {
+-        let pk_r = hpke_rs::HpkePublicKey::new(pub_key.0.clone());
++        let pk_r = hpke_rs::HpkePublicKey::new(pk_r.0.clone());
+         let (enc, ciphertext) = self
+             .0
+             .seal(&pk_r, info, aad, plaintext, None, None, None)
+@@ -68,31 +67,15 @@ impl Hpke for HpkeRs {
+         Ok((EncapsulatedSecret(enc.to_vec()), ciphertext))
+     }
+ 
+-    fn setup_sealer(
+-        &mut self,
+-        info: &[u8],
+-        pub_key: &HpkePublicKey,
+-    ) -> Result<(EncapsulatedSecret, Box<dyn HpkeSealer + 'static>), Error> {
+-        let pk_r = hpke_rs::HpkePublicKey::new(pub_key.0.clone());
+-        let (enc, context) = self
+-            .0
+-            .setup_sender(&pk_r, info, None, None, None)
+-            .map_err(other_err)?;
+-        Ok((
+-            EncapsulatedSecret(enc.to_vec()),
+-            Box::new(HpkeRsSender { context }),
+-        ))
+-    }
+-
+     fn open(
+         &mut self,
+         enc: &EncapsulatedSecret,
++        sk_r: &HpkePrivateKey,
+         info: &[u8],
+         aad: &[u8],
+         ciphertext: &[u8],
+-        secret_key: &HpkePrivateKey,
+     ) -> Result<Vec<u8>, Error> {
+-        let sk_r = hpke_rs::HpkePrivateKey::new(secret_key.secret_bytes().to_vec());
++        let sk_r = hpke_rs::HpkePrivateKey::new(sk_r.secret_bytes().to_vec());
+         self.0
+             .open(
+                 enc.0.as_slice(),
+@@ -106,47 +89,6 @@ impl Hpke for HpkeRs {
+             )
+             .map_err(other_err)
+     }
+-
+-    fn setup_opener(
+-        &mut self,
+-        enc: &EncapsulatedSecret,
+-        info: &[u8],
+-        secret_key: &HpkePrivateKey,
+-    ) -> Result<Box<dyn HpkeOpener + 'static>, Error> {
+-        let sk_r = hpke_rs::HpkePrivateKey::new(secret_key.secret_bytes().to_vec());
+-        Ok(Box::new(HpkeRsReceiver {
+-            context: self
+-                .0
+-                .setup_receiver(enc.0.as_slice(), &sk_r, info, None, None, None)
+-                .map_err(other_err)?,
+-        }))
+-    }
+-}
+-
+-#[derive(Debug)]
+-struct HpkeRsSender {
+-    context: hpke_rs::Context<HpkeRustCrypto>,
+-}
+-
+-impl HpkeSealer for HpkeRsSender {
+-    fn seal(&mut self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+-        self.context
+-            .seal(aad, plaintext)
+-            .map_err(other_err)
+-    }
+-}
+-
+-#[derive(Debug)]
+-struct HpkeRsReceiver {
+-    context: hpke_rs::Context<HpkeRustCrypto>,
+-}
+-
+-impl HpkeOpener for HpkeRsReceiver {
+-    fn open(&mut self, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
+-        self.context
+-            .open(aad, ciphertext)
+-            .map_err(other_err)
+-    }
+ }
+ 
+ #[cfg(feature = "std")]
+diff --git a/provider-example/tests/hpke.rs b/provider-example/tests/hpke.rs
+index 9925cc2b..b8e124da 100644
+--- a/provider-example/tests/hpke.rs
++++ b/provider-example/tests/hpke.rs
+@@ -30,11 +30,11 @@ fn check_test_vectors() {
+             let pt = hex::decode(enc.pt).unwrap();
+ 
+             let (enc, ciphertext) = hpke
+-                .seal(&info, &aad, &pt, &pk_r)
++                .seal(&pk_r, &info, &aad, &pt)
+                 .unwrap();
+ 
+             let plaintext = hpke
+-                .open(&enc, &info, &aad, &ciphertext, &sk_r)
++                .open(&enc, &sk_r, &info, &aad, &ciphertext)
+                 .unwrap();
+             assert_eq!(plaintext, pt);
+         }
+diff --git a/rustls/src/crypto/hpke.rs b/rustls/src/crypto/hpke.rs
+index ec38f351..cd0e6a89 100644
+--- a/rustls/src/crypto/hpke.rs
++++ b/rustls/src/crypto/hpke.rs
+@@ -19,7 +19,7 @@ pub trait HpkeProvider: Debug + Send + Sync + 'static {
+     /// Start setting up to use HPKE in base mode with the chosen suite.
+     ///
+     /// May return an error if the suite is unsupported by the provider.
+-    fn start(&self, suite: &HpkeSuite) -> Result<Box<dyn Hpke + 'static>, Error>;
++    fn start(&self, suite: &HpkeSuite) -> Result<Box<dyn Hpke>, Error>;
+ 
+     /// Does the provider support the given [HpkeSuite]?
+     fn supports_suite(&self, suite: &HpkeSuite) -> bool;
+@@ -39,73 +39,32 @@ pub struct HpkeSuite {
+ 
+ /// An HPKE instance that can be used for base-mode single-shot encryption and decryption.
+ pub trait Hpke: Debug + Send + Sync {
+-    /// Seal the provided `plaintext` to the recipient public key `pub_key` with application supplied
++    /// Seal the provided `plaintext` to the recipient public key `pk_r` with application supplied
+     /// `info`, and additional data `aad`.
+     ///
+     /// Returns ciphertext that can be used with [Self::open] by the recipient to recover plaintext
+-    /// using the same `info` and `aad` and the private key corresponding to `pub_key`. RFC 9180
+-    /// refers to `pub_key` as `pkR`.
++    /// using the same `info` and `aad` and the private key corresponding to `pk_r`.
+     fn seal(
+         &mut self,
++        pk_r: &HpkePublicKey,
+         info: &[u8],
+         aad: &[u8],
+         plaintext: &[u8],
+-        pub_key: &HpkePublicKey,
+     ) -> Result<(EncapsulatedSecret, Vec<u8>), Error>;
+ 
+-    /// Set up a sealer context for the receiver public key `pub_key` with application supplied `info`.
+-    ///
+-    /// Returns both an encapsulated ciphertext and a sealer context that can be used to seal
+-    /// messages to the recipient. RFC 9180 refers to `pub_key` as `pkR`.
+-    fn setup_sealer(
+-        &mut self,
+-        info: &[u8],
+-        pub_key: &HpkePublicKey,
+-    ) -> Result<(EncapsulatedSecret, Box<dyn HpkeSealer + 'static>), Error>;
+-
+     /// Open the provided `ciphertext` using the encapsulated secret `enc`, with application
+     /// supplied `info`, and additional data `aad`.
+     ///
+     /// Returns plaintext if  the `info` and `aad` match those used with [Self::seal], and
+-    /// decryption with `secret_key` succeeds. RFC 9180 refers to `secret_key` as `skR`.
++    /// decryption with `sk_r` succeeds.
+     fn open(
+         &mut self,
+         enc: &EncapsulatedSecret,
++        sk_r: &HpkePrivateKey,
+         info: &[u8],
+         aad: &[u8],
+         ciphertext: &[u8],
+-        secret_key: &HpkePrivateKey,
+     ) -> Result<Vec<u8>, Error>;
+-
+-    /// Set up an opener context for the secret key `secret_key` with application supplied `info`.
+-    ///
+-    /// Returns an opener context that can be used to open sealed messages encrypted to the
+-    /// public key corresponding to `secret_key`. RFC 9180 refers to `secret_key` as `skR`.
+-    fn setup_opener(
+-        &mut self,
+-        enc: &EncapsulatedSecret,
+-        info: &[u8],
+-        secret_key: &HpkePrivateKey,
+-    ) -> Result<Box<dyn HpkeOpener + 'static>, Error>;
+-}
+-
+-/// An HPKE sealer context.
+-///
+-/// This is a stateful object that can be used to seal messages for receipt by
+-/// a receiver.
+-pub trait HpkeSealer: Debug + Send + Sync + 'static {
+-    /// Seal the provided `plaintext` with additional data `aad`, returning
+-    /// ciphertext.
+-    fn seal(&mut self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Error>;
+-}
+-
+-/// An HPKE opener context.
+-///
+-/// This is a stateful object that can be used to open sealed messages sealed
+-/// by a sender.
+-pub trait HpkeOpener: Debug + Send + Sync + 'static {
+-    /// Open the provided `ciphertext` with additional data `aad`, returning plaintext.
+-    fn open(&mut self, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, Error>;
+ }
+ 
+ /// An HPKE public key.
+@@ -136,5 +95,4 @@ pub struct HpkeKeyPair {
+ }
+ 
+ /// An encapsulated secret returned from setting up a sender or receiver context.
+-#[derive(Debug)]
+ pub struct EncapsulatedSecret(pub Vec<u8>);
+diff --git a/rustls/src/msgs/handshake.rs b/rustls/src/msgs/handshake.rs
+index de932b25..d176876a 100644
+--- a/rustls/src/msgs/handshake.rs
++++ b/rustls/src/msgs/handshake.rs
+@@ -2271,7 +2271,7 @@ impl HandshakeMessagePayload {
+     }
+ }
+ 
+-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
++#[derive(Clone, Debug, Default, Eq, PartialEq)]
+ pub struct HpkeSymmetricCipherSuite {
+     pub kdf_id: HpkeKdf,
+     pub aead_id: HpkeAead,

@@ -1,0 +1,267 @@
+diff --git a/rustls/examples/internal/bogo_shim.rs b/rustls/examples/internal/bogo_shim.rs
+index 4cbbe047..27e1e9bc 100644
+--- a/rustls/examples/internal/bogo_shim.rs
++++ b/rustls/examples/internal/bogo_shim.rs
+@@ -13,7 +13,7 @@ use rustls::internal::msgs::persist;
+ use rustls::quic::{self, ClientQuicExt, QuicExt, ServerQuicExt};
+ use rustls::server::ClientHello;
+ use rustls::{CipherSuite, ProtocolVersion};
+-use rustls::{ClientConnection, Connection, ServerConnection};
++use rustls::{ClientConnection, Connection, ServerConnection, Side};
+ 
+ use std::env;
+ use std::fs;
+@@ -36,7 +36,7 @@ macro_rules! println_err(
+ #[derive(Debug)]
+ struct Options {
+     port: u16,
+-    server: bool,
++    side: Side,
+     max_fragment: Option<usize>,
+     resumes: usize,
+     verify_peer: bool,
+@@ -83,7 +83,7 @@ impl Options {
+     fn new() -> Self {
+         Options {
+             port: 0,
+-            server: false,
++            side: Side::Client,
+             max_fragment: None,
+             resumes: 0,
+             verify_peer: false,
+@@ -694,7 +694,7 @@ fn exec(opts: &Options, mut sess: Connection, count: usize) {
+             }
+         }
+ 
+-        if opts.server && opts.enable_early_data {
++        if opts.side == Side::Server && opts.enable_early_data {
+             if let Some(ref mut ed) = server(&mut sess).early_data() {
+                 let mut data = Vec::new();
+                 let data_len = ed
+@@ -751,7 +751,11 @@ fn exec(opts: &Options, mut sess: Connection, count: usize) {
+             quench_writes = true;
+         }
+ 
+-        if opts.enable_early_data && !opts.server && !sess.is_handshaking() && count > 0 {
++        if opts.enable_early_data
++            && opts.side == Side::Client
++            && !sess.is_handshaking()
++            && count > 0
++        {
+             if opts.expect_accept_early_data && !client(&mut sess).is_early_data_accepted() {
+                 quit_err("Early data was not accepted, but we expect the opposite");
+             } else if opts.expect_reject_early_data && client(&mut sess).is_early_data_accepted() {
+@@ -841,7 +845,7 @@ fn main() {
+                 opts.port = args.remove(0).parse::<u16>().unwrap();
+             }
+             "-server" => {
+-                opts.server = true;
++                opts.side = Side::Server;
+             }
+             "-key-file" => {
+                 opts.key_file = args.remove(0);
+@@ -1131,15 +1135,9 @@ fn main() {
+ 
+     println!("opts {:?}", opts);
+ 
+-    let mut server_cfg = if opts.server {
+-        Some(make_server_cfg(&opts))
+-    } else {
+-        None
+-    };
+-    let client_cfg = if !opts.server {
+-        Some(make_client_cfg(&opts))
+-    } else {
+-        None
++    let (client_cfg, mut server_cfg) = match opts.side {
++        Side::Client => (Some(make_client_cfg(&opts)), None),
++        Side::Server => (None, Some(make_server_cfg(&opts))),
+     };
+ 
+     fn make_session(
+@@ -1147,7 +1145,7 @@ fn main() {
+         scfg: &Option<Arc<rustls::ServerConfig>>,
+         ccfg: &Option<Arc<rustls::ClientConfig>>,
+     ) -> Connection {
+-        if opts.server {
++        if opts.side == Side::Server {
+             let scfg = Arc::clone(scfg.as_ref().unwrap());
+             let s = if opts.quic_transport_params.is_empty() {
+                 rustls::ServerConnection::new(scfg).unwrap()
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 4c118bbc..6918660c 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -168,7 +168,12 @@ pub(super) fn handle_server_hello(
+ 
+     #[cfg(feature = "quic")]
+     if cx.common.is_quic() {
+-        cx.common.quic.hs_secrets = Some(quic::Secrets::new(client_key, server_key, suite, true));
++        cx.common.quic.hs_secrets = Some(quic::Secrets::new(
++            client_key,
++            server_key,
++            suite,
++            cx.common.side,
++        ));
+     }
+ 
+     emit_fake_ccs(&mut sent_tls13_fake_ccs, cx.common);
+@@ -953,8 +958,12 @@ impl State<ClientConnectionData> for ExpectFinished {
+         #[cfg(feature = "quic")]
+         {
+             if cx.common.protocol == Protocol::Quic {
+-                cx.common.quic.traffic_secrets =
+-                    Some(quic::Secrets::new(client_key, server_key, st.suite, true));
++                cx.common.quic.traffic_secrets = Some(quic::Secrets::new(
++                    client_key,
++                    server_key,
++                    st.suite,
++                    cx.common.side,
++                ));
+                 return Ok(Box::new(ExpectQuicTraffic(st)));
+             }
+         }
+diff --git a/rustls/src/conn.rs b/rustls/src/conn.rs
+index 861caccf..a15fdd0e 100644
+--- a/rustls/src/conn.rs
++++ b/rustls/src/conn.rs
+@@ -1452,9 +1452,12 @@ impl Quic {
+     }
+ }
+ 
++/// Side of the connection.
+ #[derive(Clone, Copy, Debug, PartialEq)]
+-pub(crate) enum Side {
++pub enum Side {
++    /// A client initiates the connection.
+     Client,
++    /// A server waits for a client to connect.
+     Server,
+ }
+ 
+diff --git a/rustls/src/lib.rs b/rustls/src/lib.rs
+index c3d9f3b8..98e90636 100644
+--- a/rustls/src/lib.rs
++++ b/rustls/src/lib.rs
+@@ -364,7 +364,7 @@ pub use crate::builder::{
+     ConfigBuilder, ConfigSide, WantsCipherSuites, WantsKxGroups, WantsVerifier, WantsVersions,
+ };
+ pub use crate::conn::{
+-    CommonState, Connection, ConnectionCommon, IoState, Reader, SideData, Writer,
++    CommonState, Connection, ConnectionCommon, IoState, Reader, Side, SideData, Writer,
+ };
+ pub use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
+ pub use crate::error::Error;
+diff --git a/rustls/src/quic.rs b/rustls/src/quic.rs
+index 16214956..b8f6c3a6 100644
+--- a/rustls/src/quic.rs
++++ b/rustls/src/quic.rs
+@@ -1,7 +1,7 @@
+ /// This module contains optional APIs for implementing QUIC TLS.
+ use crate::cipher::{Iv, IvLen};
+ pub use crate::client::ClientQuicExt;
+-use crate::conn::CommonState;
++use crate::conn::{CommonState, Side};
+ use crate::error::Error;
+ use crate::msgs::enums::AlertDescription;
+ pub use crate::server::ServerQuicExt;
+@@ -21,7 +21,7 @@ pub struct Secrets {
+     server: hkdf::Prk,
+     /// Cipher suite used with these secrets
+     suite: &'static Tls13CipherSuite,
+-    is_client: bool,
++    side: Side,
+ }
+ 
+ impl Secrets {
+@@ -29,13 +29,13 @@ impl Secrets {
+         client: hkdf::Prk,
+         server: hkdf::Prk,
+         suite: &'static Tls13CipherSuite,
+-        is_client: bool,
++        side: Side,
+     ) -> Self {
+         Self {
+             client,
+             server,
+             suite,
+-            is_client,
++            side,
+         }
+     }
+ 
+@@ -53,10 +53,9 @@ impl Secrets {
+     }
+ 
+     fn local_remote(&self) -> (&hkdf::Prk, &hkdf::Prk) {
+-        if self.is_client {
+-            (&self.client, &self.server)
+-        } else {
+-            (&self.server, &self.client)
++        match self.side {
++            Side::Client => (&self.client, &self.server),
++            Side::Server => (&self.server, &self.client),
+         }
+     }
+ }
+@@ -374,7 +373,7 @@ pub struct Keys {
+ 
+ impl Keys {
+     /// Construct keys for use with initial packets
+-    pub fn initial(version: Version, client_dst_connection_id: &[u8], is_client: bool) -> Self {
++    pub fn initial(version: Version, client_dst_connection_id: &[u8], side: Side) -> Self {
+         const CLIENT_LABEL: &[u8] = b"client in";
+         const SERVER_LABEL: &[u8] = b"server in";
+         let salt = version.initial_salt();
+@@ -384,7 +383,7 @@ impl Keys {
+             client: hkdf_expand(&hs_secret, hkdf::HKDF_SHA256, CLIENT_LABEL, &[]),
+             server: hkdf_expand(&hs_secret, hkdf::HKDF_SHA256, SERVER_LABEL, &[]),
+             suite: TLS13_AES_128_GCM_SHA256_INTERNAL,
+-            is_client,
++            side,
+         };
+         Self::new(&secrets)
+     }
+@@ -590,7 +589,7 @@ mod test {
+                 ],
+             ),
+             suite: TLS13_AES_128_GCM_SHA256_INTERNAL,
+-            is_client: true,
++            side: Side::Client,
+         };
+         secrets.update();
+ 
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index c7ec5162..159f1282 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -547,8 +547,12 @@ mod client_hello {
+             // If 0-RTT should be rejected, this will be clobbered by ExtensionProcessing
+             // before the application can see.
+             cx.common.quic.early_secret = early_data_client_key;
+-            cx.common.quic.hs_secrets =
+-                Some(quic::Secrets::new(_client_key, server_key, suite, false));
++            cx.common.quic.hs_secrets = Some(quic::Secrets::new(
++                _client_key,
++                server_key,
++                suite,
++                cx.common.side,
++            ));
+         }
+ 
+         Ok(key_schedule)
+@@ -868,8 +872,12 @@ mod client_hello {
+ 
+         #[cfg(feature = "quic")]
+         {
+-            cx.common.quic.traffic_secrets =
+-                Some(quic::Secrets::new(_client_key, server_key, suite, false));
++            cx.common.quic.traffic_secrets = Some(quic::Secrets::new(
++                _client_key,
++                server_key,
++                suite,
++                cx.common.side,
++            ));
+         }
+ 
+         key_schedule_traffic

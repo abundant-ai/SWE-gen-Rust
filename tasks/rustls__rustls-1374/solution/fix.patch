@@ -1,0 +1,122 @@
+diff --git a/rustls/Cargo.toml b/rustls/Cargo.toml
+index 6e99f676..d8fa4d51 100644
+--- a/rustls/Cargo.toml
++++ b/rustls/Cargo.toml
+@@ -19,7 +19,7 @@ rustversion = { version = "1.0.6", optional = true }
+ log = { version = "0.4.4", optional = true }
+ ring = "0.16.20"
+ subtle = "2.5.0"
+-webpki = { package = "rustls-webpki", version = "0.101.0", features = ["alloc", "std"] }
++webpki = { package = "rustls-webpki", version = "0.101.2", features = ["alloc", "std"] }
+ 
+ [features]
+ default = ["logging", "tls12"]
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index 57ef1ed8..b8125b8c 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -744,6 +744,28 @@ impl<C: CryptoProvider> ExpectServerHelloOrHelloRetryRequest<C> {
+             });
+         }
+ 
++        // Or does not echo the session_id from our ClientHello:
++        //
++        // > the HelloRetryRequest has the same format as a ServerHello message,
++        // > and the legacy_version, legacy_session_id_echo, cipher_suite, and
++        // > legacy_compression_method fields have the same meaning
++        // <https://www.rfc-editor.org/rfc/rfc8446#section-4.1.4>
++        //
++        // and
++        //
++        // > A client which receives a legacy_session_id_echo field that does not
++        // > match what it sent in the ClientHello MUST abort the handshake with an
++        // > "illegal_parameter" alert.
++        // <https://www.rfc-editor.org/rfc/rfc8446#section-4.1.3>
++        if hrr.session_id != self.next.input.session_id {
++            return Err({
++                cx.common.send_fatal_alert(
++                    AlertDescription::IllegalParameter,
++                    PeerMisbehaved::IllegalHelloRetryRequestWithWrongSessionId,
++                )
++            });
++        }
++
+         // Or asks us to talk a protocol we didn't offer, or doesn't support HRR at all.
+         match hrr.get_supported_versions() {
+             Some(ProtocolVersion::TLSv1_3) => {
+diff --git a/rustls/src/error.rs b/rustls/src/error.rs
+index 381835f2..40d126cd 100644
+--- a/rustls/src/error.rs
++++ b/rustls/src/error.rs
+@@ -180,6 +180,7 @@ pub enum PeerMisbehaved {
+     IllegalHelloRetryRequestWithUnofferedCipherSuite,
+     IllegalHelloRetryRequestWithUnofferedNamedGroup,
+     IllegalHelloRetryRequestWithUnsupportedVersion,
++    IllegalHelloRetryRequestWithWrongSessionId,
+     IllegalMiddleboxChangeCipherSpec,
+     IllegalTlsInnerPlaintext,
+     IncorrectBinder,
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index 0015bb82..72a3b2a5 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -236,6 +236,7 @@ mod client_hello {
+                         emit_hello_retry_request(
+                             &mut self.transcript,
+                             self.suite,
++                            client_hello.session_id,
+                             cx.common,
+                             group.name(),
+                         );
+@@ -570,12 +571,13 @@ mod client_hello {
+     fn emit_hello_retry_request(
+         transcript: &mut HandshakeHash,
+         suite: &'static Tls13CipherSuite,
++        session_id: SessionId,
+         common: &mut CommonState,
+         group: NamedGroup,
+     ) {
+         let mut req = HelloRetryRequest {
+             legacy_version: ProtocolVersion::TLSv1_2,
+-            session_id: SessionId::empty(),
++            session_id,
+             cipher_suite: suite.common.suite,
+             extensions: Vec::new(),
+         };
+diff --git a/rustls/src/verify.rs b/rustls/src/verify.rs
+index eb5139ea..2513687c 100644
+--- a/rustls/src/verify.rs
++++ b/rustls/src/verify.rs
+@@ -329,11 +329,13 @@ pub fn verify_server_cert_signed_by_trust_anchor(
+     let webpki_now = webpki::Time::try_from(now).map_err(|_| Error::FailedToGetCurrentTime)?;
+ 
+     cert.0
+-        .verify_is_valid_tls_server_cert(
++        .verify_for_usage(
+             SUPPORTED_SIG_ALGS,
+-            &webpki::TlsServerTrustAnchors(&trust_roots),
++            &trust_roots,
+             &chain,
+             webpki_now,
++            webpki::KeyUsage::server_auth(),
++            &[], // no CRLs
+         )
+         .map_err(pki_error)
+         .map(|_| ())
+@@ -532,12 +534,13 @@ impl ClientCertVerifier for AllowAnyAuthenticatedClient {
+             .collect::<Vec<_>>();
+ 
+         cert.0
+-            .verify_is_valid_tls_client_cert(
++            .verify_for_usage(
+                 SUPPORTED_SIG_ALGS,
+-                &webpki::TlsClientTrustAnchors(&trust_roots),
++                &trust_roots,
+                 &chain,
+                 now,
+-                crls.as_slice(),
++                webpki::KeyUsage::client_auth(),
++                &crls,
+             )
+             .map_err(pki_error)
+             .map(|_| ClientCertVerified::assertion())

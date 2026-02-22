@@ -10,9 +10,7 @@ cp "/tests/http3.rs" "tests/http3.rs"
 mkdir -p "tests/support"
 cp "/tests/support/server.rs" "tests/support/server.rs"
 
-# Run specific integration tests (client.rs and http3.rs)
-# Note: tests/support/server.rs is a support module, not a test file itself
-# The http3 feature must be enabled for http3 tests to run
+# Run integration tests for client and http3 (http3 feature required)
 cargo test --test client --test http3 --features http3
 test_status=$?
 

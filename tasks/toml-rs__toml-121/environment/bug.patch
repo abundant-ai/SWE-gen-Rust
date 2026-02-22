@@ -1,0 +1,261 @@
+diff --git a/src/parser/datetime.rs b/src/parser/datetime.rs
+index ccf0a257..9dfa6dcd 100644
+--- a/src/parser/datetime.rs
++++ b/src/parser/datetime.rs
+@@ -1,11 +1,15 @@
+-use crate::parser::errors::CustomError;
+ use crate::value;
+-use chrono::TimeZone;
+ use combine::parser::char::{char, digit};
+-use combine::parser::range::{recognize, take};
++use combine::parser::range::{recognize, recognize_with_value};
++use combine::parser::repeat::{skip_count_min_max, SkipCountMinMax};
+ use combine::stream::RangeStream;
+ use combine::*;
+ 
++#[inline]
++pub fn repeat<I: Stream, P: Parser<I>>(count: usize, parser: P) -> SkipCountMinMax<I, P> {
++    skip_count_min_max(count, count, parser)
++}
++
+ // ;; Date and Time (as defined in RFC 3339)
+ 
+ // date-time = offset-date-time / local-date-time / local-date / local-time
+@@ -16,38 +20,37 @@ use combine::*;
+ // full-time = partial-time time-offset
+ parse!(date_time() -> value::DateTime, {
+     choice!(
+-        (
++        recognize_with_value((
+             full_date(),
+             optional((
+-                satisfy(is_time_delim),
++                char('T'),
+                 partial_time(),
+                 optional(time_offset()),
+             ))
+-        )
+-            .map(|(d, opt)| {
++        ))
++            .and_then(|(s, (_, opt))| {
+                 match opt {
+                     // Offset Date-Time
+-                    Some((_, t, Some(o))) => {
+-                        let dt = chrono::NaiveDateTime::new(d, t);
+-                        value::DateTime::OffsetDateTime(
+-                            o.from_local_datetime(&dt).unwrap()
+-                        )
++                    Some((_, _, Some(_))) => {
++                        chrono::DateTime::parse_from_rfc3339(s)
++                            .map(value::DateTime::OffsetDateTime)
+                     }
+                     // Local Date-Time
+-                    Some((_, t, None)) => {
+-                        value::DateTime::LocalDateTime(
+-                            chrono::NaiveDateTime::new(d, t)
+-                        )
++                    Some(_) => {
++                        s.parse::<chrono::NaiveDateTime>()
++                            .map(value::DateTime::LocalDateTime)
+                     }
+                     // Local Date
+                     None => {
+-                        value::DateTime::LocalDate(d)
++                        s.parse::<chrono::NaiveDate>()
++                            .map(value::DateTime::LocalDate)
+                     }
+                 }
+ 
+             }),
+         // Local Time
+-        partial_time()
++        recognize(partial_time())
++            .and_then(str::parse)
+             .message("While parsing a Time")
+             .map(value::DateTime::LocalTime)
+     )
+@@ -55,95 +58,46 @@ parse!(date_time() -> value::DateTime, {
+ });
+ 
+ // full-date      = date-fullyear "-" date-month "-" date-mday
+-parse!(full_date() -> chrono::NaiveDate, {
+-    (
+-        attempt((date_fullyear(), char('-'))),
+-        date_month(),
++// date-fullyear  = 4DIGIT
++// date-month     = 2DIGIT  ; 01-12
++// date-mday      = 2DIGIT  ; 01-28, 01-29, 01-30, 01-31 based on month/year
++parse!(full_date() -> &'a str, {
++    recognize((
++        attempt((repeat(4, digit()), char('-'))),
++        repeat(2, digit()),
+         char('-'),
+-        date_mday(),
+-    ).and_then(|((year, _), month, _, day)| {
+-        chrono::NaiveDate::from_ymd_opt(year, month, day).ok_or(CustomError::DateOutOfRange { year, month, day })
+-    })
++        repeat(2, digit()),
++    ))
+ });
+ 
+ // partial-time   = time-hour ":" time-minute ":" time-second [time-secfrac]
++// time-hour      = 2DIGIT  ; 00-23
++// time-minute    = 2DIGIT  ; 00-59
++// time-second    = 2DIGIT  ; 00-58, 00-59, 00-60 based on leap second rules
+ // time-secfrac   = "." 1*DIGIT
+-parse!(partial_time() -> chrono::NaiveTime, {
+-    recognize((
++parse!(partial_time() -> (), {
++    (
+         attempt((
+-            time_hour(),
++            repeat(2, digit()),
+             char(':'),
+         )),
+-        time_minute(),
++        repeat(2, digit()),
+         char(':'),
+-        time_second(),
++        repeat(2, digit()),
+         optional(attempt(char('.')).and(skip_many1(digit()))),
+-    )).and_then(|s: &str| s.parse::<chrono::NaiveTime>())
++    ).map(|_| ())
+ });
+ 
+ // time-offset    = "Z" / time-numoffset
+ // time-numoffset = ( "+" / "-" ) time-hour ":" time-minute
+-parse!(time_offset() -> chrono::FixedOffset, {
+-    attempt(satisfy(|c| c == 'Z' || c == 'z')).map(|_| chrono::FixedOffset::east(0))
++parse!(time_offset() -> (), {
++    attempt(char('Z')).map(|_| ())
+         .or(
+             (
+                 attempt(choice([char('+'), char('-')])),
+-                time_hour(),
++                repeat(2, digit()),
+                 char(':'),
+-                time_minute(),
+-            ).and_then(|(sign, hour, _, minute)| {
+-                const SEC: i32 = 1;
+-                const MIN: i32 = 60 * SEC;
+-                const HOUR: i32 = 60 * MIN;
+-                let secs = (hour as i32) * HOUR + (minute as i32) * MIN;
+-                match sign {
+-                    '+' => chrono::FixedOffset::east_opt(secs),
+-                    '-' => chrono::FixedOffset::west_opt(secs),
+-                    _ => unreachable!("Parser prevents this"),
+-                }.ok_or(CustomError::OffsetOutOfRange { sign, hour, minute})
+-            })
++                repeat(2, digit()),
++            ).map(|_| ())
+         ).message("While parsing a Time Offset")
+ });
+-
+-// date-fullyear  = 4DIGIT
+-parse!(date_fullyear() -> i32, {
+-    signed_digits(4)
+-});
+-
+-// date-month     = 2DIGIT  ; 01-12
+-parse!(date_month() -> u32, {
+-    unsigned_digits(2)
+-});
+-
+-// date-mday      = 2DIGIT  ; 01-28, 01-29, 01-30, 01-31 based on month/year
+-parse!(date_mday() -> u32, {
+-    unsigned_digits(2)
+-});
+-
+-// time-delim     = "T" / %x20 ; T, t, or space
+-fn is_time_delim(c: char) -> bool {
+-    matches!(c, 'T' | 't' | ' ')
+-}
+-
+-// time-hour      = 2DIGIT  ; 00-23
+-parse!(time_hour() -> u32, {
+-    unsigned_digits(2)
+-});
+-
+-// time-minute    = 2DIGIT  ; 00-59
+-parse!(time_minute() -> u32, {
+-    unsigned_digits(2)
+-});
+-
+-// time-second    = 2DIGIT  ; 00-58, 00-59, 00-60 based on leap second rules
+-parse!(time_second() -> u32, {
+-    unsigned_digits(2)
+-});
+-
+-parse!(signed_digits(count: usize) -> i32, {
+-    take(*count).and_then(|s: &str| s.parse::<i32>())
+-});
+-
+-parse!(unsigned_digits(count: usize) -> u32, {
+-    take(*count).and_then(|s: &str| s.parse::<u32>())
+-});
+diff --git a/src/parser/errors.rs b/src/parser/errors.rs
+index 2592f348..1931d8bd 100644
+--- a/src/parser/errors.rs
++++ b/src/parser/errors.rs
+@@ -103,8 +103,6 @@ pub enum CustomError {
+     DuplicateKey { key: String, table: String },
+     InvalidHexEscape(u32),
+     UnparsedLine,
+-    DateOutOfRange { year: i32, month: u32, day: u32 },
+-    OffsetOutOfRange { sign: char, hour: u32, minute: u32 },
+ }
+ 
+ impl StdError for CustomError {
+@@ -123,20 +121,6 @@ impl Display for CustomError {
+                 writeln!(f, "Invalid hex escape code: {:x} ", h)
+             }
+             CustomError::UnparsedLine => writeln!(f, "Could not parse the line"),
+-            CustomError::DateOutOfRange {
+-                ref year,
+-                ref month,
+-                ref day,
+-            } => {
+-                writeln!(f, "Date out-of-range: `{}-{}-{}`", year, month, day)
+-            }
+-            CustomError::OffsetOutOfRange {
+-                ref sign,
+-                ref hour,
+-                ref minute,
+-            } => {
+-                writeln!(f, "Offset out-of-range: `{}{}:{}`", sign, hour, minute)
+-            }
+         }
+     }
+ }
+diff --git a/tests/decoder_compliance.rs b/tests/decoder_compliance.rs
+index f9a2ec91..616501e3 100644
+--- a/tests/decoder_compliance.rs
++++ b/tests/decoder_compliance.rs
+@@ -3,9 +3,18 @@ fn main() {
+     let mut harness = toml_test_harness::DecoderHarness::new(decoder);
+     harness
+         .ignore([
++            "valid/array/array.toml",
++            "valid/comment/everywhere.toml",
++            "valid/datetime/datetime.toml",
++            "valid/datetime/local.toml",
++            "valid/datetime/milliseconds.toml",
++            "valid/datetime/timezone.toml",
++            "valid/example.toml",
+             "valid/inline-table/key-dotted.toml",
+             "valid/key/dotted.toml",
+             "valid/key/numeric-dotted.toml",
++            "valid/spec-example-1-compact.toml",
++            "valid/spec-example-1.toml",
+             "valid/string/multiline-quotes.toml",
+         ])
+         .unwrap();
+@@ -63,7 +72,7 @@ fn value_to_encoded(
+         )),
+         toml_edit::Value::DateTime(v) => match *v.value() {
+             toml_edit::DateTime::OffsetDateTime(v) => Ok(toml_test_harness::Encoded::Value(
+-                toml_test_harness::EncodedValue::Datetime(v.to_rfc3339()),
++                toml_test_harness::EncodedValue::from(v.to_string()),
+             )),
+             toml_edit::DateTime::LocalDateTime(v) => Ok(toml_test_harness::Encoded::Value(
+                 toml_test_harness::EncodedValue::DatetimeLocal(v.to_string()),

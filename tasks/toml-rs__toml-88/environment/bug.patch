@@ -1,0 +1,215 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 1b31cf2b..01d59063 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -80,10 +80,9 @@ mod table;
+ mod value;
+ 
+ pub use crate::array_of_tables::ArrayOfTables;
+-pub use crate::decor::Decor;
+ pub use crate::document::Document;
+ pub use crate::key::Key;
+ pub use crate::parser::TomlError;
+ pub use crate::table::{array, table, value, Item, Iter, Table, TableLike};
+-pub use crate::value::{Array, ArrayIter, InlineTable, Value};
++pub use crate::value::{Array, InlineTable, Value};
+ pub use formatted::decorated;
+diff --git a/src/parser/array.rs b/src/parser/array.rs
+index 631ef255..87cf2546 100644
+--- a/src/parser/array.rs
++++ b/src/parser/array.rs
+@@ -26,7 +26,7 @@ fn array_from_vec(v: Vec<Value>, comma: bool, trailing: &str) -> Result<Array, C
+             got: format!("{:?}", val.get_type()),
+             expected: format!("{:?}", array.value_type()),
+         });
+-        if array.push_formatted(val).is_err() {
++        if !array.push_value(val, /* decorate = */ false) {
+             return err;
+         }
+     }
+diff --git a/src/value.rs b/src/value.rs
+index 9416f3dc..a7aba2aa 100644
+--- a/src/value.rs
++++ b/src/value.rs
+@@ -1,8 +1,8 @@
+ use crate::decor::{Decor, Formatted, InternalString};
++use crate::formatted;
+ use crate::key::Key;
+ use crate::parser;
+ use crate::table::{Item, Iter, KeyValuePairs, TableKeyValue, TableLike};
+-use crate::{decorated, formatted};
+ use chrono::{self, FixedOffset};
+ use combine::stream::state::State;
+ use linked_hash_map::LinkedHashMap;
+@@ -99,78 +99,13 @@ impl Array {
+         Box::new(self.values.iter().filter_map(Item::as_value))
+     }
+ 
+-    /// Appends a new value to the end of the array, applying default formatting to it.
+-    ///
+-    /// Returns an error if the value was of a different type than the values in the array.
+-    pub fn push<V: Into<Value>>(&mut self, v: V) -> Result<(), Value> {
+-        self.value_op(v.into(), true, |items, value| {
+-            items.push(Item::Value(value))
+-        })
+-    }
+-
+-    /// Appends a new, already formatted value to the end of the array.
+-    ///
+-    /// Returns an error if the value was of a different type than the array.
+-    pub fn push_formatted(&mut self, v: Value) -> Result<(), Value> {
+-        self.value_op(v, false, |items, value| items.push(Item::Value(value)))
+-    }
+-
+-    /// Inserts an element at the given position within the array, applying default formatting to
+-    /// it and shifting all values after it to the right.
+-    ///
+-    /// Returns an error if the value was of a different type than the values in the array.
+-    ///
+-    /// Panics if `index > len`.
+-    pub fn insert<V: Into<Value>>(&mut self, index: usize, v: V) -> Result<(), Value> {
+-        self.value_op(v.into(), true, |items, value| {
+-            items.insert(index, Item::Value(value))
+-        })
+-    }
+-
+-    /// Inserts an already formatted value at the given position within the array, shifting all
+-    /// values after it to the right.
+-    ///
+-    /// Returns an error if the value was of a different type than the values in the array.
+-    ///
+-    /// Panics if `index > len`.
+-    pub fn insert_formatted(&mut self, index: usize, v: Value) -> Result<(), Value> {
+-        self.value_op(v, false, |items, value| {
+-            items.insert(index, Item::Value(value))
+-        })
+-    }
+-
+-    /// Replaces the element at the given position within the array, preserving existing formatting.
+-    ///
+-    /// Returns an error if the replacement was of a different type than the values in the array.
+-    ///
+-    /// Panics if `index >= len`.
+-    pub fn replace<V: Into<Value>>(&mut self, index: usize, v: V) -> Result<Value, Value> {
+-        // Read the existing value's decor and preserve it.
+-        let existing_decor = self
+-            .get(index)
+-            .unwrap_or_else(|| panic!("index {} out of bounds (len = {})", index, self.len()))
+-            .decor();
+-        let value = decorated(v.into(), existing_decor.prefix(), existing_decor.suffix());
+-        self.replace_formatted(index, value)
+-    }
+-
+-    /// Replaces the element at the given position within the array with an already formatted value.
+-    ///
+-    /// Returns an error if the replacement was of a different type than the values in the array.
+-    ///
+-    /// Panics if `index >= len`.
+-    pub fn replace_formatted(&mut self, index: usize, v: Value) -> Result<Value, Value> {
+-        self.value_op(v, false, |items, value| {
+-            match mem::replace(&mut items[index], Item::Value(value)) {
+-                Item::Value(old_value) => old_value,
+-                x => panic!("non-value item {:?} in an array", x),
+-            }
+-        })
++    /// Appends a new value.
++    pub fn push<V: Into<Value>>(&mut self, v: V) -> bool {
++        self.push_value(v.into(), true)
+     }
+ 
+-    /// Returns a reference to the value at the given index, or `None` if the index is out of
+-    /// bounds.
+-    pub fn get(&self, index: usize) -> Option<&Value> {
++    /// Return an optional reference to the value at the given index.
++    pub fn get(&mut self, index: usize) -> Option<&Value> {
+         self.values.get(index).and_then(Item::as_value)
+     }
+ 
+@@ -191,12 +126,7 @@ impl Array {
+         formatted::decorate_array(self);
+     }
+ 
+-    fn value_op<T>(
+-        &mut self,
+-        v: Value,
+-        decorate: bool,
+-        op: impl FnOnce(&mut Vec<Item>, Value) -> T,
+-    ) -> Result<T, Value> {
++    pub(crate) fn push_value(&mut self, v: Value, decorate: bool) -> bool {
+         let mut value = v;
+         if !self.is_empty() && decorate {
+             formatted::decorate(&mut value, " ", "");
+@@ -204,9 +134,10 @@ impl Array {
+             formatted::decorate(&mut value, "", "");
+         }
+         if self.is_empty() || value.get_type() == self.value_type() {
+-            Ok(op(&mut self.values, value))
++            self.values.push(Item::Value(value));
++            true
+         } else {
+-            Err(value)
++            false
+         }
+     }
+ 
+diff --git a/tests/test_edit.rs b/tests/test_edit.rs
+index 9f4cbc59..3a6a31f2 100644
+--- a/tests/test_edit.rs
++++ b/tests/test_edit.rs
+@@ -17,7 +17,7 @@ macro_rules! as_table {
+ #[cfg(test)]
+ #[cfg_attr(rustfmt, rustfmt_skip)]
+ mod tests {
+-    use toml_edit::{Document, Key, Value, Table, Item, value, table, array, decorated};
++    use toml_edit::{Document, Key, Value, Table, Item, value, table, array};
+     use std::iter::FromIterator;
+     use std::fmt;
+     use pretty_assertions::assert_eq;
+@@ -462,7 +462,7 @@ macro_rules! as_array {
+ }
+ 
+ #[test]
+-fn test_insert_replace_into_array() {
++fn test_insert_into_array() {
+     given(r#"
+         a = [1,2,3]
+         b = []"#
+@@ -472,35 +472,18 @@ fn test_insert_replace_into_array() {
+             let a = as_array!(a);
+             assert_eq!(a.len(), 3);
+             assert!(a.get(2).is_some());
+-            assert!(a.push(4).is_ok());
++            assert!(a.push(4));
+             assert_eq!(a.len(), 4);
+             a.fmt();
+         }
+         let b = root.entry("b");
+         let b = as_array!(b);
+         assert!(b.is_empty());
+-        assert!(b.push("hello").is_ok());
++        assert!(b.push("hello"));
+         assert_eq!(b.len(), 1);
+-
+-        assert!(b.push_formatted(decorated("world".into(), "\n", "\n")).is_ok());
+-        assert!(b.push_formatted(decorated("test".into(), "", "")).is_ok());
+-
+-        assert!(b.insert(1, "beep").is_ok());
+-        assert!(b.insert_formatted(2, decorated("boop".into(), "   ", "   ")).is_ok());
+-
+-        // This should preserve formatting.
+-        assert_eq!(b.replace(2, "zoink").unwrap().as_str(), Some("boop"));
+-        // This should replace formatting.
+-        assert_eq!(b.replace_formatted(4, decorated("yikes".into(), "  ", "")).unwrap().as_str(), Some("test"));
+-
+-        // Check that pushing a different type into an array fails.
+-        assert!(b.push(42).is_err());
+-
+     }).produces(r#"
+         a = [1, 2, 3, 4]
+-        b = ["hello", "beep",   "zoink"   ,
+-"world"
+-,  "yikes"]
++        b = ["hello"]
+ "#
+     );
+ }

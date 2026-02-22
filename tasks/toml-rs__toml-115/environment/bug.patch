@@ -1,0 +1,299 @@
+diff --git a/src/parser/array.rs b/src/parser/array.rs
+index 2f096355..6d3f2eb5 100644
+--- a/src/parser/array.rs
++++ b/src/parser/array.rs
+@@ -24,7 +24,13 @@ fn array_from_vec(v: Vec<Value>, comma: bool, trailing: &str) -> Result<Array, C
+         ..Default::default()
+     };
+     for val in v {
+-        array.push_formatted(val)
++        let err = Err(CustomError::MixedArrayType {
++            got: format!("{:?}", val.get_type()),
++            expected: format!("{:?}", array.value_type()),
++        });
++        if array.push_formatted(val).is_err() {
++            return err;
++        }
+     }
+     Ok(array)
+ }
+diff --git a/src/parser/errors.rs b/src/parser/errors.rs
+index 1931d8bd..785afa39 100644
+--- a/src/parser/errors.rs
++++ b/src/parser/errors.rs
+@@ -100,6 +100,7 @@ impl<'a> Display for FancyError<'a> {
+ 
+ #[derive(Debug, Clone)]
+ pub enum CustomError {
++    MixedArrayType { got: String, expected: String },
+     DuplicateKey { key: String, table: String },
+     InvalidHexEscape(u32),
+     UnparsedLine,
+@@ -114,6 +115,12 @@ impl StdError for CustomError {
+ impl Display for CustomError {
+     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+         match *self {
++            CustomError::MixedArrayType {
++                ref got,
++                ref expected,
++            } => {
++                writeln!(f, "Mixed types in array: {} and {}", expected, got)
++            }
+             CustomError::DuplicateKey { ref key, ref table } => {
+                 writeln!(f, "Duplicate key `{}` in `{}` table", key, table)
+             }
+diff --git a/src/parser/mod.rs b/src/parser/mod.rs
+index c5a58368..55834b40 100644
+--- a/src/parser/mod.rs
++++ b/src/parser/mod.rs
+@@ -358,7 +358,7 @@ trimmed in raw strings.
+             parsed_value_eq!(input);
+         }
+ 
+-        let invalid_inputs = [r#"["#, r#"[,]"#, r#"[,2]"#, r#"[1e165,,]"#];
++        let invalid_inputs = [r#"["#, r#"[,]"#, r#"[,2]"#, r#"[1e165,,]"#, r#"[ 1, 2.0 ]"#];
+         for input in &invalid_inputs {
+             let parsed = array::array().easy_parse(Stream::new(*input));
+             assert!(parsed.is_err());
+diff --git a/src/value.rs b/src/value.rs
+index c98d8c86..62e297c0 100644
+--- a/src/value.rs
++++ b/src/value.rs
+@@ -67,6 +67,18 @@ pub struct InlineTable {
+     pub(crate) decor: Decor,
+ }
+ 
++#[derive(Eq, PartialEq, Clone, Copy, Debug, Hash)]
++pub(crate) enum ValueType {
++    None,
++    Integer,
++    String,
++    Float,
++    DateTime,
++    Boolean,
++    Array,
++    InlineTable,
++}
++
+ /// An iterator type over `Array`'s values.
+ pub type ArrayIter<'a> = Box<dyn Iterator<Item = &'a Value> + 'a>;
+ 
+@@ -90,7 +102,7 @@ impl Array {
+     /// Appends a new value to the end of the array, applying default formatting to it.
+     ///
+     /// Returns an error if the value was of a different type than the values in the array.
+-    pub fn push<V: Into<Value>>(&mut self, v: V) {
++    pub fn push<V: Into<Value>>(&mut self, v: V) -> Result<(), Value> {
+         self.value_op(v.into(), true, |items, value| {
+             items.push(Item::Value(value))
+         })
+@@ -99,7 +111,7 @@ impl Array {
+     /// Appends a new, already formatted value to the end of the array.
+     ///
+     /// Returns an error if the value was of a different type than the array.
+-    pub fn push_formatted(&mut self, v: Value) {
++    pub fn push_formatted(&mut self, v: Value) -> Result<(), Value> {
+         self.value_op(v, false, |items, value| items.push(Item::Value(value)))
+     }
+ 
+@@ -109,7 +121,7 @@ impl Array {
+     /// Returns an error if the value was of a different type than the values in the array.
+     ///
+     /// Panics if `index > len`.
+-    pub fn insert<V: Into<Value>>(&mut self, index: usize, v: V) {
++    pub fn insert<V: Into<Value>>(&mut self, index: usize, v: V) -> Result<(), Value> {
+         self.value_op(v.into(), true, |items, value| {
+             items.insert(index, Item::Value(value))
+         })
+@@ -121,7 +133,7 @@ impl Array {
+     /// Returns an error if the value was of a different type than the values in the array.
+     ///
+     /// Panics if `index > len`.
+-    pub fn insert_formatted(&mut self, index: usize, v: Value) {
++    pub fn insert_formatted(&mut self, index: usize, v: Value) -> Result<(), Value> {
+         self.value_op(v, false, |items, value| {
+             items.insert(index, Item::Value(value))
+         })
+@@ -132,7 +144,7 @@ impl Array {
+     /// Returns an error if the replacement was of a different type than the values in the array.
+     ///
+     /// Panics if `index >= len`.
+-    pub fn replace<V: Into<Value>>(&mut self, index: usize, v: V) -> Value {
++    pub fn replace<V: Into<Value>>(&mut self, index: usize, v: V) -> Result<Value, Value> {
+         // Read the existing value's decor and preserve it.
+         let existing_decor = self
+             .get(index)
+@@ -147,7 +159,7 @@ impl Array {
+     /// Returns an error if the replacement was of a different type than the values in the array.
+     ///
+     /// Panics if `index >= len`.
+-    pub fn replace_formatted(&mut self, index: usize, v: Value) -> Value {
++    pub fn replace_formatted(&mut self, index: usize, v: Value) -> Result<Value, Value> {
+         self.value_op(v, false, |items, value| {
+             match mem::replace(&mut items[index], Item::Value(value)) {
+                 Item::Value(old_value) => old_value,
+@@ -184,14 +196,26 @@ impl Array {
+         v: Value,
+         decorate: bool,
+         op: impl FnOnce(&mut Vec<Item>, Value) -> T,
+-    ) -> T {
++    ) -> Result<T, Value> {
+         let mut value = v;
+         if !self.is_empty() && decorate {
+             formatted::decorate(&mut value, " ", "");
+         } else if decorate {
+             formatted::decorate(&mut value, "", "");
+         }
+-        op(&mut self.values, value)
++        if self.is_empty() || value.get_type() == self.value_type() {
++            Ok(op(&mut self.values, value))
++        } else {
++            Err(value)
++        }
++    }
++
++    pub(crate) fn value_type(&self) -> ValueType {
++        if let Some(value) = self.values.get(0).and_then(Item::as_value) {
++            value.get_type()
++        } else {
++            ValueType::None
++        }
+     }
+ }
+ 
+@@ -447,6 +471,18 @@ impl Value {
+     pub fn is_inline_table(&self) -> bool {
+         self.as_inline_table().is_some()
+     }
++
++    pub(crate) fn get_type(&self) -> ValueType {
++        match *self {
++            Value::Integer(..) => ValueType::Integer,
++            Value::String(..) => ValueType::String,
++            Value::Float(..) => ValueType::Float,
++            Value::DateTime(..) => ValueType::DateTime,
++            Value::Boolean(..) => ValueType::Boolean,
++            Value::Array(..) => ValueType::Array,
++            Value::InlineTable(..) => ValueType::InlineTable,
++        }
++    }
+ }
+ 
+ impl Value {
+diff --git a/tests/decoder_compliance.rs b/tests/decoder_compliance.rs
+index 0a15ca49..3b3e4662 100644
+--- a/tests/decoder_compliance.rs
++++ b/tests/decoder_compliance.rs
+@@ -4,6 +4,11 @@ fn main() {
+     harness
+         .ignore([
+             "valid/array/array.toml",
++            "valid/array/mixed-int-array.toml",
++            "valid/array/mixed-int-float.toml",
++            "valid/array/mixed-int-string.toml",
++            "valid/array/mixed-string-table.toml",
++            "valid/array/nested-double.toml",
+             "valid/comment/everywhere.toml",
+             "valid/datetime/datetime.toml",
+             "valid/datetime/local-date.toml",
+diff --git a/tests/fixtures/invalid/array-mixed-types-arrays-and-ints.toml b/tests/fixtures/invalid/array-mixed-types-arrays-and-ints.toml
+new file mode 100644
+index 00000000..051ec731
+--- /dev/null
++++ b/tests/fixtures/invalid/array-mixed-types-arrays-and-ints.toml
+@@ -0,0 +1 @@
++arrays-and-ints =  [1, ["Arrays are not integers."]]
+diff --git a/tests/fixtures/invalid/array-mixed-types-ints-and-floats.toml b/tests/fixtures/invalid/array-mixed-types-ints-and-floats.toml
+new file mode 100644
+index 00000000..a5aa9b7a
+--- /dev/null
++++ b/tests/fixtures/invalid/array-mixed-types-ints-and-floats.toml
+@@ -0,0 +1 @@
++ints-and-floats = [1, 1.1]
+diff --git a/tests/fixtures/invalid/array-mixed-types-strings-and-ints.toml b/tests/fixtures/invalid/array-mixed-types-strings-and-ints.toml
+new file mode 100644
+index 00000000..f3483080
+--- /dev/null
++++ b/tests/fixtures/invalid/array-mixed-types-strings-and-ints.toml
+@@ -0,0 +1 @@
++strings-and-ints = ["hi", 42]
+diff --git a/tests/test_edit.rs b/tests/test_edit.rs
+index 07f88112..83ac64e6 100644
+--- a/tests/test_edit.rs
++++ b/tests/test_edit.rs
+@@ -538,26 +538,29 @@ fn test_insert_replace_into_array() {
+             let a = as_array!(a);
+             assert_eq!(a.len(), 3);
+             assert!(a.get(2).is_some());
+-            a.push(4);
++            assert!(a.push(4).is_ok());
+             assert_eq!(a.len(), 4);
+             a.fmt();
+         }
+         let b = root.entry("b");
+         let b = as_array!(b);
+         assert!(b.is_empty());
+-        b.push("hello");
++        assert!(b.push("hello").is_ok());
+         assert_eq!(b.len(), 1);
+ 
+-        b.push_formatted(decorated("world".into(), "\n", "\n"));
+-        b.push_formatted(decorated("test".into(), "", ""));
++        assert!(b.push_formatted(decorated("world".into(), "\n", "\n")).is_ok());
++        assert!(b.push_formatted(decorated("test".into(), "", "")).is_ok());
+ 
+-        b.insert(1, "beep");
+-        b.insert_formatted(2, decorated("boop".into(), "   ", "   "));
++        assert!(b.insert(1, "beep").is_ok());
++        assert!(b.insert_formatted(2, decorated("boop".into(), "   ", "   ")).is_ok());
+ 
+         // This should preserve formatting.
+-        assert_eq!(b.replace(2, "zoink").as_str(), Some("boop"));
++        assert_eq!(b.replace(2, "zoink").unwrap().as_str(), Some("boop"));
+         // This should replace formatting.
+-        assert_eq!(b.replace_formatted(4, decorated("yikes".into(), "  ", "")).as_str(), Some("test"));
++        assert_eq!(b.replace_formatted(4, decorated("yikes".into(), "  ", "")).unwrap().as_str(), Some("test"));
++
++        // Check that pushing a different type into an array fails.
++        assert!(b.push(42).is_err());
+ 
+     }).produces(r#"
+         a = [1, 2, 3, 4]
+diff --git a/tests/test_invalid.rs b/tests/test_invalid.rs
+index 3188bad2..4a343062 100644
+--- a/tests/test_invalid.rs
++++ b/tests/test_invalid.rs
+@@ -20,6 +20,21 @@ macro_rules! t(
+     )
+ );
+ 
++t!(
++    test_array_mixed_types_arrays_and_ints,
++    "Mixed types in array",
++    "fixtures/invalid/array-mixed-types-arrays-and-ints.toml"
++);
++t!(
++    test_array_mixed_types_ints_and_floats,
++    "Mixed types in array",
++    "fixtures/invalid/array-mixed-types-ints-and-floats.toml"
++);
++t!(
++    test_array_mixed_types_strings_and_ints,
++    "Mixed types in array",
++    "fixtures/invalid/array-mixed-types-strings-and-ints.toml"
++);
+ t!(
+     test_datetime_malformed_no_leads,
+     "While parsing a Date-Time",
+diff --git a/tests/test_parse.rs b/tests/test_parse.rs
+index 76503bb3..4044686e 100644
+--- a/tests/test_parse.rs
++++ b/tests/test_parse.rs
+@@ -32,6 +32,7 @@ macro_rules! parse_error {
+ 
+ #[test]
+ fn test_parse_error() {
++    parse_error!(r#"["", 2]"#, Value, "Mixed types in array");
+     parse_error!("'hello'bla", Value, "Could not parse the line");
+     parse_error!(r#"{a = 2"#, Value, "Expected `}`");
+ 

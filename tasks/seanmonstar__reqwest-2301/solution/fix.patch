@@ -1,0 +1,126 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 46e7307..7af59bd 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -41,9 +41,12 @@ native-tls-alpn = ["native-tls", "native-tls-crate?/alpn", "hyper-tls?/alpn"]
+ native-tls-vendored = ["native-tls", "native-tls-crate?/vendored"]
+ 
+ rustls-tls = ["rustls-tls-webpki-roots"]
+-rustls-tls-manual-roots = ["__rustls"]
+-rustls-tls-webpki-roots = ["dep:webpki-roots", "__rustls"]
+-rustls-tls-native-roots = ["dep:rustls-native-certs", "__rustls"]
++rustls-tls-no-provider = ["rustls-tls-manual-roots-no-provider"]
++
++rustls-tls-manual-roots = ["__rustls", "__rustls-ring"]
++rustls-tls-webpki-roots = ["dep:webpki-roots", "__rustls", "__rustls-ring"]
++rustls-tls-native-roots = ["dep:rustls-native-certs", "__rustls", "__rustls-ring"]
++rustls-tls-manual-roots-no-provider = ["__rustls"]
+ 
+ blocking = ["dep:futures-channel", "futures-channel?/sink", "futures-util/io", "futures-util/sink", "tokio/sync"]
+ 
+@@ -77,6 +80,7 @@ macos-system-configuration = ["dep:system-configuration"]
+ # Experimental HTTP/3 client.
+ http3 = ["rustls-tls-manual-roots", "dep:h3", "dep:h3-quinn", "dep:quinn", "dep:slab", "dep:futures-channel"]
+ 
++
+ # Internal (PRIVATE!) features used to aid testing.
+ # Don't rely on these whatsoever. They may disappear at anytime.
+ 
+@@ -86,6 +90,7 @@ __tls = ["dep:rustls-pemfile", "tokio/io-util"]
+ # Enables common rustls code.
+ # Equivalent to rustls-tls-manual-roots but shorter :)
+ __rustls = ["dep:hyper-rustls", "dep:tokio-rustls", "dep:rustls", "__tls", "dep:rustls-pemfile", "dep:rustls-pki-types"]
++__rustls-ring = ["hyper-rustls?/ring", "tokio-rustls?/ring", "rustls?/ring", "quinn?/ring"]
+ 
+ # When enabled, disable using the cached SYS_PROXIES.
+ __internal_proxy_sys_no_cache = []
+@@ -133,10 +138,10 @@ native-tls-crate = { version = "0.2.10", optional = true, package = "native-tls"
+ tokio-native-tls = { version = "0.3.0", optional = true }
+ 
+ # rustls-tls
+-hyper-rustls = { version = "0.27.0", default-features = false, optional = true, features = ["http1", "http2", "native-tokio", "ring", "tls12"] }
+-rustls = { version = "0.23.4", optional = true, default-features = false, features = ["std", "ring", "tls12"] }
++hyper-rustls = { version = "0.27.0", default-features = false, optional = true, features = ["http1", "http2", "native-tokio", "tls12"] }
++rustls = { version = "0.23.4", optional = true, default-features = false, features = ["std", "tls12"] }
+ rustls-pki-types = { version = "1.1.0", features = ["alloc"] ,optional = true }
+-tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
++tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["tls12"] }
+ webpki-roots = { version = "0.26.0", optional = true }
+ rustls-native-certs = { version = "0.7", optional = true }
+ 
+@@ -157,7 +162,7 @@ hickory-resolver = { version = "0.24", optional = true, features = ["tokio-runti
+ # HTTP/3 experimental support
+ h3 = { version = "0.0.5", optional = true }
+ h3-quinn = { version = "0.0.6", optional = true }
+-quinn = { version = "0.11.1", default-features = false, features = ["rustls", "ring", "runtime-tokio"], optional = true }
++quinn = { version = "0.11.1", default-features = false, features = ["rustls", "runtime-tokio"], optional = true }
+ slab = { version = "0.4.9", optional = true } # just to get minimal versions working with quinn
+ futures-channel = { version = "0.3", optional = true }
+ 
+@@ -173,6 +178,7 @@ zstd_crate = { package = "zstd", version = "0.13" }
+ doc-comment = "0.3"
+ tokio = { version = "1.0", default-features = false, features = ["macros", "rt-multi-thread"] }
+ futures-util = { version = "0.3.28", default-features = false, features = ["std", "alloc"] }
++rustls = { version = "0.23", default-features = false, features = ["ring"] }
+ 
+ [target.'cfg(windows)'.dependencies]
+ winreg = "0.52.0"
+diff --git a/src/async_impl/client.rs b/src/async_impl/client.rs
+index 3e2edae..994fa6f 100644
+--- a/src/async_impl/client.rs
++++ b/src/async_impl/client.rs
+@@ -569,7 +569,13 @@ impl ClientBuilder {
+                     // If not, we use ring.
+                     let provider = rustls::crypto::CryptoProvider::get_default()
+                         .map(|arc| arc.clone())
+-                        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
++                        .unwrap_or_else(|| {
++                            #[cfg(not(feature = "__rustls-ring"))]
++                            panic!("No provider set");
++
++                            #[cfg(feature = "__rustls-ring")]
++                            Arc::new(rustls::crypto::ring::default_provider())
++                        });
+ 
+                     // Build TLS config
+                     let config_builder = rustls::ClientConfig::builder_with_provider(provider)
+@@ -1312,6 +1318,8 @@ impl ClientBuilder {
+     /// # Example
+     ///
+     /// ```
++    /// # #[cfg(all(feature = "__rustls", not(feature = "__rustls-ring")))]
++    /// # let _ = rustls::crypto::ring::default_provider().install_default();
+     /// use std::net::IpAddr;
+     /// let local_addr = IpAddr::from([12, 4, 1, 8]);
+     /// let client = reqwest::Client::builder()
+@@ -1331,6 +1339,8 @@ impl ClientBuilder {
+     /// # Example
+     ///
+     /// ```
++    /// # #[cfg(all(feature = "__rustls", not(feature = "__rustls-ring")))]
++    /// # let _ = rustls::crypto::ring::default_provider().install_default();
+     /// let interface = "lo";
+     /// let client = reqwest::Client::builder()
+     ///     .interface(interface)
+@@ -2762,6 +2772,8 @@ fn add_cookie_header(headers: &mut HeaderMap, cookie_store: &dyn cookie::CookieS
+ 
+ #[cfg(test)]
+ mod tests {
++    #![cfg(not(feature = "rustls-tls-manual-roots-no-provider"))]
++
+     #[tokio::test]
+     async fn execute_request_rejects_invalid_urls() {
+         let url_str = "hxxps://www.rust-lang.org/";
+diff --git a/src/async_impl/request.rs b/src/async_impl/request.rs
+index 6657104..aa900ca 100644
+--- a/src/async_impl/request.rs
++++ b/src/async_impl/request.rs
+@@ -649,6 +649,8 @@ impl TryFrom<Request> for HttpRequest<Body> {
+ 
+ #[cfg(test)]
+ mod tests {
++    #![cfg(not(feature = "rustls-tls-manual-roots-no-provider"))]
++
+     use super::{Client, HttpRequest, Request, RequestBuilder, Version};
+     use crate::Method;
+     use serde::Serialize;

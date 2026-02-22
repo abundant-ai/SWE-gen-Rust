@@ -1,0 +1,209 @@
+diff --git a/crates/cli/src/parse.rs b/crates/cli/src/parse.rs
+index d5285011..ed0ac9f6 100644
+--- a/crates/cli/src/parse.rs
++++ b/crates/cli/src/parse.rs
+@@ -1,6 +1,7 @@
+ use std::{
+     fmt, fs,
+     io::{self, Write},
++    ops::ControlFlow,
+     path::{Path, PathBuf},
+     sync::atomic::{AtomicUsize, Ordering},
+     time::{Duration, Instant},
+@@ -357,15 +358,15 @@ pub fn parse_file_at_path(
+     let progress_callback = &mut |_: &ParseState| {
+         if let Some(cancellation_flag) = opts.cancellation_flag {
+             if cancellation_flag.load(Ordering::SeqCst) != 0 {
+-                return true;
++                return ControlFlow::Break(());
+             }
+         }
+ 
+         if opts.timeout > 0 && start_time.elapsed().as_micros() > opts.timeout as u128 {
+-            return true;
++            return ControlFlow::Break(());
+         }
+ 
+-        false
++        ControlFlow::Continue(())
+     };
+ 
+     let parse_opts = ParseOptions::new().progress_callback(progress_callback);
+diff --git a/crates/highlight/src/highlight.rs b/crates/highlight/src/highlight.rs
+index e4555fa0..bb81fc08 100644
+--- a/crates/highlight/src/highlight.rs
++++ b/crates/highlight/src/highlight.rs
+@@ -7,7 +7,8 @@ use std::{
+     iter,
+     marker::PhantomData,
+     mem::{self, MaybeUninit},
+-    ops, str,
++    ops::{self, ControlFlow},
++    str,
+     sync::{
+         atomic::{AtomicUsize, Ordering},
+         LazyLock,
+@@ -538,9 +539,13 @@ impl<'a> HighlightIterLayer<'a> {
+                         None,
+                         Some(ParseOptions::new().progress_callback(&mut |_| {
+                             if let Some(cancellation_flag) = cancellation_flag {
+-                                cancellation_flag.load(Ordering::SeqCst) != 0
++                                if cancellation_flag.load(Ordering::SeqCst) != 0 {
++                                    ControlFlow::Break(())
++                                } else {
++                                    ControlFlow::Continue(())
++                                }
+                             } else {
+-                                false
++                                ControlFlow::Continue(())
+                             }
+                         })),
+                     )
+diff --git a/crates/tags/src/tags.rs b/crates/tags/src/tags.rs
+index 57179e9a..16270b0a 100644
+--- a/crates/tags/src/tags.rs
++++ b/crates/tags/src/tags.rs
+@@ -7,7 +7,7 @@ use std::{
+     collections::HashMap,
+     ffi::{CStr, CString},
+     mem,
+-    ops::Range,
++    ops::{ControlFlow, Range},
+     os::raw::c_char,
+     str,
+     sync::atomic::{AtomicUsize, Ordering},
+@@ -301,9 +301,13 @@ impl TagsContext {
+                 None,
+                 Some(ParseOptions::new().progress_callback(&mut |_| {
+                     if let Some(cancellation_flag) = cancellation_flag {
+-                        cancellation_flag.load(Ordering::SeqCst) != 0
++                        if cancellation_flag.load(Ordering::SeqCst) != 0 {
++                            ControlFlow::Break(())
++                        } else {
++                            ControlFlow::Continue(())
++                        }
+                     } else {
+-                        false
++                        ControlFlow::Continue(())
+                     }
+                 })),
+             )
+diff --git a/lib/binding_rust/lib.rs b/lib/binding_rust/lib.rs
+index cb4b34c0..e3b2d950 100644
+--- a/lib/binding_rust/lib.rs
++++ b/lib/binding_rust/lib.rs
+@@ -16,7 +16,7 @@ use core::{
+     marker::PhantomData,
+     mem::MaybeUninit,
+     num::NonZeroU16,
+-    ops::{self, Deref},
++    ops::{self, ControlFlow, Deref},
+     ptr::{self, NonNull},
+     slice, str,
+     sync::atomic::AtomicUsize,
+@@ -177,7 +177,10 @@ impl<'a> ParseOptions<'a> {
+     }
+ 
+     #[must_use]
+-    pub fn progress_callback<F: FnMut(&ParseState) -> bool>(mut self, callback: &'a mut F) -> Self {
++    pub fn progress_callback<F: FnMut(&ParseState) -> ControlFlow<()>>(
++        mut self,
++        callback: &'a mut F,
++    ) -> Self {
+         self.progress_callback = Some(callback);
+         self
+     }
+@@ -195,7 +198,7 @@ impl<'a> QueryCursorOptions<'a> {
+     }
+ 
+     #[must_use]
+-    pub fn progress_callback<F: FnMut(&QueryCursorState) -> bool>(
++    pub fn progress_callback<F: FnMut(&QueryCursorState) -> ControlFlow<()>>(
+         mut self,
+         callback: &'a mut F,
+     ) -> Self {
+@@ -232,10 +235,10 @@ type FieldId = NonZeroU16;
+ type Logger<'a> = Box<dyn FnMut(LogType, &str) + 'a>;
+ 
+ /// A callback that receives the parse state during parsing.
+-type ParseProgressCallback<'a> = &'a mut dyn FnMut(&ParseState) -> bool;
++type ParseProgressCallback<'a> = &'a mut dyn FnMut(&ParseState) -> ControlFlow<()>;
+ 
+ /// A callback that receives the query state during query execution.
+-type QueryProgressCallback<'a> = &'a mut dyn FnMut(&QueryCursorState) -> bool;
++type QueryProgressCallback<'a> = &'a mut dyn FnMut(&QueryCursorState) -> ControlFlow<()>;
+ 
+ pub trait Decode {
+     /// A callback that decodes the next code point from the input slice. It should return the code
+@@ -869,7 +872,10 @@ impl Parser {
+                 .cast::<ParseProgressCallback>()
+                 .as_mut()
+                 .unwrap();
+-            callback(&ParseState::from_raw(state))
++            match callback(&ParseState::from_raw(state)) {
++                ControlFlow::Continue(()) => false,
++                ControlFlow::Break(()) => true,
++            }
+         }
+ 
+         // This C function is passed to Tree-sitter as the input callback.
+@@ -1001,7 +1007,10 @@ impl Parser {
+                 .cast::<ParseProgressCallback>()
+                 .as_mut()
+                 .unwrap();
+-            callback(&ParseState::from_raw(state))
++            match callback(&ParseState::from_raw(state)) {
++                ControlFlow::Continue(()) => false,
++                ControlFlow::Break(()) => true,
++            }
+         }
+ 
+         // This C function is passed to Tree-sitter as the input callback.
+@@ -1118,7 +1127,10 @@ impl Parser {
+                 .cast::<ParseProgressCallback>()
+                 .as_mut()
+                 .unwrap();
+-            callback(&ParseState::from_raw(state))
++            match callback(&ParseState::from_raw(state)) {
++                ControlFlow::Continue(()) => false,
++                ControlFlow::Break(()) => true,
++            }
+         }
+ 
+         // This C function is passed to Tree-sitter as the input callback.
+@@ -1218,7 +1230,10 @@ impl Parser {
+                 .cast::<ParseProgressCallback>()
+                 .as_mut()
+                 .unwrap();
+-            callback(&ParseState::from_raw(state))
++            match callback(&ParseState::from_raw(state)) {
++                ControlFlow::Continue(()) => false,
++                ControlFlow::Break(()) => true,
++            }
+         }
+ 
+         // At compile time, create a C-compatible callback that calls the custom `decode` method.
+@@ -3103,7 +3118,10 @@ impl QueryCursor {
+                 .cast::<QueryProgressCallback>()
+                 .as_mut()
+                 .unwrap();
+-            (callback)(&QueryCursorState::from_raw(state))
++            match callback(&QueryCursorState::from_raw(state)) {
++                ControlFlow::Continue(()) => false,
++                ControlFlow::Break(()) => true,
++            }
+         }
+ 
+         let query_options = options.progress_callback.map(|cb| {
+@@ -3189,7 +3207,10 @@ impl QueryCursor {
+                 .cast::<QueryProgressCallback>()
+                 .as_mut()
+                 .unwrap();
+-            (callback)(&QueryCursorState::from_raw(state))
++            match callback(&QueryCursorState::from_raw(state)) {
++                ControlFlow::Continue(()) => false,
++                ControlFlow::Break(()) => true,
++            }
+         }
+ 
+         let query_options = options.progress_callback.map(|cb| {

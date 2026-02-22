@@ -1,0 +1,1002 @@
+diff --git a/tracing-mock/src/ancestry.rs b/tracing-mock/src/ancestry.rs
+new file mode 100644
+index 00000000..ee661d45
+--- /dev/null
++++ b/tracing-mock/src/ancestry.rs
+@@ -0,0 +1,148 @@
++//! Define the ancestry of an event or span.
++//!
++//! See the documentation on the [`Ancestry`] enum for further details.
++
++use tracing_core::{
++    span::{self, Attributes},
++    Event,
++};
++
++/// The ancestry of an event or span.
++///
++/// An event or span can have an explicitly assigned parent, or be an explicit root. Otherwise,
++/// an event or span may have a contextually assigned parent or in the final case will be a
++/// contextual root.
++#[derive(Debug, Eq, PartialEq)]
++pub enum Ancestry {
++    /// The event or span has an explicitly assigned parent (created with `parent: span_id`) with
++    /// the specified name.
++    HasExplicitParent(String),
++    /// The event or span is an explicitly defined root. It was created with `parent: None` and
++    /// has no parent.
++    IsExplicitRoot,
++    /// The event or span has a contextually assigned parent with the specified name. It has no
++    /// explicitly assigned parent, nor has it been explicitly defined as a root (it was created
++    /// without the `parent:` directive). There was a span in context when this event or span was
++    /// created.
++    HasContextualParent(String),
++    /// The event or span is a contextual root. It has no explicitly assigned parent, nor has it
++    /// been explicitly defined as a root (it was created without the `parent:` directive).
++    /// Additionally, no span was in context when this event or span was created.
++    IsContextualRoot,
++}
++
++impl Ancestry {
++    #[track_caller]
++    pub(crate) fn check(
++        &self,
++        actual_ancestry: &Ancestry,
++        ctx: impl std::fmt::Display,
++        collector_name: &str,
++    ) {
++        let expected_description = |ancestry: &Ancestry| match ancestry {
++            Self::IsExplicitRoot => "be an explicit root".to_string(),
++            Self::HasExplicitParent(name) => format!("have an explicit parent with name='{name}'"),
++            Self::IsContextualRoot => "be a contextual root".to_string(),
++            Self::HasContextualParent(name) => {
++                format!("have a contextual parent with name='{name}'")
++            }
++        };
++
++        let actual_description = |ancestry: &Ancestry| match ancestry {
++            Self::IsExplicitRoot => "was actually an explicit root".to_string(),
++            Self::HasExplicitParent(name) => {
++                format!("actually has an explicit parent with name='{name}'")
++            }
++            Self::IsContextualRoot => "was actually a contextual root".to_string(),
++            Self::HasContextualParent(name) => {
++                format!("actually has a contextual parent with name='{name}'")
++            }
++        };
++
++        assert_eq!(
++            self,
++            actual_ancestry,
++            "[{collector_name}] expected {ctx} to {expected_description}, but {actual_description}",
++            expected_description = expected_description(self),
++            actual_description = actual_description(actual_ancestry)
++        );
++    }
++}
++
++pub(crate) trait HasAncestry {
++    fn is_contextual(&self) -> bool;
++
++    fn is_root(&self) -> bool;
++
++    fn parent(&self) -> Option<&span::Id>;
++}
++
++impl HasAncestry for &Event<'_> {
++    fn is_contextual(&self) -> bool {
++        (self as &Event<'_>).is_contextual()
++    }
++
++    fn is_root(&self) -> bool {
++        (self as &Event<'_>).is_root()
++    }
++
++    fn parent(&self) -> Option<&span::Id> {
++        (self as &Event<'_>).parent()
++    }
++}
++
++impl HasAncestry for &Attributes<'_> {
++    fn is_contextual(&self) -> bool {
++        (self as &Attributes<'_>).is_contextual()
++    }
++
++    fn is_root(&self) -> bool {
++        (self as &Attributes<'_>).is_root()
++    }
++
++    fn parent(&self) -> Option<&span::Id> {
++        (self as &Attributes<'_>).parent()
++    }
++}
++
++/// Determines the ancestry of an actual span or event.
++///
++/// The rules for determining the ancestry are as follows:
++///
++/// +------------+--------------+-----------------+---------------------+
++/// | Contextual | Current Span | Explicit Parent | Ancestry            |
++/// +------------+--------------+-----------------+---------------------+
++/// | Yes        | Yes          | -               | HasContextualParent |
++/// | Yes        | No           | -               | IsContextualRoot    |
++/// | No         | -            | Yes             | HasExplicitParent   |
++/// | No         | -            | No              | IsExplicitRoot      |
++/// +------------+--------------+-----------------+---------------------+
++pub(crate) fn get_ancestry(
++    item: impl HasAncestry,
++    lookup_current: impl FnOnce() -> Option<span::Id>,
++    span_name: impl FnOnce(&span::Id) -> Option<&str>,
++) -> Ancestry {
++    if item.is_contextual() {
++        if let Some(parent_id) = lookup_current() {
++            let contextual_parent_name = span_name(&parent_id).expect(
++                "tracing-mock: contextual parent cannot \
++                            be looked up by ID. Was it recorded correctly?",
++            );
++            Ancestry::HasContextualParent(contextual_parent_name.to_string())
++        } else {
++            Ancestry::IsContextualRoot
++        }
++    } else if item.is_root() {
++        Ancestry::IsExplicitRoot
++    } else {
++        let parent_id = item.parent().expect(
++            "tracing-mock: is_contextual=false is_root=false \
++                        but no explicit parent found. This is a bug!",
++        );
++        let explicit_parent_name = span_name(parent_id).expect(
++            "tracing-mock: explicit parent cannot be looked \
++                        up by ID. Is the provided Span ID valid: {parent_id}",
++        );
++        Ancestry::HasExplicitParent(explicit_parent_name.to_string())
++    }
++}
+diff --git a/tracing-mock/src/collector.rs b/tracing-mock/src/collector.rs
+index 97a01488..89f74d05 100644
+--- a/tracing-mock/src/collector.rs
++++ b/tracing-mock/src/collector.rs
+@@ -138,6 +138,7 @@
+ //! [`Collect`]: trait@tracing::Collect
+ //! [`MockCollector`]: struct@crate::collector::MockCollector
+ use crate::{
++    ancestry::get_ancestry,
+     event::ExpectedEvent,
+     expect::Expect,
+     field::ExpectedFields,
+@@ -1039,16 +1040,20 @@ where
+                         )
+                     }
+                 }
+-                let get_parent_name = || {
+-                    let stack = self.current.lock().unwrap();
+-                    let spans = self.spans.lock().unwrap();
+-                    event
+-                        .parent()
+-                        .and_then(|id| spans.get(id))
+-                        .or_else(|| stack.last().and_then(|id| spans.get(id)))
+-                        .map(|s| s.name.to_string())
++                let event_get_ancestry = || {
++                    get_ancestry(
++                        event,
++                        || self.lookup_current(),
++                        |span_id| {
++                            self.spans
++                                .lock()
++                                .unwrap()
++                                .get(span_id)
++                                .map(|span| span.name)
++                        },
++                    )
+                 };
+-                expected.check(event, get_parent_name, &self.name);
++                expected.check(event, event_get_ancestry, &self.name);
+             }
+             Some(ex) => ex.bad(&self.name, format_args!("observed event {:#?}", event)),
+         }
+@@ -1108,14 +1113,18 @@ where
+                 if let Some(expected_id) = &expected.span.id {
+                     expected_id.set(id.into_u64()).unwrap();
+                 }
+-                let get_parent_name = || {
+-                    let stack = self.current.lock().unwrap();
+-                    span.parent()
+-                        .and_then(|id| spans.get(id))
+-                        .or_else(|| stack.last().and_then(|id| spans.get(id)))
+-                        .map(|s| s.name.to_string())
+-                };
+-                expected.check(span, get_parent_name, &self.name);
++
++                expected.check(
++                    span,
++                    || {
++                        get_ancestry(
++                            span,
++                            || self.lookup_current(),
++                            |span_id| spans.get(span_id).map(|span| span.name),
++                        )
++                    },
++                    &self.name,
++                );
+             }
+         }
+         spans.insert(
+@@ -1265,6 +1274,16 @@ where
+     }
+ }
+ 
++impl<F> Running<F>
++where
++    F: Fn(&Metadata<'_>) -> bool,
++{
++    fn lookup_current(&self) -> Option<span::Id> {
++        let stack = self.current.lock().unwrap();
++        stack.last().cloned()
++    }
++}
++
+ impl MockHandle {
+     #[cfg(feature = "tracing-subscriber")]
+     pub(crate) fn new(expected: Arc<Mutex<VecDeque<Expect>>>, name: String) -> Self {
+diff --git a/tracing-mock/src/event.rs b/tracing-mock/src/event.rs
+index 840867d0..630f005a 100644
+--- a/tracing-mock/src/event.rs
++++ b/tracing-mock/src/event.rs
+@@ -29,7 +29,7 @@
+ //! [`collector`]: mod@crate::collector
+ //! [`expect::event`]: fn@crate::expect::event
+ #![allow(missing_docs)]
+-use super::{expect, field, metadata::ExpectedMetadata, span, Parent};
++use crate::{ancestry::Ancestry, expect, field, metadata::ExpectedMetadata, span};
+ 
+ use std::fmt;
+ 
+@@ -42,7 +42,7 @@ use std::fmt;
+ #[derive(Default, Eq, PartialEq)]
+ pub struct ExpectedEvent {
+     pub(super) fields: Option<field::ExpectedFields>,
+-    pub(super) parent: Option<Parent>,
++    pub(super) ancestry: Option<Ancestry>,
+     pub(super) in_spans: Option<Vec<span::ExpectedSpan>>,
+     pub(super) metadata: ExpectedMetadata,
+ }
+@@ -253,32 +253,30 @@ impl ExpectedEvent {
+         }
+     }
+ 
+-    /// Configures this `ExpectedEvent` to expect an explicit parent span
+-    /// when matching events or to be an explicit root.
++    /// Configures this `ExpectedEvent` to expect the specified [`Ancestry`].
++    /// An event's ancestry indicates whether is has a parent or is a root, and
++    /// whether the parent is explicitly or contextually assigned.
+     ///
+-    /// An _explicit_ parent span is one passed to the `span!` macro in the
+-    /// `parent:` field.
++    /// An _explicit_ parent span is one passed to the `event!` macro in the
++    /// `parent:` field. If no `parent:` field is specified, then the event
++    /// will have a contextually determined parent or be a contextual root if
++    /// there is no parent.
+     ///
+-    /// If `Some("parent_name")` is passed to `with_explicit_parent` then
+-    /// the provided string is the name of the parent span to expect.
+-    ///
+-    /// To expect that an event is recorded with `parent: None`, `None`
+-    /// can be passed to `with_explicit_parent` instead.
+-    ///
+-    /// If an event is recorded without an explicit parent, or if the
+-    /// explicit parent has a different name, this expectation will
+-    /// fail.
++    /// If the parent is different from the provided one, this expectation
++    /// will fail.
+     ///
+     /// # Examples
+     ///
+-    /// The explicit parent is matched by name:
++    /// If `expect::has_explicit_parent("parent_name")` is passed
++    /// `with_ancestry` then the provided string is the name of the explicit
++    /// parent span to expect.
+     ///
+     /// ```
+     /// use tracing::collect::with_default;
+     /// use tracing_mock::{collector, expect};
+     ///
+     /// let event = expect::event()
+-    ///     .with_explicit_parent(Some("parent_span"));
++    ///     .with_ancestry(expect::has_explicit_parent("parent_span"));
+     ///
+     /// let (collector, handle) = collector::mock()
+     ///     .event(event)
+@@ -300,29 +298,7 @@ impl ExpectedEvent {
+     /// use tracing_mock::{collector, expect};
+     ///
+     /// let event = expect::event()
+-    ///     .with_explicit_parent(None);
+-    ///
+-    /// let (collector, handle) = collector::mock()
+-    ///     .event(event)
+-    ///     .run_with_handle();
+-    ///
+-    /// with_default(collector, || {
+-    ///     tracing::info!(parent: None, field = &"value");
+-    /// });
+-    ///
+-    /// handle.assert_finished();
+-    /// ```
+-    ///
+-    /// In the example below, the expectation fails because the
+-    /// event is contextually (rather than explicitly) within the span
+-    /// `parent_span`:
+-    ///
+-    /// ```should_panic
+-    /// use tracing::collect::with_default;
+-    /// use tracing_mock::{collector, expect};
+-    ///
+-    /// let event = expect::event()
+-    ///     .with_explicit_parent(Some("parent_span"));
++    ///     .with_ancestry(expect::is_explicit_root());
+     ///
+     /// let (collector, handle) = collector::mock()
+     ///     .enter(expect::span())
+@@ -330,48 +306,23 @@ impl ExpectedEvent {
+     ///     .run_with_handle();
+     ///
+     /// with_default(collector, || {
+-    ///     let parent = tracing::info_span!("parent_span");
+-    ///     let _guard = parent.enter();
+-    ///     tracing::info!(field = &"value");
++    ///     let _guard = tracing::info_span!("contextual parent").entered();
++    ///     tracing::info!(parent: None, field = &"value");
+     /// });
+     ///
+     /// handle.assert_finished();
+     /// ```
+-    pub fn with_explicit_parent(self, parent: Option<&str>) -> ExpectedEvent {
+-        let parent = match parent {
+-            Some(name) => Parent::Explicit(name.into()),
+-            None => Parent::ExplicitRoot,
+-        };
+-        Self {
+-            parent: Some(parent),
+-            ..self
+-        }
+-    }
+-
+-    /// Configures this `ExpectedEvent` to match an event with a
+-    /// contextually-determined parent span.
+-    ///
+-    /// The provided string is the name of the parent span to expect.
+-    /// To expect that the event is a contextually-determined root, pass
+-    /// `None` instead.
+-    ///
+-    /// To expect an event with an explicit parent span, use
+-    /// [`ExpectedEvent::with_explicit_parent`].
+-    ///
+-    /// If an event is recorded which is not inside a span, has an explicitly
+-    /// overridden parent span, or with a differently-named span as its
+-    /// parent, this expectation will fail.
+-    ///
+-    /// # Examples
+     ///
+-    /// The contextual parent is matched by name:
++    /// When `expect::has_contextual_parent("parent_name")` is passed to
++    /// `with_ancestry` then the provided string is the name of the contextual
++    /// parent span to expect.
+     ///
+     /// ```
+     /// use tracing::collect::with_default;
+     /// use tracing_mock::{collector, expect};
+     ///
+     /// let event = expect::event()
+-    ///     .with_contextual_parent(Some("parent_span"));
++    ///     .with_ancestry(expect::has_contextual_parent("parent_span"));
+     ///
+     /// let (collector, handle) = collector::mock()
+     ///     .enter(expect::span())
+@@ -387,14 +338,15 @@ impl ExpectedEvent {
+     /// handle.assert_finished();
+     /// ```
+     ///
+-    /// Matching an event recorded outside of a span:
++    /// Matching an event recorded outside of a span, a contextual
++    /// root:
+     ///
+     /// ```
+     /// use tracing::collect::with_default;
+     /// use tracing_mock::{collector, expect};
+     ///
+     /// let event = expect::event()
+-    ///     .with_contextual_parent(None);
++    ///     .with_ancestry(expect::is_contextual_root());
+     ///
+     /// let (collector, handle) = collector::mock()
+     ///     .event(event)
+@@ -407,15 +359,16 @@ impl ExpectedEvent {
+     /// handle.assert_finished();
+     /// ```
+     ///
+-    /// In the example below, the expectation fails because the
+-    /// event is recorded with an explicit parent:
++    /// In the example below, the expectation fails because the event is
++    /// recorded with an explicit parent, however a contextual parent is
++    /// expected.
+     ///
+     /// ```should_panic
+     /// use tracing::collect::with_default;
+     /// use tracing_mock::{collector, expect};
+     ///
+     /// let event = expect::event()
+-    ///     .with_contextual_parent(Some("parent_span"));
++    ///     .with_ancestry(expect::has_contextual_parent("parent_span"));
+     ///
+     /// let (collector, handle) = collector::mock()
+     ///     .enter(expect::span())
+@@ -429,13 +382,9 @@ impl ExpectedEvent {
+     ///
+     /// handle.assert_finished();
+     /// ```
+-    pub fn with_contextual_parent(self, parent: Option<&str>) -> ExpectedEvent {
+-        let parent = match parent {
+-            Some(name) => Parent::Contextual(name.into()),
+-            None => Parent::ContextualRoot,
+-        };
++    pub fn with_ancestry(self, ancenstry: Ancestry) -> ExpectedEvent {
+         Self {
+-            parent: Some(parent),
++            ancestry: Some(ancenstry),
+             ..self
+         }
+     }
+@@ -557,7 +506,7 @@ impl ExpectedEvent {
+     pub(crate) fn check(
+         &mut self,
+         event: &tracing::Event<'_>,
+-        get_parent_name: impl FnOnce() -> Option<String>,
++        get_ancestry: impl FnOnce() -> Ancestry,
+         collector_name: &str,
+     ) {
+         let meta = event.metadata();
+@@ -577,14 +526,9 @@ impl ExpectedEvent {
+             checker.finish();
+         }
+ 
+-        if let Some(ref expected_parent) = self.parent {
+-            let actual_parent = get_parent_name();
+-            expected_parent.check_parent_name(
+-                actual_parent.as_deref(),
+-                event.parent().cloned(),
+-                event.metadata().name(),
+-                collector_name,
+-            )
++        if let Some(ref expected_ancestry) = self.ancestry {
++            let actual_ancestry = get_ancestry();
++            expected_ancestry.check(&actual_ancestry, event.metadata().name(), collector_name);
+         }
+     }
+ }
+@@ -615,7 +559,7 @@ impl fmt::Debug for ExpectedEvent {
+             s.field("fields", fields);
+         }
+ 
+-        if let Some(ref parent) = self.parent {
++        if let Some(ref parent) = self.ancestry {
+             s.field("parent", &format_args!("{:?}", parent));
+         }
+ 
+diff --git a/tracing-mock/src/expect.rs b/tracing-mock/src/expect.rs
+index beb66d36..95ad3176 100644
+--- a/tracing-mock/src/expect.rs
++++ b/tracing-mock/src/expect.rs
+@@ -1,6 +1,7 @@
+ use std::fmt;
+ 
+ use crate::{
++    ancestry::Ancestry,
+     event::ExpectedEvent,
+     field::{ExpectedField, ExpectedFields, ExpectedValue},
+     span::{ExpectedId, ExpectedSpan, NewSpan},
+@@ -70,6 +71,28 @@ pub fn id() -> ExpectedId {
+     ExpectedId::new_unset()
+ }
+ 
++/// Convenience function that returns [`Ancestry::IsContextualRoot`].
++pub fn is_contextual_root() -> Ancestry {
++    Ancestry::IsContextualRoot
++}
++
++/// Convenience function that returns [`Ancestry::HasContextualParent`] with
++/// provided name.
++pub fn has_contextual_parent<S: Into<String>>(name: S) -> Ancestry {
++    Ancestry::HasContextualParent(name.into())
++}
++
++/// Convenience function that returns [`Ancestry::IsExplicitRoot`].
++pub fn is_explicit_root() -> Ancestry {
++    Ancestry::IsExplicitRoot
++}
++
++/// Convenience function that returns [`Ancestry::HasExplicitParent`] with
++/// provided name.
++pub fn has_explicit_parent<S: Into<String>>(name: S) -> Ancestry {
++    Ancestry::HasExplicitParent(name.into())
++}
++
+ impl Expect {
+     pub(crate) fn bad(&self, name: impl AsRef<str>, what: fmt::Arguments<'_>) {
+         let name = name.as_ref();
+diff --git a/tracing-mock/src/lib.rs b/tracing-mock/src/lib.rs
+index 9fdeab58..1f6d2e49 100644
+--- a/tracing-mock/src/lib.rs
++++ b/tracing-mock/src/lib.rs
+@@ -1,4 +1,5 @@
+ #![doc = include_str!("../README.md")]
++pub mod ancestry;
+ pub mod collector;
+ pub mod event;
+ pub mod expect;
+@@ -8,88 +9,3 @@ pub mod span;
+ 
+ #[cfg(feature = "tracing-subscriber")]
+ pub mod subscriber;
+-
+-#[derive(Debug, Eq, PartialEq)]
+-pub enum Parent {
+-    ContextualRoot,
+-    Contextual(String),
+-    ExplicitRoot,
+-    Explicit(String),
+-}
+-
+-impl Parent {
+-    pub fn check_parent_name(
+-        &self,
+-        parent_name: Option<&str>,
+-        provided_parent: Option<tracing_core::span::Id>,
+-        ctx: impl std::fmt::Display,
+-        collector_name: &str,
+-    ) {
+-        match self {
+-            Parent::ExplicitRoot => {
+-                assert!(
+-                    provided_parent.is_none(),
+-                    "[{}] expected {} to be an explicit root, but its parent was actually {:?} (name: {:?})",
+-                    collector_name,
+-                    ctx,
+-                    provided_parent,
+-                    parent_name,
+-                );
+-            }
+-            Parent::Explicit(expected_parent) => {
+-                assert!(
+-                    provided_parent.is_some(),
+-                    "[{}] expected {} to have explicit parent {}, but it has no explicit parent",
+-                    collector_name,
+-                    ctx,
+-                    expected_parent,
+-                );
+-                assert_eq!(
+-                    Some(expected_parent.as_ref()),
+-                    parent_name,
+-                    "[{}] expected {} to have explicit parent {}, but its parent was actually {:?} (name: {:?})",
+-                    collector_name,
+-                    ctx,
+-                    expected_parent,
+-                    provided_parent,
+-                    parent_name,
+-                );
+-            }
+-            Parent::ContextualRoot => {
+-                assert!(
+-                    provided_parent.is_none(),
+-                    "[{}] expected {} to be a contextual root, but its parent was actually {:?} (name: {:?})",
+-                    collector_name,
+-                    ctx,
+-                    provided_parent,
+-                    parent_name,
+-                );
+-                assert!(
+-                    parent_name.is_none(),
+-                    "[{}] expected {} to be contextual a root, but we were inside span {:?}",
+-                    collector_name,
+-                    ctx,
+-                    parent_name,
+-                );
+-            }
+-            Parent::Contextual(expected_parent) => {
+-                assert!(provided_parent.is_none(),
+-                    "[{}] expected {} to have a contextual parent\nbut it has the explicit parent {:?} (name: {:?})",
+-                    collector_name,
+-                    ctx,
+-                    provided_parent,
+-                    parent_name,
+-                );
+-                assert_eq!(
+-                    Some(expected_parent.as_ref()),
+-                    parent_name,
+-                    "[{}] expected {} to have contextual parent {:?}, but got {:?}",
+-                    collector_name,
+-                    ctx,
+-                    expected_parent,
+-                    parent_name,
+-                );
+-            }
+-        }
+-    }
+-}
+diff --git a/tracing-mock/src/span.rs b/tracing-mock/src/span.rs
+index b666cd71..a568484f 100644
+--- a/tracing-mock/src/span.rs
++++ b/tracing-mock/src/span.rs
+@@ -41,7 +41,7 @@
+ //! let new_span = span
+ //!     .clone()
+ //!     .with_fields(expect::field("field.name").with_value(&"field_value"))
+-//!     .with_explicit_parent(Some("parent_span"));
++//!     .with_ancestry(expect::has_explicit_parent("parent_span"));
+ //!
+ //! let (collector, handle) = collector::mock()
+ //!     .new_span(expect::span().named("parent_span"))
+@@ -92,7 +92,8 @@
+ //! [`expect::span`]: fn@crate::expect::span
+ #![allow(missing_docs)]
+ use crate::{
+-    collector::SpanState, expect, field::ExpectedFields, metadata::ExpectedMetadata, Parent,
++    ancestry::Ancestry, collector::SpanState, expect, field::ExpectedFields,
++    metadata::ExpectedMetadata,
+ };
+ use std::{
+     error, fmt,
+@@ -134,7 +135,7 @@ pub struct ExpectedSpan {
+ pub struct NewSpan {
+     pub(crate) span: ExpectedSpan,
+     pub(crate) fields: ExpectedFields,
+-    pub(crate) parent: Option<Parent>,
++    pub(crate) ancestry: Option<Ancestry>,
+ }
+ 
+ pub fn named<I>(name: I) -> ExpectedSpan
+@@ -421,8 +422,9 @@ impl ExpectedSpan {
+         }
+     }
+ 
+-    /// Configures this `ExpectedSpan` to expect an explicit parent
+-    /// span or to be an explicit root.
++    /// Configures this `ExpectedSpan` to expect the specified [`Ancestry`]. A
++    /// span's ancestry indicates whether it has a parent or is a root span
++    /// and whether the parent is explitly or contextually assigned.
+     ///
+     /// **Note**: This method returns a [`NewSpan`] and as such, this
+     /// expectation can only be validated when expecting a new span via
+@@ -431,27 +433,24 @@ impl ExpectedSpan {
+     /// method on [`MockCollector`] that takes an `ExpectedSpan`.
+     ///
+     /// An _explicit_ parent span is one passed to the `span!` macro in the
+-    /// `parent:` field.
++    /// `parent:` field. If no `parent:` field is specified, then the span
++    /// will have a contextually determined parent or be a contextual root if
++    /// there is no parent.
+     ///
+-    /// If `Some("parent_name")` is passed to `with_explicit_parent` then,
+-    /// the provided string is the name of the parent span to expect.
+-    ///
+-    /// To expect that a span is recorded with no parent, `None`
+-    /// can be passed to `with_explicit_parent` instead.
+-    ///
+-    /// If a span is recorded without an explicit parent, or if the
+-    /// explicit parent has a different name, this expectation will
+-    /// fail.
++    /// If the ancestry is different from the provided one, this expectation
++    /// will fail.
+     ///
+     /// # Examples
+     ///
+-    /// The explicit parent is matched by name:
++    /// If `expect::has_explicit_parent("parent_name")` is passed
++    /// `with_ancestry` then the provided string is the name of the explicit
++    /// parent span to expect.
+     ///
+     /// ```
+     /// use tracing_mock::{collector, expect};
+     ///
+     /// let span = expect::span()
+-    ///     .with_explicit_parent(Some("parent_span"));
++    ///     .with_ancestry(expect::has_explicit_parent("parent_span"));
+     ///
+     /// let (collector, handle) = collector::mock()
+     ///     .new_span(expect::span().named("parent_span"))
+@@ -472,7 +471,7 @@ impl ExpectedSpan {
+     /// use tracing_mock::{collector, expect};
+     ///
+     /// let span = expect::span()
+-    ///     .with_explicit_parent(None);
++    ///     .with_ancestry(expect::is_explicit_root());
+     ///
+     /// let (collector, handle) = collector::mock()
+     ///     .new_span(span)
+@@ -485,79 +484,16 @@ impl ExpectedSpan {
+     /// handle.assert_finished();
+     /// ```
+     ///
+-    /// In the example below, the expectation fails because the
+-    /// span is *contextually*—as opposed to explicitly—within the span
+-    /// `parent_span`:
+-    ///
+-    /// ```should_panic
+-    /// use tracing_mock::{collector, expect};
+-    ///
+-    /// let parent_span = expect::span().named("parent_span");
+-    /// let span = expect::span()
+-    ///     .with_explicit_parent(Some("parent_span"));
+-    ///
+-    /// let (collector, handle) = collector::mock()
+-    ///     .new_span(parent_span.clone())
+-    ///     .enter(parent_span)
+-    ///     .new_span(span)
+-    ///     .run_with_handle();
+-    ///
+-    /// tracing::collect::with_default(collector, || {
+-    ///     let parent = tracing::info_span!("parent_span");
+-    ///     let _guard = parent.enter();
+-    ///     tracing::info_span!("span");
+-    /// });
+-    ///
+-    /// handle.assert_finished();
+-    /// ```
+-    ///
+-    /// [`MockCollector`]: struct@crate::collector::MockCollector
+-    /// [`MockCollector::enter`]: fn@crate::collector::MockCollector::enter
+-    /// [`MockCollector::exit`]: fn@crate::collector::MockCollector::exit
+-    /// [`MockCollector::new_span`]: fn@crate::collector::MockCollector::new_span
+-    pub fn with_explicit_parent(self, parent: Option<&str>) -> NewSpan {
+-        let parent = match parent {
+-            Some(name) => Parent::Explicit(name.into()),
+-            None => Parent::ExplicitRoot,
+-        };
+-        NewSpan {
+-            parent: Some(parent),
+-            span: self,
+-            ..Default::default()
+-        }
+-    }
+-
+-    /// Configures this `ExpectedSpan` to expect a
+-    /// contextually-determined parent span, or be a contextual
+-    /// root.
+-    ///
+-    /// **Note**: This method returns a [`NewSpan`] and as such, this
+-    /// expectation can only be validated when expecting a new span via
+-    /// [`MockCollector::new_span`]. It cannot be validated on
+-    /// [`MockCollector::enter`], [`MockCollector::exit`], or any other
+-    /// method on [`MockCollector`] that takes an `ExpectedSpan`.
+-    ///
+-    /// The provided string is the name of the parent span to expect.
+-    /// To expect that the event is a contextually-determined root, pass
+-    /// `None` instead.
+-    ///
+-    /// To expect a span with an explicit parent span, use
+-    /// [`ExpectedSpan::with_explicit_parent`].
+-    ///
+-    /// If a span is recorded which is not inside a span, has an explicitly
+-    /// overridden parent span, or has a differently-named span as its
+-    /// parent, this expectation will fail.
+-    ///
+-    /// # Examples
+-    ///
+-    /// The contextual parent is matched by name:
++    /// When `expect::has_contextual_parent("parent_name")` is passed to
++    /// `with_ancestry` then the provided string is the name of the contextual
++    /// parent span to expect.
+     ///
+     /// ```
+     /// use tracing_mock::{collector, expect};
+     ///
+     /// let parent_span = expect::span().named("parent_span");
+     /// let span = expect::span()
+-    ///     .with_contextual_parent(Some("parent_span"));
++    ///     .with_ancestry(expect::has_contextual_parent("parent_span"));
+     ///
+     /// let (collector, handle) = collector::mock()
+     ///     .new_span(parent_span.clone())
+@@ -581,7 +517,7 @@ impl ExpectedSpan {
+     /// use tracing_mock::{collector, expect};
+     ///
+     /// let span = expect::span()
+-    ///     .with_contextual_parent(None);
++    ///     .with_ancestry(expect::is_contextual_root());
+     ///
+     /// let (collector, handle) = collector::mock()
+     ///     .new_span(span)
+@@ -595,22 +531,26 @@ impl ExpectedSpan {
+     /// ```
+     ///
+     /// In the example below, the expectation fails because the
+-    /// span is recorded with an explicit parent:
++    /// span is *contextually*—as opposed to explicitly—within the span
++    /// `parent_span`:
+     ///
+     /// ```should_panic
+     /// use tracing_mock::{collector, expect};
+     ///
++    /// let parent_span = expect::span().named("parent_span");
+     /// let span = expect::span()
+-    ///     .with_contextual_parent(Some("parent_span"));
++    ///     .with_ancestry(expect::has_explicit_parent("parent_span"));
+     ///
+     /// let (collector, handle) = collector::mock()
+-    ///     .new_span(expect::span().named("parent_span"))
++    ///     .new_span(parent_span.clone())
++    ///     .enter(parent_span)
+     ///     .new_span(span)
+     ///     .run_with_handle();
+     ///
+     /// tracing::collect::with_default(collector, || {
+     ///     let parent = tracing::info_span!("parent_span");
+-    ///     tracing::info_span!(parent: parent.id(), "span");
++    ///     let _guard = parent.enter();
++    ///     tracing::info_span!("span");
+     /// });
+     ///
+     /// handle.assert_finished();
+@@ -620,13 +560,9 @@ impl ExpectedSpan {
+     /// [`MockCollector::enter`]: fn@crate::collector::MockCollector::enter
+     /// [`MockCollector::exit`]: fn@crate::collector::MockCollector::exit
+     /// [`MockCollector::new_span`]: fn@crate::collector::MockCollector::new_span
+-    pub fn with_contextual_parent(self, parent: Option<&str>) -> NewSpan {
+-        let parent = match parent {
+-            Some(name) => Parent::Contextual(name.into()),
+-            None => Parent::ContextualRoot,
+-        };
++    pub fn with_ancestry(self, ancestry: Ancestry) -> NewSpan {
+         NewSpan {
+-            parent: Some(parent),
++            ancestry: Some(ancestry),
+             span: self,
+             ..Default::default()
+         }
+@@ -769,39 +705,15 @@ impl From<ExpectedSpan> for NewSpan {
+ }
+ 
+ impl NewSpan {
+-    /// Configures this `ExpectedSpan` to expect an explicit parent
+-    /// span or to be an explicit root.
+-    ///
+-    /// For more information and examples, see the documentation on
+-    /// [`ExpectedSpan::with_explicit_parent`].
+-    ///
+-    /// [`ExpectedSpan::with_explicit_parent`]: fn@crate::span::ExpectedSpan::with_explicit_parent
+-    pub fn with_explicit_parent(self, parent: Option<&str>) -> NewSpan {
+-        let parent = match parent {
+-            Some(name) => Parent::Explicit(name.into()),
+-            None => Parent::ExplicitRoot,
+-        };
+-        NewSpan {
+-            parent: Some(parent),
+-            ..self
+-        }
+-    }
+-
+-    /// Configures this `NewSpan` to expect a
+-    /// contextually-determined parent span, or to be a contextual
+-    /// root.
++    /// Configures this `NewSpan` to expect the specified [`Ancestry`]. A
++    /// span's ancestry indicates whether it has a parent or is a root span
++    /// and whether the parent is explitly or contextually assigned.
+     ///
+     /// For more information and examples, see the documentation on
+-    /// [`ExpectedSpan::with_contextual_parent`].
+-    ///
+-    /// [`ExpectedSpan::with_contextual_parent`]: fn@crate::span::ExpectedSpan::with_contextual_parent
+-    pub fn with_contextual_parent(self, parent: Option<&str>) -> NewSpan {
+-        let parent = match parent {
+-            Some(name) => Parent::Contextual(name.into()),
+-            None => Parent::ContextualRoot,
+-        };
++    /// [`ExpectedSpan::with_ancestry`].
++    pub fn with_ancestry(self, ancestry: Ancestry) -> NewSpan {
+         NewSpan {
+-            parent: Some(parent),
++            ancestry: Some(ancestry),
+             ..self
+         }
+     }
+@@ -825,7 +737,7 @@ impl NewSpan {
+     pub(crate) fn check(
+         &mut self,
+         span: &tracing_core::span::Attributes<'_>,
+-        get_parent_name: impl FnOnce() -> Option<String>,
++        get_ancestry: impl FnOnce() -> Ancestry,
+         collector_name: &str,
+     ) {
+         let meta = span.metadata();
+@@ -837,14 +749,13 @@ impl NewSpan {
+         span.record(&mut checker);
+         checker.finish();
+ 
+-        if let Some(expected_parent) = self.parent.as_ref() {
+-            let actual_parent = get_parent_name();
+-            expected_parent.check_parent_name(
+-                actual_parent.as_deref(),
+-                span.parent().cloned(),
++        if let Some(ref expected_ancestry) = self.ancestry {
++            let actual_ancestry = get_ancestry();
++            expected_ancestry.check(
++                &actual_ancestry,
+                 format_args!("span `{}`", name),
+                 collector_name,
+-            )
++            );
+         }
+     }
+ }
+@@ -875,7 +786,7 @@ impl fmt::Debug for NewSpan {
+             s.field("target", &target);
+         }
+ 
+-        if let Some(ref parent) = self.parent {
++        if let Some(ref parent) = self.ancestry {
+             s.field("parent", &format_args!("{:?}", parent));
+         }
+ 
+diff --git a/tracing-mock/src/subscriber.rs b/tracing-mock/src/subscriber.rs
+index f9560065..07d8bb39 100644
+--- a/tracing-mock/src/subscriber.rs
++++ b/tracing-mock/src/subscriber.rs
+@@ -116,6 +116,7 @@
+ //!
+ //! [`Subscribe`]: trait@tracing_subscriber::subscribe::Subscribe
+ use crate::{
++    ancestry::{get_ancestry, Ancestry, HasAncestry},
+     collector::MockHandle,
+     event::ExpectedEvent,
+     expect::Expect,
+@@ -414,7 +415,7 @@ impl MockSubscriberBuilder {
+     ///
+     /// This function accepts `Into<NewSpan>` instead of
+     /// [`ExpectedSpan`] directly. [`NewSpan`] can be used to test
+-    /// span fields and the span parent.
++    /// span fields and the span ancestry.
+     ///
+     /// The new span doesn't need to be entered for this expectation
+     /// to succeed.
+@@ -905,8 +906,7 @@ where
+         match self.expected.lock().unwrap().pop_front() {
+             None => {}
+             Some(Expect::Event(mut expected)) => {
+-                let get_parent_name = || cx.event_span(event).map(|span| span.name().to_string());
+-                expected.check(event, get_parent_name, &self.name);
++                expected.check(event, || context_get_ancestry(event, &cx), &self.name);
+ 
+                 if let Some(expected_scope) = expected.scope_mut() {
+                     self.check_event_scope(cx.event_scope(event), expected_scope);
+@@ -937,13 +937,7 @@ where
+         let was_expected = matches!(expected.front(), Some(Expect::NewSpan(_)));
+         if was_expected {
+             if let Expect::NewSpan(mut expected) = expected.pop_front().unwrap() {
+-                let get_parent_name = || {
+-                    span.parent()
+-                        .and_then(|id| cx.span(id))
+-                        .or_else(|| cx.lookup_current())
+-                        .map(|span| span.name().to_string())
+-                };
+-                expected.check(span, get_parent_name, &self.name);
++                expected.check(span, || context_get_ancestry(span, &cx), &self.name);
+             }
+         }
+     }
+@@ -1043,6 +1037,17 @@ where
+     }
+ }
+ 
++fn context_get_ancestry<C>(item: impl HasAncestry, ctx: &Context<'_, C>) -> Ancestry
++where
++    C: Collect + for<'a> LookupSpan<'a>,
++{
++    get_ancestry(
++        item,
++        || ctx.lookup_current().map(|s| s.id()),
++        |span_id| ctx.span(span_id).map(|span| span.name()),
++    )
++}
++
+ impl fmt::Debug for MockSubscriber {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         let mut s = f.debug_struct("ExpectSubscriber");

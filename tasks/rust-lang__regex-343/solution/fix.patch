@@ -1,0 +1,198 @@
+diff --git a/regex-syntax/src/literals.rs b/regex-syntax/src/literals.rs
+index 0b89ccb..e3de167 100644
+--- a/regex-syntax/src/literals.rs
++++ b/regex-syntax/src/literals.rs
+@@ -819,7 +819,7 @@ fn repeat_range_literals<F: FnMut(&Expr, &mut Literals)>(
+             let n = cmp::min(lits.limit_size, min as usize);
+             let es = iter::repeat(e.clone()).take(n).collect();
+             f(&Concat(es), lits);
+-            if n < min as usize {
++            if n < min as usize || lits.contains_empty() {
+                 lits.cut();
+             }
+         }
+@@ -1156,8 +1156,9 @@ mod tests {
+ 
+     // Test regexes with empty assertions.
+     test_lit!(pfx_empty1, prefixes, "^a", M("a"));
+-    test_lit!(pfx_empty2, prefixes, "^abc", M("abc"));
+-    test_lit!(pfx_empty3, prefixes, "(?:^abc)|(?:^z)", M("abc"), M("z"));
++    test_lit!(pfx_empty2, prefixes, "a${2}", C("a"));
++    test_lit!(pfx_empty3, prefixes, "^abc", M("abc"));
++    test_lit!(pfx_empty4, prefixes, "(?:^abc)|(?:^z)", M("abc"), M("z"));
+ 
+     // Make sure some curious regexes have no prefixes.
+     test_lit!(pfx_nothing1, prefixes, ".");
+@@ -1306,6 +1307,7 @@ mod tests {
+ 
+     // Test regexes with empty assertions.
+     test_lit!(sfx_empty1, suffixes, "a$", M("a"));
++    test_lit!(sfx_empty2, suffixes, "${2}a", C("a"));
+ 
+     // Make sure some curious regexes have no suffixes.
+     test_lit!(sfx_nothing1, suffixes, ".");
+diff --git a/src/exec.rs b/src/exec.rs
+index d5d3bf3..68a9e18 100644
+--- a/src/exec.rs
++++ b/src/exec.rs
+@@ -850,9 +850,12 @@ impl<'c> ExecNoSync<'c> {
+         match_start: usize,
+         match_end: usize,
+     ) -> Option<(usize, usize)> {
+-        // We can't use match_end directly, because we may need to examine
+-        // one "character" after the end of a match for lookahead operators.
+-        let e = cmp::min(next_utf8(text, match_end), text.len());
++        // We can't use match_end directly, because we may need to examine one
++        // "character" after the end of a match for lookahead operators. We
++        // need to move two characters beyond the end, since some look-around
++        // operations may falsely assume a premature end of text otherwise.
++        let e = cmp::min(
++            next_utf8(text, next_utf8(text, match_end)), text.len());
+         self.captures_nfa(slots, &text[..e], match_start)
+     }
+ 
+diff --git a/src/lib.rs b/src/lib.rs
+index 2dcdad2..96cdb45 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -161,6 +161,10 @@ assert_eq!(after, "03/14/2012, 01/01/2013 and 07/05/2014");
+ # }
+ ```
+ 
++If you wish to match against whitespace in this mode, you can still use `\s`,
++`\n`, `\t`, etc. For escaping a single space character, you can use its hex
++character code `\x20` or temporarily disable the `x` flag, e.g., `(?-x: )`.
++
+ # Example: match multiple regular expressions simultaneously
+ 
+ This demonstrates how to use a `RegexSet` to match multiple (possibly
+diff --git a/src/re_builder.rs b/src/re_builder.rs
+index 3849c89..12b2515 100644
+--- a/src/re_builder.rs
++++ b/src/re_builder.rs
+@@ -115,8 +115,6 @@ impl RegexBuilder {
+     }
+ 
+     /// Set the value for the Unicode (`u`) flag.
+-    ///
+-    /// For byte based regular expressions, this is disabled by default.
+     pub fn unicode(&mut self, yes: bool) -> &mut RegexBuilder {
+         self.0.unicode = yes;
+         self
+@@ -228,8 +226,6 @@ impl RegexSetBuilder {
+     }
+ 
+     /// Set the value for the Unicode (`u`) flag.
+-    ///
+-    /// For byte based regular expressions, this is disabled by default.
+     pub fn unicode(&mut self, yes: bool) -> &mut RegexSetBuilder {
+         self.0.unicode = yes;
+         self
+diff --git a/src/re_bytes.rs b/src/re_bytes.rs
+index 27ed144..8a8550e 100644
+--- a/src/re_bytes.rs
++++ b/src/re_bytes.rs
+@@ -427,12 +427,23 @@ impl Regex {
+     /// Note that using `$2` instead of `$first` or `$1` instead of `$last`
+     /// would produce the same result. To write a literal `$` use `$$`.
+     ///
+-    /// If `$name` isn't a valid capture group (whether the name doesn't exist
+-    /// or isn't a valid index), then it is replaced with the empty string.
++    /// Sometimes the replacement string requires use of curly braces to
++    /// delineate a capture group replacement and surrounding literal text.
++    /// For example, if we wanted to join two words together with an
++    /// underscore:
+     ///
+-    /// The longest possible name is used. e.g., `$1a` looks up the capture
+-    /// group named `1a` and not the capture group at index `1`. To exert more
+-    /// precise control over the name, use braces, e.g., `${1}a`.
++    /// ```rust
++    /// # extern crate regex; use regex::bytes::Regex;
++    /// # fn main() {
++    /// let re = Regex::new(r"(?P<first>\w+)\s+(?P<second>\w+)").unwrap();
++    /// let result = re.replace(b"deep fried", &b"${first}_$second"[..]);
++    /// assert_eq!(result, &b"deep_fried"[..]);
++    /// # }
++    /// ```
++    ///
++    /// Without the curly braces, the capture group name `first_` would be
++    /// used, and since it doesn't exist, it would be replaced with the empty
++    /// string.
+     ///
+     /// Finally, sometimes you just want to replace a literal string with no
+     /// regard for capturing group expansion. This can be done by wrapping a
+@@ -778,6 +789,22 @@ impl<'t> Captures<'t> {
+     /// Returns the match associated with the capture group at index `i`. If
+     /// `i` does not correspond to a capture group, or if the capture group
+     /// did not participate in the match, then `None` is returned.
++    ///
++    /// # Examples
++    ///
++    /// Get the text of the match with a default of an empty string if this
++    /// group didn't participate in the match:
++    ///
++    /// ```rust
++    /// # use regex::bytes::Regex;
++    /// let re = Regex::new(r"[a-z]+(?:([0-9]+)|([A-Z]+))").unwrap();
++    /// let caps = re.captures(b"abc123").unwrap();
++    ///
++    /// let text1 = caps.get(1).map_or(&b""[..], |m| m.as_bytes());
++    /// let text2 = caps.get(2).map_or(&b""[..], |m| m.as_bytes());
++    /// assert_eq!(text1, &b"123"[..]);
++    /// assert_eq!(text2, &b""[..]);
++    /// ```
+     pub fn get(&self, i: usize) -> Option<Match<'t>> {
+         self.locs.pos(i).map(|(s, e)| Match::new(self.text, s, e))
+     }
+diff --git a/src/re_unicode.rs b/src/re_unicode.rs
+index 1e22275..d90be4f 100644
+--- a/src/re_unicode.rs
++++ b/src/re_unicode.rs
+@@ -501,6 +501,24 @@ impl Regex {
+     /// Note that using `$2` instead of `$first` or `$1` instead of `$last`
+     /// would produce the same result. To write a literal `$` use `$$`.
+     ///
++    /// Sometimes the replacement string requires use of curly braces to
++    /// delineate a capture group replacement and surrounding literal text.
++    /// For example, if we wanted to join two words together with an
++    /// underscore:
++    ///
++    /// ```rust
++    /// # extern crate regex; use regex::Regex;
++    /// # fn main() {
++    /// let re = Regex::new(r"(?P<first>\w+)\s+(?P<second>\w+)").unwrap();
++    /// let result = re.replace("deep fried", "${first}_$second");
++    /// assert_eq!(result, "deep_fried");
++    /// # }
++    /// ```
++    ///
++    /// Without the curly braces, the capture group name `first_` would be
++    /// used, and since it doesn't exist, it would be replaced with the empty
++    /// string.
++    ///
+     /// Finally, sometimes you just want to replace a literal string with no
+     /// regard for capturing group expansion. This can be done by wrapping a
+     /// byte string with `NoExpand`:
+@@ -916,6 +934,22 @@ impl<'t> Captures<'t> {
+     /// Returns the match associated with the capture group at index `i`. If
+     /// `i` does not correspond to a capture group, or if the capture group
+     /// did not participate in the match, then `None` is returned.
++    ///
++    /// # Examples
++    ///
++    /// Get the text of the match with a default of an empty string if this
++    /// group didn't participate in the match:
++    ///
++    /// ```rust
++    /// # use regex::Regex;
++    /// let re = Regex::new(r"[a-z]+(?:([0-9]+)|([A-Z]+))").unwrap();
++    /// let caps = re.captures("abc123").unwrap();
++    ///
++    /// let text1 = caps.get(1).map_or("", |m| m.as_str());
++    /// let text2 = caps.get(2).map_or("", |m| m.as_str());
++    /// assert_eq!(text1, "123");
++    /// assert_eq!(text2, "");
++    /// ```
+     pub fn get(&self, i: usize) -> Option<Match<'t>> {
+         self.locs.pos(i).map(|(s, e)| Match::new(self.text, s, e))
+     }

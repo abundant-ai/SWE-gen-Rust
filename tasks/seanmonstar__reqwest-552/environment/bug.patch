@@ -1,0 +1,403 @@
+diff --git a/src/async_impl/decoder.rs b/src/async_impl/decoder.rs
+index 7aa6848..1ec034e 100644
+--- a/src/async_impl/decoder.rs
++++ b/src/async_impl/decoder.rs
+@@ -142,6 +142,14 @@ impl Decoder {
+             Decoder::plain_text(body)
+         }
+     }
++
++
++    pub(crate) fn content_length(&self) -> Option<u64> {
++        match self.inner {
++            Inner::PlainText(ref body) => body.content_length(),
++            _ => None,
++        }
++    }
+ }
+ 
+ impl Stream for Decoder {
+diff --git a/src/async_impl/response.rs b/src/async_impl/response.rs
+index 0277208..9a375f9 100644
+--- a/src/async_impl/response.rs
++++ b/src/async_impl/response.rs
+@@ -2,16 +2,13 @@ use std::fmt;
+ use std::mem;
+ use std::marker::PhantomData;
+ use std::net::SocketAddr;
+-use std::borrow::Cow;
+ 
+-use encoding_rs::{Encoding, UTF_8};
+ use futures::{Async, Future, Poll, Stream};
+ use futures::stream::Concat2;
+ use http;
+ use hyper::{HeaderMap, StatusCode, Version};
+ use hyper::client::connect::HttpInfo;
+ use hyper::header::{CONTENT_LENGTH};
+-use mime::Mime;
+ use tokio::timer::Delay;
+ use serde::de::DeserializeOwned;
+ use serde_json;
+@@ -138,35 +135,6 @@ impl Response {
+         self.version
+     }
+ 
+-    /// Get the response text
+-    pub fn text(&mut self) -> impl Future<Item = String, Error = ::Error> {
+-        self.text_with_charset("utf-8")
+-    }
+-
+-    /// Get the response text given a specific encoding
+-    pub fn text_with_charset(&mut self, default_encoding: &str) -> impl Future<Item = String, Error = ::Error> {
+-        let body = mem::replace(&mut self.body, Decoder::empty());
+-        let content_type = self.headers.get(::header::CONTENT_TYPE)
+-            .and_then(|value| {
+-                value.to_str().ok()
+-            })
+-            .and_then(|value| {
+-                value.parse::<Mime>().ok()
+-            });
+-        let encoding_name = content_type
+-            .as_ref()
+-            .and_then(|mime| {
+-                mime
+-                    .get_param("charset")
+-                    .map(|charset| charset.as_str())
+-            })
+-            .unwrap_or(default_encoding);
+-        let encoding = Encoding::for_label(encoding_name.as_bytes()).unwrap_or(UTF_8);
+-        Text {
+-            concat: body.concat2(),
+-            encoding
+-        }
+-    }
+ 
+     /// Try to deserialize the response body as JSON using `serde`.
+     #[inline]
+@@ -271,7 +239,7 @@ impl<T: Into<Body>> From<http::Response<T>> for Response {
+ }
+ 
+ /// A JSON object.
+-struct Json<T> {
++pub struct Json<T> {
+     concat: Concat2<Decoder>,
+     _marker: PhantomData<T>,
+ }
+@@ -293,33 +261,6 @@ impl<T> fmt::Debug for Json<T> {
+     }
+ }
+ 
+-#[derive(Debug)]
+-struct Text {
+-    concat: Concat2<Decoder>,
+-    encoding: &'static Encoding,
+-}
+-
+-impl Future for Text {
+-    type Item = String;
+-    type Error = ::Error;
+-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+-        let bytes = try_ready!(self.concat.poll());
+-        // a block because of borrow checker
+-        {
+-            let (text, _, _) = self.encoding.decode(&bytes);
+-            match text {
+-                Cow::Owned(s) => return Ok(Async::Ready(s)),
+-                _ => (),
+-            }
+-        }
+-        unsafe {
+-            // decoding returned Cow::Borrowed, meaning these bytes
+-            // are already valid utf8
+-            Ok(Async::Ready(String::from_utf8_unchecked(bytes.to_vec())))
+-        }
+-    }
+-}
+-
+ #[derive(Debug, Clone, PartialEq)]
+ struct ResponseUrl(Url);
+ 
+diff --git a/src/response.rs b/src/response.rs
+index 8ffb43f..843c12e 100644
+--- a/src/response.rs
++++ b/src/response.rs
+@@ -3,10 +3,14 @@ use std::fmt;
+ use std::io::{self, Read};
+ use std::net::SocketAddr;
+ use std::time::Duration;
++use std::borrow::Cow;
+ 
++use encoding_rs::{Encoding, UTF_8};
+ use futures::{Async, Poll, Stream};
+ use http;
++use mime::Mime;
+ use serde::de::DeserializeOwned;
++use serde_json;
+ 
+ use cookie;
+ use client::KeepCoreThreadAlive;
+@@ -16,8 +20,8 @@ use {async_impl, StatusCode, Url, Version, wait};
+ /// A Response to a submitted `Request`.
+ pub struct Response {
+     inner: async_impl::Response,
+-    body: Option<async_impl::ReadableChunks<WaitBody>>,
+-    timeout: Option<Duration>,
++    body: async_impl::ReadableChunks<WaitBody>,
++    content_length: Option<u64>,
+     _thread_handle: KeepCoreThreadAlive,
+ }
+ 
+@@ -28,11 +32,17 @@ impl fmt::Debug for Response {
+ }
+ 
+ impl Response {
+-    pub(crate) fn new(res: async_impl::Response, timeout: Option<Duration>, thread: KeepCoreThreadAlive) -> Response {
++    pub(crate) fn new(mut res: async_impl::Response, timeout: Option<Duration>, thread: KeepCoreThreadAlive) -> Response {
++        let body = mem::replace(res.body_mut(), async_impl::Decoder::empty());
++        let len = body.content_length();
++        let body = async_impl::ReadableChunks::new(WaitBody {
++            inner: wait::stream(body, timeout)
++        });
++
+         Response {
+             inner: res,
+-            body: None,
+-            timeout,
++            body: body,
++            content_length: len,
+             _thread_handle: thread,
+         }
+     }
+@@ -202,13 +212,21 @@ impl Response {
+     /// [`serde_json::from_reader`]: https://docs.serde.rs/serde_json/fn.from_reader.html
+     #[inline]
+     pub fn json<T: DeserializeOwned>(&mut self) -> ::Result<T> {
+-        wait::timeout(self.inner.json(), self.timeout).map_err(|e| {
+-            match e {
+-                wait::Waited::TimedOut => ::error::timedout(None),
+-                wait::Waited::Executor(e) => ::error::from(e),
+-                wait::Waited::Inner(e) => e,
+-            }
+-        })
++        // There's 2 ways we could implement this:
++        //
++        // 1. Just using from_reader(self), making use of our blocking read adapter
++        // 2. Just use self.inner.json().wait()
++        //
++        // Doing 1 is pretty easy, but it means we have the `serde_json` code
++        // in more than one place, doing basically the same thing.
++        //
++        // Doing 2 would mean `serde_json` is only in one place, but we'd
++        // need to update the sync Response to lazily make a blocking read
++        // adapter, so that our `inner` could possibly still have the original
++        // body.
++        //
++        // Went for easier for now, just to get it working.
++        serde_json::from_reader(self).map_err(::error::from)
+     }
+ 
+     /// Get the response text.
+@@ -260,13 +278,38 @@ impl Response {
+     /// This consumes the body. Trying to read more, or use of `response.json()`
+     /// will return empty values.
+     pub fn text_with_charset(&mut self, default_encoding: &str) -> ::Result<String> {
+-        wait::timeout(self.inner.text_with_charset(default_encoding), self.timeout).map_err(|e| {
+-            match e {
+-                wait::Waited::TimedOut => ::error::timedout(None),
+-                wait::Waited::Executor(e) => ::error::from(e),
+-                wait::Waited::Inner(e) => e,
++        let len = self.content_length.unwrap_or(0);
++        let mut content = Vec::with_capacity(len as usize);
++        self.read_to_end(&mut content).map_err(::error::from)?;
++        let content_type = self.headers().get(::header::CONTENT_TYPE)
++            .and_then(|value| {
++                value.to_str().ok()
++            })
++            .and_then(|value| {
++                value.parse::<Mime>().ok()
++            });
++        let encoding_name = content_type
++            .as_ref()
++            .and_then(|mime| {
++                mime
++                    .get_param("charset")
++                    .map(|charset| charset.as_str())
++            })
++            .unwrap_or(default_encoding);
++        let encoding = Encoding::for_label(encoding_name.as_bytes()).unwrap_or(UTF_8);
++        // a block because of borrow checker
++        {
++            let (text, _, _) = encoding.decode(&content);
++            match text {
++                Cow::Owned(s) => return Ok(s),
++                _ => (),
+             }
+-        })
++        }
++        unsafe {
++            // decoding returned Cow::Borrowed, meaning these bytes
++            // are already valid utf8
++            Ok(String::from_utf8_unchecked(content))
++        }
+     }
+ 
+     /// Copy the response body into a writer.
+@@ -314,12 +357,12 @@ impl Response {
+     /// ```
+     #[inline]
+     pub fn error_for_status(self) -> ::Result<Self> {
+-        let Response { body, inner, timeout, _thread_handle } = self;
++        let Response { body, content_length, inner, _thread_handle } = self;
+         inner.error_for_status().map(move |inner| {
+             Response {
+                 inner,
+                 body,
+-                timeout,
++                content_length,
+                 _thread_handle,
+             }
+         })
+@@ -350,17 +393,7 @@ impl Response {
+ impl Read for Response {
+     #[inline]
+     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+-        if self.body.is_none() {
+-            let body = mem::replace(self.inner.body_mut(), async_impl::Decoder::empty());
+-            let body = async_impl::ReadableChunks::new(WaitBody {
+-                inner: wait::stream(body, self.timeout)
+-            });
+-            self.body = Some(body);
+-        }
+-        let mut body = self.body.take().unwrap();
+-        let bytes = body.read(buf);
+-        self.body = Some(body);
+-        bytes
++        self.body.read(buf)
+     }
+ }
+ 
+diff --git a/tests/async.rs b/tests/async.rs
+index f39678f..ecbd681 100644
+--- a/tests/async.rs
++++ b/tests/async.rs
+@@ -29,78 +29,6 @@ fn gzip_single_byte_chunks() {
+     gzip_case(10, 1);
+ }
+ 
+-#[test]
+-fn response_text() {
+-    let _ = env_logger::try_init();
+-
+-    let server = server! {
+-        request: b"\
+-            GET /text HTTP/1.1\r\n\
+-            user-agent: $USERAGENT\r\n\
+-            accept: */*\r\n\
+-            accept-encoding: gzip\r\n\
+-            host: $HOST\r\n\
+-            \r\n\
+-            ",
+-        response: b"\
+-            HTTP/1.1 200 OK\r\n\
+-            Content-Length: 5\r\n\
+-            \r\n\
+-            Hello\
+-            "
+-    };
+-
+-    let mut rt = Runtime::new().expect("new rt");
+-
+-    let client = Client::new();
+-
+-    let res_future = client.get(&format!("http://{}/text", server.addr()))
+-        .send()
+-        .and_then(|mut res| res.text())
+-        .and_then(|text| {
+-            assert_eq!("Hello", text);
+-            Ok(())
+-        });
+-
+-    rt.block_on(res_future).unwrap();
+-}
+-
+-#[test]
+-fn response_json() {
+-    let _ = env_logger::try_init();
+-
+-    let server = server! {
+-        request: b"\
+-            GET /json HTTP/1.1\r\n\
+-            user-agent: $USERAGENT\r\n\
+-            accept: */*\r\n\
+-            accept-encoding: gzip\r\n\
+-            host: $HOST\r\n\
+-            \r\n\
+-            ",
+-        response: b"\
+-            HTTP/1.1 200 OK\r\n\
+-            Content-Length: 7\r\n\
+-            \r\n\
+-            \"Hello\"\
+-            "
+-    };
+-
+-    let mut rt = Runtime::new().expect("new rt");
+-
+-    let client = Client::new();
+-
+-    let res_future = client.get(&format!("http://{}/json", server.addr()))
+-        .send()
+-        .and_then(|mut res| res.json::<String>())
+-        .and_then(|text| {
+-            assert_eq!("Hello", text);
+-            Ok(())
+-        });
+-
+-    rt.block_on(res_future).unwrap();
+-}
+-
+ #[test]
+ fn multipart() {
+     let _ = env_logger::try_init();
+diff --git a/tests/client.rs b/tests/client.rs
+index 084c381..08c8d05 100644
+--- a/tests/client.rs
++++ b/tests/client.rs
+@@ -69,37 +69,6 @@ fn test_response_non_utf_8_text() {
+     assert_eq!(b"\xe4\xbd\xa0\xe5\xa5\xbd", body.as_bytes());  // Now it's utf-8
+ }
+ 
+-#[test]
+-fn test_response_json() {
+-    let server = server! {
+-        request: b"\
+-            GET /json HTTP/1.1\r\n\
+-            user-agent: $USERAGENT\r\n\
+-            accept: */*\r\n\
+-            accept-encoding: gzip\r\n\
+-            host: $HOST\r\n\
+-            \r\n\
+-            ",
+-        response: b"\
+-            HTTP/1.1 200 OK\r\n\
+-            Server: test\r\n\
+-            Content-Length: 7\r\n\
+-            \r\n\
+-            \"Hello\"\
+-            "
+-    };
+-
+-    let url = format!("http://{}/json", server.addr());
+-    let mut res = reqwest::get(&url).unwrap();
+-    assert_eq!(res.url().as_str(), &url);
+-    assert_eq!(res.status(), reqwest::StatusCode::OK);
+-    assert_eq!(res.headers().get(reqwest::header::SERVER).unwrap(), &"test");
+-    assert_eq!(res.headers().get(reqwest::header::CONTENT_LENGTH).unwrap(), &"7");
+-
+-    let body = res.json::<String>().unwrap();
+-    assert_eq!("Hello", body);
+-}
+-
+ #[test]
+ fn test_response_copy_to() {
+     let server = server! {

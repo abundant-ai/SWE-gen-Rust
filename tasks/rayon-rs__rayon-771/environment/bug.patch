@@ -1,0 +1,254 @@
+diff --git a/src/range.rs b/src/range.rs
+index 09ba25e..f3b0c51 100644
+--- a/src/range.rs
++++ b/src/range.rs
+@@ -18,7 +18,6 @@
+ 
+ use crate::iter::plumbing::*;
+ use crate::iter::*;
+-use std::char;
+ use std::ops::Range;
+ use std::usize;
+ 
+@@ -224,75 +223,6 @@ unindexed_range_impl! {i64, u64}
+ unindexed_range_impl! {u128, u128}
+ unindexed_range_impl! {i128, u128}
+ 
+-// char is special because of the surrogate range hole
+-macro_rules! convert_char {
+-    ( $self:ident . $method:ident ( $( $arg:expr ),* ) ) => {{
+-        let start = $self.range.start as u32;
+-        let end = $self.range.end as u32;
+-        if start < 0xD800 && 0xE000 < end {
+-            // chain the before and after surrogate range fragments
+-            (start..0xD800)
+-                .into_par_iter()
+-                .chain(0xE000..end)
+-                .map(|codepoint| unsafe { char::from_u32_unchecked(codepoint) })
+-                .$method($( $arg ),*)
+-        } else {
+-            // no surrogate range to worry about
+-            (start..end)
+-                .into_par_iter()
+-                .map(|codepoint| unsafe { char::from_u32_unchecked(codepoint) })
+-                .$method($( $arg ),*)
+-        }
+-    }};
+-}
+-
+-impl ParallelIterator for Iter<char> {
+-    type Item = char;
+-
+-    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+-    where
+-        C: UnindexedConsumer<Self::Item>,
+-    {
+-        convert_char!(self.drive(consumer))
+-    }
+-
+-    fn opt_len(&self) -> Option<usize> {
+-        Some(self.len())
+-    }
+-}
+-
+-impl IndexedParallelIterator for Iter<char> {
+-    // Split at the surrogate range first if we're allowed to
+-    fn drive<C>(self, consumer: C) -> C::Result
+-    where
+-        C: Consumer<Self::Item>,
+-    {
+-        convert_char!(self.drive(consumer))
+-    }
+-
+-    fn len(&self) -> usize {
+-        // Taken from <char as Step>::steps_between
+-        let start = self.range.start as u32;
+-        let end = self.range.end as u32;
+-        if start < end {
+-            let mut count = end - start;
+-            if start < 0xD800 && 0xE000 <= end {
+-                count -= 0x800
+-            }
+-            count as usize
+-        } else {
+-            0
+-        }
+-    }
+-
+-    fn with_producer<CB>(self, callback: CB) -> CB::Output
+-    where
+-        CB: ProducerCallback<Self::Item>,
+-    {
+-        convert_char!(self.with_producer(callback))
+-    }
+-}
+-
+ #[test]
+ fn check_range_split_at_overflow() {
+     // Note, this split index overflows i8!
+diff --git a/src/range_inclusive.rs b/src/range_inclusive.rs
+index c802b6c..c175770 100644
+--- a/src/range_inclusive.rs
++++ b/src/range_inclusive.rs
+@@ -18,7 +18,6 @@
+ 
+ use crate::iter::plumbing::*;
+ use crate::iter::*;
+-use std::char;
+ use std::ops::RangeInclusive;
+ 
+ /// Parallel iterator over an inclusive range, implemented for all integer types.
+@@ -49,8 +48,7 @@ pub struct Iter<T> {
+ 
+ impl<T> Iter<T>
+ where
+-    RangeInclusive<T>: Eq,
+-    T: Ord + Copy,
++    RangeInclusive<T>: Clone + Iterator<Item = T> + DoubleEndedIterator,
+ {
+     /// Returns `Some((start, end))` for `start..=end`, or `None` if it is exhausted.
+     ///
+@@ -58,16 +56,7 @@ where
+     /// so this is a way for us to figure out what we've got.  Thankfully, all of the
+     /// integer types we care about can be trivially cloned.
+     fn bounds(&self) -> Option<(T, T)> {
+-        let start = *self.range.start();
+-        let end = *self.range.end();
+-        if start <= end && self.range == (start..=end) {
+-            // If the range is still nonempty, this is obviously true
+-            // If the range is exhausted, either start > end or
+-            // the range does not equal start..=end.
+-            Some((start, end))
+-        } else {
+-            None
+-        }
++        Some((self.range.clone().next()?, self.range.clone().next_back()?))
+     }
+ }
+ 
+@@ -158,80 +147,6 @@ parallel_range_impl! {i64}
+ parallel_range_impl! {u128}
+ parallel_range_impl! {i128}
+ 
+-// char is special
+-macro_rules! convert_char {
+-    ( $self:ident . $method:ident ( $( $arg:expr ),* ) ) => {
+-        if let Some((start, end)) = $self.bounds() {
+-            let start = start as u32;
+-            let end = end as u32;
+-            if start < 0xD800 && 0xE000 <= end {
+-                // chain the before and after surrogate range fragments
+-                (start..0xD800)
+-                    .into_par_iter()
+-                    .chain(0xE000..end + 1) // cannot use RangeInclusive, so add one to end
+-                    .map(|codepoint| unsafe { char::from_u32_unchecked(codepoint) })
+-                    .$method($( $arg ),*)
+-            } else {
+-                // no surrogate range to worry about
+-                (start..end + 1) // cannot use RangeInclusive, so add one to end
+-                    .into_par_iter()
+-                    .map(|codepoint| unsafe { char::from_u32_unchecked(codepoint) })
+-                    .$method($( $arg ),*)
+-            }
+-        } else {
+-            empty().into_par_iter().$method($( $arg ),*)
+-        }
+-    };
+-}
+-
+-impl ParallelIterator for Iter<char> {
+-    type Item = char;
+-
+-    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+-    where
+-        C: UnindexedConsumer<Self::Item>,
+-    {
+-        convert_char!(self.drive(consumer))
+-    }
+-
+-    fn opt_len(&self) -> Option<usize> {
+-        Some(self.len())
+-    }
+-}
+-
+-// Range<u32> is broken on 16 bit platforms, may as well benefit from it
+-impl IndexedParallelIterator for Iter<char> {
+-    // Split at the surrogate range first if we're allowed to
+-    fn drive<C>(self, consumer: C) -> C::Result
+-    where
+-        C: Consumer<Self::Item>,
+-    {
+-        convert_char!(self.drive(consumer))
+-    }
+-
+-    fn len(&self) -> usize {
+-        if let Some((start, end)) = self.bounds() {
+-            // Taken from <char as Step>::steps_between
+-            let start = start as u32;
+-            let end = end as u32;
+-            let mut count = end - start;
+-            if start < 0xD800 && 0xE000 <= end {
+-                count -= 0x800
+-            }
+-            (count + 1) as usize // add one for inclusive
+-        } else {
+-            0
+-        }
+-    }
+-
+-    fn with_producer<CB>(self, callback: CB) -> CB::Output
+-    where
+-        CB: ProducerCallback<Self::Item>,
+-    {
+-        convert_char!(self.with_producer(callback))
+-    }
+-}
+-
+ #[test]
+ #[cfg(target_pointer_width = "64")]
+ fn test_u32_opt_len() {
+diff --git a/tests/chars.rs b/tests/chars.rs
+deleted file mode 100644
+index ac8e3f3..0000000
+--- a/tests/chars.rs
++++ /dev/null
+@@ -1,39 +0,0 @@
+-use rayon::prelude::*;
+-use std::char;
+-
+-#[test]
+-fn half_open_correctness() {
+-    let low = char::from_u32(0xD800 - 0x7).unwrap();
+-    let high = char::from_u32(0xE000 + 0x7).unwrap();
+-
+-    let range = low..high;
+-    let mut chars: Vec<char> = range.into_par_iter().collect();
+-    chars.sort();
+-
+-    assert_eq!(
+-        chars,
+-        vec![
+-            '\u{D7F9}', '\u{D7FA}', '\u{D7FB}', '\u{D7FC}', '\u{D7FD}', '\u{D7FE}', '\u{D7FF}',
+-            '\u{E000}', '\u{E001}', '\u{E002}', '\u{E003}', '\u{E004}', '\u{E005}', '\u{E006}',
+-        ]
+-    );
+-}
+-
+-#[test]
+-fn closed_correctness() {
+-    let low = char::from_u32(0xD800 - 0x7).unwrap();
+-    let high = char::from_u32(0xE000 + 0x7).unwrap();
+-
+-    let range = low..=high;
+-    let mut chars: Vec<char> = range.into_par_iter().collect();
+-    chars.sort();
+-
+-    assert_eq!(
+-        chars,
+-        vec![
+-            '\u{D7F9}', '\u{D7FA}', '\u{D7FB}', '\u{D7FC}', '\u{D7FD}', '\u{D7FE}', '\u{D7FF}',
+-            '\u{E000}', '\u{E001}', '\u{E002}', '\u{E003}', '\u{E004}', '\u{E005}', '\u{E006}',
+-            '\u{E007}',
+-        ]
+-    );
+-}

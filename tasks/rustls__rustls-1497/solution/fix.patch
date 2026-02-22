@@ -1,0 +1,260 @@
+diff --git a/provider-example/src/aead.rs b/provider-example/src/aead.rs
+index 0515cbbc..2c9d4104 100644
+--- a/provider-example/src/aead.rs
++++ b/provider-example/src/aead.rs
+@@ -1,5 +1,5 @@
+ use chacha20poly1305::{AeadInPlace, KeyInit, KeySizeUser};
+-use rustls::crypto::cipher::{self, AeadKey, Iv, UnsupportedOperationError};
++use rustls::crypto::cipher::{self, AeadKey, Iv, UnsupportedOperationError, NONCE_LEN};
+ use rustls::{ConnectionTrafficSecrets, ContentType, ProtocolVersion};
+ 
+ pub struct Chacha20Poly1305;
+@@ -28,10 +28,6 @@ impl cipher::Tls13AeadAlgorithm for Chacha20Poly1305 {
+         key: AeadKey,
+         iv: Iv,
+     ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
+-        let (key, iv) = (
+-            ConnectionTrafficSecrets::slice_to_array(key.as_ref()),
+-            ConnectionTrafficSecrets::slice_to_array(iv.as_ref()),
+-        );
+         Ok(ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv })
+     }
+ }
+@@ -70,11 +66,12 @@ impl cipher::Tls12AeadAlgorithm for Chacha20Poly1305 {
+         iv: &[u8],
+         _explicit: &[u8],
+     ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
+-        let (key, iv) = (
+-            ConnectionTrafficSecrets::slice_to_array(key.as_ref()),
+-            ConnectionTrafficSecrets::slice_to_array(iv),
+-        );
+-        Ok(ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv })
++        // This should always be true because KeyBlockShape and the Iv nonce len are in agreement.
++        debug_assert_eq!(NONCE_LEN, iv.len());
++        Ok(ConnectionTrafficSecrets::Chacha20Poly1305 {
++            key,
++            iv: Iv::new(iv[..].try_into().unwrap()),
++        })
+     }
+ }
+ 
+diff --git a/rustls/src/crypto/ring/tls12.rs b/rustls/src/crypto/ring/tls12.rs
+index 859d1ff6..09d23dbd 100644
+--- a/rustls/src/crypto/ring/tls12.rs
++++ b/rustls/src/crypto/ring/tls12.rs
+@@ -132,24 +132,9 @@ impl Tls12AeadAlgorithm for GcmAlgorithm {
+         write_iv: &[u8],
+         explicit: &[u8],
+     ) -> Box<dyn MessageEncrypter> {
+-        debug_assert_eq!(write_iv.len(), 4);
+-        debug_assert_eq!(explicit.len(), 8);
+-
+         let enc_key =
+             aead::LessSafeKey::new(aead::UnboundKey::new(self.0, enc_key.as_ref()).unwrap());
+-
+-        // The GCM nonce is constructed from a 32-bit 'salt' derived
+-        // from the master-secret, and a 64-bit explicit part,
+-        // with no specified construction.  Thanks for that.
+-        //
+-        // We use the same construction as TLS1.3/ChaCha20Poly1305:
+-        // a starting point extracted from the key block, xored with
+-        // the sequence number.
+-        let mut iv = [0; NONCE_LEN];
+-        iv[..4].copy_from_slice(write_iv);
+-        iv[4..].copy_from_slice(explicit);
+-        let iv = Iv::new(iv);
+-
++        let iv = gcm_iv(write_iv, explicit);
+         Box::new(GcmMessageEncrypter { enc_key, iv })
+     }
+ 
+@@ -164,23 +149,12 @@ impl Tls12AeadAlgorithm for GcmAlgorithm {
+     fn extract_keys(
+         &self,
+         key: AeadKey,
+-        iv: &[u8],
++        write_iv: &[u8],
+         explicit: &[u8],
+     ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
+-        Ok(match key.as_ref().len() {
+-            16 => {
+-                // nb. "fixed IV" becomes the GCM nonce "salt"
+-                let (key, salt, iv) =
+-                    ConnectionTrafficSecrets::slices_to_arrays(key.as_ref(), iv, explicit);
+-                ConnectionTrafficSecrets::Aes128Gcm { key, salt, iv }
+-            }
+-            32 => {
+-                // nb. "fixed IV" becomes the GCM nonce "salt"
+-                let (key, salt, iv) =
+-                    ConnectionTrafficSecrets::slices_to_arrays(key.as_ref(), iv, explicit);
+-                ConnectionTrafficSecrets::Aes256Gcm { key, salt, iv }
+-            }
+-            _ => unreachable!(),
++        Ok(ConnectionTrafficSecrets::Aes128Gcm {
++            key,
++            iv: gcm_iv(write_iv, explicit),
+         })
+     }
+ }
+@@ -222,11 +196,12 @@ impl Tls12AeadAlgorithm for ChaCha20Poly1305 {
+         iv: &[u8],
+         _explicit: &[u8],
+     ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
+-        let (key, iv) = (
+-            ConnectionTrafficSecrets::slice_to_array(key.as_ref()),
+-            ConnectionTrafficSecrets::slice_to_array(iv),
+-        );
+-        Ok(ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv })
++        // This should always be true because KeyBlockShape and the Iv nonce len are in agreement.
++        debug_assert_eq!(aead::NONCE_LEN, iv.len());
++        Ok(ConnectionTrafficSecrets::Chacha20Poly1305 {
++            key,
++            iv: Iv::new(iv[..].try_into().unwrap()),
++        })
+     }
+ }
+ 
+@@ -367,3 +342,21 @@ impl MessageEncrypter for ChaCha20Poly1305MessageEncrypter {
+         Ok(OpaqueMessage::new(msg.typ, msg.version, buf))
+     }
+ }
++
++fn gcm_iv(write_iv: &[u8], explicit: &[u8]) -> Iv {
++    debug_assert_eq!(write_iv.len(), 4);
++    debug_assert_eq!(explicit.len(), 8);
++
++    // The GCM nonce is constructed from a 32-bit 'salt' derived
++    // from the master-secret, and a 64-bit explicit part,
++    // with no specified construction.  Thanks for that.
++    //
++    // We use the same construction as TLS1.3/ChaCha20Poly1305:
++    // a starting point extracted from the key block, xored with
++    // the sequence number.
++    let mut iv = [0; NONCE_LEN];
++    iv[..4].copy_from_slice(write_iv);
++    iv[4..].copy_from_slice(explicit);
++
++    Iv::new(iv)
++}
+diff --git a/rustls/src/crypto/ring/tls13.rs b/rustls/src/crypto/ring/tls13.rs
+index 2a77b0f1..5349f14f 100644
+--- a/rustls/src/crypto/ring/tls13.rs
++++ b/rustls/src/crypto/ring/tls13.rs
+@@ -86,10 +86,6 @@ impl Tls13AeadAlgorithm for Chacha20Poly1305Aead {
+         key: AeadKey,
+         iv: Iv,
+     ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
+-        let (key, iv) = (
+-            ConnectionTrafficSecrets::slice_to_array(key.as_ref()),
+-            ConnectionTrafficSecrets::slice_to_array(iv.as_ref()),
+-        );
+         Ok(ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv })
+     }
+ }
+@@ -114,10 +110,7 @@ impl Tls13AeadAlgorithm for Aes256GcmAead {
+         key: AeadKey,
+         iv: Iv,
+     ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
+-        let iv = iv.as_ref();
+-        let (key, salt, iv) =
+-            ConnectionTrafficSecrets::slices_to_arrays(key.as_ref(), &iv[..4], &iv[4..]);
+-        Ok(ConnectionTrafficSecrets::Aes256Gcm { key, salt, iv })
++        Ok(ConnectionTrafficSecrets::Aes256Gcm { key, iv })
+     }
+ }
+ 
+@@ -141,10 +134,7 @@ impl Tls13AeadAlgorithm for Aes128GcmAead {
+         key: AeadKey,
+         iv: Iv,
+     ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
+-        let iv = iv.as_ref();
+-        let (key, salt, iv) =
+-            ConnectionTrafficSecrets::slices_to_arrays(key.as_ref(), &iv[..4], &iv[4..]);
+-        Ok(ConnectionTrafficSecrets::Aes128Gcm { key, salt, iv })
++        Ok(ConnectionTrafficSecrets::Aes128Gcm { key, iv })
+     }
+ }
+ 
+diff --git a/rustls/src/suites.rs b/rustls/src/suites.rs
+index 6915ecf5..fd591a9e 100644
+--- a/rustls/src/suites.rs
++++ b/rustls/src/suites.rs
+@@ -1,6 +1,7 @@
+ use core::fmt;
+ 
+ use crate::crypto;
++use crate::crypto::cipher::{AeadKey, Iv};
+ use crate::enums::{CipherSuite, ProtocolVersion, SignatureAlgorithm, SignatureScheme};
+ #[cfg(feature = "tls12")]
+ use crate::tls12::Tls12CipherSuite;
+@@ -186,58 +187,29 @@ pub(crate) struct PartiallyExtractedSecrets {
+ pub enum ConnectionTrafficSecrets {
+     /// Secrets for the AES_128_GCM AEAD algorithm
+     Aes128Gcm {
+-        /// key (16 bytes)
+-        key: [u8; 16],
+-        /// salt (4 bytes)
+-        salt: [u8; 4],
+-        /// initialization vector (8 bytes, chopped from key block)
+-        iv: [u8; 8],
++        /// AEAD Key
++        key: AeadKey,
++        /// Initialization vector
++        iv: Iv,
+     },
+ 
+     /// Secrets for the AES_256_GCM AEAD algorithm
+     Aes256Gcm {
+-        /// key (32 bytes)
+-        key: [u8; 32],
+-        /// salt (4 bytes)
+-        salt: [u8; 4],
+-        /// initialization vector (8 bytes, chopped from key block)
+-        iv: [u8; 8],
++        /// AEAD Key
++        key: AeadKey,
++        /// Initialization vector
++        iv: Iv,
+     },
+ 
+     /// Secrets for the CHACHA20_POLY1305 AEAD algorithm
+     Chacha20Poly1305 {
+-        /// key (32 bytes)
+-        key: [u8; 32],
+-        /// initialization vector (12 bytes)
+-        iv: [u8; 12],
++        /// AEAD Key
++        key: AeadKey,
++        /// Initialization vector
++        iv: Iv,
+     },
+ }
+ 
+-impl ConnectionTrafficSecrets {
+-    /// Convert three slices to three fixed sized arrays, panicking if any slice is not the correct
+-    /// constant size length.
+-    pub fn slices_to_arrays<const NK: usize, const NS: usize, const NI: usize>(
+-        k: &[u8],
+-        s: &[u8],
+-        i: &[u8],
+-    ) -> ([u8; NK], [u8; NS], [u8; NI]) {
+-        (
+-            Self::slice_to_array(k),
+-            Self::slice_to_array(s),
+-            Self::slice_to_array(i),
+-        )
+-    }
+-
+-    /// Convert a slice to a fixed sized array, panicking if the slice is not the correct
+-    /// constant size length.
+-    pub fn slice_to_array<const N: usize>(slice: &[u8]) -> [u8; N] {
+-        // this is guaranteed true because `ConnectionTrafficSecrets` items and
+-        // call-site `TlsXXAeadAlgorithm` impl `key_len()`s are in agreement.
+-        debug_assert_eq!(N, slice.len());
+-        slice.try_into().unwrap()
+-    }
+-}
+-
+ #[cfg(all(test, feature = "ring"))]
+ mod tests {
+     use super::crypto::ring::tls13::*;

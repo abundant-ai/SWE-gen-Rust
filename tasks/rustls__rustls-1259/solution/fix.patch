@@ -1,0 +1,573 @@
+diff --git a/rustls/examples/internal/bench.rs b/rustls/examples/internal/bench.rs
+index 77c647d4..357ccecc 100644
+--- a/rustls/examples/internal/bench.rs
++++ b/rustls/examples/internal/bench.rs
+@@ -11,7 +11,7 @@ use std::ops::DerefMut;
+ use std::sync::Arc;
+ use std::time::{Duration, Instant};
+ 
+-use rustls::client::{ClientSessionMemoryCache, NoClientSessionStorage};
++use rustls::client::Resumption;
+ use rustls::server::{
+     AllowAnyAuthenticatedClient, NoClientAuth, NoServerSessionStorage, ServerSessionMemoryCache,
+ };
+@@ -127,13 +127,13 @@ enum ClientAuth {
+ }
+ 
+ #[derive(PartialEq, Clone, Copy)]
+-enum Resumption {
++enum ResumptionParam {
+     No,
+     SessionID,
+     Tickets,
+ }
+ 
+-impl Resumption {
++impl ResumptionParam {
+     fn label(&self) -> &'static str {
+         match *self {
+             Self::No => "no-resume",
+@@ -294,7 +294,7 @@ impl KeyType {
+ fn make_server_config(
+     params: &BenchmarkParam,
+     client_auth: ClientAuth,
+-    resume: Resumption,
++    resume: ResumptionParam,
+     max_fragment_size: Option<usize>,
+ ) -> ServerConfig {
+     let client_auth = match client_auth {
+@@ -318,9 +318,9 @@ fn make_server_config(
+         .with_single_cert(params.key_type.get_chain(), params.key_type.get_key())
+         .expect("bad certs/private key?");
+ 
+-    if resume == Resumption::SessionID {
++    if resume == ResumptionParam::SessionID {
+         cfg.session_storage = ServerSessionMemoryCache::new(128);
+-    } else if resume == Resumption::Tickets {
++    } else if resume == ResumptionParam::Tickets {
+         cfg.ticketer = Ticketer::new().unwrap();
+     } else {
+         cfg.session_storage = Arc::new(NoServerSessionStorage {});
+@@ -333,7 +333,7 @@ fn make_server_config(
+ fn make_client_config(
+     params: &BenchmarkParam,
+     clientauth: ClientAuth,
+-    resume: Resumption,
++    resume: ResumptionParam,
+ ) -> ClientConfig {
+     let mut root_store = RootCertStore::empty();
+     let mut rootbuf =
+@@ -357,10 +357,10 @@ fn make_client_config(
+         cfg.with_no_client_auth()
+     };
+ 
+-    if resume != Resumption::No {
+-        cfg.session_storage = ClientSessionMemoryCache::new(128);
++    if resume != ResumptionParam::No {
++        cfg.resumption = Resumption::in_memory_sessions(128);
+     } else {
+-        cfg.session_storage = Arc::new(NoClientSessionStorage {});
++        cfg.resumption = Resumption::disabled();
+     }
+ 
+     cfg
+@@ -377,13 +377,17 @@ fn apply_work_multiplier(work: u64) -> u64 {
+     ((work as f64) * mul).round() as u64
+ }
+ 
+-fn bench_handshake(params: &BenchmarkParam, clientauth: ClientAuth, resume: Resumption) {
++fn bench_handshake(params: &BenchmarkParam, clientauth: ClientAuth, resume: ResumptionParam) {
+     let client_config = Arc::new(make_client_config(params, clientauth, resume));
+     let server_config = Arc::new(make_server_config(params, clientauth, resume, None));
+ 
+     assert!(params.ciphersuite.version() == params.version);
+ 
+-    let rounds = apply_work_multiplier(if resume == Resumption::No { 512 } else { 4096 });
++    let rounds = apply_work_multiplier(if resume == ResumptionParam::No {
++        512
++    } else {
++        4096
++    });
+     let mut client_time = 0f64;
+     let mut server_time = 0f64;
+ 
+@@ -449,11 +453,15 @@ fn do_handshake(client: &mut ClientConnection, server: &mut ServerConnection) {
+ }
+ 
+ fn bench_bulk(params: &BenchmarkParam, plaintext_size: u64, max_fragment_size: Option<usize>) {
+-    let client_config = Arc::new(make_client_config(params, ClientAuth::No, Resumption::No));
++    let client_config = Arc::new(make_client_config(
++        params,
++        ClientAuth::No,
++        ResumptionParam::No,
++    ));
+     let server_config = Arc::new(make_server_config(
+         params,
+         ClientAuth::No,
+-        Resumption::No,
++        ResumptionParam::No,
+         max_fragment_size,
+     ));
+ 
+@@ -509,11 +517,15 @@ fn bench_bulk(params: &BenchmarkParam, plaintext_size: u64, max_fragment_size: O
+ }
+ 
+ fn bench_memory(params: &BenchmarkParam, conn_count: u64) {
+-    let client_config = Arc::new(make_client_config(params, ClientAuth::No, Resumption::No));
++    let client_config = Arc::new(make_client_config(
++        params,
++        ClientAuth::No,
++        ResumptionParam::No,
++    ));
+     let server_config = Arc::new(make_server_config(
+         params,
+         ClientAuth::No,
+-        Resumption::No,
++        ResumptionParam::No,
+         None,
+     ));
+ 
+@@ -599,11 +611,11 @@ fn selected_tests(mut args: env::Args) {
+         "handshake" | "handshake-resume" | "handshake-ticket" => match args.next() {
+             Some(suite) => {
+                 let resume = if mode == "handshake" {
+-                    Resumption::No
++                    ResumptionParam::No
+                 } else if mode == "handshake-resume" {
+-                    Resumption::SessionID
++                    ResumptionParam::SessionID
+                 } else {
+-                    Resumption::Tickets
++                    ResumptionParam::Tickets
+                 };
+ 
+                 for param in lookup_matching_benches(&suite).iter() {
+@@ -643,12 +655,12 @@ fn all_tests() {
+     for test in ALL_BENCHMARKS.iter() {
+         bench_bulk(test, 1024 * 1024, None);
+         bench_bulk(test, 1024 * 1024, Some(10000));
+-        bench_handshake(test, ClientAuth::No, Resumption::No);
+-        bench_handshake(test, ClientAuth::Yes, Resumption::No);
+-        bench_handshake(test, ClientAuth::No, Resumption::SessionID);
+-        bench_handshake(test, ClientAuth::Yes, Resumption::SessionID);
+-        bench_handshake(test, ClientAuth::No, Resumption::Tickets);
+-        bench_handshake(test, ClientAuth::Yes, Resumption::Tickets);
++        bench_handshake(test, ClientAuth::No, ResumptionParam::No);
++        bench_handshake(test, ClientAuth::Yes, ResumptionParam::No);
++        bench_handshake(test, ClientAuth::No, ResumptionParam::SessionID);
++        bench_handshake(test, ClientAuth::Yes, ResumptionParam::SessionID);
++        bench_handshake(test, ClientAuth::No, ResumptionParam::Tickets);
++        bench_handshake(test, ClientAuth::Yes, ResumptionParam::Tickets);
+     }
+ }
+ 
+diff --git a/rustls/examples/internal/bogo_shim.rs b/rustls/examples/internal/bogo_shim.rs
+index a3581a37..9ff5d537 100644
+--- a/rustls/examples/internal/bogo_shim.rs
++++ b/rustls/examples/internal/bogo_shim.rs
+@@ -4,7 +4,9 @@
+ // https://boringssl.googlesource.com/boringssl/+/master/ssl/test
+ //
+ 
+-use rustls::client::{ClientConfig, ClientConnection};
++use rustls::client::{
++    ClientConfig, ClientConnection, Resumption, Tls12ClientSessionValue, Tls13ClientSessionValue,
++};
+ use rustls::internal::msgs::codec::Codec;
+ use rustls::internal::msgs::persist;
+ use rustls::server::{ClientHello, ServerConfig, ServerConnection};
+@@ -18,8 +20,9 @@ use rustls::{
+ use base64::prelude::{Engine, BASE64_STANDARD};
+ use env_logger;
+ 
++use std::collections::HashMap;
+ use std::io::{self, BufReader, Read, Write};
+-use std::sync::Arc;
++use std::sync::{Arc, Mutex};
+ use std::time::{self, SystemTime};
+ use std::{env, fs, net, process, thread};
+ 
+@@ -459,14 +462,16 @@ fn make_server_cfg(opts: &Options) -> Arc<ServerConfig> {
+ 
+ struct ClientCacheWithoutKxHints {
+     delay: u32,
+-    storage: Arc<client::ClientSessionMemoryCache>,
++    tls12_storage: Arc<Mutex<HashMap<ServerName, Tls12ClientSessionValue>>>,
++    tls13_storage: Arc<Mutex<HashMap<ServerName, Tls13ClientSessionValue>>>,
+ }
+ 
+ impl ClientCacheWithoutKxHints {
+     fn new(delay: u32) -> Arc<ClientCacheWithoutKxHints> {
+         Arc::new(ClientCacheWithoutKxHints {
+             delay,
+-            storage: client::ClientSessionMemoryCache::new(32),
++            tls12_storage: Default::default(),
++            tls13_storage: Default::default(),
+         })
+     }
+ }
+@@ -483,17 +488,25 @@ impl client::ClientSessionStore for ClientCacheWithoutKxHints {
+         mut value: client::Tls12ClientSessionValue,
+     ) {
+         value.rewind_epoch(self.delay);
+-        self.storage
+-            .set_tls12_session(server_name, value);
++        self.tls12_storage
++            .lock()
++            .unwrap()
++            .insert(server_name.clone(), value);
+     }
+ 
+     fn tls12_session(&self, server_name: &ServerName) -> Option<client::Tls12ClientSessionValue> {
+-        self.storage.tls12_session(server_name)
++        self.tls12_storage
++            .lock()
++            .unwrap()
++            .get(server_name)
++            .map(Tls12ClientSessionValue::clone)
+     }
+ 
+     fn remove_tls12_session(&self, server_name: &ServerName) {
+-        self.storage
+-            .remove_tls12_session(server_name);
++        self.tls12_storage
++            .lock()
++            .unwrap()
++            .remove(server_name);
+     }
+ 
+     fn insert_tls13_ticket(
+@@ -502,16 +515,20 @@ impl client::ClientSessionStore for ClientCacheWithoutKxHints {
+         mut value: client::Tls13ClientSessionValue,
+     ) {
+         value.rewind_epoch(self.delay);
+-        self.storage
+-            .insert_tls13_ticket(server_name, value);
++        self.tls13_storage
++            .lock()
++            .unwrap()
++            .insert(server_name.clone(), value);
+     }
+ 
+     fn take_tls13_ticket(
+         &self,
+         server_name: &ServerName,
+     ) -> Option<client::Tls13ClientSessionValue> {
+-        self.storage
+-            .take_tls13_ticket(server_name)
++        self.tls13_storage
++            .lock()
++            .unwrap()
++            .remove(server_name)
+     }
+ }
+ 
+@@ -550,8 +567,7 @@ fn make_client_cfg(opts: &Options) -> Arc<ClientConfig> {
+         });
+     }
+ 
+-    let persist = ClientCacheWithoutKxHints::new(opts.resumption_delay);
+-    cfg.session_storage = persist;
++    cfg.resumption = Resumption::store(ClientCacheWithoutKxHints::new(opts.resumption_delay));
+     cfg.enable_sni = opts.use_sni;
+     cfg.max_fragment_size = opts.max_fragment;
+ 
+diff --git a/rustls/src/client/builder.rs b/rustls/src/client/builder.rs
+index b7e3b9f1..6f5947c2 100644
+--- a/rustls/src/client/builder.rs
++++ b/rustls/src/client/builder.rs
+@@ -7,12 +7,12 @@ use crate::suites::SupportedCipherSuite;
+ use crate::verify::{self, CertificateTransparencyPolicy};
+ use crate::{anchors, key, versions};
+ 
+-use super::Tls12Resumption;
+-
+ use std::marker::PhantomData;
+ use std::sync::Arc;
+ use std::time::SystemTime;
+ 
++use super::client_conn::Resumption;
++
+ impl ConfigBuilder<ClientConfig, WantsVerifier> {
+     /// Choose how to verify client certificates.
+     pub fn with_root_certificates(
+@@ -175,10 +175,9 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
+             cipher_suites: self.state.cipher_suites,
+             kx_groups: self.state.kx_groups,
+             alpn_protocols: Vec::new(),
+-            session_storage: handy::ClientSessionMemoryCache::new(256),
++            resumption: Resumption::default(),
+             max_fragment_size: None,
+             client_auth_cert_resolver,
+-            tls12_resumption: Some(Tls12Resumption::SessionIdOrTickets),
+             versions: self.state.versions,
+             enable_sni: true,
+             verifier: self.state.verifier,
+diff --git a/rustls/src/client/client_conn.rs b/rustls/src/client/client_conn.rs
+index de2647de..6a789c77 100644
+--- a/rustls/src/client/client_conn.rs
++++ b/rustls/src/client/client_conn.rs
+@@ -17,6 +17,7 @@ use crate::versions;
+ use crate::ExtractedSecrets;
+ use crate::KeyLog;
+ 
++use super::handy::{ClientSessionMemoryCache, NoClientSessionStorage};
+ use super::hs;
+ 
+ use std::error::Error as StdError;
+@@ -116,7 +117,8 @@ pub trait ResolvesClientCert: Send + Sync {
+ /// # Defaults
+ ///
+ /// * [`ClientConfig::max_fragment_size`]: the default is `None`: TLS packets are not fragmented to a specific size.
+-/// * [`ClientConfig::session_storage`]: the default stores 256 sessions in memory.
++/// * [`ClientConfig::resumption`]: supports resumption with up to 256 server names, using session
++///    ids or tickets, with a max of eight tickets per server.
+ /// * [`ClientConfig::alpn_protocols`]: the default is empty -- no ALPN protocol is negotiated.
+ /// * [`ClientConfig::key_log`]: key material is not logged.
+ #[derive(Clone)]
+@@ -135,8 +137,8 @@ pub struct ClientConfig {
+     /// If empty, no ALPN extension is sent.
+     pub alpn_protocols: Vec<Vec<u8>>,
+ 
+-    /// How we store session data or tickets.
+-    pub session_storage: Arc<dyn ClientSessionStore>,
++    /// How and when the client can resume a previous session.
++    pub resumption: Resumption,
+ 
+     /// The maximum size of TLS message we'll emit.  If None, we don't limit TLS
+     /// message lengths except to the 2**16 limit specified in the standard.
+@@ -150,13 +152,6 @@ pub struct ClientConfig {
+     /// How to decide what client auth certificate/keys to use.
+     pub client_auth_cert_resolver: Arc<dyn ResolvesClientCert>,
+ 
+-    /// Whether to support RFC5077 tickets.  You must provide a working
+-    /// `session_storage` member for this to have any meaningful
+-    /// effect.
+-    ///
+-    /// The default is true.
+-    pub tls12_resumption: Option<Tls12Resumption>,
+-
+     /// Supported versions, in no particular order.  The default
+     /// is all supported versions.
+     pub(super) versions: versions::EnabledVersions,
+@@ -199,8 +194,8 @@ impl fmt::Debug for ClientConfig {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         f.debug_struct("ClientConfig")
+             .field("alpn_protocols", &self.alpn_protocols)
++            .field("resumption", &self.resumption)
+             .field("max_fragment_size", &self.max_fragment_size)
+-            .field("tls12_resumption", &self.tls12_resumption)
+             .field("enable_sni", &self.enable_sni)
+             .field("enable_early_data", &self.enable_early_data)
+             .finish_non_exhaustive()
+@@ -244,6 +239,73 @@ impl ClientConfig {
+     }
+ }
+ 
++/// Configuration for how/when a client is allowed to resume a previous session.
++#[derive(Clone)]
++pub struct Resumption {
++    /// How we store session data or tickets. The default is to use an in-memory
++    /// [ClientSessionMemoryCache].
++    pub(super) store: Arc<dyn ClientSessionStore>,
++
++    /// What mechanism is used for resuming a TLS 1.2 session. None, or
++    /// one of the choices from [Tls12Resumption].
++    pub(super) tls12_resumption: Option<Tls12Resumption>,
++}
++
++impl Resumption {
++    /// Create a new `Resumption` that stores data for the given number of sessions in memory.
++    ///
++    /// This is the default `Resumption` choice, and enables resuming a TLS 1.2 session with
++    /// a session id or RFC 5077 ticket.
++    pub fn in_memory_sessions(num: usize) -> Self {
++        Self {
++            store: ClientSessionMemoryCache::new(num),
++            tls12_resumption: Some(Tls12Resumption::SessionIdOrTickets),
++        }
++    }
++
++    /// Use a custom [`ClientSessionStore`] implementation to store sessions.
++    ///
++    /// By default, enables resuming a TLS 1.2 session with a session id or RFC 5077 ticket.
++    pub fn store(store: Arc<dyn ClientSessionStore>) -> Self {
++        Self {
++            store,
++            tls12_resumption: Some(Tls12Resumption::SessionIdOrTickets),
++        }
++    }
++
++    /// Disable all use of session resumption.
++    pub fn disabled() -> Self {
++        Self {
++            store: Arc::new(NoClientSessionStorage),
++            tls12_resumption: None,
++        }
++    }
++
++    /// Configure whether TLS 1.2 sessions may be resumed, and by what mechanism.
++    ///
++    /// This is meaningless if you've disabled resumption entirely.
++    pub fn tls12_resumption(mut self, tls12: Option<Tls12Resumption>) -> Self {
++        self.tls12_resumption = tls12;
++        self
++    }
++}
++
++impl fmt::Debug for Resumption {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("Resumption")
++            .field("tls12_resumption", &self.tls12_resumption)
++            .finish()
++    }
++}
++
++impl Default for Resumption {
++    /// Create an in-memory session store resumption with up to 256 server names, allowing
++    /// a TLS 1.2 session to resume with a session id or RFC 5077 ticket.
++    fn default() -> Self {
++        Self::in_memory_sessions(256)
++    }
++}
++
+ /// Encodes ways a client can know the expected name of the server.
+ ///
+ /// This currently covers knowing the DNS name of the server, but
+diff --git a/rustls/src/client/handy.rs b/rustls/src/client/handy.rs
+index c0e43519..4ed296f1 100644
+--- a/rustls/src/client/handy.rs
++++ b/rustls/src/client/handy.rs
+@@ -12,7 +12,7 @@ use std::collections::VecDeque;
+ use std::sync::{Arc, Mutex};
+ 
+ /// An implementer of `ClientSessionStore` which does nothing.
+-pub struct NoClientSessionStorage {}
++pub(super) struct NoClientSessionStorage;
+ 
+ impl client::ClientSessionStore for NoClientSessionStorage {
+     fn set_kx_hint(&self, _: &ServerName, _: NamedGroup) {}
+@@ -71,7 +71,7 @@ pub struct ClientSessionMemoryCache {
+ impl ClientSessionMemoryCache {
+     /// Make a new ClientSessionMemoryCache.  `size` is the
+     /// maximum number of stored sessions.
+-    pub fn new(size: usize) -> Arc<Self> {
++    pub(super) fn new(size: usize) -> Arc<Self> {
+         let max_servers =
+             size.saturating_add(MAX_TLS13_TICKETS_PER_SERVER - 1) / MAX_TLS13_TICKETS_PER_SERVER;
+         Arc::new(Self {
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index faa125ca..7f1861f6 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -45,14 +45,16 @@ fn find_session(
+ ) -> Option<persist::Retrieved<ClientSessionValue>> {
+     #[allow(clippy::let_and_return)]
+     let found = config
+-        .session_storage
++        .resumption
++        .store
+         .take_tls13_ticket(server_name)
+         .map(ClientSessionValue::Tls13)
+         .or_else(|| {
+             #[cfg(feature = "tls12")]
+             {
+                 config
+-                    .session_storage
++                    .resumption
++                    .store
+                     .tls12_session(server_name)
+                     .map(ClientSessionValue::Tls12)
+             }
+@@ -383,7 +385,7 @@ fn prepare_resumption<'a>(
+         Some(resuming) if !resuming.ticket().is_empty() => resuming,
+         _ => {
+             if config.supports_version(ProtocolVersion::TLSv1_3)
+-                || config.tls12_resumption == Some(Tls12Resumption::SessionIdOrTickets)
++                || config.resumption.tls12_resumption == Some(Tls12Resumption::SessionIdOrTickets)
+             {
+                 // If we don't have a ticket, request one.
+                 exts.push(ClientExtension::SessionTicket(ClientSessionTicket::Request));
+@@ -397,7 +399,7 @@ fn prepare_resumption<'a>(
+         None => {
+             // TLS 1.2; send the ticket if we have support this protocol version
+             if config.supports_version(ProtocolVersion::TLSv1_2)
+-                && config.tls12_resumption == Some(Tls12Resumption::SessionIdOrTickets)
++                && config.resumption.tls12_resumption == Some(Tls12Resumption::SessionIdOrTickets)
+             {
+                 exts.push(ClientExtension::SessionTicket(ClientSessionTicket::Offer(
+                     Payload::new(resuming.ticket()),
+diff --git a/rustls/src/client/tls12.rs b/rustls/src/client/tls12.rs
+index d8c14bcc..37a19b64 100644
+--- a/rustls/src/client/tls12.rs
++++ b/rustls/src/client/tls12.rs
+@@ -1019,7 +1019,8 @@ impl ExpectFinished {
+         );
+ 
+         self.config
+-            .session_storage
++            .resumption
++            .store
+             .set_tls12_session(&self.server_name, session_value);
+     }
+ }
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 92fa5506..e3443282 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -140,7 +140,8 @@ pub(super) fn handle_server_hello(
+ 
+     // Remember what KX group the server liked for next time.
+     config
+-        .session_storage
++        .resumption
++        .store
+         .set_kx_hint(&server_name, their_key_share.group);
+ 
+     // If we change keying when a subsequent handshake message is being joined,
+@@ -190,7 +191,8 @@ pub(super) fn initial_key_share(
+     server_name: &ServerName,
+ ) -> Result<kx::KeyExchange, Error> {
+     let group = config
+-        .session_storage
++        .resumption
++        .store
+         .kx_hint(server_name)
+         .and_then(|group| kx::KeyExchange::choose(group, &config.kx_groups))
+         .unwrap_or_else(|| {
+@@ -883,7 +885,8 @@ impl State<ClientConnectionData> for ExpectFinished {
+         /* We're now sure this server supports TLS1.3.  But if we run out of TLS1.3 tickets
+          * when connecting to it again, we definitely don't want to attempt a TLS1.2 resumption. */
+         st.config
+-            .session_storage
++            .resumption
++            .store
+             .remove_tls12_session(&st.server_name);
+ 
+         /* Now move to our application traffic keys. */
+@@ -892,7 +895,7 @@ impl State<ClientConnectionData> for ExpectFinished {
+         cx.common.start_traffic();
+ 
+         let st = ExpectTraffic {
+-            session_storage: Arc::clone(&st.config.session_storage),
++            session_storage: Arc::clone(&st.config.resumption.store),
+             server_name: st.server_name,
+             suite: st.suite,
+             transcript: st.transcript,
+diff --git a/rustls/src/lib.rs b/rustls/src/lib.rs
+index 733cad90..1316373b 100644
+--- a/rustls/src/lib.rs
++++ b/rustls/src/lib.rs
+@@ -408,9 +408,10 @@ pub mod client {
+     pub use builder::{WantsClientCert, WantsTransparencyPolicyOrClientCert};
+     pub use client_conn::{
+         ClientConfig, ClientConnection, ClientConnectionData, ClientSessionStore,
+-        InvalidDnsNameError, ResolvesClientCert, ServerName, Tls12Resumption, WriteEarlyData,
++        InvalidDnsNameError, ResolvesClientCert, Resumption, ServerName, Tls12Resumption,
++        WriteEarlyData,
+     };
+-    pub use handy::{ClientSessionMemoryCache, NoClientSessionStorage};
++    pub use handy::ClientSessionMemoryCache;
+ 
+     #[cfg(feature = "dangerous_configuration")]
+     pub use crate::verify::{

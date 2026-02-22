@@ -6,7 +6,7 @@
   </a>
 </p>
 
-> 1000 Rust tasks generated from 17 open-source GitHub repos using [SWE-gen](https://github.com/abundant-ai/SWE-gen).
+> 1000 Rust tasks generated from 23 open-source GitHub repos using [SWE-gen](https://github.com/abundant-ai/SWE-gen).
 
 ## Each task
 - is a merged GitHub PR with 2-10 source files edited

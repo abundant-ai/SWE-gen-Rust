@@ -1,0 +1,1248 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 675de4d..39c54a7 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -7,15 +7,13 @@ license = "Apache-2.0/MIT"
+ repository = "https://github.com/nikomatsakis/rayon"
+ documentation = "https://docs.rs/rayon/"
+ 
+-[workspace]
+-members = [ "rayon-demo" ]
+-
+ [dependencies]
+ rand = "0.3"
+ num_cpus = "1.2"
+ deque = "0.3.1"
+ libc = "0.2.16"
+ lazy_static = "0.2.2"
++futures = { version = "0.1.7", optional = true }
+ 
+ [dev-dependencies]
+ compiletest_rs = "0.2.1"
+@@ -26,4 +24,4 @@ rustc-serialize = "0.3"
+ [features]
+ # Unstable APIs that have not yet
+ # proven their utility.
+-unstable = []
++unstable = ["futures"]
+diff --git a/src/join/mod.rs b/src/join/mod.rs
+index 7d26139..60e06a8 100644
+--- a/src/join/mod.rs
++++ b/src/join/mod.rs
+@@ -1,4 +1,4 @@
+-use latch::{Latch, SpinLatch};
++use latch::{LatchProbe, SpinLatch};
+ #[allow(unused_imports)]
+ use log::Event::*;
+ use job::StackJob;
+diff --git a/src/latch.rs b/src/latch.rs
+index 69e8b27..4fe4086 100644
+--- a/src/latch.rs
++++ b/src/latch.rs
+@@ -27,14 +27,16 @@ use std::sync::{Mutex, Condvar};
+ /// - Once `set()` occurs, the next `probe()` *will* observe it.  This
+ ///   typically requires a seq-cst ordering. See [the "tickle-then-get-sleepy" scenario in the sleep
+ ///   README](/src/sleep/README.md#tickle-then-get-sleepy) for details.
+-pub trait Latch {
+-    /// Test if the latch is set.
+-    fn probe(&self) -> bool;
+-
++pub trait Latch: LatchProbe {
+     /// Set the latch, signalling others.
+     fn set(&self);
+ }
+ 
++pub trait LatchProbe {
++    /// Test if the latch is set.
++    fn probe(&self) -> bool;
++}
++
+ /// Spin latches are the simplest, most efficient kind, but they do
+ /// not support a `wait()` operation. They just have a boolean flag
+ /// that becomes true when `set()` is called.
+@@ -49,12 +51,14 @@ impl SpinLatch {
+     }
+ }
+ 
+-impl Latch for SpinLatch {
++impl LatchProbe for SpinLatch {
+     #[inline]
+     fn probe(&self) -> bool {
+         self.b.load(Ordering::SeqCst)
+     }
++}
+ 
++impl Latch for SpinLatch {
+     #[inline]
+     fn set(&self) {
+         self.b.store(true, Ordering::SeqCst);
+@@ -86,14 +90,16 @@ impl LockLatch {
+     }
+ }
+ 
+-impl Latch for LockLatch {
++impl LatchProbe for LockLatch {
+     #[inline]
+     fn probe(&self) -> bool {
+         // Not particularly efficient, but we don't really use this operation
+         let guard = self.m.lock().unwrap();
+         *guard
+     }
++}
+ 
++impl Latch for LockLatch {
+     #[inline]
+     fn set(&self) {
+         let mut guard = self.m.lock().unwrap();
+@@ -124,13 +130,15 @@ impl CountLatch {
+     }
+ }
+ 
+-impl Latch for CountLatch {
++impl LatchProbe for CountLatch {
+     #[inline]
+     fn probe(&self) -> bool {
+         // Need to acquire any memory reads before latch was set:
+         self.counter.load(Ordering::SeqCst) == 0
+     }
++}
+ 
++impl Latch for CountLatch {
+     /// Set the latch to true, releasing all threads who are waiting.
+     #[inline]
+     fn set(&self) {
+diff --git a/src/lib.rs b/src/lib.rs
+index 67c105d..91b2402 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -4,6 +4,8 @@
+ extern crate deque;
+ #[macro_use]
+ extern crate lazy_static;
++#[cfg(feature = "unstable")]
++extern crate futures;
+ extern crate libc;
+ extern crate num_cpus;
+ extern crate rand;
+diff --git a/src/log.rs b/src/log.rs
+index 47c6665..2c786bd 100644
+--- a/src/log.rs
++++ b/src/log.rs
+@@ -26,6 +26,19 @@ pub enum Event {
+     PoppedJob { worker: usize },
+     PoppedRhs { worker: usize },
+     LostJob { worker: usize },
++    JobCompletedOk { owner_thread: usize },
++    JobPanickedErrorStored { owner_thread: usize },
++    JobPanickedErrorNotStored { owner_thread: usize },
++    ScopeCompletePanicked { owner_thread: usize },
++    ScopeCompleteNoPanic { owner_thread: usize },
++
++    FutureExecute { state: usize },
++    FutureExecuteReady,
++    FutureExecuteNotReady,
++    FutureExecuteErr,
++    FutureInstallWaitingTask { state: usize },
++    FutureUnparkWaitingTask,
++    FutureComplete,
+ }
+ 
+ pub const DUMP_LOGS: bool = cfg!(debug_assertions);
+diff --git a/src/registry.rs b/src/registry.rs
+index 877c102..a960a94 100644
+--- a/src/registry.rs
++++ b/src/registry.rs
+@@ -2,7 +2,7 @@ use Configuration;
+ use deque;
+ use deque::{Worker, Stealer, Stolen};
+ use job::{JobRef, StackJob};
+-use latch::{Latch, CountLatch, LockLatch};
++use latch::{LatchProbe, Latch, CountLatch, LockLatch};
+ #[allow(unused_imports)]
+ use log::Event::*;
+ use rand::{self, Rng};
+@@ -144,6 +144,8 @@ impl Registry {
+     /// So long as all of the worker threads are hanging out in their
+     /// top-level loop, there is no work to be done.
+ 
++    /// Unsafe: caller asserts that injected jobs will remain valid
++    /// until they are executed.
+     pub unsafe fn inject(&self, injected_jobs: &[JobRef]) {
+         log!(InjectJobs { count: injected_jobs.len() });
+         {
+@@ -250,7 +252,7 @@ impl WorkerThread {
+     /// NULL if this is not a worker thread. This pointer is valid
+     /// anywhere on the current thread.
+     #[inline]
+-    pub unsafe fn current() -> *const WorkerThread {
++    pub fn current() -> *const WorkerThread {
+         WORKER_THREAD_STATE.with(|t| t.get())
+     }
+ 
+@@ -290,7 +292,7 @@ impl WorkerThread {
+     /// Wait until the latch is set. Try to keep busy by popping and
+     /// stealing tasks as necessary.
+     #[inline]
+-    pub unsafe fn wait_until<L: Latch>(&self, latch: &L) {
++    pub unsafe fn wait_until<L: LatchProbe + ?Sized>(&self, latch: &L) {
+         log!(WaitUntil { worker: self.index });
+         if !latch.probe() {
+             self.wait_until_cold(latch);
+@@ -298,7 +300,7 @@ impl WorkerThread {
+     }
+ 
+     #[cold]
+-    unsafe fn wait_until_cold<L: Latch>(&self, latch: &L) {
++    unsafe fn wait_until_cold<L: LatchProbe + ?Sized>(&self, latch: &L) {
+         // the code below should swallow all panics and hence never
+         // unwind; but if something does wrong, we want to abort,
+         // because otherwise other code in rayon may assume that the
+diff --git a/src/scope/future/README.md b/src/scope/future/README.md
+new file mode 100644
+index 0000000..f636faf
+--- /dev/null
++++ b/src/scope/future/README.md
+@@ -0,0 +1,267 @@
++# Future integration into Rayon
++
++## How futures work
++
++Let's start with a brief coverage of how futures work. Our example will
++be a simple chain of futures:
++
++    F_map -> F_socket
++
++Here `F_socket` is a future that maps to a TCP socket. It returns a
++`Vec<u8>` of data read from that socket. `F_map` is a future will take
++that data and do some transformation. (Note that the real futures for
++reading from sockets etc do not work in this way, this is just an
++example.)
++
++The idea of futures is that each future offers a `poll()` method. When
++`poll()` is invoked, the future will attempt to execute. Typically,
++this often involves recursively calling `poll()` on other futures. So,
++in our example, `F_map` when it starts would call `F_socket.poll()` to
++see if the data is ready. The idea is that `poll()` returns one of
++three values:
++
++- `Ok(Async::Ready(R))` -- the future has completed, here is the result `R`.
++- `Err(E)` -- the future has completed and resulted in an error `E`.
++- `Ok(Async::NotReady)` -- the future is not yet complete.
++
++The last one is the most interesting. It means that the future is
++blocked on *some event X*, typically an I/O event (i.e., we are
++waiting for more data to arrive on a TCP socket).
++
++When a future returns `NotReady`, it also has one additional job. It
++must register the "current task" (think for now of the current thread)
++to be re-awoken when the event X has occurred. For most futures, this
++job is delegated to another future: e.g., in our example, `F_map`
++invokes `F_socket.poll()`. So if `F_socket.poll()` returns not-ready,
++then it will have registered the current thread already, and hence
++`F_map` can merely propagates the `NotReady` result further up.
++
++### The current task and executor
++
++A key concept of the futures.rs library is that of an *executor*.  The
++executor is the runtime that first invokes the top-level future
++(`T_map`, in our example). This is precisely the role that Rayon
++plays. Note that in any futures system there may be many
++interoperating execturs though.
++
++Part of an executors job is to maintain some thread-local storage
++(TLS) when a future is executing. In particular, it must setup the
++"current task" (basically a unique integer, although it's an opaque
++type) as well as an "unpark object" of type
++`Arc<Unpark>`. [The `Unpark` trait][unpark] offers a single method
++(`unpark()`) which can be invoked when the task should be
++re-awoken. So `F_socket` might, for example, get the current
++`Arc<Unpark>` object and store it for use by an I/O thread. The I/O
++thread might invoke `epoll()` or `select()` or whatever and, when it
++detects the socket has more data, invoke the `unpark()` method.
++
++[unpark]: https://docs.rs/futures/0.1/futures/executor/trait.Unpark.html
++
++## Rayon's futures integration
++
++When you spawn a future of type `F` into rayon, the idea is that it is
++going to start independently executing in the thread-pool. Meanwhile,
++the `spawn_future()` method returns to you your own future (let's call
++it `F'`) that you can use to poll and monitor its progress. Internally
++within Rayon, however, we only allocate a single `Arc` to represent
++both of these things -- an `Arc<ScopeFuture<F>>`, to be precise -- and
++this `Arc` hence serves two distinct roles.
++
++The operations on `F'` (the handle returned to the user) are specified
++by the trait `ScopeFutureTrait` and are very simple. The user can
++either `poll()` the future, which is checking to see if rayon is done
++executing it yet, or `cancel()` the future. `cancel()` occurs when
++`F'` is dropped, which indicates that the user no longer has interest
++in the result.
++
++### Future reference counting
++
++Each spawned future is represents by an `Arc`. This `Arc` actually has
++some interesting structure. Each of the edges in the diagram below
++represents something that is "kept alive" by holding a ref count (in
++some way, usually via an `Arc`):
++
++      F' ---+  [ deque ] --+
++            |              |
++            v              v
++      +---> /---------------------\
++      |     | registry:           | ------> [rayon registry]
++      |     | contents: --------\ |
++      |     | | scope         | | ------> [spawning scope]
++      |     | | unpark          | | --+
++      |     | | this            | | --+ (self references)
++      |     | | ...             | |   |
++      |     | \-----------------/ |   |
++      |     \---------------------/   |
++      +-------------------------------+
++
++Let's walk through them:
++
++- The incoming edge from `F'` represents the edge from the future that was returned
++  to the caller of `spawn_future`. This ensures that the future arc will
++  not be freed so long as the caller is still interesting in looking at
++  its result.
++- The incoming edge from `[ deque ]` represents the fact that when the
++  future is enqueued into a thread-local deque (which it only
++  sometimes is), that deque holds a ref. This is done by transmuting
++  the `Arc` into a `*const Job` object (and hence the `*const`
++  logically holds the ref that was owned by the `Arc`).  When the job
++  is executed, it is transmuted back and the resulting `Arc` is
++  eventually dropped, releasing the ref.
++- The `registry` field holds onto an `Arc<Registry>` and hence keeps
++  some central registry alive. This doesn't really do much but prevent
++  the `Registry` from being dropped. In particular, this doesn't
++  prevent the threads in a registry from terminating while the future
++  is unscheduled etc (though other fields in the future do).
++- The `scope` field is a `*const Scope<'scope>`, and the idea is that
++  when the future is created one job is allocated for this future in
++  the scope. Once the future has finished executing completely (and
++  hence its data is ready), this count will be marked as
++  completed. Until this time, the scope will not terminate. This has
++  an interesting relationship to the future `F`, as the type `F` is
++  known to be valid for *at least* the call to `scope()` (i.e., we
++  know that it outlives `'scope`, though that is all we know; it may
++  have references into the stack which become invalidated once
++  `scope()` returns).
++  - All of our data of type `F` is stored in the field `spawn` (not
++    shown here). This field is always set to `None` before the scope
++    counter is decremented. See the section on lifetime safety for more
++    details.
++- The `unpark` and `self` fields both store an `Arc` which is actually
++  this same future. Thus the future has a ref count cycle (two of
++  them...) and cannot be freed until this cycle is broken. Both of
++  these fields are actually `Option<Arc<..>>` fields and will be set
++  to `None` once the future is complete, breakin the cycle and
++  allowing it to be freed when other references are dropped.
++
++### The future state machine
++
++Internally, futures go through various states, depicted here:
++
++    PARKED <----+
++    |           |
++    v           |
++    UNPARKED    |
++    |           |
++    v           |
++    EXECUTING --+
++    |   |   ^
++    |   v   |
++    |   EXECUTING_UNPARKED
++    |
++    v
++    COMPLETE
++
++When they are first created, futures begin as *PARKED*. A *PARKED*
++future is one that is waiting for something to happen. It is not
++scheduled in the deque of any thread. Even before we return from
++`spawn_future()`, however, we will transition into *UNPARKED*. An
++*UNPARKED* future is one that is waiting to be executed. It is
++enqueued in the deque of some Rayon thread and hence will execute when
++the thread gets around to it.
++
++Once the future begins to execute (it itself is a Rayon job), it
++transitions into the *EXECUTING* state. This means that it is busy
++calling `F.poll()`, basically. While it calls `poll()`, it also sets
++up its `contents.unpark` field as the current "unpark" instance. Hence
++if `F` returns `NotReady`, it will clone this `unpark` field and hold
++onto it to signal us the future is ready to execute again.
++
++For now let's assume that `F` is complete and hence readys either
++`Ok(Ready(_))` or `Err(_)`. In that case, the future can transition to
++`COMPLETE`. At this point, many bits of state that are no longer
++needed (e.g., the future itself, but also the `this` and `unpark`
++fields) are set to `None` and dropped, and the result is stored in the
++`result` field. (Moreover, we may have to signal other tasks, but that
++is discussed in a future section.)
++
++If `F` returns `Ok(Async::NotReady)`, then we would typically
++transition to the `PARKED` state and await the call to
++`unpark()`. When `unpark()` is called, it would move the future into
++the `UNPARK` state and inject it into the registry.
++
++However, due to the vagaries of thread-scheduling, it *can* happen
++that `unpark()` is called before we exit the `EXECUTING` state. For
++example, we might invoke `F.poll()`, which send the `Unpark` instance
++to the I/O thread, which detects I/O, and invokes `unpark()`, all
++before `F.poll()` has returned. In that case, the `unpark()` method
++will transition the state (atomically, of course) to
++`EXECUTING_UNPARKED`. In that case, instead of transitioning to
++`PARKED` when `F.poll()` returns, the future will simply transition
++right back to `EXECUTING` and try calling `poll()` again. This can
++repeat a few times.
++
++### Lifetime safety
++
++Of course, Rayon's signature feature is that it allows you to use a
++future `F` that includes references, so long as those references
++outlive the lifetime of the scope `'scope`. So why is this safe?
++
++The basic idea of why this is safe is as follows. The `ScopeFuture`
++struct holds a ref on the scope itself (via the field `scope`).
++Until this ref is decremented, the scope will not end (and hence
++`'scope` is still active). This ref is only decremented while the
++future transitions into the *COMPLETE* state -- so anytime before
++then, we know we don't have to worry, the references are still valid.
++
++As we transition into the *COMPLETE* state is where things get more
++interesting. You'll notice that signaling the `self.scope` job as done
++the *last* thing that happens during that transition. Importantly,
++before that is done, we drop all access that we have to the type `F`:
++that is, we store `None` into the fields that might reference values
++of type `F`. This implies that we know that, whatever happens after we
++transition into *COMPLETE*, we can't access any of the references
++found in `F` anymore.
++
++This is good, because there *are* still active refs to the
++`ScopeFuture` after we enter the *COMPLETE* state. There are two
++sources of these: unpark values and the future result.
++
++**Unpark values.** We may have given away `Arc<Unpark>` values --
++these are trait objects, but they are actually refs to our
++`ScopeFuture`. Note that `Arc<Unpark>: 'static`, so these could be
++floating about for any length of time (we had to transmute away the
++lifetimes to give them out). This is ok because (a) the `Arc` keeps
++the `ScopeFuture` alive and (b) the only thing you can do is to call
++`unpark()`, which will promptly return since the state is *COMPLETE*
++(and, anyhow, as we saw above, it doesn't have access to any
++references anyhow).
++
++**Future result.** The other, more interesting reference to the
++`ScopeFuture` is the value that we gave back to the user when we
++spawned the future in the first place. This value is more interesting
++because it can be used to do non-trivial things, unlike the
++`Arc<Unpark>`. If you look carefully at this handle, you will see that
++its type has been designed to hide the type `F`. In fact, it only
++reveals the types `T` and `E` which are the ok/err result types of the
++future `F`.  This is intentonal: suppose that the type `F` includes
++some references, but those references don't appear in the result. We
++want the "result" future to be able to escape the scope, then, to any
++place where the types `T` and `E` are still in scope. If we exposed
++`F` here that would not be possible. (Hiding `F` also requires a
++transmute to an object type, in this case an internal trait called
++`ScopeFutureTrait`.) Note though that it is possible for `T` and `E`
++to have references in them. They could even be references tied to the
++scope.
++
++So what can a user do with this result future? They have two
++operations available: poll and cancel. Let's look at cancel first,
++since it's simpler. If the state is *COMPLETE*, then `cancel()` is an
++immediate no-op, so we know that it can't be used to access any
++references that may be invalid. In any case, the only thing it does is
++to set a field to true and invoke `unpark()`, and we already examined
++the possible effects of `unpark()` in the previous section.q
++
++So what about `poll()`? This is how the user gets the final result out
++of the future. The important thing that it does is to access (and
++effectively nullify) the field `result`, which stores the result of
++the future and hence may have access to `T` and `E` values. These
++values may contain references...so how we know that they are still in
++scope?  The answer is that those types are exposed in the user's type
++of the future, and hence the basic Rust type system should guarantee
++that any references are still valid, or else the user shouldn't be
++able to call `poll()`. (The same is true at the time of cancellation,
++but that's not important, since `cancel()` doesn't do anything of
++interest.)
++
++
+diff --git a/src/scope/future/mod.rs b/src/scope/future/mod.rs
+new file mode 100644
+index 0000000..eafb215
+--- /dev/null
++++ b/src/scope/future/mod.rs
+@@ -0,0 +1,464 @@
++use latch::{LatchProbe};
++#[allow(warnings)]
++use log::Event::*;
++use futures::{Async, Future, Poll};
++use futures::executor;
++use futures::future::CatchUnwind;
++use futures::task::{self, Spawn, Task, Unpark};
++use job::{Job, JobRef};
++use registry::{Registry, WorkerThread};
++use std::any::Any;
++use std::panic::AssertUnwindSafe;
++use std::mem;
++use std::sync::Arc;
++use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::Ordering::*;
++use std::sync::Mutex;
++use unwind;
++
++use super::Scope;
++
++const STATE_PARKED: usize = 0;
++const STATE_UNPARKED: usize = 1;
++const STATE_EXECUTING: usize = 2;
++const STATE_EXECUTING_UNPARKED: usize = 3;
++const STATE_COMPLETE: usize = 4;
++
++// Warning: Public end-user API.
++pub struct RayonFuture<T, E> {
++    inner: Arc<ScopeFutureTrait<Result<T, E>, Box<Any + Send + 'static>>>,
++}
++
++/// Create a `RayonFuture` that will execute `F` and yield its result,
++/// propagating any panics.
++///
++/// Unsafe because caller asserts that all references in `F` will
++/// remain valid at least until `counter` is decremented via `set()`.
++/// In practice, this is ensured by the `scope()` API, which ensures
++/// that `F: 'scope` and that `'scope` does not end until `counter`
++/// reaches 0.
++///
++/// NB. This is a free fn so that we can expose `RayonFuture` as public API.
++pub unsafe fn new_rayon_future<'scope, F>(future: F,
++                                          scope: *const Scope<'scope>)
++                                          -> RayonFuture<F::Item, F::Error>
++    where F: Future + Send + 'scope,
++{
++    // We always have to have a non-null scope (for now, anyway):
++    debug_assert!(!scope.is_null());
++
++    let inner = ScopeFuture::spawn(future, scope);
++    return RayonFuture { inner: hide_lifetime(inner) };
++
++    unsafe fn hide_lifetime<'l, T, E>(x: Arc<ScopeFutureTrait<T, E> + 'l>)
++                                      -> Arc<ScopeFutureTrait<T, E>> {
++        mem::transmute(x)
++    }
++}
++
++impl<T, E> RayonFuture<T, E> {
++    pub fn rayon_wait(mut self) -> Result<T, E> {
++        let worker_thread = WorkerThread::current();
++        if worker_thread.is_null() {
++            self.wait()
++        } else {
++            // Assert that uses of `worker_thread` pointer below are
++            // valid (because we are on the worker-thread).
++            unsafe {
++                (*worker_thread).wait_until(&*self.inner);
++                debug_assert!(self.inner.probe());
++                self.poll().map(|a_v| match a_v {
++                    Async::Ready(v) => v,
++                    Async::NotReady => panic!("probe() returned true but poll not ready")
++                })
++            }
++        }
++    }
++}
++
++impl<T, E> Future for RayonFuture<T, E> {
++    type Item = T;
++    type Error = E;
++
++    fn wait(self) -> Result<T, E> {
++        if WorkerThread::current().is_null() {
++            executor::spawn(self).wait_future()
++        } else {
++            panic!("using  `wait()` in a Rayon thread is unwise; try `rayon_wait()`")
++        }
++    }
++
++    fn poll(&mut self) -> Poll<T, E> {
++        match self.inner.poll() {
++            Ok(Async::Ready(Ok(v))) => Ok(Async::Ready(v)),
++            Ok(Async::Ready(Err(e))) => Err(e),
++            Ok(Async::NotReady) => Ok(Async::NotReady),
++            Err(e) => unwind::resume_unwinding(e),
++        }
++    }
++}
++
++impl<T, E> Drop for RayonFuture<T, E> {
++    fn drop(&mut self) {
++        self.inner.cancel();
++    }
++}
++
++/// ////////////////////////////////////////////////////////////////////////
++
++struct ScopeFuture<'scope, F: Future + Send + 'scope> {
++    state: AtomicUsize,
++    registry: Arc<Registry>,
++    contents: Mutex<ScopeFutureContents<'scope, F>>,
++}
++
++type CU<F> = CatchUnwind<AssertUnwindSafe<F>>;
++type CUItem<F> = <CU<F> as Future>::Item;
++type CUError<F> = <CU<F> as Future>::Error;
++
++struct ScopeFutureContents<'scope, F: Future + Send + 'scope> {
++    spawn: Option<Spawn<CU<F>>>,
++    unpark: Option<Arc<Unpark>>,
++
++    // Pointer to ourselves. We `None` this out when we are finished
++    // executing, but it's convenient to keep around normally.
++    this: Option<Arc<ScopeFuture<'scope, F>>>,
++
++    // the counter in the scope; since the scope doesn't terminate until
++    // counter reaches zero, and we hold a ref in this counter, we are
++    // assured that this pointer remains valid
++    scope: *const Scope<'scope>,
++
++    waiting_task: Option<Task>,
++    result: Poll<CUItem<F>, CUError<F>>,
++
++    canceled: bool,
++}
++
++// Assert that the `*const` is safe to transmit between threads:
++unsafe impl<'scope, F: Future + Send> Send for ScopeFuture<'scope, F> {}
++unsafe impl<'scope, F: Future + Send> Sync for ScopeFuture<'scope, F> {}
++
++impl<'scope, F: Future + Send> ScopeFuture<'scope, F> {
++    // Unsafe: Caller asserts that `future` and `counter` will remain
++    // valid until we invoke `counter.set()`.
++    unsafe fn spawn(future: F, scope: *const Scope<'scope>) -> Arc<Self> {
++        let worker_thread = WorkerThread::current();
++        debug_assert!(!worker_thread.is_null());
++
++        // Using `AssertUnwindSafe` is valid here because (a) the data
++        // is `Send + Sync`, which is our usual boundary and (b)
++        // panics will be propagated when the `RayonFuture` is polled.
++        let spawn = task::spawn(AssertUnwindSafe(future).catch_unwind());
++
++        let future: Arc<Self> = Arc::new(ScopeFuture::<F> {
++            state: AtomicUsize::new(STATE_PARKED),
++            registry: (*worker_thread).registry().clone(),
++            contents: Mutex::new(ScopeFutureContents {
++                spawn: None,
++                unpark: None,
++                this: None,
++                scope: scope,
++                waiting_task: None,
++                result: Ok(Async::NotReady),
++                canceled: false,
++            }),
++        });
++
++        // Make the two self-cycles. Note that these imply the future
++        // cannot be freed until these fields are set to `None` (which
++        // occurs when it is finished executing).
++        {
++            let mut contents = future.contents.try_lock().unwrap();
++            contents.spawn = Some(spawn);
++            contents.unpark = Some(Self::make_unpark(&future));
++            contents.this = Some(future.clone());
++        }
++
++        future.unpark();
++
++        future
++    }
++
++    /// Creates a `JobRef` from this job -- note that this hides all
++    /// lifetimes, so it is up to you to ensure that this JobRef
++    /// doesn't outlive any data that it closes over.
++    unsafe fn into_job_ref(this: Arc<Self>) -> JobRef {
++        let this: *const Self = mem::transmute(this);
++        JobRef::new(this)
++    }
++
++    fn make_unpark(this: &Arc<Self>) -> Arc<Unpark> {
++        // Hide any lifetimes in `self`. This is safe because, until
++        // `self` is dropped, the counter is not decremented, and so
++        // the `'scope` lifetimes cannot end.
++        //
++        // Unfortunately, as `Unpark` currently requires `'static`, we
++        // have to do an indirection and this ultimately requires a
++        // fresh allocation.
++        //
++        // Here we assert that hiding the lifetimes in this fashion is
++        // safe: we claim this is true because the lifetimes we are
++        // hiding are part of `F`, and we now that any lifetimes in
++        // `F` outlive `counter`. And we can see from `complete()`
++        // that we drop all values of type `F` before decrementing
++        // `counter`.
++        unsafe {
++            return hide_lifetime(this.clone());
++        }
++
++        unsafe fn hide_lifetime<'l>(x: Arc<Unpark + 'l>) -> Arc<Unpark> {
++            mem::transmute(x)
++        }
++    }
++
++    fn unpark_inherent(&self) {
++        loop {
++            match self.state.load(Relaxed) {
++                STATE_PARKED => {
++                    if {
++                        self.state
++                            .compare_exchange_weak(STATE_PARKED, STATE_UNPARKED, Release, Relaxed)
++                            .is_ok()
++                    } {
++                        // Contention here is unlikely but possible: a
++                        // previous execution might have moved us to the
++                        // PARKED state but not yet released the lock.
++                        let contents = self.contents.lock().unwrap();
++
++                        // Assert that `job_ref` remains valid until
++                        // it is executed.  That's true because
++                        // `job_ref` holds a ref on the `Arc` and
++                        // because, until `job_ref` completes, the
++                        // references in the future are valid.
++                        unsafe {
++                            let job_ref = Self::into_job_ref(contents.this.clone().unwrap());
++                            self.registry.inject(&[job_ref]);
++                        }
++                        return;
++                    }
++                }
++
++                STATE_EXECUTING => {
++                    if {
++                        self.state
++                            .compare_exchange_weak(STATE_EXECUTING,
++                                                   STATE_EXECUTING_UNPARKED,
++                                                   Release,
++                                                   Relaxed)
++                            .is_ok()
++                    } {
++                        return;
++                    }
++                }
++
++                state => {
++                    debug_assert!(state == STATE_UNPARKED || state == STATE_EXECUTING_UNPARKED ||
++                                  state == STATE_COMPLETE);
++                    return;
++                }
++            }
++        }
++    }
++
++    fn begin_execute_state(&self) {
++        // When we are put into the unparked state, we are enqueued in
++        // a worker thread. We should then be executed exactly once,
++        // at which point we transiition to STATE_EXECUTING. Nobody
++        // should be contending with us to change the state here.
++        let state = self.state.load(Acquire);
++        debug_assert_eq!(state, STATE_UNPARKED);
++        let result = self.state.compare_exchange(state, STATE_EXECUTING, Release, Relaxed);
++        debug_assert_eq!(result, Ok(STATE_UNPARKED));
++    }
++
++    fn end_execute_state(&self) -> bool {
++        loop {
++            match self.state.load(Relaxed) {
++                STATE_EXECUTING => {
++                    if {
++                        self.state
++                            .compare_exchange_weak(STATE_EXECUTING, STATE_PARKED, Release, Relaxed)
++                            .is_ok()
++                    } {
++                        // We put ourselves into parked state, no need to
++                        // re-execute.  We'll just wait for the Unpark.
++                        return true;
++                    }
++                }
++
++                state => {
++                    debug_assert_eq!(state, STATE_EXECUTING_UNPARKED);
++                    if {
++                        self.state
++                            .compare_exchange_weak(state, STATE_EXECUTING, Release, Relaxed)
++                            .is_ok()
++                    } {
++                        // We finished executing, but an unpark request
++                        // came in the meantime.  We need to execute
++                        // again. Return false as we failed to end the
++                        // execution phase.
++                        return false;
++                    }
++                }
++            }
++        }
++    }
++}
++
++impl<'scope, F: Future + Send> Unpark for ScopeFuture<'scope, F> {
++    fn unpark(&self) {
++        self.unpark_inherent();
++    }
++}
++
++impl<'scope, F: Future + Send> Job for ScopeFuture<'scope, F> {
++    unsafe fn execute(this: *const Self) {
++        let this: Arc<Self> = mem::transmute(this);
++
++        // *generally speaking* there should be no contention for the
++        // lock, but it is possible -- we can end execution, get re-enqeueud,
++        // and re-executed, before we have time to return from this fn
++        let mut contents = this.contents.lock().unwrap();
++
++        log!(FutureExecute { state: this.state.load(Relaxed) });
++
++        this.begin_execute_state();
++        loop {
++            if contents.canceled {
++                return contents.complete(Ok(Async::NotReady));
++            } else {
++                match contents.poll() {
++                    Ok(Async::Ready(v)) => {
++                        log!(FutureExecuteReady);
++                        return contents.complete(Ok(Async::Ready(v)));
++                    }
++                    Ok(Async::NotReady) => {
++                        log!(FutureExecuteNotReady);
++                        if this.end_execute_state() {
++                            return;
++                        }
++                    }
++                    Err(err) => {
++                        log!(FutureExecuteErr);
++                        return contents.complete(Err(err));
++                    }
++                }
++            }
++        }
++    }
++}
++
++impl<'scope, F: Future + Send> ScopeFutureContents<'scope, F> {
++    fn poll(&mut self) -> Poll<CUItem<F>, CUError<F>> {
++        let unpark = self.unpark.clone().unwrap();
++        self.spawn.as_mut().unwrap().poll_future(unpark)
++    }
++
++    fn complete(&mut self, value: Poll<CUItem<F>, CUError<F>>) {
++        log!(FutureComplete);
++
++        // So, this is subtle. We know that the type `F` may have some
++        // data which is only valid until the end of the scope, and we
++        // also know that the scope doesn't end until `self.counter`
++        // is decremented below. So we want to be sure to drop
++        // `self.future` first, lest its dtor try to access some of
++        // that state or something!
++        mem::drop(self.spawn.take().unwrap());
++
++        self.unpark = None;
++        self.result = value;
++        let this = self.this.take().unwrap();
++        if cfg!(debug_assertions) {
++            let state = this.state.load(Relaxed);
++            debug_assert!(state == STATE_EXECUTING || state == STATE_EXECUTING_UNPARKED,
++                          "cannot complete when not executing (state = {})",
++                          state);
++        }
++        this.state.store(STATE_COMPLETE, Release);
++
++        // `unpark()` here is arbitrary user-code, so it may well
++        // panic. We try to capture that panic and forward it
++        // somewhere useful if we can.
++        let mut err = None;
++        if let Some(waiting_task) = self.waiting_task.take() {
++            log!(FutureUnparkWaitingTask);
++            match unwind::halt_unwinding(|| waiting_task.unpark()) {
++                Ok(()) => { }
++                Err(e) => { err = Some(e); }
++            }
++        }
++
++        // Allow the enclosing scope to end. Asserts that
++        // `self.counter` is still valid, which we know because caller
++        // to `new_rayon_future()` ensures it for us.
++        unsafe {
++            if let Some(err) = err {
++                (*self.scope).job_panicked(err);
++            } else {
++                (*self.scope).job_completed_ok();
++            }
++        }
++    }
++}
++
++impl<'scope, F> LatchProbe for ScopeFuture<'scope, F>
++    where F: Future + Send
++{
++    fn probe(&self) -> bool {
++        self.state.load(Acquire) == STATE_COMPLETE
++    }
++}
++
++pub trait ScopeFutureTrait<T, E>: Send + Sync + LatchProbe {
++    fn poll(&self) -> Poll<T, E>;
++    fn cancel(&self);
++}
++
++impl<'scope, F> ScopeFutureTrait<CUItem<F>, CUError<F>> for ScopeFuture<'scope, F>
++    where F: Future + Send
++{
++    fn poll(&self) -> Poll<CUItem<F>, CUError<F>> {
++        // Important: due to transmute hackery, not all the fields are
++        // truly known to be valid at this point. In particular, the
++        // type F is erased. But the `state` and `result` fields
++        // should be valid.
++        let mut contents = self.contents.lock().unwrap();
++        let state = self.state.load(Relaxed);
++        if state == STATE_COMPLETE {
++            let r = mem::replace(&mut contents.result, Ok(Async::NotReady));
++            return r;
++        } else {
++            log!(FutureInstallWaitingTask { state: state });
++            contents.waiting_task = Some(task::park());
++            Ok(Async::NotReady)
++        }
++    }
++
++    fn cancel(&self) {
++        // Fast-path: check if this is already complete and return if
++        // so. A relaxed load suffices since we are not going to
++        // access any data as a result of this action.
++        if self.state.load(Relaxed) == STATE_COMPLETE {
++            return;
++        }
++
++        // Slow-path. Get the lock and set the canceled flag to
++        // true. Also grab the `unpark` instance (which may be `None`,
++        // if the future completes before we get the lack).
++        let unpark = {
++            let mut contents = self.contents.lock().unwrap();
++            contents.canceled = true;
++            contents.unpark.clone()
++        };
++
++        // If the `unpark` we grabbed was not `None`, then signal it.
++        // This will schedule the future.
++        if let Some(u) = unpark {
++            u.unpark();
++        }
++    }
++}
++
++#[cfg(test)]
++mod test;
+diff --git a/src/scope/future/test.rs b/src/scope/future/test.rs
+new file mode 100644
+index 0000000..866aa77
+--- /dev/null
++++ b/src/scope/future/test.rs
+@@ -0,0 +1,220 @@
++use futures::{self, Async, Future};
++use futures::future::lazy;
++use futures::sync::oneshot;
++use futures::task::{self, Unpark};
++use std::sync::Arc;
++use std::sync::atomic::{AtomicUsize, Ordering};
++use ::{scope, ThreadPool, Configuration};
++
++/// Basic test of using futures to data on the stack frame.
++#[test]
++fn future_test() {
++    let data = &[0, 1];
++
++    // Here we call `wait` on a select future, which will block at
++    // least one thread. So we need a second thread to ensure no
++    // deadlock.
++    ThreadPool::new(Configuration::new().set_num_threads(2)).unwrap().install(|| {
++        scope(|s| {
++            let a = s.spawn_future(futures::future::ok::<_, ()>(&data[0]));
++            let b = s.spawn_future(futures::future::ok::<_, ()>(&data[1]));
++            let (item1, next) = a.select(b).wait().ok().unwrap();
++            let item2 = next.wait().unwrap();
++            assert!(*item1 == 0 || *item1 == 1);
++            assert!(*item2 == 1 - *item1);
++        });
++    });
++}
++
++/// Test using `map` on a Rayon future. The `map` closure is eecuted
++/// for side-effects, and modifies the `data` variable that is owned
++/// by enclosing stack frame.
++#[test]
++fn future_map() {
++    let data = &mut [format!("Hello, ")];
++
++    let mut future = None;
++    scope(|s| {
++        let a = s.spawn_future(lazy(|| Ok::<_, ()>(&mut data[0])));
++        future = Some(s.spawn_future(a.map(|v| {
++            v.push_str("world!");
++        })));
++    });
++
++    // future must have executed for the scope to have ended, even
++    // though we never invoked `wait` to observe its result
++    assert_eq!(data[0], "Hello, world!");
++    assert!(future.is_some());
++}
++
++/// Test that we can create a future that returns an `&mut` to data,
++/// so long as it outlives the scope.
++#[test]
++fn future_escape_ref() {
++    let data = &mut [format!("Hello, ")];
++
++    {
++        let mut future = None;
++        scope(|s| {
++            let data = &mut *data;
++            future = Some(s.spawn_future(lazy(move || Ok::<_, ()>(&mut data[0]))));
++        });
++        let s = future.unwrap().wait().unwrap();
++        s.push_str("world!");
++    }
++
++    assert_eq!(data[0], "Hello, world!");
++}
++
++#[test]
++#[should_panic]
++fn future_panic_prop() {
++    scope(|s| {
++        let future = s.spawn_future(lazy(move || Ok::<(), ()>(argh())));
++        let _ = future.rayon_wait(); // should panic, not return a value
++    });
++
++    fn argh() -> () {
++        if true {
++            panic!("Hello, world!");
++        }
++    }
++}
++
++/// Test that, even if we have only one thread, invoke `rayon_wait`
++/// will not panic.
++#[test]
++fn future_rayon_wait_1_thread() {
++    // run with only 1 worker thread; this would deadlock if we couldn't make progress
++    let mut result = None;
++    ThreadPool::new(Configuration::new().set_num_threads(1)).unwrap().install(|| {
++        scope(|s| {
++            use std::sync::mpsc::channel;
++            let (tx, rx) = channel();
++            let a = s.spawn_future(lazy(move || Ok::<usize, ()>(rx.recv().unwrap())));
++            //                          ^^^^ FIXME: why is this needed?
++            let b = s.spawn_future(a.map(|v| v + 1));
++            let c = s.spawn_future(b.map(|v| v + 1));
++            s.spawn(move |_| tx.send(20).unwrap());
++            result = Some(c.rayon_wait().unwrap());
++        });
++    });
++    assert_eq!(result, Some(22));
++}
++
++/// Test that invoking `wait` on a `RayonFuture` will panic, if it is inside
++/// a Rayon worker thread.
++#[test]
++#[should_panic]
++fn future_wait_panics_inside_rayon_thread() {
++    scope(|s| {
++        let future = s.spawn_future(lazy(move || Ok::<(), ()>(())));
++        let _ = future.wait(); // should panic, not return a value
++    });
++}
++
++/// Test that invoking `wait` on a `RayonFuture` will not panic if we
++/// are outside a Rayon worker thread.
++#[test]
++fn future_wait_works_outside_rayon_threads() {
++    let mut future = None;
++    scope(|s| {
++        future = Some(s.spawn_future(lazy(move || Ok::<(), ()>(()))));
++    });
++    assert_eq!(Ok(()), future.unwrap().wait());
++}
++
++/// Test that invoking `wait` on a `RayonFuture` will not panic if we
++/// are outside a Rayon worker thread.
++#[test]
++#[should_panic(expected = "Hello, world!")]
++fn panicy_unpark() {
++    scope(|s| {
++        let (a_tx, a_rx) = oneshot::channel::<u32>();
++        let rf = s.spawn_future(a_rx);
++
++        // invoke `poll_future` with a `PanicUnpark` instance;
++        // this should get installed as a 'waiting task' on the
++        // Rayon future `rf`
++        let mut spawn = task::spawn(rf);
++        let unpark = Arc::new(PanicUnpark);
++        match spawn.poll_future(unpark.clone()) {
++            Ok(Async::NotReady) => {
++                // good, we expect not to be ready yet
++            }
++            r => panic!("spawn poll returned: {:?}", r),
++        }
++
++        // this should trigger the future `a_rx` to be awoken
++        // and executing in a Rayon background thread
++        a_tx.complete(22);
++
++        // now we wait for `rf` to complete; when it does, it will
++        // also signal the `PanicUnpark` to wake up (that is
++        // *supposed* to be what triggers us to `poll` again, but
++        // we are sidestepping that)
++        let v = spawn.into_inner().rayon_wait().unwrap();
++        assert_eq!(v, 22);
++    });
++    panic!("scope failed to panic!");
++
++    struct PanicUnpark;
++
++    impl Unpark for PanicUnpark {
++        fn unpark(&self) {
++            panic!("Hello, world!");
++        }
++    }
++}
++
++#[test]
++fn double_unpark() {
++    let unpark0 = Arc::new(TrackUnpark { value: AtomicUsize::new(0) });
++    let unpark1 = Arc::new(TrackUnpark { value: AtomicUsize::new(0) });
++    let mut _tag = None;
++    scope(|s| {
++        let (a_tx, a_rx) = oneshot::channel::<u32>();
++        let rf = s.spawn_future(a_rx);
++
++        let mut spawn = task::spawn(rf);
++
++        // test that we don't panic if people try to install a task many times;
++        // even if they are different tasks
++        for i in 0..22 {
++            let u = if i % 2 == 0 {
++                unpark0.clone()
++            } else {
++                unpark1.clone()
++            };
++            match spawn.poll_future(u) {
++                Ok(Async::NotReady) => {
++                    // good, we expect not to be ready yet
++                }
++                r => panic!("spawn poll returned: {:?}", r),
++            }
++        }
++
++        a_tx.complete(22);
++
++        // just hold onto `rf` to ensure that nothing is cancelled
++        _tag = Some(spawn.into_inner());
++    });
++
++    // Since scope is done, our spawned future must have completed. It
++    // should have signalled the unpark value we gave it -- but
++    // exactly once, even though we called `poll` many times.
++    assert_eq!(unpark1.value.load(Ordering::SeqCst), 1);
++
++    // unpark0 was not the last unpark supplied, so it will never be signalled
++    assert_eq!(unpark0.value.load(Ordering::SeqCst), 0);
++
++    struct TrackUnpark {
++        value: AtomicUsize,
++    }
++
++    impl Unpark for TrackUnpark {
++        fn unpark(&self) {
++            self.value.fetch_add(1, Ordering::SeqCst);
++        }
++    }
++}
+diff --git a/src/scope/mod.rs b/src/scope/mod.rs
+index b87b5fa..9cced87 100644
+--- a/src/scope/mod.rs
++++ b/src/scope/mod.rs
+@@ -1,5 +1,8 @@
++#[cfg(feature = "unstable")]
++use futures::Future;
+ use latch::{Latch, CountLatch};
+-use job::{HeapJob};
++use log::Event::*;
++use job::HeapJob;
+ use std::any::Any;
+ use std::marker::PhantomData;
+ use std::mem;
+@@ -8,6 +11,11 @@ use std::sync::atomic::{AtomicPtr, Ordering};
+ use registry::{in_worker, WorkerThread};
+ use unwind;
+ 
++#[cfg(feature = "unstable")]
++mod future;
++#[cfg(feature = "unstable")]
++use self::future::RayonFuture;
++
+ #[cfg(test)]
+ mod test;
+ 
+@@ -274,6 +282,19 @@ impl<'scope> Scope<'scope> {
+         }
+     }
+ 
++    #[cfg(feature = "unstable")]
++    pub fn spawn_future<F>(&self, future: F) -> RayonFuture<F::Item, F::Error>
++        where F: Future + Send + 'scope
++    {
++        self.job_completed_latch.increment();
++
++        // we assert that we have the future `F` type will remain
++        // valid until `job_completed_latch` is fully set
++        let future = unsafe { future::new_rayon_future(future, self) };
++
++        future
++    }
++
+     /// Executes `func` as a job, either aborting or executing as
+     /// appropriate.
+     ///
+@@ -302,14 +323,19 @@ impl<'scope> Scope<'scope> {
+         // capture the first error we see, free the rest
+         let nil = ptr::null_mut();
+         let mut err = Box::new(err); // box up the fat ptr
+-        if self.panic.compare_and_swap(nil, &mut *err, Ordering::SeqCst).is_null() {
++        if self.panic.compare_exchange(nil, &mut *err, Ordering::Release, Ordering::Relaxed).is_ok() {
++            log!(JobPanickedErrorStored { owner_thread: (*self.owner_thread).index() });
+             mem::forget(err); // ownership now transferred into self.panic
++        } else {
++            log!(JobPanickedErrorNotStored { owner_thread: (*self.owner_thread).index() });
+         }
+ 
+-        self.job_completed_ok()
++
++        self.job_completed_latch.set();
+     }
+ 
+     unsafe fn job_completed_ok(&self) {
++        log!(JobCompletedOk { owner_thread: (*self.owner_thread).index() });
+         self.job_completed_latch.set();
+     }
+ 
+@@ -322,8 +348,11 @@ impl<'scope> Scope<'scope> {
+         // ordering:
+         let panic = self.panic.swap(ptr::null_mut(), Ordering::Relaxed);
+         if !panic.is_null() {
++            log!(ScopeCompletePanicked { owner_thread: (*self.owner_thread).index() });
+             let value: Box<Box<Any + Send + 'static>> = mem::transmute(panic);
+             unwind::resume_unwinding(*value);
++        } else {
++            log!(ScopeCompleteNoPanic { owner_thread: (*self.owner_thread).index() });
+         }
+     }
+ }

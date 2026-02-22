@@ -1,16 +1,12 @@
 FROM ubuntu:24.04
 
-# Base system packages (common to all languages)
+# Install system packages
 RUN apt-get update && apt-get install -y \
     git \
     curl \
     ca-certificates \
     patch \
     build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install additional system packages for Rust and HTTP/3 testing
-RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -38,23 +34,22 @@ ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 ENV RUSTFLAGS='--cfg reqwest_unstable'
 ENV RUSTDOCFLAGS='--cfg reqwest_unstable'
 
-# Pin quinn to 0.11.1 to match h3-quinn 0.0.7 compatibility
-# h3-quinn 0.0.7 is not compatible with newer quinn 0.11.x versions
-# quinn 0.11.1 requires quinn-proto ^0.11.2, so we allow proto to be latest compatible
-RUN cargo update -p quinn --precise 0.11.1
+# Pin quinn ecosystem to 0.11.2 for compatibility with h3-quinn 0.0.7
+# h3-quinn 0.0.7 requires StreamId.0 to be public, which was changed in newer versions
+# We use 0.11.2 for all quinn crates to ensure compatibility
+RUN cargo update -p quinn --precise 0.11.2 && \
+    cargo update -p quinn-proto --precise 0.11.2 && \
+    cargo update -p quinn-udp --precise 0.5.5
 
-# Build with http3 feature to generate Cargo.lock with compatible dependency versions
-# This ensures we get the same versions that worked when the commit was made
+# Build with http3 feature to generate Cargo.lock
 RUN cargo build --features http3 --release || true
 
 # Reset source code to ensure bug.patch applies cleanly
-# Note: Cargo.lock is not tracked in git for this repo, so it won't be reset
 RUN git reset --hard HEAD
 
 # Apply bug.patch to revert to buggy state (BASE)
 COPY bug.patch /tmp/bug.patch
 RUN patch -p1 < /tmp/bug.patch && rm /tmp/bug.patch
-
 
 RUN rm -rf /app/src/.git
 

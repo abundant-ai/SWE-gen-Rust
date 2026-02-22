@@ -1,0 +1,848 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 4249f780..8d8bf314 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2129,7 +2129,6 @@ dependencies = [
+  "env_logger",
+  "log",
+  "num-bigint",
+- "once_cell",
+  "ring",
+  "rustls-pemfile 2.0.0",
+  "rustls-pki-types",
+diff --git a/fuzz/Cargo.lock b/fuzz/Cargo.lock
+index 77f9ac26..2bbe3b67 100644
+--- a/fuzz/Cargo.lock
++++ b/fuzz/Cargo.lock
+@@ -55,12 +55,6 @@ version = "0.4.20"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b5e6163cb8c49088c2c36f57875e58ccd8c87c7427f7fbd50ea6710b2f3f2e8f"
+ 
+-[[package]]
+-name = "once_cell"
+-version = "1.19.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "3fdb12b2476b595f9358c5161aa467c2438859caa136dec86c26fdd2efe17b92"
+-
+ [[package]]
+ name = "ring"
+ version = "0.17.7"
+@@ -80,7 +74,6 @@ name = "rustls"
+ version = "0.23.0-alpha.0"
+ dependencies = [
+  "log",
+- "once_cell",
+  "ring",
+  "rustls-pki-types",
+  "rustls-webpki",
+diff --git a/rustls/Cargo.toml b/rustls/Cargo.toml
+index 99f2d5bb..1629976c 100644
+--- a/rustls/Cargo.toml
++++ b/rustls/Cargo.toml
+@@ -18,8 +18,6 @@ rustversion = { version = "1.0.6", optional = true }
+ [dependencies]
+ aws-lc-rs = { version = "1.6", optional = true, default-features = false, features = ["aws-lc-sys"] }
+ log = { version = "0.4.4", optional = true }
+-# remove once our MSRV is >= 1.70
+-once_cell = "1"
+ ring = { version = "0.17", optional = true }
+ subtle = { version = "2.5.0", default-features = false }
+ webpki = { package = "rustls-webpki", version = "0.102.2", features = ["std"], default-features = false }
+diff --git a/rustls/src/builder.rs b/rustls/src/builder.rs
+index c0bc4c47..5524193d 100644
+--- a/rustls/src/builder.rs
++++ b/rustls/src/builder.rs
+@@ -29,7 +29,6 @@ use crate::{ClientConfig, ServerConfig};
+ ///
+ /// ```
+ /// # #[cfg(feature = "ring")] {
+-/// # rustls::crypto::ring::default_provider().install_default();
+ /// use rustls::{ClientConfig, ServerConfig};
+ /// ClientConfig::builder()
+ /// //  ...
+@@ -45,7 +44,6 @@ use crate::{ClientConfig, ServerConfig};
+ ///
+ /// ```no_run
+ /// # #[cfg(feature = "ring")] {
+-/// # rustls::crypto::ring::default_provider().install_default();
+ /// # use rustls::ServerConfig;
+ /// ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+ /// //  ...
+@@ -81,7 +79,6 @@ use crate::{ClientConfig, ServerConfig};
+ ///
+ /// ```
+ /// # #[cfg(feature = "ring")] {
+-/// # rustls::crypto::ring::default_provider().install_default();
+ /// # use rustls::ClientConfig;
+ /// # let root_certs = rustls::RootCertStore::empty();
+ /// ClientConfig::builder()
+@@ -105,7 +102,6 @@ use crate::{ClientConfig, ServerConfig};
+ ///
+ /// ```no_run
+ /// # #[cfg(feature = "ring")] {
+-/// # rustls::crypto::ring::default_provider().install_default();
+ /// # use rustls::ServerConfig;
+ /// # let certs = vec![];
+ /// # let private_key = pki_types::PrivateKeyDer::from(
+diff --git a/rustls/src/client/client_conn.rs b/rustls/src/client/client_conn.rs
+index 08aff079..58f926fb 100644
+--- a/rustls/src/client/client_conn.rs
++++ b/rustls/src/client/client_conn.rs
+@@ -1,6 +1,8 @@
+ use crate::builder::ConfigBuilder;
+ use crate::common_state::{CommonState, Protocol, Side};
+ use crate::conn::{ConnectionCommon, ConnectionCore, UnbufferedConnectionCommon};
++#[cfg(any(feature = "ring", feature = "fips"))]
++use crate::crypto::default_provider;
+ use crate::crypto::{CryptoProvider, SupportedKxGroup};
+ use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
+ use crate::error::Error;
+@@ -14,7 +16,9 @@ use crate::suites::{ExtractedSecrets, SupportedCipherSuite};
+ use crate::unbuffered::{EncryptError, TransmitTlsData};
+ use crate::versions;
+ use crate::KeyLog;
+-use crate::{verify, WantsVerifier, WantsVersions};
++#[cfg(any(feature = "ring", feature = "fips"))]
++use crate::WantsVerifier;
++use crate::{verify, WantsVersions};
+ 
+ use super::handy::{ClientSessionMemoryCache, NoClientSessionStorage};
+ use super::hs;
+@@ -218,38 +222,43 @@ pub struct ClientConfig {
+ }
+ 
+ impl ClientConfig {
+-    /// Create a builder for a client configuration with the process-default
+-    /// [`CryptoProvider`]: [`CryptoProvider::get_default`] and safe
+-    /// protocol version defaults.
++    /// Create a builder for a client configuration with the default
++    /// [`CryptoProvider`].
++    ///
++    /// This is:
++    ///
++    /// - [`crypto::aws_lc_rs::default_provider`] if the `fips` crate feature is
++    ///   enabled.
++    /// - [`crypto::ring::default_provider`] if the `ring` crate feature is
++    ///   enabled and the `fips` crate feature is not enabled.
++    ///
++    /// If neither of these are true, this function is not available and you
++    /// must use [`ClientConfig::builder_with_provider()`] instead.
+     ///
+     /// For more information, see the [`ConfigBuilder`] documentation.
++    #[cfg(any(feature = "ring", feature = "fips"))]
+     pub fn builder() -> ConfigBuilder<Self, WantsVerifier> {
+-        Self::builder_with_protocol_versions(versions::DEFAULT_VERSIONS)
++        // Safety: we know the *ring* and aws-lc-rs providers' ciphersuites are compatible with the safe default protocol versions.
++        Self::builder_with_provider(default_provider().into())
++            .with_safe_default_protocol_versions()
++            .unwrap()
+     }
+ 
+-    /// Create a builder for a client configuration with the process-default
+-    /// [`CryptoProvider`]: [`CryptoProvider::get_default`] and
+-    /// the provided protocol versions.
++    /// Create a builder for a client configuration with the default
++    /// [`CryptoProvider`] (see [`ClientConfig::builder()`] for details), safe
++    /// ciphersuite defaults and the provided protocol versions.
+     ///
+-    /// Panics if
+-    /// - the supported versions are not compatible with the provider (eg.
+-    ///   the combination of ciphersuites supported by the provider and supported
+-    ///   versions lead to zero cipher suites being usable),
+-    /// - if a `CryptoProvider` cannot be resolved using a combination of
+-    ///   the crate features and process default.
++    /// Panics if provided an empty slice of supported versions.
+     ///
+     /// For more information, see the [`ConfigBuilder`] documentation.
++    #[cfg(any(feature = "ring", feature = "fips"))]
+     pub fn builder_with_protocol_versions(
+         versions: &[&'static versions::SupportedProtocolVersion],
+     ) -> ConfigBuilder<Self, WantsVerifier> {
+-        // Safety assumptions:
+-        // 1. that the provider has been installed (explicitly or implicitly)
+-        // 2. that the process-level default provider is usable with the supplied protocol versions.
+-        Self::builder_with_provider(Arc::clone(
+-            CryptoProvider::get_default_or_install_from_crate_features(),
+-        ))
+-        .with_protocol_versions(versions)
+-        .unwrap()
++        // Safety: we know the *ring* and aws-lc-rs providers' ciphersuites are compatible with all protocol version choices.
++        Self::builder_with_provider(default_provider().into())
++            .with_protocol_versions(versions)
++            .unwrap()
+     }
+ 
+     /// Create a builder for a client configuration with a specific [`CryptoProvider`].
+diff --git a/rustls/src/crypto/mod.rs b/rustls/src/crypto/mod.rs
+index 0e639915..cc44acad 100644
+--- a/rustls/src/crypto/mod.rs
++++ b/rustls/src/crypto/mod.rs
+@@ -7,7 +7,6 @@ use alloc::sync::Arc;
+ use alloc::vec::Vec;
+ use core::fmt::Debug;
+ 
+-use once_cell::sync::OnceCell;
+ use pki_types::PrivateKeyDer;
+ use zeroize::Zeroize;
+ 
+@@ -76,25 +75,6 @@ pub use crate::msgs::handshake::KeyExchangeAlgorithm;
+ /// This structure provides defaults. Everything in it can be overridden at
+ /// runtime by replacing field values as needed.
+ ///
+-/// # Using the per-process default `CryptoProvider`
+-///
+-/// There is the concept of an implicit default provider, configured at run-time once in
+-/// a given process.
+-///
+-/// It is used for functions like [`ClientConfig::builder()`] and [`ServerConfig::builder()`].
+-///
+-/// The intention is that an application can specify the [`CryptoProvider`] they wish to use
+-/// once, and have that apply to the variety of places where their application does TLS
+-/// (which may be wrapped inside other libraries).
+-/// They should do this by calling [`CryptoProvider::install_default()`] early on.
+-///
+-/// To achieve this goal:
+-///
+-/// - _libraries_ should use [`ClientConfig::builder()`]/[`ServerConfig::builder()`]
+-///   or otherwise rely on the [`CryptoProvider::get_default()`] provider.
+-/// - _applications_ should call [`CryptoProvider::install_default()`] early
+-///   in their `fn main()`.
+-///
+ /// # Using a specific `CryptoProvider`
+ ///
+ /// Supply the provider when constructing your [`ClientConfig`] or [`ServerConfig`]:
+@@ -217,61 +197,6 @@ pub struct CryptoProvider {
+ }
+ 
+ impl CryptoProvider {
+-    /// Sets this `CryptoProvider` as the default for this process.
+-    ///
+-    /// This can be called successfully at most once in any process execution.
+-    ///
+-    /// Call this early in your process to configure which provider is used for
+-    /// the provider.  The configuration should happen before any use of
+-    /// [`ClientConfig::builder()`] or [`ServerConfig::builder()`].
+-    pub fn install_default(self) -> Result<(), Arc<Self>> {
+-        PROCESS_DEFAULT_PROVIDER.set(Arc::new(self))
+-    }
+-
+-    /// Returns the default `CryptoProvider` for this process.
+-    ///
+-    /// This will be `None` if no default has been set yet.
+-    pub fn get_default() -> Option<&'static Arc<Self>> {
+-        PROCESS_DEFAULT_PROVIDER.get()
+-    }
+-
+-    /// An internal function that:
+-    ///
+-    /// - gets the pre-installed default, or
+-    /// - installs one `from_crate_features()`, or else
+-    /// - panics about the need to call [`CryptoProvider::install_default()`]
+-    pub(crate) fn get_default_or_install_from_crate_features() -> &'static Arc<Self> {
+-        if let Some(provider) = Self::get_default() {
+-            return provider;
+-        }
+-
+-        let provider = Self::from_crate_features()
+-            .expect("no process-level `CryptoProvider` available. call `CryptoProvider::install_default()` before this point");
+-        // Ignore the error resulting from us losing a race, and accept the outcome.
+-        let _ = provider.install_default();
+-        Self::get_default().unwrap()
+-    }
+-
+-    /// Returns a provider named unambiguously by rustls crate features.
+-    ///
+-    /// This function returns `None` if the crate features are ambiguous (ie, specify two
+-    /// providers), or specify no providers.  In both cases the application should
+-    /// explicitly specify the provider to use with [`CryptoProvider::install_default`].
+-    fn from_crate_features() -> Option<Self> {
+-        #[cfg(all(feature = "ring", not(feature = "aws_lc_rs")))]
+-        {
+-            return Some(ring::default_provider());
+-        }
+-
+-        #[cfg(all(feature = "aws_lc_rs", not(feature = "ring")))]
+-        {
+-            return Some(aws_lc_rs::default_provider());
+-        }
+-
+-        #[allow(unreachable_code)]
+-        None
+-    }
+-
+     /// Returns `true` if this `CryptoProvider` is operating in FIPS mode.
+     ///
+     /// This covers only the cryptographic parts of FIPS approval.  There are
+@@ -300,8 +225,6 @@ impl CryptoProvider {
+     }
+ }
+ 
+-static PROCESS_DEFAULT_PROVIDER: OnceCell<Arc<CryptoProvider>> = OnceCell::new();
+-
+ /// A source of cryptographically secure randomness.
+ pub trait SecureRandom: Send + Sync + Debug {
+     /// Fill the given buffer with random bytes.
+@@ -497,6 +420,18 @@ impl From<&[u8]> for SharedSecret {
+     }
+ }
+ 
++#[cfg(any(feature = "ring", feature = "fips"))]
++pub(crate) fn default_provider() -> CryptoProvider {
++    #[cfg(all(feature = "ring", not(feature = "fips")))]
++    {
++        crate::crypto::ring::default_provider()
++    }
++    #[cfg(feature = "fips")]
++    {
++        crate::crypto::aws_lc_rs::default_provider()
++    }
++}
++
+ /// This function returns a [`CryptoProvider`] that uses
+ /// FIPS140-3-approved cryptography.
+ ///
+diff --git a/rustls/src/lib.rs b/rustls/src/lib.rs
+index fc4c13ff..1390531d 100644
+--- a/rustls/src/lib.rs
++++ b/rustls/src/lib.rs
+@@ -203,7 +203,6 @@
+ //! # use rustls;
+ //! # use webpki;
+ //! # use std::sync::Arc;
+-//! # rustls::crypto::ring::default_provider().install_default();
+ //! # let root_store = rustls::RootCertStore::from_iter(
+ //! #  webpki_roots::TLS_SERVER_ROOTS
+ //! #      .iter()
+diff --git a/rustls/src/server/server_conn.rs b/rustls/src/server/server_conn.rs
+index 3bece3d1..6889bdcf 100644
+--- a/rustls/src/server/server_conn.rs
++++ b/rustls/src/server/server_conn.rs
+@@ -1,6 +1,8 @@
+ use crate::builder::ConfigBuilder;
+ use crate::common_state::{CommonState, Context, Protocol, Side, State};
+ use crate::conn::{ConnectionCommon, ConnectionCore, UnbufferedConnectionCommon};
++#[cfg(any(feature = "ring", feature = "fips"))]
++use crate::crypto::default_provider;
+ use crate::crypto::CryptoProvider;
+ use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
+ use crate::error::Error;
+@@ -12,9 +14,12 @@ use crate::msgs::message::Message;
+ use crate::suites::ExtractedSecrets;
+ use crate::vecbuf::ChunkVecBuffer;
+ use crate::verify;
++#[cfg(any(feature = "ring", feature = "fips"))]
+ use crate::versions;
+ use crate::KeyLog;
+-use crate::{sign, WantsVerifier, WantsVersions};
++#[cfg(any(feature = "ring", feature = "fips"))]
++use crate::WantsVerifier;
++use crate::{sign, WantsVersions};
+ 
+ use super::hs;
+ 
+@@ -354,38 +359,43 @@ impl Clone for ServerConfig {
+ }
+ 
+ impl ServerConfig {
+-    /// Create a builder for a server configuration with the process-default
+-    /// [`CryptoProvider`]: [`CryptoProvider::get_default`] and safe
+-    /// protocol version defaults.
++    /// Create a builder for a server configuration with the default
++    /// [`CryptoProvider`].
++    ///
++    /// This is:
++    ///
++    /// - [`crypto::aws_lc_rs::default_provider`] if the `fips` crate feature is
++    ///   enabled.
++    /// - [`crypto::ring::default_provider`] if the `ring` crate feature is
++    ///   enabled and the `fips` crate feature is not enabled.
++    ///
++    /// If neither of these are true, this function is not available and you
++    /// must use [`ServerConfig::builder_with_provider()`] instead.
+     ///
+     /// For more information, see the [`ConfigBuilder`] documentation.
++    #[cfg(any(feature = "ring", feature = "fips"))]
+     pub fn builder() -> ConfigBuilder<Self, WantsVerifier> {
+-        Self::builder_with_protocol_versions(versions::DEFAULT_VERSIONS)
++        // Safety: we know the *ring* and aws-lc-rs providers' ciphersuites are compatible with the safe default protocol versions.
++        Self::builder_with_provider(default_provider().into())
++            .with_safe_default_protocol_versions()
++            .unwrap()
+     }
+ 
+-    /// Create a builder for a server configuration with the process-default
+-    /// [`CryptoProvider`]: [`CryptoProvider::get_default`] and
+-    /// the provided protocol versions.
++    /// Create a builder for a server configuration with the default
++    /// [`CryptoProvider`] (see [`ServerConfig::builder()`] for details), safe
++    /// ciphersuite defaults and the provided protocol versions.
+     ///
+-    /// Panics if
+-    /// - the supported versions are not compatible with the provider (eg.
+-    ///   the combination of ciphersuites supported by the provider and supported
+-    ///   versions lead to zero cipher suites being usable),
+-    /// - if a `CryptoProvider` cannot be resolved using a combination of
+-    ///   the crate features and process default.
++    /// Panics if provided an empty slice of supported versions.
+     ///
+     /// For more information, see the [`ConfigBuilder`] documentation.
++    #[cfg(any(feature = "ring", feature = "fips"))]
+     pub fn builder_with_protocol_versions(
+         versions: &[&'static versions::SupportedProtocolVersion],
+     ) -> ConfigBuilder<Self, WantsVerifier> {
+-        // Safety assumptions:
+-        // 1. that the provider has been installed (explicitly or implicitly)
+-        // 2. that the process-level default provider is usable with the supplied protocol versions.
+-        Self::builder_with_provider(Arc::clone(
+-            CryptoProvider::get_default_or_install_from_crate_features(),
+-        ))
+-        .with_protocol_versions(versions)
+-        .unwrap()
++        // Safety: we know the *ring* and aws-lc-rs providers' ciphersuites are compatible with all protocol version choices.
++        Self::builder_with_provider(default_provider().into())
++            .with_protocol_versions(versions)
++            .unwrap()
+     }
+ 
+     /// Create a builder for a server configuration with a specific [`CryptoProvider`].
+diff --git a/rustls/src/webpki/client_verifier.rs b/rustls/src/webpki/client_verifier.rs
+index 861c14b3..87f00280 100644
+--- a/rustls/src/webpki/client_verifier.rs
++++ b/rustls/src/webpki/client_verifier.rs
+@@ -182,7 +182,7 @@ impl ClientCertVerifierBuilder {
+ ///
+ /// To require all clients present a client certificate issued by a trusted CA:
+ /// ```no_run
+-/// # #[cfg(any(feature = "ring", feature = "aws_lc_rs"))] {
++/// # #[cfg(feature = "ring")] {
+ /// # use rustls::RootCertStore;
+ /// # use rustls::server::WebPkiClientVerifier;
+ /// # let roots = RootCertStore::empty();
+@@ -195,7 +195,7 @@ impl ClientCertVerifierBuilder {
+ /// Or, to allow clients presenting a client certificate authenticated by a trusted CA, or
+ /// anonymous clients that present no client certificate:
+ /// ```no_run
+-/// # #[cfg(any(feature = "ring", feature = "aws_lc_rs"))] {
++/// # #[cfg(feature = "ring")] {
+ /// # use rustls::RootCertStore;
+ /// # use rustls::server::WebPkiClientVerifier;
+ /// # let roots = RootCertStore::empty();
+@@ -217,7 +217,7 @@ impl ClientCertVerifierBuilder {
+ /// You can also configure the client verifier to check for certificate revocation with
+ /// client certificate revocation lists (CRLs):
+ /// ```no_run
+-/// # #[cfg(any(feature = "ring", feature = "aws_lc_rs"))] {
++/// # #[cfg(feature = "ring")] {
+ /// # use rustls::RootCertStore;
+ /// # use rustls::server::{WebPkiClientVerifier};
+ /// # let roots = RootCertStore::empty();
+@@ -249,15 +249,13 @@ impl WebPkiClientVerifier {
+     /// will be verified using the trust anchors found in the provided `roots`. If you
+     /// wish to disable client authentication use [WebPkiClientVerifier::no_client_auth()] instead.
+     ///
+-    /// The cryptography used comes from the process-default [`CryptoProvider`]: [`CryptoProvider::get_default`].
++    /// The cryptography used comes from the default [`CryptoProvider`]: [`crypto::ring::default_provider`].
+     /// Use [`Self::builder_with_provider`] if you wish to customize this.
+     ///
+     /// For more information, see the [`ClientCertVerifierBuilder`] documentation.
++    #[cfg(feature = "ring")]
+     pub fn builder(roots: Arc<RootCertStore>) -> ClientCertVerifierBuilder {
+-        Self::builder_with_provider(
+-            roots,
+-            Arc::clone(CryptoProvider::get_default_or_install_from_crate_features()),
+-        )
++        Self::builder_with_provider(roots, crate::crypto::ring::default_provider().into())
+     }
+ 
+     /// Create a builder for the `webpki` client certificate verifier configuration using
+@@ -411,7 +409,6 @@ pub(crate) enum AnonymousClientPolicy {
+ mod tests {
+     use super::WebPkiClientVerifier;
+     use crate::server::VerifierBuilderError;
+-    use crate::test_provider;
+     use crate::RootCertStore;
+ 
+     use pki_types::{CertificateDer, CertificateRevocationListDer};
+@@ -464,10 +461,7 @@ mod tests {
+     fn test_client_verifier_required_auth() {
+         // We should be able to build a verifier that requires client authentication, and does
+         // no revocation checking.
+-        let builder = WebPkiClientVerifier::builder_with_provider(
+-            test_roots(),
+-            test_provider::default_provider().into(),
+-        );
++        let builder = WebPkiClientVerifier::builder(test_roots());
+         // The builder should be Debug.
+         println!("{:?}", builder);
+         builder.build().unwrap();
+@@ -477,11 +471,7 @@ mod tests {
+     fn test_client_verifier_optional_auth() {
+         // We should be able to build a verifier that allows client authentication, and anonymous
+         // access, and does no revocation checking.
+-        let builder = WebPkiClientVerifier::builder_with_provider(
+-            test_roots(),
+-            test_provider::default_provider().into(),
+-        )
+-        .allow_unauthenticated();
++        let builder = WebPkiClientVerifier::builder(test_roots()).allow_unauthenticated();
+         // The builder should be Debug.
+         println!("{:?}", builder);
+         builder.build().unwrap();
+@@ -492,10 +482,7 @@ mod tests {
+         // We should be able to build a verifier that requires client authentication, and does
+         // no revocation checking, that hasn't been configured to determine how to handle
+         // unauthenticated clients yet.
+-        let builder = WebPkiClientVerifier::builder_with_provider(
+-            test_roots(),
+-            test_provider::default_provider().into(),
+-        );
++        let builder = WebPkiClientVerifier::builder(test_roots());
+         // The builder should be Debug.
+         println!("{:?}", builder);
+         builder.build().unwrap();
+@@ -505,11 +492,7 @@ mod tests {
+     fn test_client_verifier_without_crls_opptional_auth() {
+         // We should be able to build a verifier that allows client authentication,
+         // and anonymous access, that does no revocation checking.
+-        let builder = WebPkiClientVerifier::builder_with_provider(
+-            test_roots(),
+-            test_provider::default_provider().into(),
+-        )
+-        .allow_unauthenticated();
++        let builder = WebPkiClientVerifier::builder(test_roots()).allow_unauthenticated();
+         // The builder should be Debug.
+         println!("{:?}", builder);
+         builder.build().unwrap();
+@@ -518,12 +501,9 @@ mod tests {
+     #[test]
+     fn test_with_invalid_crls() {
+         // Trying to build a client verifier with invalid CRLs should error at build time.
+-        let result = WebPkiClientVerifier::builder_with_provider(
+-            test_roots(),
+-            test_provider::default_provider().into(),
+-        )
+-        .with_crls(vec![CertificateRevocationListDer::from(vec![0xFF])])
+-        .build();
++        let result = WebPkiClientVerifier::builder(test_roots())
++            .with_crls(vec![CertificateRevocationListDer::from(vec![0xFF])])
++            .build();
+         assert!(matches!(result, Err(VerifierBuilderError::InvalidCrl(_))));
+     }
+ 
+@@ -535,12 +515,9 @@ mod tests {
+             load_crls(&[
+                 include_bytes!("../../../test-ca/eddsa/client.revoked.crl.pem").as_slice(),
+             ]);
+-        let builder = WebPkiClientVerifier::builder_with_provider(
+-            test_roots(),
+-            test_provider::default_provider().into(),
+-        )
+-        .with_crls(initial_crls.clone())
+-        .with_crls(extra_crls.clone());
++        let builder = WebPkiClientVerifier::builder(test_roots())
++            .with_crls(initial_crls.clone())
++            .with_crls(extra_crls.clone());
+ 
+         // There should be the expected number of crls.
+         assert_eq!(builder.crls.len(), initial_crls.len() + extra_crls.len());
+@@ -553,11 +530,7 @@ mod tests {
+     fn test_client_verifier_with_crls_required_auth_implicit() {
+         // We should be able to build a verifier that requires client authentication, and that does
+         // revocation checking with CRLs, and that does not allow any anonymous access.
+-        let builder = WebPkiClientVerifier::builder_with_provider(
+-            test_roots(),
+-            test_provider::default_provider().into(),
+-        )
+-        .with_crls(test_crls());
++        let builder = WebPkiClientVerifier::builder(test_roots()).with_crls(test_crls());
+         // The builder should be Debug.
+         println!("{:?}", builder);
+         builder.build().unwrap();
+@@ -567,12 +540,9 @@ mod tests {
+     fn test_client_verifier_with_crls_optional_auth() {
+         // We should be able to build a verifier that supports client authentication, that does
+         // revocation checking with CRLs, and that allows anonymous access.
+-        let builder = WebPkiClientVerifier::builder_with_provider(
+-            test_roots(),
+-            test_provider::default_provider().into(),
+-        )
+-        .with_crls(test_crls())
+-        .allow_unauthenticated();
++        let builder = WebPkiClientVerifier::builder(test_roots())
++            .with_crls(test_crls())
++            .allow_unauthenticated();
+         // The builder should be Debug.
+         println!("{:?}", builder);
+         builder.build().unwrap();
+@@ -581,12 +551,9 @@ mod tests {
+     #[test]
+     fn test_client_verifier_ee_only() {
+         // We should be able to build a client verifier that only checks EE revocation status.
+-        let builder = WebPkiClientVerifier::builder_with_provider(
+-            test_roots(),
+-            test_provider::default_provider().into(),
+-        )
+-        .with_crls(test_crls())
+-        .only_check_end_entity_revocation();
++        let builder = WebPkiClientVerifier::builder(test_roots())
++            .with_crls(test_crls())
++            .only_check_end_entity_revocation();
+         // The builder should be Debug.
+         println!("{:?}", builder);
+         builder.build().unwrap();
+@@ -595,12 +562,9 @@ mod tests {
+     #[test]
+     fn test_client_verifier_allow_unknown() {
+         // We should be able to build a client verifier that allows unknown revocation status
+-        let builder = WebPkiClientVerifier::builder_with_provider(
+-            test_roots(),
+-            test_provider::default_provider().into(),
+-        )
+-        .with_crls(test_crls())
+-        .allow_unknown_revocation_status();
++        let builder = WebPkiClientVerifier::builder(test_roots())
++            .with_crls(test_crls())
++            .allow_unknown_revocation_status();
+         // The builder should be Debug.
+         println!("{:?}", builder);
+         builder.build().unwrap();
+@@ -609,11 +573,7 @@ mod tests {
+     #[test]
+     fn test_builder_no_roots() {
+         // Trying to create a client verifier builder with no trust anchors should fail at build time
+-        let result = WebPkiClientVerifier::builder_with_provider(
+-            RootCertStore::empty().into(),
+-            test_provider::default_provider().into(),
+-        )
+-        .build();
++        let result = WebPkiClientVerifier::builder(RootCertStore::empty().into()).build();
+         assert!(matches!(result, Err(VerifierBuilderError::NoRootAnchors)));
+     }
+ 
+diff --git a/rustls/src/webpki/server_verifier.rs b/rustls/src/webpki/server_verifier.rs
+index cea41aff..fb523e41 100644
+--- a/rustls/src/webpki/server_verifier.rs
++++ b/rustls/src/webpki/server_verifier.rs
+@@ -132,15 +132,13 @@ impl WebPkiServerVerifier {
+     ///
+     /// Server certificates will be verified using the trust anchors found in the provided `roots`.
+     ///
+-    /// The cryptography used comes from the process-default [`CryptoProvider`]: [`CryptoProvider::get_default`].
++    /// The cryptography used comes from the default [`CryptoProvider`]: [`crypto::ring::default_provider`].
+     /// Use [`Self::builder_with_provider`] if you wish to customize this.
+     ///
+     /// For more information, see the [`ServerCertVerifierBuilder`] documentation.
++    #[cfg(feature = "ring")]
+     pub fn builder(roots: Arc<RootCertStore>) -> ServerCertVerifierBuilder {
+-        Self::builder_with_provider(
+-            roots,
+-            Arc::clone(CryptoProvider::get_default_or_install_from_crate_features()),
+-        )
++        Self::builder_with_provider(roots, crate::crypto::ring::default_provider().into())
+     }
+ 
+     /// Create a builder for the `webpki` server certificate verifier configuration using
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index 262ec73c..9b6e0760 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -1324,10 +1324,7 @@ fn test_client_cert_resolve(
+     for version in rustls::ALL_VERSIONS {
+         let expected_sigschemes = match version.version {
+             ProtocolVersion::TLSv1_2 => vec![
+-                #[cfg(all(
+-                    not(all(feature = "ring", not(feature = "fips"))),
+-                    feature = "aws_lc_rs"
+-                ))]
++                #[cfg(all(not(feature = "ring"), feature = "aws_lc_rs"))]
+                 SignatureScheme::ECDSA_NISTP521_SHA512,
+                 SignatureScheme::ECDSA_NISTP384_SHA384,
+                 SignatureScheme::ECDSA_NISTP256_SHA256,
+@@ -1340,10 +1337,7 @@ fn test_client_cert_resolve(
+                 SignatureScheme::RSA_PKCS1_SHA256,
+             ],
+             ProtocolVersion::TLSv1_3 => vec![
+-                #[cfg(all(
+-                    not(all(feature = "ring", not(feature = "fips"))),
+-                    feature = "aws_lc_rs"
+-                ))]
++                #[cfg(all(not(feature = "ring"), feature = "aws_lc_rs"))]
+                 SignatureScheme::ECDSA_NISTP521_SHA512,
+                 SignatureScheme::ECDSA_NISTP384_SHA384,
+                 SignatureScheme::ECDSA_NISTP256_SHA256,
+diff --git a/rustls/tests/common/mod.rs b/rustls/tests/common/mod.rs
+index 670327de..57ef7416 100644
+--- a/rustls/tests/common/mod.rs
++++ b/rustls/tests/common/mod.rs
+@@ -345,9 +345,12 @@ impl KeyType {
+ pub fn server_config_builder() -> rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier> {
+     // ensure `ServerConfig::builder()` is covered, even though it is
+     // equivalent to `builder_with_provider(provider::provider().into())`.
+-    if exactly_one_provider() {
++    #[cfg(any(feature = "ring", feature = "fips"))]
++    {
+         rustls::ServerConfig::builder()
+-    } else {
++    }
++    #[cfg(all(not(feature = "ring"), not(feature = "fips")))]
++    {
+         rustls::ServerConfig::builder_with_provider(provider::default_provider().into())
+             .with_safe_default_protocol_versions()
+             .unwrap()
+@@ -357,9 +360,12 @@ pub fn server_config_builder() -> rustls::ConfigBuilder<ServerConfig, rustls::Wa
+ pub fn server_config_builder_with_versions(
+     versions: &[&'static rustls::SupportedProtocolVersion],
+ ) -> rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier> {
+-    if exactly_one_provider() {
++    #[cfg(feature = "ring")]
++    {
+         rustls::ServerConfig::builder_with_protocol_versions(versions)
+-    } else {
++    }
++    #[cfg(not(feature = "ring"))]
++    {
+         rustls::ServerConfig::builder_with_provider(provider::default_provider().into())
+             .with_protocol_versions(versions)
+             .unwrap()
+@@ -369,9 +375,12 @@ pub fn server_config_builder_with_versions(
+ pub fn client_config_builder() -> rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier> {
+     // ensure `ClientConfig::builder()` is covered, even though it is
+     // equivalent to `builder_with_provider(provider::provider().into())`.
+-    if exactly_one_provider() {
++    #[cfg(any(feature = "ring", feature = "fips"))]
++    {
+         rustls::ClientConfig::builder()
+-    } else {
++    }
++    #[cfg(all(not(feature = "ring"), not(feature = "fips")))]
++    {
+         rustls::ClientConfig::builder_with_provider(provider::default_provider().into())
+             .with_safe_default_protocol_versions()
+             .unwrap()
+@@ -381,9 +390,12 @@ pub fn client_config_builder() -> rustls::ConfigBuilder<ClientConfig, rustls::Wa
+ pub fn client_config_builder_with_versions(
+     versions: &[&'static rustls::SupportedProtocolVersion],
+ ) -> rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier> {
+-    if exactly_one_provider() {
++    #[cfg(feature = "ring")]
++    {
+         rustls::ClientConfig::builder_with_protocol_versions(versions)
+-    } else {
++    }
++    #[cfg(not(feature = "ring"))]
++    {
+         rustls::ClientConfig::builder_with_provider(provider::default_provider().into())
+             .with_protocol_versions(versions)
+             .unwrap()
+@@ -562,17 +574,25 @@ pub fn make_client_config_with_verifier(
+ }
+ 
+ pub fn webpki_client_verifier_builder(roots: Arc<RootCertStore>) -> ClientCertVerifierBuilder {
+-    if exactly_one_provider() {
++    #[cfg(feature = "ring")]
++    {
+         WebPkiClientVerifier::builder(roots)
+-    } else {
++    }
++
++    #[cfg(not(feature = "ring"))]
++    {
+         WebPkiClientVerifier::builder_with_provider(roots, provider::default_provider().into())
+     }
+ }
+ 
+ pub fn webpki_server_verifier_builder(roots: Arc<RootCertStore>) -> ServerCertVerifierBuilder {
+-    if exactly_one_provider() {
++    #[cfg(feature = "ring")]
++    {
+         WebPkiServerVerifier::builder(roots)
+-    } else {
++    }
++
++    #[cfg(not(feature = "ring"))]
++    {
+         WebPkiServerVerifier::builder_with_provider(roots, provider::default_provider().into())
+     }
+ }
+@@ -735,10 +755,3 @@ pub fn do_suite_test(
+     assert_eq!(Some(expect_suite), client.negotiated_cipher_suite());
+     assert_eq!(Some(expect_suite), server.negotiated_cipher_suite());
+ }
+-
+-fn exactly_one_provider() -> bool {
+-    cfg!(any(
+-        all(feature = "ring", not(feature = "aws_lc_rs")),
+-        all(feature = "aws_lc_rs", not(feature = "ring"))
+-    ))
+-}
+diff --git a/rustls/tests/process_provider.rs b/rustls/tests/process_provider.rs
+deleted file mode 100644
+index 07492165..00000000
+--- a/rustls/tests/process_provider.rs
++++ /dev/null
+@@ -1,65 +0,0 @@
+-#![cfg(any(feature = "ring", feature = "aws_lc_rs"))]
+-
+-//! Note that the default test runner builds each test file into a separate
+-//! executable, and runs tests in an indeterminate order.  That restricts us
+-//! to doing all the desired tests, in series, in one function.
+-
+-use rustls::crypto::CryptoProvider;
+-use rustls::ClientConfig;
+-
+-mod common;
+-use crate::common::*;
+-
+-#[test]
+-fn test_process_provider() {
+-    if dbg!(cfg!(all(feature = "ring", feature = "aws_lc_rs"))) {
+-        test_explicit_choice_required();
+-    } else if dbg!(cfg!(all(feature = "ring", not(feature = "aws_lc_rs")))) {
+-        test_ring_used_as_implicit_provider();
+-    } else if dbg!(cfg!(all(feature = "aws_lc_rs", not(feature = "ring")))) {
+-        test_aws_lc_rs_used_as_implicit_provider();
+-    } else {
+-        panic!("fix feature combinations");
+-    }
+-}
+-
+-fn test_explicit_choice_required() {
+-    assert!(CryptoProvider::get_default().is_none());
+-    provider::default_provider()
+-        .install_default()
+-        .expect("cannot install");
+-    CryptoProvider::get_default().expect("provider missing");
+-    provider::default_provider()
+-        .install_default()
+-        .expect_err("install succeeded a second time");
+-    CryptoProvider::get_default().expect("provider missing");
+-
+-    // does not panic
+-    finish_client_config(KeyType::Rsa, ClientConfig::builder());
+-}
+-
+-fn test_ring_used_as_implicit_provider() {
+-    assert!(CryptoProvider::get_default().is_none());
+-
+-    // implicitly installs ring provider
+-    finish_client_config(KeyType::Rsa, ClientConfig::builder());
+-
+-    assert!(format!(
+-        "{:?}",
+-        CryptoProvider::get_default().expect("provider missing")
+-    )
+-    .contains("secure_random: Ring"));
+-}
+-
+-fn test_aws_lc_rs_used_as_implicit_provider() {
+-    assert!(CryptoProvider::get_default().is_none());
+-
+-    // implicitly installs aws-lc-rs provider
+-    finish_client_config(KeyType::Rsa, ClientConfig::builder());
+-
+-    assert!(format!(
+-        "{:?}",
+-        CryptoProvider::get_default().expect("provider missing")
+-    )
+-    .contains("secure_random: AwsLcRs"));
+-}

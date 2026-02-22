@@ -1,0 +1,162 @@
+diff --git a/src/index.rs b/src/index.rs
+index c4821cf5..276db795 100644
+--- a/src/index.rs
++++ b/src/index.rs
+@@ -26,9 +26,7 @@ impl Index for usize {
+     fn index_mut<'v>(&self, v: &'v mut Item) -> Option<&'v mut Item> {
+         match *v {
+             Item::ArrayOfTables(ref mut vec) => vec.values.get_mut(*self),
+-            Item::Value(ref mut a) if a.is_array() => {
+-                a.as_array_mut().and_then(|a| a.values.get_mut(*self))
+-            }
++            Item::Value(ref mut a) => a.as_array_mut().and_then(|a| a.values.get_mut(*self)),
+             _ => None,
+         }
+     }
+@@ -38,9 +36,16 @@ impl Index for str {
+     fn index<'v>(&self, v: &'v Item) -> Option<&'v Item> {
+         match *v {
+             Item::Table(ref t) => t.get(self),
+-            Item::Value(ref v) if v.is_inline_table() => v
++            Item::Value(ref v) => v
+                 .as_inline_table()
+-                .and_then(|t| t.items.get(self).map(|kv| &kv.value)),
++                .and_then(|t| t.items.get(self))
++                .and_then(|kv| {
++                    if !kv.value.is_none() {
++                        Some(&kv.value)
++                    } else {
++                        None
++                    }
++                }),
+             _ => None,
+         }
+     }
+@@ -55,7 +60,7 @@ impl Index for str {
+         }
+         match *v {
+             Item::Table(ref mut t) => Some(t.entry(self).or_insert(Item::None)),
+-            Item::Value(ref mut v) if v.is_inline_table() => v.as_inline_table_mut().map(|t| {
++            Item::Value(ref mut v) => v.as_inline_table_mut().map(|t| {
+                 &mut t
+                     .items
+                     .entry(InternalString::from(self))
+diff --git a/src/inline_table.rs b/src/inline_table.rs
+index 59b05c6f..1b8cf74b 100644
+--- a/src/inline_table.rs
++++ b/src/inline_table.rs
+@@ -205,16 +205,15 @@ impl InlineTable {
+         match self.items.entry(key.into()) {
+             indexmap::map::Entry::Occupied(mut entry) => {
+                 // Ensure it is a `Value` to simplify `InlineOccupiedEntry`'s code.
+-                let mut scratch = Item::None;
+-                std::mem::swap(&mut scratch, &mut entry.get_mut().value);
+-                let mut scratch = Item::Value(
++                let scratch = std::mem::take(&mut entry.get_mut().value);
++                let scratch = Item::Value(
+                     scratch
+                         .into_value()
+                         // HACK: `Item::None` is a corner case of a corner case, let's just pick a
+                         // "safe" value
+                         .unwrap_or_else(|_| Value::InlineTable(Default::default())),
+                 );
+-                std::mem::swap(&mut scratch, &mut entry.get_mut().value);
++                entry.get_mut().value = scratch;
+ 
+                 InlineEntry::Occupied(InlineOccupiedEntry { entry })
+             }
+@@ -230,16 +229,15 @@ impl InlineTable {
+         match self.items.entry(key.get().into()) {
+             indexmap::map::Entry::Occupied(mut entry) => {
+                 // Ensure it is a `Value` to simplify `InlineOccupiedEntry`'s code.
+-                let mut scratch = Item::None;
+-                std::mem::swap(&mut scratch, &mut entry.get_mut().value);
+-                let mut scratch = Item::Value(
++                let scratch = std::mem::take(&mut entry.get_mut().value);
++                let scratch = Item::Value(
+                     scratch
+                         .into_value()
+                         // HACK: `Item::None` is a corner case of a corner case, let's just pick a
+                         // "safe" value
+                         .unwrap_or_else(|_| Value::InlineTable(Default::default())),
+                 );
+-                std::mem::swap(&mut scratch, &mut entry.get_mut().value);
++                entry.get_mut().value = scratch;
+ 
+                 InlineEntry::Occupied(InlineOccupiedEntry { entry })
+             }
+@@ -264,7 +262,7 @@ impl InlineTable {
+     /// Returns true iff the table contains given key.
+     pub fn contains_key(&self, key: &str) -> bool {
+         if let Some(kv) = self.items.get(key) {
+-            !kv.value.is_none()
++            kv.value.is_value()
+         } else {
+             false
+         }
+diff --git a/src/parser/errors.rs b/src/parser/errors.rs
+index 295d3c5b..9a18a9a3 100644
+--- a/src/parser/errors.rs
++++ b/src/parser/errors.rs
+@@ -273,7 +273,7 @@ impl Display for CustomError {
+                 let path = key.iter().join(".");
+                 writeln!(
+                     f,
+-                    "Dotted key `{}` attempted to extend non-table type (`{}`)",
++                    "Dotted key `{}` attempted to extend non-table type ({})",
+                     path, actual
+                 )
+             }
+diff --git a/src/table.rs b/src/table.rs
+index a933867b..72e1c971 100644
+--- a/src/table.rs
++++ b/src/table.rs
+@@ -227,7 +227,12 @@ impl Table {
+ impl Table {
+     /// Returns an iterator over all key/value pairs, including empty.
+     pub fn iter(&self) -> Iter<'_> {
+-        Box::new(self.items.iter().map(|(key, kv)| (&key[..], &kv.value)))
++        Box::new(
++            self.items
++                .iter()
++                .filter(|(_, kv)| !kv.value.is_none())
++                .map(|(key, kv)| (&key[..], &kv.value)),
++        )
+     }
+ 
+     /// Returns an mutable iterator over all key/value pairs, including empty.
+@@ -235,6 +240,7 @@ impl Table {
+         Box::new(
+             self.items
+                 .iter_mut()
++                .filter(|(_, kv)| !kv.value.is_none())
+                 .map(|(_, kv)| (kv.key.as_mut(), &mut kv.value)),
+         )
+     }
+@@ -277,12 +283,24 @@ impl Table {
+ 
+     /// Returns an optional reference to an item given the key.
+     pub fn get<'a>(&'a self, key: &str) -> Option<&'a Item> {
+-        self.items.get(key).map(|kv| &kv.value)
++        self.items.get(key).and_then(|kv| {
++            if !kv.value.is_none() {
++                Some(&kv.value)
++            } else {
++                None
++            }
++        })
+     }
+ 
+     /// Returns an optional mutable reference to an item given the key.
+     pub fn get_mut<'a>(&'a mut self, key: &str) -> Option<&'a mut Item> {
+-        self.items.get_mut(key).map(|kv| &mut kv.value)
++        self.items.get_mut(key).and_then(|kv| {
++            if !kv.value.is_none() {
++                Some(&mut kv.value)
++            } else {
++                None
++            }
++        })
+     }
+ 
+     /// Returns true iff the table contains an item with the given key.

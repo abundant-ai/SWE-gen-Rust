@@ -1,0 +1,289 @@
+diff --git a/src/async_impl/client.rs b/src/async_impl/client.rs
+index 095adf4..6e21908 100644
+--- a/src/async_impl/client.rs
++++ b/src/async_impl/client.rs
+@@ -39,6 +39,8 @@ use crate::dns::{gai::GaiResolver, DnsResolverWithOverrides, DynResolver, Resolv
+ use crate::error;
+ use crate::into_url::try_uri;
+ use crate::redirect::{self, remove_sensitive_headers};
++#[cfg(feature = "__rustls")]
++use crate::tls::CertificateRevocationList;
+ #[cfg(feature = "__tls")]
+ use crate::tls::{self, TlsBackend};
+ #[cfg(feature = "__tls")]
+@@ -118,6 +120,8 @@ struct Config {
+     tls_built_in_certs_webpki: bool,
+     #[cfg(feature = "rustls-tls-native-roots")]
+     tls_built_in_certs_native: bool,
++    #[cfg(feature = "__rustls")]
++    crls: Vec<CertificateRevocationList>,
+     #[cfg(feature = "__tls")]
+     min_tls_version: Option<tls::Version>,
+     #[cfg(feature = "__tls")]
+@@ -217,6 +221,8 @@ impl ClientBuilder {
+                 tls_built_in_certs_native: true,
+                 #[cfg(any(feature = "native-tls", feature = "__rustls"))]
+                 identity: None,
++                #[cfg(feature = "__rustls")]
++                crls: vec![],
+                 #[cfg(feature = "__tls")]
+                 min_tls_version: None,
+                 #[cfg(feature = "__tls")]
+@@ -588,9 +594,10 @@ impl ClientBuilder {
+ 
+                     // Build TLS config
+                     let signature_algorithms = provider.signature_verification_algorithms;
+-                    let config_builder = rustls::ClientConfig::builder_with_provider(provider)
+-                        .with_protocol_versions(&versions)
+-                        .map_err(|_| crate::error::builder("invalid TLS versions"))?;
++                    let config_builder =
++                        rustls::ClientConfig::builder_with_provider(provider.clone())
++                            .with_protocol_versions(&versions)
++                            .map_err(|_| crate::error::builder("invalid TLS versions"))?;
+ 
+                     let config_builder = if !config.certs_verification {
+                         config_builder
+@@ -604,7 +611,26 @@ impl ClientBuilder {
+                                 signature_algorithms,
+                             )))
+                     } else {
+-                        config_builder.with_root_certificates(root_cert_store)
++                        if config.crls.is_empty() {
++                            config_builder.with_root_certificates(root_cert_store)
++                        } else {
++                            let crls = config
++                                .crls
++                                .iter()
++                                .map(|e| e.as_rustls_crl())
++                                .collect::<Vec<_>>();
++                            let verifier =
++                                rustls::client::WebPkiServerVerifier::builder_with_provider(
++                                    Arc::new(root_cert_store),
++                                    provider,
++                                )
++                                .with_crls(crls)
++                                .build()
++                                .map_err(|_| {
++                                    crate::error::builder("invalid TLS verification settings")
++                                })?;
++                            config_builder.with_webpki_verifier(verifier)
++                        }
+                     };
+ 
+                     // Finalize TLS config
+@@ -1406,6 +1432,35 @@ impl ClientBuilder {
+         self
+     }
+ 
++    /// Add a certificate revocation list.
++    ///
++    ///
++    /// # Optional
++    ///
++    /// This requires the `rustls-tls(-...)` Cargo feature enabled.
++    #[cfg(feature = "__rustls")]
++    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
++    pub fn add_crl(mut self, crl: CertificateRevocationList) -> ClientBuilder {
++        self.config.crls.push(crl);
++        self
++    }
++
++    /// Add multiple certificate revocation lists.
++    ///
++    ///
++    /// # Optional
++    ///
++    /// This requires the `rustls-tls(-...)` Cargo feature enabled.
++    #[cfg(feature = "__rustls")]
++    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
++    pub fn add_crls(
++        mut self,
++        crls: impl IntoIterator<Item = CertificateRevocationList>,
++    ) -> ClientBuilder {
++        self.config.crls.extend(crls);
++        self
++    }
++
+     /// Controls the use of built-in/preloaded certificates during certificate validation.
+     ///
+     /// Defaults to `true` -- built-in system certs will be used.
+diff --git a/src/blocking/client.rs b/src/blocking/client.rs
+index d4b973e..9a447e2 100644
+--- a/src/blocking/client.rs
++++ b/src/blocking/client.rs
+@@ -19,6 +19,8 @@ use super::wait;
+ use crate::dns::Resolve;
+ #[cfg(feature = "__tls")]
+ use crate::tls;
++#[cfg(feature = "__rustls")]
++use crate::tls::CertificateRevocationList;
+ #[cfg(feature = "__tls")]
+ use crate::Certificate;
+ #[cfg(any(feature = "native-tls", feature = "__rustls"))]
+@@ -606,6 +608,33 @@ impl ClientBuilder {
+         self.with_inner(move |inner| inner.add_root_certificate(cert))
+     }
+ 
++    /// Add a certificate revocation list.
++    ///
++    ///
++    /// # Optional
++    ///
++    /// This requires the `rustls-tls(-...)` Cargo feature enabled.
++    #[cfg(feature = "__rustls")]
++    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
++    pub fn add_crl(mut self, crl: CertificateRevocationList) -> ClientBuilder {
++        self.with_inner(move |inner| inner.add_crl(crl))
++    }
++
++    /// Add multiple certificate revocation lists.
++    ///
++    ///
++    /// # Optional
++    ///
++    /// This requires the `rustls-tls(-...)` Cargo feature enabled.
++    #[cfg(feature = "__rustls")]
++    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
++    pub fn add_crls(
++        mut self,
++        crls: impl IntoIterator<Item = CertificateRevocationList>,
++    ) -> ClientBuilder {
++        self.with_inner(move |inner| inner.add_crls(crls))
++    }
++
+     /// Controls the use of built-in system certificates during certificate validation.
+     ///
+     /// Defaults to `true` -- built-in system certs will be used.
+diff --git a/src/tls.rs b/src/tls.rs
+index 83f3fee..e5480dc 100644
+--- a/src/tls.rs
++++ b/src/tls.rs
+@@ -58,6 +58,13 @@ use std::{
+     io::{BufRead, BufReader},
+ };
+ 
++/// Represents a X509 certificate revocation list.
++#[cfg(feature = "__rustls")]
++pub struct CertificateRevocationList {
++    #[cfg(feature = "__rustls")]
++    inner: rustls_pki_types::CertificateRevocationListDer<'static>,
++}
++
+ /// Represents a server X509 certificate.
+ #[derive(Clone)]
+ pub struct Certificate {
+@@ -409,6 +416,75 @@ impl Identity {
+     }
+ }
+ 
++#[cfg(feature = "__rustls")]
++impl CertificateRevocationList {
++    /// Parses a PEM encoded CRL.
++    ///
++    /// # Examples
++    ///
++    /// ```
++    /// # use std::fs::File;
++    /// # use std::io::Read;
++    /// # fn crl() -> Result<(), Box<dyn std::error::Error>> {
++    /// let mut buf = Vec::new();
++    /// File::open("my_crl.pem")?
++    ///     .read_to_end(&mut buf)?;
++    /// let crl = reqwest::tls::CertificateRevocationList::from_pem(&buf)?;
++    /// # drop(crl);
++    /// # Ok(())
++    /// # }
++    /// ```
++    ///
++    /// # Optional
++    ///
++    /// This requires the `rustls-tls(-...)` Cargo feature enabled.
++    #[cfg(feature = "__rustls")]
++    pub fn from_pem(pem: &[u8]) -> crate::Result<CertificateRevocationList> {
++        Ok(CertificateRevocationList {
++            #[cfg(feature = "__rustls")]
++            inner: rustls_pki_types::CertificateRevocationListDer::from(pem.to_vec()),
++        })
++    }
++
++    /// Creates a collection of `CertificateRevocationList`s from a PEM encoded CRL bundle.
++    /// Example byte sources may be `.crl` or `.pem` files.
++    ///
++    /// # Examples
++    ///
++    /// ```
++    /// # use std::fs::File;
++    /// # use std::io::Read;
++    /// # fn crls() -> Result<(), Box<dyn std::error::Error>> {
++    /// let mut buf = Vec::new();
++    /// File::open("crl-bundle.crl")?
++    ///     .read_to_end(&mut buf)?;
++    /// let crls = reqwest::tls::CertificateRevocationList::from_pem_bundle(&buf)?;
++    /// # drop(crls);
++    /// # Ok(())
++    /// # }
++    /// ```
++    ///
++    /// # Optional
++    ///
++    /// This requires the `rustls-tls(-...)` Cargo feature enabled.
++    #[cfg(feature = "__rustls")]
++    pub fn from_pem_bundle(pem_bundle: &[u8]) -> crate::Result<Vec<CertificateRevocationList>> {
++        let mut reader = BufReader::new(pem_bundle);
++
++        rustls_pemfile::crls(&mut reader)
++            .map(|result| match result {
++                Ok(crl) => Ok(CertificateRevocationList { inner: crl }),
++                Err(_) => Err(crate::error::builder("invalid crl encoding")),
++            })
++            .collect::<crate::Result<Vec<CertificateRevocationList>>>()
++    }
++
++    #[cfg(feature = "__rustls")]
++    pub(crate) fn as_rustls_crl<'a>(&self) -> rustls_pki_types::CertificateRevocationListDer<'a> {
++        self.inner.clone()
++    }
++}
++
+ impl fmt::Debug for Certificate {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+         f.debug_struct("Certificate").finish()
+@@ -421,6 +497,13 @@ impl fmt::Debug for Identity {
+     }
+ }
+ 
++#[cfg(feature = "__rustls")]
++impl fmt::Debug for CertificateRevocationList {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        f.debug_struct("CertificateRevocationList").finish()
++    }
++}
++
+ /// A TLS protocol version.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+ pub struct Version(InnerVersion);
+@@ -736,4 +819,24 @@ mod tests {
+ 
+         assert!(Certificate::from_pem_bundle(PEM_BUNDLE).is_ok())
+     }
++
++    #[cfg(feature = "__rustls")]
++    #[test]
++    fn crl_from_pem() {
++        let pem = b"-----BEGIN X509 CRL-----\n-----END X509 CRL-----\n";
++
++        CertificateRevocationList::from_pem(pem).unwrap();
++    }
++
++    #[cfg(feature = "__rustls")]
++    #[test]
++    fn crl_from_pem_bundle() {
++        let pem_bundle = std::fs::read("tests/support/crl.pem").unwrap();
++
++        let result = CertificateRevocationList::from_pem_bundle(&pem_bundle);
++
++        assert!(result.is_ok());
++        let result = result.unwrap();
++        assert_eq!(result.len(), 1);
++    }
+ }

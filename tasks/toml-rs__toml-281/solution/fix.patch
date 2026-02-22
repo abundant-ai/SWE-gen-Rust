@@ -1,0 +1,163 @@
+diff --git a/src/parser/document.rs b/src/parser/document.rs
+index 4b3b1843..f6e14279 100644
+--- a/src/parser/document.rs
++++ b/src/parser/document.rs
+@@ -159,7 +159,7 @@ impl TomlParser {
+         if mixed_table_types {
+             return Err(CustomError::DuplicateKey {
+                 key: kv.key.get().into(),
+-                table: "<unknown>".into(), // TODO: get actual table name
++                table: None,
+             });
+         }
+ 
+@@ -170,7 +170,7 @@ impl TomlParser {
+         if duplicate_key {
+             return Err(CustomError::DuplicateKey {
+                 key: key.as_str().into(),
+-                table: "<unknown>".into(), // TODO: get actual table name
++                table: Some(self.current_table_path.clone()),
+             });
+         }
+ 
+diff --git a/src/parser/errors.rs b/src/parser/errors.rs
+index 7ec9786f..295d3c5b 100644
+--- a/src/parser/errors.rs
++++ b/src/parser/errors.rs
+@@ -1,6 +1,8 @@
++use crate::Key;
+ use combine::easy::Errors as ParseError;
+ use combine::stream::easy::Error;
+ use combine::stream::position::SourcePosition;
++use itertools::Itertools;
+ use std::error::Error as StdError;
+ use std::fmt::{Display, Formatter, Result};
+ 
+@@ -233,7 +235,14 @@ mod test_translate_position {
+ 
+ #[derive(Debug, Clone)]
+ pub(crate) enum CustomError {
+-    DuplicateKey { key: String, table: String },
++    DuplicateKey {
++        key: String,
++        table: Option<Vec<Key>>,
++    },
++    DottedKeyExtendWrongType {
++        key: Vec<Key>,
++        actual: &'static str,
++    },
+     InvalidHexEscape(u32),
+     UnparsedLine,
+     OutOfRange,
+@@ -247,11 +256,28 @@ impl StdError for CustomError {
+ 
+ impl Display for CustomError {
+     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+-        match *self {
+-            CustomError::DuplicateKey { ref key, ref table } => {
+-                writeln!(f, "Duplicate key `{}` in `{}` table", key, table)
++        match self {
++            CustomError::DuplicateKey { key, table } => {
++                if let Some(table) = table {
++                    if table.is_empty() {
++                        writeln!(f, "Duplicate key `{}` in document root", key)
++                    } else {
++                        let path = table.iter().join(".");
++                        writeln!(f, "Duplicate key `{}` in table `{}`", key, path)
++                    }
++                } else {
++                    writeln!(f, "Duplicate key `{}`", key)
++                }
+             }
+-            CustomError::InvalidHexEscape(ref h) => {
++            CustomError::DottedKeyExtendWrongType { key, actual } => {
++                let path = key.iter().join(".");
++                writeln!(
++                    f,
++                    "Dotted key `{}` attempted to extend non-table type (`{}`)",
++                    path, actual
++                )
++            }
++            CustomError::InvalidHexEscape(h) => {
+                 writeln!(f, "Invalid hex escape code: {:x} ", h)
+             }
+             CustomError::UnparsedLine => writeln!(f, "Could not parse the line"),
+diff --git a/src/parser/inline_table.rs b/src/parser/inline_table.rs
+index bc797c12..7cc9d43a 100644
+--- a/src/parser/inline_table.rs
++++ b/src/parser/inline_table.rs
+@@ -1,7 +1,7 @@
+ use crate::key::Key;
+ use crate::parser::errors::CustomError;
+ use crate::parser::key::key;
+-use crate::parser::table::duplicate_key;
++use crate::parser::table::extend_wrong_type;
+ use crate::parser::trivia::ws;
+ use crate::parser::value::value;
+ use crate::table::TableKeyValue;
+@@ -35,7 +35,7 @@ fn table_from_pairs(
+         if duplicate_key {
+             return Err(CustomError::DuplicateKey {
+                 key: key.as_str().into(),
+-                table: "inline".into(),
++                table: None,
+             });
+         }
+     }
+@@ -57,8 +57,8 @@ fn descend_path<'a>(
+             Value::InlineTable(ref mut sweet_child_of_mine) => {
+                 table = sweet_child_of_mine;
+             }
+-            _ => {
+-                return Err(duplicate_key(path, i));
++            ref v => {
++                return Err(extend_wrong_type(path, i, v.type_name()));
+             }
+         }
+     }
+diff --git a/src/parser/table.rs b/src/parser/table.rs
+index b05edfb6..6c17df75 100644
+--- a/src/parser/table.rs
++++ b/src/parser/table.rs
+@@ -9,7 +9,6 @@ use combine::parser::byte::byte;
+ use combine::parser::range::range;
+ use combine::stream::RangeStream;
+ use combine::*;
+-use itertools::Itertools;
+ use std::cell::RefCell;
+ use std::mem;
+ // https://github.com/rust-lang/rust/issues/41358
+@@ -71,13 +70,17 @@ parser! {
+ 
+ pub(crate) fn duplicate_key(path: &[Key], i: usize) -> CustomError {
+     assert!(i < path.len());
+-    let header = path[..i]
+-        .iter()
+-        .map(|k| k.to_repr().as_ref().as_raw().to_owned())
+-        .join(".");
+     CustomError::DuplicateKey {
+         key: path[i].to_repr().as_ref().as_raw().into(),
+-        table: format!("[{}]", header),
++        table: Some(path[..i].to_vec()),
++    }
++}
++
++pub(crate) fn extend_wrong_type(path: &[Key], i: usize, actual: &'static str) -> CustomError {
++    assert!(i < path.len());
++    CustomError::DottedKeyExtendWrongType {
++        key: path[..=i].to_vec(),
++        actual,
+     }
+ }
+ 
+@@ -96,8 +99,8 @@ impl TomlParser {
+                 Item::Table(new_table)
+             });
+             match *entry {
+-                Item::Value(..) => {
+-                    return Err(duplicate_key(path, i));
++                Item::Value(ref v) => {
++                    return Err(extend_wrong_type(path, i, v.type_name()));
+                 }
+                 Item::ArrayOfTables(ref mut array) => {
+                     debug_assert!(!array.is_empty());

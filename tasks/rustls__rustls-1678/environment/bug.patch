@@ -1,0 +1,207 @@
+diff --git a/rustls/Cargo.toml b/rustls/Cargo.toml
+index 0c93c037..eb300dfc 100644
+--- a/rustls/Cargo.toml
++++ b/rustls/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "rustls"
+-version = "0.21.10"
++version = "0.21.9"
+ edition = "2021"
+ rust-version = "1.61"
+ license = "Apache-2.0 OR ISC OR MIT"
+diff --git a/rustls/src/client/tls12.rs b/rustls/src/client/tls12.rs
+index 57b62131..150f051b 100644
+--- a/rustls/src/client/tls12.rs
++++ b/rustls/src/client/tls12.rs
+@@ -1072,18 +1072,6 @@ impl State<ClientConnectionData> for ExpectFinished {
+             _fin_verified,
+         }))
+     }
+-
+-    // we could not decrypt the encrypted handshake message with session resumption
+-    // this might mean that the ticket was invalid for some reason, so we remove it
+-    // from the store to restart a session from scratch
+-    fn handle_decrypt_error(&self) {
+-        if self.resuming {
+-            self.config
+-                .resumption
+-                .store
+-                .remove_tls12_session(&self.server_name);
+-        }
+-    }
+ }
+ 
+ // -- Traffic transit state --
+diff --git a/rustls/src/common_state.rs b/rustls/src/common_state.rs
+index a886a8a4..27ba9b68 100644
+--- a/rustls/src/common_state.rs
++++ b/rustls/src/common_state.rs
+@@ -642,8 +642,6 @@ pub(crate) trait State<Data>: Send + Sync {
+     fn extract_secrets(&self) -> Result<PartiallyExtractedSecrets, Error> {
+         Err(Error::HandshakeNotComplete)
+     }
+-
+-    fn handle_decrypt_error(&self) {}
+ }
+ 
+ pub(crate) struct Context<'a, Data> {
+diff --git a/rustls/src/conn.rs b/rustls/src/conn.rs
+index 68e5ea48..5762091a 100644
+--- a/rustls/src/conn.rs
++++ b/rustls/src/conn.rs
+@@ -441,7 +441,7 @@ impl<Data> ConnectionCommon<Data> {
+     pub(crate) fn first_handshake_message(&mut self) -> Result<Option<Message>, Error> {
+         match self
+             .core
+-            .deframe(None)?
++            .deframe()?
+             .map(Message::try_from)
+         {
+             Some(Ok(msg)) => Ok(Some(msg)),
+@@ -622,7 +622,7 @@ impl<Data> ConnectionCore<Data> {
+             }
+         };
+ 
+-        while let Some(msg) = self.deframe(Some(&*state))? {
++        while let Some(msg) = self.deframe()? {
+             match self.process_msg(msg, state) {
+                 Ok(new) => state = new,
+                 Err(e) => {
+@@ -637,7 +637,7 @@ impl<Data> ConnectionCore<Data> {
+     }
+ 
+     /// Pull a message out of the deframer and send any messages that need to be sent as a result.
+-    fn deframe(&mut self, state: Option<&dyn State<Data>>) -> Result<Option<PlainMessage>, Error> {
++    fn deframe(&mut self) -> Result<Option<PlainMessage>, Error> {
+         match self
+             .message_deframer
+             .pop(&mut self.common_state.record_layer)
+@@ -678,14 +678,9 @@ impl<Data> ConnectionCore<Data> {
+             Err(err @ Error::PeerSentOversizedRecord) => Err(self
+                 .common_state
+                 .send_fatal_alert(AlertDescription::RecordOverflow, err)),
+-            Err(err @ Error::DecryptError) => {
+-                if let Some(state) = state {
+-                    state.handle_decrypt_error();
+-                }
+-                Err(self
+-                    .common_state
+-                    .send_fatal_alert(AlertDescription::BadRecordMac, err))
+-            }
++            Err(err @ Error::DecryptError) => Err(self
++                .common_state
++                .send_fatal_alert(AlertDescription::BadRecordMac, err)),
+             Err(e) => Err(e),
+         }
+     }
+diff --git a/rustls/src/versions.rs b/rustls/src/versions.rs
+index 7ff3d8a8..68f6e2a7 100644
+--- a/rustls/src/versions.rs
++++ b/rustls/src/versions.rs
+@@ -8,7 +8,6 @@ use crate::enums::ProtocolVersion;
+ /// the [`ALL_VERSIONS`] array, as well as individually as [`TLS12`]
+ /// and [`TLS13`].
+ #[derive(Eq, PartialEq)]
+-#[allow(clippy::manual_non_exhaustive)] // Fixed in main
+ pub struct SupportedProtocolVersion {
+     /// The TLS enumeration naming this version.
+     pub version: ProtocolVersion,
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index 1a6ffebd..41d5274b 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -4887,61 +4887,3 @@ fn test_debug_server_name_from_string() {
+         "DnsName(\"a.com\")"
+     )
+ }
+-
+-#[cfg(feature = "tls12")]
+-#[test]
+-fn test_client_removes_tls12_session_if_server_sends_undecryptable_first_message() {
+-    fn inject_corrupt_finished_message(msg: &mut Message) -> Altered {
+-        if let MessagePayload::ChangeCipherSpec(_) = msg.payload {
+-            // interdict "real" ChangeCipherSpec with its encoding, plus a faulty encrypted Finished.
+-            let mut raw_change_cipher_spec = [0x14u8, 0x03, 0x03, 0x00, 0x01, 0x01].to_vec();
+-            let mut corrupt_finished = [0x16, 0x03, 0x03, 0x00, 0x28].to_vec();
+-            corrupt_finished.extend([0u8; 0x28]);
+-
+-            let mut both = vec![];
+-            both.append(&mut raw_change_cipher_spec);
+-            both.append(&mut corrupt_finished);
+-
+-            Altered::Raw(both)
+-        } else {
+-            Altered::InPlace
+-        }
+-    }
+-
+-    let mut client_config =
+-        make_client_config_with_versions(KeyType::Rsa, &[&rustls::version::TLS12]);
+-    let storage = Arc::new(ClientStorage::new());
+-    client_config.resumption = Resumption::store(storage.clone());
+-    let client_config = Arc::new(client_config);
+-    let server_config = Arc::new(make_server_config(KeyType::Rsa));
+-
+-    // successful handshake to allow resumption
+-    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+-    do_handshake(&mut client, &mut server);
+-
+-    // resumption
+-    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+-    transfer(&mut client, &mut server);
+-    server.process_new_packets().unwrap();
+-    let mut client = client.into();
+-    transfer_altered(
+-        &mut server.into(),
+-        inject_corrupt_finished_message,
+-        &mut client,
+-    );
+-
+-    // discard storage operations up to this point, to observe the one we want to test for.
+-    storage.ops_and_reset();
+-
+-    // client cannot decrypt faulty Finished, and deletes saved session in case
+-    // server resumption is buggy.
+-    assert_eq!(
+-        Some(Error::DecryptError),
+-        client.process_new_packets().err()
+-    );
+-
+-    assert!(matches!(
+-        storage.ops()[0],
+-        ClientStorageOp::RemoveTls12Session(_)
+-    ));
+-}
+diff --git a/rustls/tests/common/mod.rs b/rustls/tests/common/mod.rs
+index 5924704b..e9d67e90 100644
+--- a/rustls/tests/common/mod.rs
++++ b/rustls/tests/common/mod.rs
+@@ -162,21 +162,12 @@ where
+         let mut reader = Reader::init(&buf[..sz]);
+         while reader.any_left() {
+             let message = OpaqueMessage::read(&mut reader).unwrap();
+-
+-            // this is a bit of a falsehood: we don't know whether message
+-            // is encrypted.  it is quite unlikely that a genuine encrypted
+-            // message can be decoded by `Message::try_from`.
+-            let plain = message.into_plain_message();
+-
+-            let message_enc = match Message::try_from(plain.clone()) {
+-                Ok(mut message) => match filter(&mut message) {
+-                    Altered::InPlace => PlainMessage::from(message)
+-                        .into_unencrypted_opaque()
+-                        .encode(),
+-                    Altered::Raw(data) => data,
+-                },
+-                // pass through encrypted/undecodable messages
+-                Err(_) => plain.into_unencrypted_opaque().encode(),
++            let mut message = Message::try_from(message.into_plain_message()).unwrap();
++            let message_enc = match filter(&mut message) {
++                Altered::InPlace => PlainMessage::from(message)
++                    .into_unencrypted_opaque()
++                    .encode(),
++                Altered::Raw(data) => data,
+             };
+ 
+             let message_enc_reader: &mut dyn io::Read = &mut &message_enc[..];

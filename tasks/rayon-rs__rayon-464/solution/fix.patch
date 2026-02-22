@@ -1,0 +1,258 @@
+diff --git a/src/iter/empty.rs b/src/iter/empty.rs
+new file mode 100644
+index 0000000..f4ca744
+--- /dev/null
++++ b/src/iter/empty.rs
+@@ -0,0 +1,93 @@
++use iter::internal::*;
++use iter::*;
++
++use std;
++use std::fmt;
++use std::marker::PhantomData;
++
++/// Creates a parallel iterator that produces nothing.
++///
++/// This admits no parallelism on its own, but it could be used for code that
++/// deals with generic parallel iterators.
++///
++/// # Examples
++///
++/// ```
++/// use rayon::prelude::*;
++/// use rayon::iter::empty;
++///
++/// let pi = (0..1234).into_par_iter()
++///     .chain(empty())
++///     .chain(1234..10_000);
++///
++/// assert_eq!(pi.count(), 10_000);
++/// ```
++pub fn empty<T: Send>() -> Empty<T> {
++    Empty { marker: PhantomData }
++}
++
++/// Iterator adaptor for [the `empty()` function](fn.empty.html).
++pub struct Empty<T: Send> {
++    marker: PhantomData<T>,
++}
++
++impl<T: Send> Clone for Empty<T> {
++    fn clone(&self) -> Self {
++        empty()
++    }
++}
++
++impl<T: Send> fmt::Debug for Empty<T> {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        f.pad("Empty")
++    }
++}
++
++impl<T: Send> ParallelIterator for Empty<T> {
++    type Item = T;
++
++    fn drive_unindexed<C>(self, consumer: C) -> C::Result
++        where C: UnindexedConsumer<Self::Item>
++    {
++        self.drive(consumer)
++    }
++
++    fn opt_len(&mut self) -> Option<usize> {
++        Some(0)
++    }
++}
++
++impl<T: Send> IndexedParallelIterator for Empty<T> {
++    fn drive<C>(self, consumer: C) -> C::Result
++        where C: Consumer<Self::Item>
++    {
++        consumer.into_folder().complete()
++    }
++
++    fn len(&mut self) -> usize {
++        0
++    }
++
++    fn with_producer<CB>(self, callback: CB) -> CB::Output
++        where CB: ProducerCallback<Self::Item>
++    {
++        callback.callback(EmptyProducer(PhantomData))
++    }
++}
++
++/// Private empty producer
++struct EmptyProducer<T: Send>(PhantomData<T>);
++
++impl<T: Send> Producer for EmptyProducer<T> {
++    type Item = T;
++    type IntoIter = std::iter::Empty<T>;
++
++    fn into_iter(self) -> Self::IntoIter {
++        std::iter::empty()
++    }
++
++    fn split_at(self, index: usize) -> (Self, Self) {
++        debug_assert_eq!(index, 0);
++        (self, EmptyProducer(PhantomData))
++    }
++}
+diff --git a/src/iter/mod.rs b/src/iter/mod.rs
+index 30ed113..ba9f4bc 100644
+--- a/src/iter/mod.rs
++++ b/src/iter/mod.rs
+@@ -87,6 +87,11 @@ mod repeat;
+ pub use self::repeat::{Repeat, repeat};
+ pub use self::repeat::{RepeatN, repeatn};
+ 
++mod empty;
++pub use self::empty::{Empty, empty};
++mod once;
++pub use self::once::{Once, once};
++
+ #[cfg(test)]
+ mod test;
+ 
+diff --git a/src/iter/once.rs b/src/iter/once.rs
+new file mode 100644
+index 0000000..87160cc
+--- /dev/null
++++ b/src/iter/once.rs
+@@ -0,0 +1,65 @@
++use iter::internal::*;
++use iter::*;
++
++/// Creates a parallel iterator that produces an element exactly once.
++///
++/// This admits no parallelism on its own, but it could be chained to existing
++/// parallel iterators to extend their contents, or otherwise used for any code
++/// that deals with generic parallel iterators.
++///
++/// # Examples
++///
++/// ```
++/// use rayon::prelude::*;
++/// use rayon::iter::once;
++///
++/// let pi = (0..1234).into_par_iter()
++///     .chain(once(-1))
++///     .chain(1234..10_000);
++///
++/// assert_eq!(pi.clone().count(), 10_001);
++/// assert_eq!(pi.clone().filter(|&x| x < 0).count(), 1);
++/// assert_eq!(pi.position_any(|x| x < 0), Some(1234));
++/// ```
++pub fn once<T: Send>(item: T) -> Once<T> {
++    Once { item: item }
++}
++
++/// Iterator adaptor for [the `once()` function](fn.once.html).
++#[derive(Clone, Debug)]
++pub struct Once<T: Send> {
++    item: T,
++}
++
++impl<T: Send> ParallelIterator for Once<T> {
++    type Item = T;
++
++    fn drive_unindexed<C>(self, consumer: C) -> C::Result
++        where C: UnindexedConsumer<Self::Item>
++    {
++        self.drive(consumer)
++    }
++
++    fn opt_len(&mut self) -> Option<usize> {
++        Some(1)
++    }
++}
++
++impl<T: Send> IndexedParallelIterator for Once<T> {
++    fn drive<C>(self, consumer: C) -> C::Result
++        where C: Consumer<Self::Item>
++    {
++        consumer.into_folder().consume(self.item).complete()
++    }
++
++    fn len(&mut self) -> usize {
++        1
++    }
++
++    fn with_producer<CB>(self, callback: CB) -> CB::Output
++        where CB: ProducerCallback<Self::Item>
++    {
++        // Let `OptionProducer` handle it.
++        Some(self.item).into_par_iter().with_producer(callback)
++    }
++}
+diff --git a/src/iter/test.rs b/src/iter/test.rs
+index a41b721..d5c596b 100644
+--- a/src/iter/test.rs
++++ b/src/iter/test.rs
+@@ -1888,3 +1888,33 @@ fn check_repeatn_zip_right() {
+         assert_eq!(item, (4, 4));
+     }
+ }
++
++#[test]
++fn check_empty() {
++    // drive_unindexed
++    let mut v: Vec<i32> = empty().filter(|_| unreachable!()).collect();
++    assert!(v.is_empty());
++
++    // drive (indexed)
++    empty().collect_into(&mut v);
++    assert!(v.is_empty());
++
++    // with_producer
++    let v: Vec<(i32, i32)> = empty().zip(1..10).collect();
++    assert!(v.is_empty());
++}
++
++#[test]
++fn check_once() {
++    // drive_unindexed
++    let mut v: Vec<i32> = once(42).filter(|_| true).collect();
++    assert_eq!(v, &[42]);
++
++    // drive (indexed)
++    once(42).collect_into(&mut v);
++    assert_eq!(v, &[42]);
++
++    // with_producer
++    let v: Vec<(i32, i32)> = once(42).zip(1..10).collect();
++    assert_eq!(v, &[(42, 1)]);
++}
+diff --git a/src/option.rs b/src/option.rs
+index a7efd74..33f2879 100644
+--- a/src/option.rs
++++ b/src/option.rs
+@@ -29,7 +29,7 @@ impl<T: Send> ParallelIterator for IntoIter<T> {
+     fn drive_unindexed<C>(self, consumer: C) -> C::Result
+         where C: UnindexedConsumer<Self::Item>
+     {
+-        bridge(self, consumer)
++        self.drive(consumer)
+     }
+ 
+     fn opt_len(&mut self) -> Option<usize> {
+@@ -41,7 +41,11 @@ impl<T: Send> IndexedParallelIterator for IntoIter<T> {
+     fn drive<C>(self, consumer: C) -> C::Result
+         where C: Consumer<Self::Item>
+     {
+-        bridge(self, consumer)
++        let mut folder = consumer.into_folder();
++        if let Some(item) = self.opt {
++            folder = folder.consume(item);
++        }
++        folder.complete()
+     }
+ 
+     fn len(&mut self) -> usize {
+@@ -121,6 +125,7 @@ impl<T: Send> Producer for OptionProducer<T> {
+     }
+ 
+     fn split_at(self, index: usize) -> (Self, Self) {
++        debug_assert!(index <= 1);
+         let none = OptionProducer { opt: None };
+         if index == 0 {
+             (none, self)

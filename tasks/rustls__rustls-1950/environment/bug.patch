@@ -1,0 +1,326 @@
+diff --git a/rustls/src/conn.rs b/rustls/src/conn.rs
+index a019dce2..2a046895 100644
+--- a/rustls/src/conn.rs
++++ b/rustls/src/conn.rs
+@@ -10,9 +10,7 @@ use crate::enums::{AlertDescription, ContentType};
+ use crate::error::{Error, PeerMisbehaved};
+ #[cfg(feature = "logging")]
+ use crate::log::trace;
+-use crate::msgs::deframer::{
+-    Deframed, DeframerSliceBuffer, DeframerVecBuffer, FilledDeframerBuffer, MessageDeframer,
+-};
++use crate::msgs::deframer::{Deframed, DeframerSliceBuffer, DeframerVecBuffer, MessageDeframer};
+ use crate::msgs::handshake::Random;
+ use crate::msgs::message::{InboundPlainMessage, Message, MessagePayload};
+ use crate::suites::{ExtractedSecrets, PartiallyExtractedSecrets};
+@@ -159,28 +157,10 @@ mod connection {
+     /// A structure that implements [`std::io::Read`] for reading plaintext.
+     pub struct Reader<'a> {
+         pub(super) received_plaintext: &'a mut ChunkVecBuffer,
+-        pub(super) has_received_close_notify: bool,
++        pub(super) peer_cleanly_closed: bool,
+         pub(super) has_seen_eof: bool,
+     }
+ 
+-    impl<'a> Reader<'a> {
+-        /// Check the connection's state if no bytes are available for reading.
+-        fn check_no_bytes_state(&self) -> io::Result<()> {
+-            match (self.has_received_close_notify, self.has_seen_eof) {
+-                // cleanly closed; don't care about TCP EOF: express this as Ok(0)
+-                (true, _) => Ok(()),
+-                // unclean closure
+-                (false, true) => Err(io::Error::new(
+-                    io::ErrorKind::UnexpectedEof,
+-                    UNEXPECTED_EOF_MESSAGE,
+-                )),
+-                // connection still going, but needs more data: signal `WouldBlock` so that
+-                // the caller knows this
+-                (false, false) => Err(io::ErrorKind::WouldBlock.into()),
+-            }
+-        }
+-    }
+-
+     impl<'a> io::Read for Reader<'a> {
+         /// Obtain plaintext data received from the peer over this TLS connection.
+         ///
+@@ -204,12 +184,26 @@ mod connection {
+         /// the return of [`Connection::process_new_packets`].
+         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+             let len = self.received_plaintext.read(buf)?;
+-            if len > 0 || buf.is_empty() {
+-                return Ok(len);
++
++            if len == 0 && !buf.is_empty() {
++                // No bytes available:
++                match (self.peer_cleanly_closed, self.has_seen_eof) {
++                    // cleanly closed; don't care about TCP EOF: express this as Ok(0)
++                    (true, _) => {}
++                    // unclean closure
++                    (false, true) => {
++                        return Err(io::Error::new(
++                            io::ErrorKind::UnexpectedEof,
++                            UNEXPECTED_EOF_MESSAGE,
++                        ))
++                    }
++                    // connection still going, but needs more data: signal `WouldBlock` so that
++                    // the caller knows this
++                    (false, false) => return Err(io::ErrorKind::WouldBlock.into()),
++                }
+             }
+ 
+-            self.check_no_bytes_state()
+-                .map(|()| len)
++            Ok(len)
+         }
+ 
+         /// Obtain plaintext data received from the peer over this TLS connection.
+@@ -239,11 +233,26 @@ mod connection {
+             self.received_plaintext
+                 .read_buf(cursor.reborrow())?;
+             let len = cursor.written() - before;
+-            if len > 0 || cursor.capacity() == 0 {
+-                return Ok(());
++
++            if len == 0 && cursor.capacity() > 0 {
++                // No bytes available:
++                match (self.peer_cleanly_closed, self.has_seen_eof) {
++                    // cleanly closed; don't care about TCP EOF: express this as Ok(0)
++                    (true, _) => {}
++                    // unclean closure
++                    (false, true) => {
++                        return Err(io::Error::new(
++                            io::ErrorKind::UnexpectedEof,
++                            UNEXPECTED_EOF_MESSAGE,
++                        ));
++                    }
++                    // connection still going, but need more data: signal `WouldBlock` so that
++                    // the caller knows this
++                    (false, false) => return Err(io::ErrorKind::WouldBlock.into()),
++                }
+             }
+ 
+-            self.check_no_bytes_state()
++            Ok(())
+         }
+     }
+ 
+@@ -492,7 +501,8 @@ impl<Data> ConnectionCommon<Data> {
+             received_plaintext: &mut common.received_plaintext,
+             // Are we done? i.e., have we processed all received messages, and received a
+             // close_notify to indicate that no new messages will arrive?
+-            has_received_close_notify: common.has_received_close_notify,
++            peer_cleanly_closed: common.has_received_close_notify
++                && !self.deframer_buffer.has_pending(),
+             has_seen_eof: common.has_seen_eof,
+         }
+     }
+@@ -786,16 +796,6 @@ impl<Data> ConnectionCore<Data> {
+                     return Err(e);
+                 }
+             }
+-
+-            if self
+-                .common_state
+-                .has_received_close_notify
+-            {
+-                // "Any data received after a closure alert has been received MUST be ignored."
+-                // -- <https://datatracker.ietf.org/doc/html/rfc8446#section-6.1>
+-                discard = borrowed_buffer.filled().len();
+-                break;
+-            }
+         }
+ 
+         deframer_buffer.discard(discard);
+diff --git a/rustls/src/msgs/deframer.rs b/rustls/src/msgs/deframer.rs
+index 8c6ec710..4734c376 100644
+--- a/rustls/src/msgs/deframer.rs
++++ b/rustls/src/msgs/deframer.rs
+@@ -614,7 +614,7 @@ trait DeframerBuffer<'a, P: AppendPayload<'a>>: FilledDeframerBuffer {
+     fn copy(&mut self, payload: &P, at: usize);
+ }
+ 
+-pub(crate) trait FilledDeframerBuffer {
++trait FilledDeframerBuffer {
+     fn filled_get_mut<I: SliceIndex<[u8]>>(&mut self, index: I) -> &mut I::Output {
+         self.filled_mut()
+             .get_mut(index)
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index 3a04960a..b582d813 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -6367,80 +6367,6 @@ fn test_complete_io_with_no_io_needed() {
+     );
+ }
+ 
+-#[test]
+-fn test_junk_after_close_notify_received() {
+-    let (mut client, mut server) = make_pair(KeyType::Rsa2048);
+-    do_handshake(&mut client, &mut server);
+-    client
+-        .writer()
+-        .write_all(b"hello")
+-        .unwrap();
+-    client.send_close_notify();
+-
+-    let mut client_buffer = vec![];
+-    client
+-        .write_tls(&mut io::Cursor::new(&mut client_buffer))
+-        .unwrap();
+-
+-    // add some junk that will be dropped from the deframer buffer
+-    // after the close_notify
+-    client_buffer.extend_from_slice(&[0x17, 0x03, 0x03, 0x01]);
+-
+-    server
+-        .read_tls(&mut io::Cursor::new(&client_buffer[..]))
+-        .unwrap();
+-    server.process_new_packets().unwrap();
+-
+-    // can read data received prior to close_notify
+-    let mut received_data = [0u8; 128];
+-    let len = server
+-        .reader()
+-        .read(&mut received_data)
+-        .unwrap();
+-    assert_eq!(&received_data[..len], b"hello");
+-
+-    // but subsequent reads just report clean EOF
+-    assert_eq!(
+-        server
+-            .reader()
+-            .read(&mut received_data)
+-            .unwrap(),
+-        0
+-    );
+-}
+-
+-#[test]
+-fn test_data_after_close_notify_is_ignored() {
+-    let (mut client, mut server) = make_pair(KeyType::Rsa2048);
+-    do_handshake(&mut client, &mut server);
+-
+-    client
+-        .writer()
+-        .write_all(b"before")
+-        .unwrap();
+-    client.send_close_notify();
+-    client
+-        .writer()
+-        .write_all(b"after")
+-        .unwrap();
+-    transfer(&mut client, &mut server);
+-    server.process_new_packets().unwrap();
+-
+-    let mut received_data = [0u8; 128];
+-    let count = server
+-        .reader()
+-        .read(&mut received_data)
+-        .unwrap();
+-    assert_eq!(&received_data[..count], b"before");
+-    assert_eq!(
+-        server
+-            .reader()
+-            .read(&mut received_data)
+-            .unwrap(),
+-        0
+-    );
+-}
+-
+ struct FakeStream<'a>(&'a [u8]);
+ 
+ impl<'a> io::Read for FakeStream<'a> {
+diff --git a/rustls/tests/unbuffered.rs b/rustls/tests/unbuffered.rs
+index c2d2f91d..245ddb3a 100644
+--- a/rustls/tests/unbuffered.rs
++++ b/rustls/tests/unbuffered.rs
+@@ -13,7 +13,7 @@ use rustls::unbuffered::{
+     UnbufferedStatus, WriteTraffic,
+ };
+ use rustls::version::TLS13;
+-use rustls::{ClientConfig, ServerConfig, SideData};
++use rustls::{ClientConfig, ServerConfig};
+ 
+ mod common;
+ use common::*;
+@@ -402,8 +402,6 @@ fn run(
+         assert!(count <= MAX_ITERATIONS, "handshake was not completed");
+     }
+ 
+-    outcome.server = Some(server);
+-    outcome.client = Some(client);
+     outcome
+ }
+ 
+@@ -455,56 +453,6 @@ fn close_notify_server_to_client() {
+     }
+ }
+ 
+-#[test]
+-fn junk_after_close_notify_received() {
+-    // cf. test_junk_after_close_notify_received in api.rs
+-    let mut outcome = handshake(&rustls::version::TLS13);
+-    let mut client = outcome.client.take().unwrap();
+-    let mut server = outcome.server.take().unwrap();
+-
+-    let mut client_send_buf = [0u8; 128];
+-    let mut len = dbg!(write_traffic(
+-        client.process_tls_records(&mut []),
+-        |mut wt: WriteTraffic<_>| wt.queue_close_notify(&mut client_send_buf),
+-    )
+-    .unwrap());
+-
+-    client_send_buf[len..len + 4].copy_from_slice(&[0x17, 0x03, 0x03, 0x01]);
+-    len += 4;
+-
+-    let discard = match dbg!(server.process_tls_records(dbg!(&mut client_send_buf[..len]))) {
+-        UnbufferedStatus {
+-            discard,
+-            state: Ok(ConnectionState::Closed),
+-        } => {
+-            assert_eq!(discard, 24);
+-            discard
+-        }
+-        st => {
+-            panic!("unexpected server state {st:?} (wanted Closed)");
+-        }
+-    };
+-
+-    // further data in client_send_buf is ignored
+-    let UnbufferedStatus { discard, .. } =
+-        server.process_tls_records(dbg!(&mut client_send_buf[discard..len]));
+-    assert_eq!(discard, 0);
+-}
+-
+-fn write_traffic<T: SideData, F: FnMut(WriteTraffic<T>) -> Result<usize, EncryptError>>(
+-    status: UnbufferedStatus<'_, '_, T>,
+-    mut f: F,
+-) -> Result<usize, EncryptError> {
+-    let UnbufferedStatus { discard, state } = status;
+-    assert_eq!(discard, 0);
+-    let state = state.unwrap();
+-    if let ConnectionState::WriteTraffic(state) = state {
+-        f(state)
+-    } else {
+-        panic!("unexpected client state {state:?} (wanted WriteTraffic)");
+-    }
+-}
+-
+ #[derive(Debug)]
+ enum State {
+     Closed,
+@@ -548,14 +496,12 @@ impl Actions<'_> {
+     }
+ }
+ 
+-#[derive(Default)]
++#[derive(Clone, Debug, Default)]
+ struct Outcome {
+-    server: Option<UnbufferedServerConnection>,
+     server_transcript: Vec<String>,
+     server_received_early_data: Vec<Vec<u8>>,
+     server_received_app_data: Vec<Vec<u8>>,
+     server_reached_connection_closed_state: bool,
+-    client: Option<UnbufferedClientConnection>,
+     client_transcript: Vec<String>,
+     client_received_app_data: Vec<Vec<u8>>,
+     client_reached_connection_closed_state: bool,

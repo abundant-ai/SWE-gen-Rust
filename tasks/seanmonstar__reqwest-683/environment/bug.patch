@@ -1,0 +1,387 @@
+diff --git a/.travis.yml b/.travis.yml
+index ad997ba..1a61b79 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -102,4 +102,4 @@ env:
+     - RUST_BACKTRACE=1
+ script:
+   - cargo build $FEATURES
+-  - cargo test -v $FEATURES --features __internal_proxy_sys_no_cache -- --test-threads=1
++  - cargo test -v $FEATURES -- --test-threads=1
+diff --git a/Cargo.toml b/Cargo.toml
+index b1aecc6..e0361a4 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -37,12 +37,6 @@ json = ["serde_json"]
+ 
+ unstable-stream = []
+ 
+-# Internal (PRIVATE!) features used to aid testing.
+-# Don't rely on these whatsoever. They may disappear at anytime.
+-
+-# When enabled, disable using the cached SYS_PROXIES.
+-__internal_proxy_sys_no_cache = []
+-
+ [dependencies]
+ http = "0.1.15"
+ url = "2.1"
+@@ -55,7 +49,6 @@ futures-core-preview = { version = "=0.3.0-alpha.19" }
+ futures-util-preview = { version = "=0.3.0-alpha.19" }
+ http-body = "=0.2.0-alpha.3"
+ hyper = { version = "=0.13.0-alpha.4", default-features = false, features = ["tcp"] }
+-lazy_static = "1.4"
+ log = "0.4"
+ mime = "0.3.7"
+ mime_guess = "2.0"
+@@ -157,3 +150,4 @@ required-features = ["cookies"]
+ name = "gzip"
+ path = "tests/gzip.rs"
+ required-features = ["gzip"]
++
+diff --git a/src/async_impl/client.rs b/src/async_impl/client.rs
+index 383b3b3..6b7881b 100644
+--- a/src/async_impl/client.rs
++++ b/src/async_impl/client.rs
+@@ -28,6 +28,7 @@ use crate::connect::Connector;
+ #[cfg(feature = "cookies")]
+ use crate::cookie;
+ use crate::into_url::{expect_uri, try_uri};
++use crate::proxy::get_proxies;
+ use crate::redirect::{self, remove_sensitive_headers, RedirectPolicy};
+ #[cfg(feature = "tls")]
+ use crate::tls::TlsBackend;
+@@ -68,7 +69,6 @@ struct Config {
+     #[cfg(feature = "tls")]
+     identity: Option<Identity>,
+     proxies: Vec<Proxy>,
+-    auto_sys_proxy: bool,
+     redirect_policy: RedirectPolicy,
+     referer: bool,
+     timeout: Option<Duration>,
+@@ -104,7 +104,6 @@ impl ClientBuilder {
+                 connect_timeout: None,
+                 max_idle_per_host: std::usize::MAX,
+                 proxies: Vec::new(),
+-                auto_sys_proxy: true,
+                 redirect_policy: RedirectPolicy::default(),
+                 referer: true,
+                 timeout: None,
+@@ -132,11 +131,7 @@ impl ClientBuilder {
+     /// cannot load the system configuration.
+     pub fn build(self) -> crate::Result<Client> {
+         let config = self.config;
+-        let mut proxies = config.proxies;
+-        if config.auto_sys_proxy {
+-            proxies.push(Proxy::system());
+-        }
+-        let proxies = Arc::new(proxies);
++        let proxies = Arc::new(config.proxies);
+ 
+         let mut connector = {
+             #[cfg(feature = "tls")]
+@@ -370,28 +365,27 @@ impl ClientBuilder {
+     // Proxy options
+ 
+     /// Add a `Proxy` to the list of proxies the `Client` will use.
+-    ///
+-    /// # Note
+-    ///
+-    /// Adding a proxy will disable the automatic usage of the "system" proxy.
+     pub fn proxy(mut self, proxy: Proxy) -> ClientBuilder {
+         self.config.proxies.push(proxy);
+-        self.config.auto_sys_proxy = false;
+         self
+     }
+ 
+     /// Clear all `Proxies`, so `Client` will use no proxy anymore.
+-    ///
+-    /// This also disables the automatic usage of the "system" proxy.
+     pub fn no_proxy(mut self) -> ClientBuilder {
+         self.config.proxies.clear();
+-        self.config.auto_sys_proxy = false;
+         self
+     }
+ 
+-    #[doc(hidden)]
+-    #[deprecated(note = "the system proxy is used automatically")]
+-    pub fn use_sys_proxy(self) -> ClientBuilder {
++    /// Add system proxy setting to the list of proxies
++    pub fn use_sys_proxy(mut self) -> ClientBuilder {
++        let proxies = get_proxies();
++        self.config.proxies.push(Proxy::custom(move |url| {
++            if proxies.contains_key(url.scheme()) {
++                Some((*proxies.get(url.scheme()).unwrap()).clone())
++            } else {
++                None
++            }
++        }));
+         self
+     }
+ 
+@@ -782,7 +776,7 @@ impl Client {
+ 
+ impl fmt::Debug for Client {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+-        let mut builder = f.debug_struct("Client");
++        let mut builder = f.debug_struct("ClientBuilder");
+         self.inner.fmt_fields(&mut builder);
+         builder.finish()
+     }
+diff --git a/src/blocking/client.rs b/src/blocking/client.rs
+index 7d1b14d..eb70f4d 100644
+--- a/src/blocking/client.rs
++++ b/src/blocking/client.rs
+@@ -193,25 +193,18 @@ impl ClientBuilder {
+     // Proxy options
+ 
+     /// Add a `Proxy` to the list of proxies the `Client` will use.
+-    ///
+-    /// # Note
+-    ///
+-    /// Adding a proxy will disable the automatic usage of the "system" proxy.
+     pub fn proxy(self, proxy: Proxy) -> ClientBuilder {
+         self.with_inner(move |inner| inner.proxy(proxy))
+     }
+ 
+-    /// Clear all `Proxies`, so `Client` will use no proxy anymore.
+-    ///
+-    /// This also disables the automatic usage of the "system" proxy.
++    /// Disable proxy setting.
+     pub fn no_proxy(self) -> ClientBuilder {
+         self.with_inner(move |inner| inner.no_proxy())
+     }
+ 
+-    #[doc(hidden)]
+-    #[deprecated(note = "the system proxy is used automatically")]
++    /// Enable system proxy setting.
+     pub fn use_sys_proxy(self) -> ClientBuilder {
+-        self
++        self.with_inner(move |inner| inner.use_sys_proxy())
+     }
+ 
+     // Timeout options
+diff --git a/src/lib.rs b/src/lib.rs
+index bbbd182..40843c9 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -263,9 +263,6 @@ if_hyper! {
+     #[macro_use]
+     extern crate doc_comment;
+ 
+-    #[macro_use]
+-    extern crate lazy_static;
+-
+     #[cfg(test)]
+     doctest!("../README.md");
+ 
+diff --git a/src/proxy.rs b/src/proxy.rs
+index 407677a..0334a86 100644
+--- a/src/proxy.rs
++++ b/src/proxy.rs
+@@ -180,13 +180,11 @@ impl Proxy {
+         }))
+     }
+ 
+-    pub(crate) fn system() -> Proxy {
+-        if cfg!(feature = "__internal_proxy_sys_no_cache") {
+-            Proxy::new(Intercept::System(Arc::new(get_sys_proxies())))
+-        } else {
+-            Proxy::new(Intercept::System(SYS_PROXIES.clone()))
+-        }
++    /*
++    pub fn unix<P: AsRef<Path>(path: P) -> Proxy {
++
+     }
++    */
+ 
+     fn new(intercept: Intercept) -> Proxy {
+         Proxy { intercept }
+@@ -250,9 +248,6 @@ impl Proxy {
+                     None
+                 }
+             }
+-            Intercept::System(ref map) => {
+-                map.get(uri.scheme()).cloned()
+-            }
+             Intercept::Custom(ref custom) => custom.call(uri),
+         }
+     }
+@@ -262,7 +257,6 @@ impl Proxy {
+             Intercept::All(_) => true,
+             Intercept::Http(_) => uri.scheme() == "http",
+             Intercept::Https(_) => uri.scheme() == "https",
+-            Intercept::System(ref map) => map.contains_key(uri.scheme()),
+             Intercept::Custom(ref custom) => custom.call(uri).is_some(),
+         }
+     }
+@@ -375,14 +369,11 @@ impl ProxyScheme {
+     }
+ }
+ 
+-type SystemProxyMap = HashMap<String, ProxyScheme>;
+-
+ #[derive(Clone, Debug)]
+ enum Intercept {
+     All(ProxyScheme),
+     Http(ProxyScheme),
+     Https(ProxyScheme),
+-    System(Arc<SystemProxyMap>),
+     Custom(Custom),
+ }
+ 
+@@ -392,7 +383,6 @@ impl Intercept {
+             Intercept::All(ref mut s)
+             | Intercept::Http(ref mut s)
+             | Intercept::Https(ref mut s) => s.set_basic_auth(username, password),
+-            Intercept::System(_) => unimplemented!(),
+             Intercept::Custom(ref mut custom) => {
+                 let header = encode_basic_auth(username, password);
+                 custom.auth = Some(header);
+@@ -494,10 +484,6 @@ impl Dst for Uri {
+     }
+ }
+ 
+-lazy_static! {
+-    static ref SYS_PROXIES: Arc<SystemProxyMap> = Arc::new(get_sys_proxies());
+-}
+-
+ /// Get system proxies information.
+ ///
+ /// It can only support Linux, Unix like, and windows system.  Note that it will always
+@@ -507,8 +493,8 @@ lazy_static! {
+ /// Returns:
+ ///     System proxies information as a hashmap like
+ ///     {"http": Url::parse("http://127.0.0.1:80"), "https": Url::parse("https://127.0.0.1:80")}
+-fn get_sys_proxies() -> SystemProxyMap {
+-    let proxies = get_from_environment();
++pub fn get_proxies() -> HashMap<String, Url> {
++    let proxies: HashMap<String, Url> = get_from_environment();
+ 
+     // TODO: move the following #[cfg] to `if expression` when attributes on `if` expressions allowed
+     #[cfg(target_os = "windows")]
+@@ -521,14 +507,14 @@ fn get_sys_proxies() -> SystemProxyMap {
+     proxies
+ }
+ 
+-fn insert_proxy(proxies: &mut SystemProxyMap, schema: String, addr: String) {
+-    if let Ok(valid_addr) = addr.into_proxy_scheme() {
++fn insert_proxy(proxies: &mut HashMap<String, Url>, schema: String, addr: String) {
++    if let Ok(valid_addr) = Url::parse(&addr) {
+         proxies.insert(schema, valid_addr);
+     }
+ }
+ 
+-fn get_from_environment() -> SystemProxyMap {
+-    let mut proxies = HashMap::new();
++fn get_from_environment() -> HashMap<String, Url> {
++    let mut proxies: HashMap<String, Url> = HashMap::new();
+ 
+     const PROXY_KEY_ENDS: &str = "_proxy";
+ 
+@@ -544,7 +530,7 @@ fn get_from_environment() -> SystemProxyMap {
+ }
+ 
+ #[cfg(target_os = "windows")]
+-fn get_from_registry_impl() -> Result<SystemProxyMap, Box<dyn Error>> {
++fn get_from_registry_impl() -> Result<HashMap<String, Url>, Box<dyn Error>> {
+     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+     let internet_setting: RegKey =
+         hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")?;
+@@ -556,7 +542,7 @@ fn get_from_registry_impl() -> Result<SystemProxyMap, Box<dyn Error>> {
+         return Ok(HashMap::new());
+     }
+ 
+-    let mut proxies = HashMap::new();
++    let mut proxies: HashMap<String, Url> = HashMap::new();
+     if proxy_server.contains("=") {
+         // per-protocol settings.
+         for p in proxy_server.split(";") {
+@@ -603,7 +589,7 @@ fn get_from_registry_impl() -> Result<SystemProxyMap, Box<dyn Error>> {
+ }
+ 
+ #[cfg(target_os = "windows")]
+-fn get_from_registry() -> SystemProxyMap {
++fn get_from_registry() -> HashMap<String, Url> {
+     get_from_registry_impl().unwrap_or(HashMap::new())
+ }
+ 
+@@ -699,30 +685,24 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn test_get_sys_proxies() {
++    fn test_get_proxies() {
+         // save system setting first.
+         let system_proxy = env::var("http_proxy");
+ 
+         // remove proxy.
+         env::remove_var("http_proxy");
+-        assert_eq!(get_sys_proxies().contains_key("http"), false);
++        assert_eq!(get_proxies().contains_key("http"), false);
+ 
+         // the system proxy setting url is invalid.
+         env::set_var("http_proxy", "123465");
+-        assert_eq!(get_sys_proxies().contains_key("http"), false);
++        assert_eq!(get_proxies().contains_key("http"), false);
+ 
+         // set valid proxy
+         env::set_var("http_proxy", "http://127.0.0.1/");
+-        let proxies = get_sys_proxies();
+-
+-        match &proxies["http"] {
+-            ProxyScheme::Http { uri, .. } => {
+-                assert_eq!(uri, "http://127.0.0.1/");
+-            },
+-            #[cfg(feature = "socks")]
+-            _ => panic!("socks not expected"),
+-        }
++        let proxies = get_proxies();
++        let http_target = proxies.get("http").unwrap().as_str();
+ 
++        assert_eq!(http_target, "http://127.0.0.1/");
+         // reset user setting.
+         match system_proxy {
+             Err(_) => env::remove_var("http_proxy"),
+diff --git a/tests/proxy.rs b/tests/proxy.rs
+index 11cab33..d269200 100644
+--- a/tests/proxy.rs
++++ b/tests/proxy.rs
+@@ -119,28 +119,30 @@ async fn test_no_proxy() {
+     assert_eq!(res.status(), reqwest::StatusCode::OK);
+ }
+ 
+-#[cfg_attr(not(feature = "__internal_proxy_sys_no_cache"), ignore)]
+ #[tokio::test]
+ async fn test_using_system_proxy() {
+-    let url = "http://not.a.real.sub.hyper.rs/prox";
++    let url = "http://hyper.rs/prox";
+     let server = server::http(move |req| {
+         assert_eq!(req.method(), "GET");
+         assert_eq!(req.uri(), url);
+-        assert_eq!(req.headers()["host"], "not.a.real.sub.hyper.rs");
++        assert_eq!(req.headers()["host"], "hyper.rs");
+ 
+         async { http::Response::default() }
+     });
+ 
+-    // Note: we're relying on the `__internal_proxy_sys_no_cache` feature to
+-    // check the environment every time.
+-
+     // save system setting first.
+     let system_proxy = env::var("http_proxy");
+     // set-up http proxy.
+     env::set_var("http_proxy", format!("http://{}", server.addr()));
+ 
+-    // system proxy is used by default
+-    let res = reqwest::get(url).await.unwrap();
++    let res = reqwest::Client::builder()
++        .use_sys_proxy()
++        .build()
++        .unwrap()
++        .get(url)
++        .send()
++        .await
++        .unwrap();
+ 
+     assert_eq!(res.url().as_str(), url);
+     assert_eq!(res.status(), reqwest::StatusCode::OK);

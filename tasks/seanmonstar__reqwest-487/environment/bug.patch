@@ -1,0 +1,921 @@
+diff --git a/.travis.yml b/.travis.yml
+index 282d8e7..31b617d 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -23,10 +23,6 @@ matrix:
+         - rust: stable
+           env: FEATURES="--features rustls-tls"
+ 
+-        # default-tls, rustls, and socks!
+-        - rust: stable
+-          env: FEATURES="--features rustls-tls,socks"
+-
+         - rust: stable
+           env: FEATURES="--features hyper-011"
+ 
+diff --git a/Cargo.toml b/Cargo.toml
+index d226b7c..530ba61 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -17,32 +17,28 @@ encoding_rs = "0.8"
+ futures = "0.1.23"
+ http = "0.1.15"
+ hyper = "0.12.22"
++hyper-old-types = { version = "0.11", optional = true, features = ["compat"] }
+ flate2 = { version = "^1.0.7", default-features = false, features = ["rust_backend"] }
++hyper-tls = { version = "0.3.2", optional = true }
+ log = "0.4"
+ mime = "0.3.7"
+ mime_guess = "2.0.0-alpha.6"
++native-tls = { version = "0.2", optional = true }
+ serde = "1.0"
+ serde_json = "1.0"
+ serde_urlencoded = "0.5"
+-tokio = { version = "0.1.7", default-features = false, features = ["rt-full", "tcp"] }
++tokio = { version = "0.1.7", default-features = false, features = ["rt-full"] }
+ tokio-executor = "0.1.4" # a minimum version so trust-dns-resolver compiles
+ tokio-io = "0.1"
+ tokio-threadpool = "0.1.8" # a minimum version so tokio compiles
+ tokio-timer = "0.2.6" # a minimum version so trust-dns-resolver compiles
++trust-dns-resolver = { version = "0.10", optional = true }
+ url = "1.2"
+ uuid = { version = "0.7", features = ["v4"] }
+-
+-# Optional deps...
+-
+-hyper-old-types = { version = "0.11", optional = true, features = ["compat"] }
+ hyper-rustls = { version = "0.16", optional = true }
+-hyper-tls = { version = "0.3.2", optional = true }
+-native-tls = { version = "0.2", optional = true }
+-rustls = { version = "0.15", features = ["dangerous_configuration"], optional = true }
+-socks = { version = "0.3.2", optional = true }
+ tokio-rustls = { version = "0.9", optional = true }
+-trust-dns-resolver = { version = "0.10", optional = true }
+ webpki-roots = { version = "0.16", optional = true }
++rustls = { version = "0.15", features = ["dangerous_configuration"], optional = true }
+ 
+ [dev-dependencies]
+ env_logger = "0.6"
+diff --git a/src/async_impl/client.rs b/src/async_impl/client.rs
+index 94ac612..3f12875 100644
+--- a/src/async_impl/client.rs
++++ b/src/async_impl/client.rs
+@@ -579,11 +579,11 @@ impl Client {
+ 
+         for proxy in self.inner.proxies.iter() {
+             if proxy.is_match(dst) {
+-                match proxy.http_basic_auth(dst) {
+-                    Some(header) => {
++                match proxy.auth() {
++                    Some(::proxy::Auth::Basic(ref header)) => {
+                         headers.insert(
+                             PROXY_AUTHORIZATION,
+-                            header,
++                            header.clone()
+                         );
+                     },
+                     None => (),
+diff --git a/src/connect.rs b/src/connect.rs
+index 640510b..92423d3 100644
+--- a/src/connect.rs
++++ b/src/connect.rs
+@@ -19,7 +19,7 @@ use std::time::Duration;
+ 
+ #[cfg(feature = "trust-dns")]
+ use dns::TrustDnsResolver;
+-use proxy::{Proxy, ProxyScheme};
++use Proxy;
+ 
+ #[cfg(feature = "trust-dns")]
+ type HttpConnector = ::hyper::client::HttpConnector<TrustDnsResolver>;
+@@ -121,79 +121,6 @@ impl Connector {
+     pub(crate) fn set_timeout(&mut self, timeout: Option<Duration>) {
+         self.timeout = timeout;
+     }
+-
+-    #[cfg(feature = "socks")]
+-    fn connect_socks(&self, dst: Destination, proxy: ProxyScheme) -> Connecting {
+-        macro_rules! timeout {
+-            ($future:expr) => {
+-                if let Some(dur) = self.timeout {
+-                    Box::new(Timeout::new($future, dur).map_err(|err| {
+-                        if err.is_inner() {
+-                            err.into_inner().expect("is_inner")
+-                        } else if err.is_elapsed() {
+-                            io::Error::new(io::ErrorKind::TimedOut, "connect timed out")
+-                        } else {
+-                            io::Error::new(io::ErrorKind::Other, err)
+-                        }
+-                    }))
+-                } else {
+-                    Box::new($future)
+-                }
+-            }
+-        }
+-
+-        let dns = match proxy {
+-            ProxyScheme::Socks5 { remote_dns: false, .. } => socks::DnsResolve::Local,
+-            ProxyScheme::Socks5 { remote_dns: true, .. } => socks::DnsResolve::Proxy,
+-            ProxyScheme::Http { .. } => {
+-                unreachable!("connect_socks is only called for socks proxies");
+-            },
+-        };
+-
+-
+-        match &self.inner {
+-            #[cfg(feature = "default-tls")]
+-            Inner::DefaultTls(_http, tls) => if dst.scheme() == "https" {
+-                use self::native_tls_async::TlsConnectorExt;
+-
+-                let tls = tls.clone();
+-                let host = dst.host().to_owned();
+-                let socks_connecting = socks::connect(proxy, dst, dns);
+-                return timeout!(socks_connecting.and_then(move |(conn, connected)| {
+-                    tls.connect_async(&host, conn)
+-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+-                        .map(move |io| (Box::new(io) as Conn, connected))
+-                }));
+-            },
+-            #[cfg(feature = "rustls-tls")]
+-            Inner::RustlsTls { tls_proxy, .. } => if dst.scheme() == "https" {
+-                use tokio_rustls::TlsConnector as RustlsConnector;
+-                use tokio_rustls::webpki::DNSNameRef;
+-
+-                let tls = tls_proxy.clone();
+-                let host = dst.host().to_owned();
+-                let socks_connecting = socks::connect(proxy, dst, dns);
+-                return timeout!(socks_connecting.and_then(move |(conn, connected)| {
+-                    let maybe_dnsname = DNSNameRef::try_from_ascii_str(&host)
+-                        .map(|dnsname| dnsname.to_owned())
+-                        .map_err(|_| io::Error::new(io::ErrorKind::Other, "Invalid DNS Name"));
+-                    futures::future::result(maybe_dnsname)
+-                        .and_then(move |dnsname| {
+-                            RustlsConnector::from(tls).connect(dnsname.as_ref(), conn)
+-                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+-                        })
+-                        .map(move |io| {
+-                            (Box::new(io) as Conn, connected)
+-                        })
+-                }));
+-            },
+-            #[cfg(not(feature = "tls"))]
+-            Inner::Http(_) => ()
+-        }
+-
+-        // else no TLS
+-        socks::connect(proxy, dst, dns)
+-    }
+ }
+ 
+ #[cfg(feature = "trust-dns")]
+@@ -289,17 +216,9 @@ impl Connect for Connector {
+         }
+ 
+         for prox in self.proxies.iter() {
+-            if let Some(proxy_scheme) = prox.intercept(&dst) {
+-                trace!("proxy({:?}) intercepts {:?}", proxy_scheme, dst);
+-
+-                let (puri, _auth) = match proxy_scheme {
+-                    ProxyScheme::Http { uri, auth, .. } => (uri, auth),
+-                    #[cfg(feature = "socks")]
+-                    ProxyScheme::Socks5 { .. } => return self.connect_socks(dst, proxy_scheme),
+-                };
+-
++            if let Some(puri) = prox.intercept(&dst) {
++                trace!("proxy({:?}) intercepts {:?}", puri, dst);
+                 let mut ndst = dst.clone();
+-
+                 let new_scheme = puri
+                     .scheme_part()
+                     .map(Scheme::as_str)
+@@ -313,7 +232,7 @@ impl Connect for Connector {
+                 ndst.set_port(puri.port_part().map(|port| port.as_u16()));
+ 
+                 #[cfg(feature = "tls")]
+-                let auth = _auth;
++                let auth = prox.auth().cloned();
+ 
+                 match &self.inner {
+                     #[cfg(feature = "default-tls")]
+@@ -388,14 +307,14 @@ pub(crate) type Conn = Box<dyn AsyncConn + Send + Sync + 'static>;
+ pub(crate) type Connecting = Box<Future<Item=(Conn, Connected), Error=io::Error> + Send>;
+ 
+ #[cfg(feature = "tls")]
+-fn tunnel<T>(conn: T, host: String, port: u16, auth: Option<::http::header::HeaderValue>) -> Tunnel<T> {
++fn tunnel<T>(conn: T, host: String, port: u16, auth: Option<::proxy::Auth>) -> Tunnel<T> {
+     let mut buf = format!("\
+         CONNECT {0}:{1} HTTP/1.1\r\n\
+         Host: {0}:{1}\r\n\
+     ", host, port).into_bytes();
+ 
+     match auth {
+-        Some(value) => {
++        Some(::proxy::Auth::Basic(value)) => {
+             debug!("tunnel to {}:{} using basic auth", host, port);
+             buf.extend_from_slice(b"Proxy-Authorization: ");
+             buf.extend_from_slice(value.as_bytes());
+@@ -429,9 +348,7 @@ enum TunnelState {
+ 
+ #[cfg(feature = "tls")]
+ impl<T> Future for Tunnel<T>
+-where
+-    T: AsyncRead + AsyncWrite,
+-{
++where T: AsyncRead + AsyncWrite {
+     type Item = T;
+     type Error = io::Error;
+ 
+@@ -610,72 +527,6 @@ mod native_tls_async {
+     }
+ }
+ 
+-
+-#[cfg(feature = "socks")]
+-mod socks {
+-    use std::io;
+-
+-    use futures::{Future, future};
+-    use hyper::client::connect::{Connected, Destination};
+-    use socks::Socks5Stream;
+-    use std::net::ToSocketAddrs;
+-    use tokio::{net::TcpStream, reactor};
+-
+-    use super::{Connecting};
+-    use proxy::{ProxyScheme};
+-
+-    pub(super) enum DnsResolve {
+-        Local,
+-        Proxy,
+-    }
+-
+-    pub(super) fn connect(
+-        proxy: ProxyScheme,
+-        dst: Destination,
+-        dns: DnsResolve,
+-    ) -> Connecting {
+-        let https = dst.scheme() == "https";
+-        let original_host = dst.host().to_owned();
+-        let mut host = original_host.clone();
+-        let port = dst.port().unwrap_or_else(|| {
+-            if https { 443 } else { 80 }
+-        });
+-
+-        if let DnsResolve::Local = dns {
+-            let maybe_new_target = match (host.as_str(), port).to_socket_addrs() {
+-                Ok(mut iter) => iter.next(),
+-                Err(err) => {
+-                    return Box::new(future::err(err));
+-                }
+-            };
+-            if let Some(new_target) = maybe_new_target {
+-                host = new_target.ip().to_string();
+-            }
+-        }
+-
+-        let (socket_addr, auth) = match proxy {
+-            ProxyScheme::Socks5 { addr, auth, .. } => (addr, auth),
+-            _ => unreachable!(),
+-        };
+-
+-        // Get a Tokio TcpStream
+-        let stream = future::result(if let Some((username, password)) = auth {
+-            Socks5Stream::connect_with_password(
+-                socket_addr, (host.as_str(), port), &username, &password
+-            )
+-        } else {
+-            Socks5Stream::connect(socket_addr, (host.as_str(), port))
+-        }.and_then(|s| {
+-            TcpStream::from_std(s.into_inner(), &reactor::Handle::default())
+-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+-        }));
+-
+-        Box::new(
+-            stream.map(|s| (Box::new(s) as super::Conn, Connected::new()))
+-        )
+-    }
+-}
+-
+ #[cfg(feature = "tls")]
+ #[cfg(test)]
+ mod tests {
+@@ -801,7 +652,7 @@ mod tests {
+         let host = addr.ip().to_string();
+         let port = addr.port();
+         let work = work.and_then(|tcp| {
+-            tunnel(tcp, host, port, Some(proxy::encode_basic_auth("Aladdin", "open sesame")))
++            tunnel(tcp, host, port, Some(proxy::Auth::basic("Aladdin", "open sesame")))
+         });
+ 
+         rt.block_on(work).unwrap();
+diff --git a/src/error.rs b/src/error.rs
+index b7e88f2..912567a 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -149,8 +149,7 @@ impl Error {
+             Kind::TooManyRedirects |
+             Kind::RedirectLoop |
+             Kind::ClientError(_) |
+-            Kind::ServerError(_) |
+-            Kind::UnknownProxyScheme => None,
++            Kind::ServerError(_) => None,
+         }
+     }
+ 
+@@ -274,7 +273,6 @@ impl fmt::Display for Error {
+                 f.write_str("Server Error: ")?;
+                 fmt::Display::fmt(code, f)
+             }
+-            Kind::UnknownProxyScheme => f.write_str("Unknown proxy scheme"),
+         }
+     }
+ }
+@@ -302,7 +300,6 @@ impl StdError for Error {
+             Kind::RedirectLoop => "Infinite redirect loop",
+             Kind::ClientError(_) => "Client Error",
+             Kind::ServerError(_) => "Server Error",
+-            Kind::UnknownProxyScheme => "Unknown proxy scheme",
+         }
+     }
+ 
+@@ -328,8 +325,7 @@ impl StdError for Error {
+             Kind::TooManyRedirects |
+             Kind::RedirectLoop |
+             Kind::ClientError(_) |
+-            Kind::ServerError(_) |
+-            Kind::UnknownProxyScheme => None,
++            Kind::ServerError(_) => None,
+         }
+     }
+ }
+@@ -356,7 +352,6 @@ pub(crate) enum Kind {
+     RedirectLoop,
+     ClientError(StatusCode),
+     ServerError(StatusCode),
+-    UnknownProxyScheme,
+ }
+ 
+ 
+@@ -522,10 +517,6 @@ pub(crate) fn dns_system_conf(io: io::Error) -> Error {
+     Error::new(Kind::DnsSystemConf(io), None)
+ }
+ 
+-pub(crate) fn unknown_proxy_scheme() -> Error {
+-    Error::new(Kind::UnknownProxyScheme, None)
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/src/lib.rs b/src/lib.rs
+index 6fe7157..296ca3b 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -203,8 +203,6 @@ extern crate tokio_timer;
+ extern crate trust_dns_resolver;
+ extern crate url;
+ extern crate uuid;
+-#[cfg(feature = "socks")]
+-extern crate socks;
+ 
+ #[cfg(feature = "rustls-tls")]
+ extern crate hyper_rustls;
+diff --git a/src/proxy.rs b/src/proxy.rs
+index ba5912d..7926186 100644
+--- a/src/proxy.rs
++++ b/src/proxy.rs
+@@ -1,12 +1,9 @@
+ use std::fmt;
+ use std::sync::Arc;
+-#[cfg(feature = "socks")]
+-use std::net::{SocketAddr, ToSocketAddrs};
+ 
+ use http::{header::HeaderValue, Uri};
+ use hyper::client::connect::Destination;
+-use url::percent_encoding::percent_decode;
+-use {IntoUrl, Url};
++use {into_url, IntoUrl, Url};
+ 
+ /// Configuration of a proxy that a `Client` should pass requests to.
+ ///
+@@ -34,43 +31,13 @@ use {IntoUrl, Url};
+ /// would prevent a `Proxy` later in the list from ever working, so take care.
+ #[derive(Clone, Debug)]
+ pub struct Proxy {
++    auth: Option<Auth>,
+     intercept: Intercept,
+ }
+ 
+-/// A particular scheme used for proxying requests.
+-///
+-/// For example, HTTP vs SOCKS5
+ #[derive(Clone, Debug)]
+-pub enum ProxyScheme {
+-    Http {
+-        auth: Option<HeaderValue>,
+-        uri: ::hyper::Uri,
+-    },
+-    #[cfg(feature = "socks")]
+-    Socks5 {
+-        addr: SocketAddr,
+-        auth: Option<(String, String)>,
+-        remote_dns: bool,
+-    },
+-}
+-
+-/// Trait used for converting into a proxy scheme. This trait supports
+-/// parsing from a URL-like type, whilst also supporting proxy schemes
+-/// built directly using the factory methods.
+-pub trait IntoProxyScheme {
+-    fn into_proxy_scheme(self) -> ::Result<ProxyScheme>;
+-}
+-
+-impl<T: IntoUrl> IntoProxyScheme for T {
+-    fn into_proxy_scheme(self) -> ::Result<ProxyScheme> {
+-        ProxyScheme::parse(self.into_url()?)
+-    }
+-}
+-
+-impl IntoProxyScheme for ProxyScheme {
+-    fn into_proxy_scheme(self) -> ::Result<ProxyScheme> {
+-        Ok(self)
+-    }
++pub(crate) enum Auth {
++    Basic(HeaderValue),
+ }
+ 
+ impl Proxy {
+@@ -88,10 +55,9 @@ impl Proxy {
+     /// # }
+     /// # fn main() {}
+     /// ```
+-    pub fn http<U: IntoProxyScheme>(proxy_scheme: U) -> ::Result<Proxy> {
+-        Ok(Proxy::new(Intercept::Http(
+-            proxy_scheme.into_proxy_scheme()?
+-        )))
++    pub fn http<U: IntoUrl>(url: U) -> ::Result<Proxy> {
++        let uri = ::into_url::expect_uri(&url.into_url()?);
++        Ok(Proxy::new(Intercept::Http(uri)))
+     }
+ 
+     /// Proxy all HTTPS traffic to the passed URL.
+@@ -108,10 +74,9 @@ impl Proxy {
+     /// # }
+     /// # fn main() {}
+     /// ```
+-    pub fn https<U: IntoProxyScheme>(proxy_scheme: U) -> ::Result<Proxy> {
+-        Ok(Proxy::new(Intercept::Https(
+-            proxy_scheme.into_proxy_scheme()?
+-        )))
++    pub fn https<U: IntoUrl>(url: U) -> ::Result<Proxy> {
++        let uri = ::into_url::expect_uri(&url.into_url()?);
++        Ok(Proxy::new(Intercept::Https(uri)))
+     }
+ 
+     /// Proxy **all** traffic to the passed URL.
+@@ -128,10 +93,9 @@ impl Proxy {
+     /// # }
+     /// # fn main() {}
+     /// ```
+-    pub fn all<U: IntoProxyScheme>(proxy_scheme: U) -> ::Result<Proxy> {
+-        Ok(Proxy::new(Intercept::All(
+-            proxy_scheme.into_proxy_scheme()?
+-        )))
++    pub fn all<U: IntoUrl>(url: U) -> ::Result<Proxy> {
++        let uri = ::into_url::expect_uri(&url.into_url()?);
++        Ok(Proxy::new(Intercept::All(uri)))
+     }
+ 
+     /// Provide a custom function to determine what traffix to proxy to where.
+@@ -154,14 +118,9 @@ impl Proxy {
+     /// # Ok(())
+     /// # }
+     /// # fn main() {}
+-    pub fn custom<F, U: IntoProxyScheme>(fun: F) -> Proxy
+-    where F: Fn(&Url) -> Option<U> + Send + Sync + 'static {
+-        Proxy::new(Intercept::Custom(Custom {
+-            auth: None,
+-            func: Arc::new(move |url| {
+-                fun(url).map(IntoProxyScheme::into_proxy_scheme)
+-            }),
+-        }))
++    pub fn custom<F>(fun: F) -> Proxy
++    where F: Fn(&Url) -> Option<Url> + Send + Sync + 'static {
++        Proxy::new(Intercept::Custom(Custom(Arc::new(fun))))
+     }
+ 
+     /*
+@@ -172,6 +131,7 @@ impl Proxy {
+ 
+     fn new(intercept: Intercept) -> Proxy {
+         Proxy {
++            auth: None,
+             intercept,
+         }
+     }
+@@ -190,36 +150,28 @@ impl Proxy {
+     /// # fn main() {}
+     /// ```
+     pub fn basic_auth(mut self, username: &str, password: &str) -> Proxy {
+-        self.intercept.set_basic_auth(username, password);
++        self.auth = Some(Auth::basic(username, password));
+         self
+     }
+ 
+-    pub(crate) fn maybe_has_http_auth(&self) -> bool {
+-        match self.intercept {
+-            Intercept::All(ProxyScheme::Http { auth: Some(..), .. }) |
+-            Intercept::Http(ProxyScheme::Http { auth: Some(..), .. }) |
+-            // Custom *may* match 'http', so assume so.
+-            Intercept::Custom(_) => true,
+-            _ => false,
+-        }
++    pub(crate) fn auth(&self) -> Option<&Auth> {
++        self.auth.as_ref()
+     }
+ 
+-    pub(crate) fn http_basic_auth<D: Dst>(&self, uri: &D) -> Option<HeaderValue> {
+-        match self.intercept {
+-            Intercept::All(ProxyScheme::Http { ref auth, .. }) |
+-            Intercept::Http(ProxyScheme::Http { ref auth, .. }) => auth.clone(),
+-            Intercept::Custom(ref custom) => {
+-                custom.call(uri).and_then(|scheme| match scheme {
+-                    ProxyScheme::Http { auth, .. } => auth,
+-                    #[cfg(feature = "socks")]
+-                    _ => None,
+-                })
+-            }
+-            _ => None,
++    pub(crate) fn maybe_has_http_auth(&self) -> bool {
++        match self.auth {
++            Some(Auth::Basic(_)) => match self.intercept {
++                Intercept::All(_) |
++                Intercept::Http(_) |
++                // Custom *may* match 'http', so assume so.
++                Intercept::Custom(_) => true,
++                Intercept::Https(_) => false,
++            },
++            None => false,
+         }
+     }
+ 
+-    pub(crate) fn intercept<D: Dst>(&self, uri: &D) -> Option<ProxyScheme> {
++    pub(crate) fn intercept<D: Dst>(&self, uri: &D) -> Option<::hyper::Uri> {
+         match self.intercept {
+             Intercept::All(ref u) => Some(u.clone()),
+             Intercept::Http(ref u) => {
+@@ -236,7 +188,20 @@ impl Proxy {
+                     None
+                 }
+             },
+-            Intercept::Custom(ref custom) => custom.call(uri),
++            Intercept::Custom(ref fun) => {
++                (fun.0)(
++                    &format!(
++                        "{}://{}{}{}",
++                        uri.scheme(),
++                        uri.host(),
++                        uri.port().map(|_| ":").unwrap_or(""),
++                        uri.port().map(|p| p.to_string()).unwrap_or(String::new())
++                    )
++                        .parse()
++                        .expect("should be valid Url")
++                )
++                    .map(|u| into_url::expect_uri(&u) )
++            },
+         }
+     }
+ 
+@@ -249,169 +214,33 @@ impl Proxy {
+             Intercept::Https(_) => {
+                 uri.scheme() == "https"
+             },
+-            Intercept::Custom(ref custom) => custom.call(uri).is_some(),
+-        }
+-    }
+-}
+-
+-impl ProxyScheme {
+-    // To start conservative, keep builders private for now.
+-
+-    /// Proxy traffic via the specified URL over HTTP
+-    fn http<T: IntoUrl>(url: T) -> ::Result<Self> {
+-        Ok(ProxyScheme::Http {
+-            auth: None,
+-            uri: ::into_url::expect_uri(&url.into_url()?),
+-        })
+-    }
+-
+-    /// Proxy traffic via the specified socket address over SOCKS5
+-    ///
+-    /// # Note
+-    ///
+-    /// Current SOCKS5 support is provided via blocking IO.
+-    #[cfg(feature = "socks")]
+-    fn socks5(addr: SocketAddr) -> ::Result<Self> {
+-        Ok(ProxyScheme::Socks5 {
+-            addr,
+-            auth: None,
+-            remote_dns: false,
+-        })
+-    }
+-
+-    /// Proxy traffic via the specified socket address over SOCKS5H
+-    ///
+-    /// This differs from SOCKS5 in that DNS resolution is also performed via the proxy.
+-    ///
+-    /// # Note
+-    ///
+-    /// Current SOCKS5 support is provided via blocking IO.
+-    #[cfg(feature = "socks")]
+-    fn socks5h(addr: SocketAddr) -> ::Result<Self> {
+-        Ok(ProxyScheme::Socks5 {
+-            addr,
+-            auth: None,
+-            remote_dns: true,
+-        })
+-    }
+-
+-    /// Use a username and password when connecting to the proxy server
+-    fn with_basic_auth<T: Into<String>, U: Into<String>>(mut self, username: T, password: U) -> Self {
+-        self.set_basic_auth(username, password);
+-        self
+-    }
+-
+-    fn set_basic_auth<T: Into<String>, U: Into<String>>(&mut self, username: T, password: U) {
+-        match *self {
+-            ProxyScheme::Http { ref mut auth, .. } => {
+-                let header = encode_basic_auth(&username.into(), &password.into());
+-                *auth = Some(header);
++            Intercept::Custom(ref fun) => {
++                (fun.0)(
++                    &format!(
++                        "{}://{}{}{}",
++                        uri.scheme(),
++                        uri.host(),
++                        uri.port().map(|_| ":").unwrap_or(""),
++                        uri.port().map(|p| p.to_string()).unwrap_or(String::new())
++                    )
++                        .parse()
++                        .expect("should be valid Url")
++                ).is_some()
+             },
+-            #[cfg(feature = "socks")]
+-            ProxyScheme::Socks5 { ref mut auth, .. } => {
+-                *auth = Some((username.into(), password.into()));
+-            }
+         }
+     }
+-
+-    /// Convert a URL into a proxy scheme
+-    ///
+-    /// Supported schemes: HTTP, HTTPS, (SOCKS5, SOCKS5H if `socks` feature is enabled).
+-    // Private for now...
+-    fn parse(url: Url) -> ::Result<Self> {
+-        // Resolve URL to a host and port
+-        #[cfg(feature = "socks")]
+-        let to_addr = || {
+-            let host_and_port = try_!(url.with_default_port(|url| match url.scheme() {
+-                "socks5" | "socks5h" => Ok(1080),
+-                _ => Err(())
+-            }));
+-            let mut addr = try_!(host_and_port.to_socket_addrs());
+-            addr
+-                .next()
+-                .ok_or_else(::error::unknown_proxy_scheme)
+-        };
+-
+-        let mut scheme = match url.scheme() {
+-            "http" | "https" => Self::http(url.clone())?,
+-            #[cfg(feature = "socks")]
+-            "socks5" => Self::socks5(to_addr()?)?,
+-            #[cfg(feature = "socks")]
+-            "socks5h" => Self::socks5h(to_addr()?)?,
+-            _ => return Err(::error::unknown_proxy_scheme())
+-        };
+-
+-        if let Some(pwd) = url.password() {
+-            let decoded_username = percent_decode(url.username().as_bytes()).decode_utf8_lossy();
+-            let decoded_password = percent_decode(pwd.as_bytes()).decode_utf8_lossy();
+-            scheme = scheme.with_basic_auth(decoded_username, decoded_password);
+-        }
+-
+-        Ok(scheme)
+-    }
+ }
+ 
+-
+-
+ #[derive(Clone, Debug)]
+ enum Intercept {
+-    All(ProxyScheme),
+-    Http(ProxyScheme),
+-    Https(ProxyScheme),
++    All(::hyper::Uri),
++    Http(::hyper::Uri),
++    Https(::hyper::Uri),
+     Custom(Custom),
+ }
+ 
+-impl Intercept {
+-    fn set_basic_auth(&mut self, username: &str, password: &str) {
+-        match self {
+-            Intercept::All(ref mut s) |
+-            Intercept::Http(ref mut s) |
+-            Intercept::Https(ref mut s) => s.set_basic_auth(username, password),
+-            Intercept::Custom(ref mut custom) => {
+-                let header = encode_basic_auth(username, password);
+-                custom.auth = Some(header);
+-            }
+-        }
+-    }
+-}
+-
+ #[derive(Clone)]
+-struct Custom {
+-    // This auth only applies if the returned ProxyScheme doesn't have an auth...
+-    auth: Option<HeaderValue>,
+-    func: Arc<Fn(&Url) -> Option<::Result<ProxyScheme>> + Send + Sync + 'static>,
+-}
+-
+-impl Custom {
+-    fn call<D: Dst>(&self, uri: &D) -> Option<ProxyScheme> {
+-        let url = format!(
+-            "{}://{}{}{}",
+-            uri.scheme(),
+-            uri.host(),
+-            uri.port().map(|_| ":").unwrap_or(""),
+-            uri.port().map(|p| p.to_string()).unwrap_or(String::new())
+-        )
+-            .parse()
+-            .expect("should be valid Url");
+-
+-        (self.func)(&url)
+-            .and_then(|result| result.ok())
+-            .map(|scheme| match scheme {
+-                ProxyScheme::Http { auth, uri } => {
+-                    if auth.is_some() {
+-                        ProxyScheme::Http { auth, uri }
+-                    } else {
+-                        ProxyScheme::Http {
+-                            auth: self.auth.clone(),
+-                            uri,
+-                        }
+-                    }
+-                },
+-                #[cfg(feature = "socks")]
+-                socks => socks,
+-            })
+-    }
+-}
++struct Custom(Arc<Fn(&Url) -> Option<Url> + Send + Sync + 'static>);
+ 
+ impl fmt::Debug for Custom {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+@@ -419,15 +248,6 @@ impl fmt::Debug for Custom {
+     }
+ }
+ 
+-pub(crate) fn encode_basic_auth(username: &str, password: &str) -> HeaderValue {
+-    let val = format!("{}:{}", username, password);
+-    let mut header = format!("Basic {}", base64::encode(&val))
+-        .parse::<HeaderValue>()
+-        .expect("base64 is always valid HeaderValue");
+-    header.set_sensitive(true);
+-    header
+-}
+-
+ /// A helper trait to allow testing `Proxy::intercept` without having to
+ /// construct `hyper::client::connect::Destination`s.
+ pub(crate) trait Dst {
+@@ -469,6 +289,17 @@ impl Dst for Uri {
+     }
+ }
+ 
++impl Auth {
++    pub(crate) fn basic(username: &str, password: &str) -> Auth {
++        let val = format!("{}:{}", username, password);
++        let mut header = format!("Basic {}", base64::encode(&val))
++            .parse::<HeaderValue>()
++            .expect("base64 is always valid HeaderValue");
++        header.set_sensitive(true);
++        Auth::Basic(header)
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -492,15 +323,6 @@ mod tests {
+         s.parse().unwrap()
+     }
+ 
+-
+-    fn intercepted_uri(p: &Proxy, s: &str) -> Uri {
+-        match p.intercept(&url(s)).unwrap() {
+-            ProxyScheme::Http { uri, .. } => uri,
+-            #[cfg(feature = "socks")]
+-            _ => panic!("intercepted as socks"),
+-        }
+-    }
+-
+     #[test]
+     fn test_http() {
+         let target = "http://example.domain/";
+@@ -509,7 +331,7 @@ mod tests {
+         let http = "http://hyper.rs";
+         let other = "https://hyper.rs";
+ 
+-        assert_eq!(intercepted_uri(&p, http), target);
++        assert_eq!(p.intercept(&url(http)).unwrap(), target);
+         assert!(p.intercept(&url(other)).is_none());
+     }
+ 
+@@ -522,7 +344,7 @@ mod tests {
+         let other = "https://hyper.rs";
+ 
+         assert!(p.intercept(&url(http)).is_none());
+-        assert_eq!(intercepted_uri(&p, other), target);
++        assert_eq!(p.intercept(&url(other)).unwrap(), target);
+     }
+ 
+     #[test]
+@@ -534,9 +356,9 @@ mod tests {
+         let https = "https://hyper.rs";
+         let other = "x-youve-never-heard-of-me-mr-proxy://hyper.rs";
+ 
+-        assert_eq!(intercepted_uri(&p, http), target);
+-        assert_eq!(intercepted_uri(&p, https), target);
+-        assert_eq!(intercepted_uri(&p, other), target);
++        assert_eq!(p.intercept(&url(http)).unwrap(), target);
++        assert_eq!(p.intercept(&url(https)).unwrap(), target);
++        assert_eq!(p.intercept(&url(other)).unwrap(), target);
+     }
+ 
+ 
+@@ -550,7 +372,7 @@ mod tests {
+             } else if url.scheme() == "http" {
+                 target2.parse().ok()
+             } else {
+-                None::<Url>
++                None
+             }
+         });
+ 
+@@ -558,8 +380,9 @@ mod tests {
+         let https = "https://hyper.rs";
+         let other = "x-youve-never-heard-of-me-mr-proxy://seanmonstar.com";
+ 
+-        assert_eq!(intercepted_uri(&p, http), target2);
+-        assert_eq!(intercepted_uri(&p, https), target1);
++        assert_eq!(p.intercept(&url(http)).unwrap(), target2);
++        assert_eq!(p.intercept(&url(https)).unwrap(), target1);
+         assert!(p.intercept(&url(other)).is_none());
+     }
++
+ }
+diff --git a/tests/proxy.rs b/tests/proxy.rs
+index 9663c15..ae5a6d4 100644
+--- a/tests/proxy.rs
++++ b/tests/proxy.rs
+@@ -77,41 +77,3 @@ fn http_proxy_basic_auth() {
+     assert_eq!(res.status(), reqwest::StatusCode::OK);
+     assert_eq!(res.headers().get(reqwest::header::SERVER).unwrap(), &"proxied");
+ }
+-
+-#[test]
+-fn http_proxy_basic_auth_parsed() {
+-    let server = server! {
+-        request: b"\
+-            GET http://hyper.rs/prox HTTP/1.1\r\n\
+-            user-agent: $USERAGENT\r\n\
+-            accept: */*\r\n\
+-            accept-encoding: gzip\r\n\
+-            proxy-authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\n\
+-            host: hyper.rs\r\n\
+-            \r\n\
+-            ",
+-        response: b"\
+-            HTTP/1.1 200 OK\r\n\
+-            Server: proxied\r\n\
+-            Content-Length: 0\r\n\
+-            \r\n\
+-            "
+-    };
+-
+-    let proxy = format!("http://Aladdin:open sesame@{}", server.addr());
+-
+-    let url = "http://hyper.rs/prox";
+-    let res = reqwest::Client::builder()
+-        .proxy(
+-            reqwest::Proxy::http(&proxy).unwrap()
+-        )
+-        .build()
+-        .unwrap()
+-        .get(url)
+-        .send()
+-        .unwrap();
+-
+-    assert_eq!(res.url().as_str(), url);
+-    assert_eq!(res.status(), reqwest::StatusCode::OK);
+-    assert_eq!(res.headers().get(reqwest::header::SERVER).unwrap(), &"proxied");
+-}

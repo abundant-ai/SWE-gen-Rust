@@ -1,0 +1,292 @@
+diff --git a/.travis.yml b/.travis.yml
+index b8a3de8..9eed600 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -7,8 +7,8 @@ rust:
+ sudo: false
+ script:
+   - cargo build --verbose
+-  - cargo build --verbose --manifest-path=regex-debug/Cargo.toml
+   - if [ "$TRAVIS_RUST_VERSION" = "nightly" ]; then
++      cargo build --verbose --manifest-path=regex-debug/Cargo.toml;
+       RUSTFLAGS="-C target-feature=+ssse3" cargo test --verbose --features 'simd-accel pattern';
+     else
+       travis_wait cargo test --verbose;
+diff --git a/regex-syntax/src/lib.rs b/regex-syntax/src/lib.rs
+index ee96045..147a490 100644
+--- a/regex-syntax/src/lib.rs
++++ b/regex-syntax/src/lib.rs
+@@ -528,6 +528,21 @@ impl Expr {
+         }
+     }
+ 
++    /// Returns true if and only if the expression has at least one matchable
++    /// sub-expression that must match the beginning of text.
++    pub fn has_anchored_start(&self) -> bool {
++        match *self {
++            Repeat { ref e, r, .. } => {
++                !r.matches_empty() && e.has_anchored_start()
++            }
++            Group { ref e, .. } => e.has_anchored_start(),
++            Concat(ref es) => es[0].has_anchored_start(),
++            Alternate(ref es) => es.iter().any(|e| e.has_anchored_start()),
++            StartText => true,
++            _ => false,
++        }
++    }
++
+     /// Returns true if and only if the expression is required to match at the
+     /// end of the text.
+     pub fn is_anchored_end(&self) -> bool {
+@@ -543,6 +558,21 @@ impl Expr {
+         }
+     }
+ 
++    /// Returns true if and only if the expression has at least one matchable
++    /// sub-expression that must match the beginning of text.
++    pub fn has_anchored_end(&self) -> bool {
++        match *self {
++            Repeat { ref e, r, .. } => {
++                !r.matches_empty() && e.has_anchored_end()
++            }
++            Group { ref e, .. } => e.has_anchored_end(),
++            Concat(ref es) => es[es.len() - 1].has_anchored_end(),
++            Alternate(ref es) => es.iter().any(|e| e.has_anchored_end()),
++            EndText => true,
++            _ => false,
++        }
++    }
++
+     /// Returns true if and only if the expression contains sub-expressions
+     /// that can match arbitrary bytes.
+     pub fn has_bytes(&self) -> bool {
+diff --git a/src/compile.rs b/src/compile.rs
+index 9db743f..32d1f6a 100644
+--- a/src/compile.rs
++++ b/src/compile.rs
+@@ -143,7 +143,9 @@ impl Compiler {
+         // matching engine itself.
+         let mut dotstar_patch = Patch { hole: Hole::None, entry: 0 };
+         self.compiled.is_anchored_start = expr.is_anchored_start();
++        self.compiled.has_anchored_start = expr.has_anchored_start();
+         self.compiled.is_anchored_end = expr.is_anchored_end();
++        self.compiled.has_anchored_end = expr.has_anchored_end();
+         if self.compiled.needs_dotstar() {
+             dotstar_patch = try!(self.c_dotstar());
+             self.compiled.start = dotstar_patch.entry;
+@@ -171,6 +173,10 @@ impl Compiler {
+             exprs.iter().all(|e| e.is_anchored_start());
+         self.compiled.is_anchored_end =
+             exprs.iter().all(|e| e.is_anchored_end());
++        self.compiled.has_anchored_start =
++            exprs.iter().any(|e| e.has_anchored_start());
++        self.compiled.has_anchored_end =
++            exprs.iter().any(|e| e.has_anchored_end());
+         let mut dotstar_patch = Patch { hole: Hole::None, entry: 0 };
+         if self.compiled.needs_dotstar() {
+             dotstar_patch = try!(self.c_dotstar());
+diff --git a/src/dfa.rs b/src/dfa.rs
+index 0216f25..ed472ef 100644
+--- a/src/dfa.rs
++++ b/src/dfa.rs
+@@ -152,6 +152,9 @@ struct CacheInner {
+     /// The total number of times this cache has been flushed by the DFA
+     /// because of space constraints.
+     flush_count: u64,
++    /// The total heap size of the DFA's cache. We use this to determine when
++    /// we should flush the cache.
++    size: usize,
+ }
+ 
+ /// The transition table.
+@@ -420,18 +423,32 @@ impl Cache {
+     pub fn new(prog: &Program) -> Self {
+         // We add 1 to account for the special EOF byte.
+         let num_byte_classes = (prog.byte_classes[255] as usize + 1) + 1;
+-        Cache {
++        let starts = vec![STATE_UNKNOWN; 256];
++        let mut cache = Cache {
+             inner: CacheInner {
+                 compiled: HashMap::new(),
+                 trans: Transitions::new(num_byte_classes),
+                 states: vec![],
+-                start_states: vec![STATE_UNKNOWN; 256],
++                start_states: starts,
+                 stack: vec![],
+                 flush_count: 0,
++                size: 0,
+             },
+             qcur: SparseSet::new(prog.insts.len()),
+             qnext: SparseSet::new(prog.insts.len()),
+-        }
++        };
++        cache.inner.reset_size();
++        cache
++    }
++}
++
++impl CacheInner {
++    /// Resets the cache size to account for fixed costs, such as the program
++    /// and stack sizes.
++    fn reset_size(&mut self) {
++        self.size =
++            (self.start_states.len() * mem::size_of::<StatePtr>())
++            + (self.stack.len() * mem::size_of::<InstPtr>());
+     }
+ }
+ 
+@@ -1151,7 +1168,9 @@ impl<'a> Fsm<'a> {
+         }
+         // If the cache has gotten too big, wipe it.
+         if self.approximate_size() > self.prog.dfa_size_limit {
++            println!("clearing cache (size: {:?})", self.approximate_size());
+             if !self.clear_cache_and_save(current_state) {
++                println!("giving up");
+                 // Ooops. DFA is giving up.
+                 return None;
+             }
+@@ -1280,6 +1299,7 @@ impl<'a> Fsm<'a> {
+         } else {
+             None
+         };
++        self.cache.reset_size();
+         self.cache.trans.clear();
+         self.cache.states.clear();
+         self.cache.compiled.clear();
+@@ -1454,6 +1474,11 @@ impl<'a> Fsm<'a> {
+         }
+         // Finally, put our actual state on to our heap of states and index it
+         // so we can find it later.
++        self.cache.size +=
++            self.cache.trans.state_heap_size()
++            + (2 * state.data.len())
++            + (2 * mem::size_of::<State>())
++            + mem::size_of::<StatePtr>();
+         self.cache.states.push(state.clone());
+         self.cache.compiled.insert(state, si);
+         // Transition table and set of states and map should all be in sync.
+@@ -1536,51 +1561,8 @@ impl<'a> Fsm<'a> {
+     /// be wiped. Namely, it is possible that for certain regexes on certain
+     /// inputs, a new state could be created for every byte of input. (This is
+     /// bad for memory use, so we bound it with a cache.)
+-    ///
+-    /// The approximation is guaranteed to be done in constant time (and
+-    /// indeed, this requirement is why it's approximate).
+     fn approximate_size(&self) -> usize {
+-        use std::mem::size_of as size;
+-        // Estimate that there are about 16 instructions per state consuming
+-        // 20 = 4 + (15 * 1) bytes of space (1 byte because of delta encoding).
+-        const STATE_HEAP: usize = 20 + 1; // one extra byte for flags
+-        let compiled =
+-            (self.cache.compiled.len() * (size::<State>() + STATE_HEAP))
+-            + (self.cache.compiled.len() * size::<StatePtr>());
+-        let states =
+-            self.cache.states.len()
+-            * (size::<State>()
+-               + STATE_HEAP
+-               + (self.num_byte_classes() * size::<StatePtr>()));
+-        let start_states = self.cache.start_states.len() * size::<StatePtr>();
+-        self.prog.approximate_size() + compiled + states + start_states
+-    }
+-
+-    /// Returns the actual heap space of the DFA. This visits every state in
+-    /// the DFA.
+-    #[allow(dead_code)] // useful for debugging
+-    fn actual_size(&self) -> usize {
+-        let mut compiled = 0;
+-        for k in self.cache.compiled.keys() {
+-            compiled += mem::size_of::<State>();
+-            compiled += mem::size_of::<StatePtr>();
+-            compiled += k.data.len() * mem::size_of::<u8>();
+-        }
+-        let mut states = 0;
+-        for s in &self.cache.states {
+-            states += mem::size_of::<State>();
+-            states += s.data.len() * mem::size_of::<u8>();
+-        }
+-        compiled
+-        + states
+-        + (self.cache.trans.num_states() *
+-           mem::size_of::<StatePtr>() *
+-           self.num_byte_classes())
+-        + (self.cache.start_states.len() * mem::size_of::<StatePtr>())
+-        + (self.cache.stack.len() * mem::size_of::<InstPtr>())
+-        + mem::size_of::<Fsm>()
+-        + mem::size_of::<CacheInner>()
+-        + self.prog.approximate_size() // OK, not actual, but close enough
++        self.cache.size + self.prog.approximate_size()
+     }
+ }
+ 
+@@ -1628,6 +1610,11 @@ impl Transitions {
+         self.table[si as usize + cls]
+     }
+ 
++    /// The heap size, in bytes, of a single state in the transition table.
++    fn state_heap_size(&self) -> usize {
++        self.num_byte_classes * mem::size_of::<StatePtr>()
++    }
++
+     /// Like `next`, but uses unchecked access and is therefore unsafe.
+     unsafe fn next_unchecked(&self, si: StatePtr, cls: usize) -> StatePtr {
+         debug_assert!((si as usize) < self.table.len());
+diff --git a/src/exec.rs b/src/exec.rs
+index 65a3935..5d0541a 100644
+--- a/src/exec.rs
++++ b/src/exec.rs
+@@ -840,11 +840,7 @@ impl<'c> ExecNoSync<'c> {
+     ) -> Option<(usize, usize)> {
+         // We can't use match_end directly, because we may need to examine
+         // one "character" after the end of a match for lookahead operators.
+-        let e = if self.ro.nfa.uses_bytes() {
+-            cmp::min(match_end + 1, text.len())
+-        } else {
+-            cmp::min(next_utf8(text, match_end), text.len())
+-        };
++        let e = cmp::min(next_utf8(text, match_end), text.len());
+         self.captures_nfa(slots, &text[..e], match_start)
+     }
+ 
+@@ -1113,7 +1109,15 @@ impl ExecReadOnly {
+         // If our set of prefixes is complete, then we can use it to find
+         // a match in lieu of a regex engine. This doesn't quite work well in
+         // the presence of multiple regexes, so only do it when there's one.
+-        if self.res.len() == 1 {
++        //
++        // TODO(burntsushi): Also, don't try to match literals if the regex is
++        // partially anchored. We could technically do it, but we'd need to
++        // create two sets of literals: all of them and then the subset that
++        // aren't anchored. We would then only search for all of them when at
++        // the beginning of the input and use the subset in all other cases.
++        if self.res.len() == 1
++            && !self.nfa.has_anchored_start
++            && !self.nfa.has_anchored_end {
+             if self.nfa.prefixes.complete() {
+                 return if self.nfa.is_anchored_start {
+                     Literal(MatchLiteralType::AnchoredStart)
+diff --git a/src/prog.rs b/src/prog.rs
+index 36f2aff..41ebde0 100644
+--- a/src/prog.rs
++++ b/src/prog.rs
+@@ -52,6 +52,12 @@ pub struct Program {
+     pub is_anchored_start: bool,
+     /// Whether the regex must match at the end of the input.
+     pub is_anchored_end: bool,
++    /// Whether the regex has at least one matchable sub-expression that must
++    /// match from the start of the input.
++    pub has_anchored_start: bool,
++    /// Whether the regex has at least one matchable sub-expression that must
++    /// match at the end of the input.
++    pub has_anchored_end: bool,
+     /// Whether this program contains a Unicode word boundary instruction.
+     pub has_unicode_word_boundary: bool,
+     /// A possibly empty machine for very quickly matching prefix literals.
+@@ -91,6 +97,8 @@ impl Program {
+             is_reverse: false,
+             is_anchored_start: false,
+             is_anchored_end: false,
++            has_anchored_start: false,
++            has_anchored_end: false,
+             has_unicode_word_boundary: false,
+             prefixes: LiteralSearcher::empty(),
+             dfa_size_limit: 2 * (1<<20),

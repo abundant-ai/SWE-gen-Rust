@@ -1,0 +1,928 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a58396e1..157e3974 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -55,7 +55,6 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
+ - *(derive)* Changed the default for arguments from `parse` to `value_parser`., removing `parse` support
+ - *(derive)* `subcommand_required(true).arg_required_else_help(true)` is set instead of `SubcommandRequiredElseHelp` (#3280)
+ - *(derive)* Remove `arg_enum` attribute in favor of `value_enum`
+-- *(derive)* Remove `structopt()` attributes in favor of `clap()`
+ 
+ ### Compatibility
+ 
+diff --git a/clap_derive/src/attr.rs b/clap_derive/src/attr.rs
+index aee3ee51..f073d23f 100644
+--- a/clap_derive/src/attr.rs
++++ b/clap_derive/src/attr.rs
+@@ -5,6 +5,7 @@ use proc_macro_error::abort;
+ use proc_macro_error::ResultExt;
+ use quote::quote;
+ use quote::ToTokens;
++use syn::spanned::Spanned;
+ use syn::{
+     parenthesized,
+     parse::{Parse, ParseStream},
+@@ -12,8 +13,11 @@ use syn::{
+     Attribute, Expr, Ident, LitStr, Token,
+ };
+ 
++use crate::utils::Sp;
++
+ #[derive(Clone)]
+ pub struct ClapAttr {
++    pub kind: Sp<AttrKind>,
+     pub name: Ident,
+     pub magic: Option<MagicAttrName>,
+     pub value: Option<AttrValue>,
+@@ -23,10 +27,24 @@ impl ClapAttr {
+     pub fn parse_all(all_attrs: &[Attribute]) -> Vec<Self> {
+         all_attrs
+             .iter()
+-            .filter(|attr| attr.path.is_ident("clap"))
+-            .flat_map(|attr| {
++            .filter_map(|attr| {
++                let kind = if attr.path.is_ident("clap") {
++                    Some(Sp::new(AttrKind::Clap, attr.path.span()))
++                } else if attr.path.is_ident("structopt") {
++                    Some(Sp::new(AttrKind::StructOpt, attr.path.span()))
++                } else {
++                    None
++                };
++                kind.map(|k| (k, attr))
++            })
++            .flat_map(|(k, attr)| {
+                 attr.parse_args_with(Punctuated::<ClapAttr, Token![,]>::parse_terminated)
+                     .unwrap_or_abort()
++                    .into_iter()
++                    .map(move |mut a| {
++                        a.kind = k;
++                        a
++                    })
+             })
+             .collect()
+     }
+@@ -113,7 +131,12 @@ impl Parse for ClapAttr {
+             None
+         };
+ 
+-        Ok(Self { name, magic, value })
++        Ok(Self {
++            kind: Sp::new(AttrKind::Clap, name.span()),
++            name,
++            magic,
++            value,
++        })
+     }
+ }
+ 
+@@ -166,3 +189,18 @@ impl ToTokens for AttrValue {
+         }
+     }
+ }
++
++#[derive(Copy, Clone, PartialEq, Eq)]
++pub enum AttrKind {
++    Clap,
++    StructOpt,
++}
++
++impl AttrKind {
++    pub fn as_str(&self) -> &'static str {
++        match self {
++            Self::Clap => "clap",
++            Self::StructOpt => "structopt",
++        }
++    }
++}
+diff --git a/clap_derive/src/derives/args.rs b/clap_derive/src/derives/args.rs
+index 9cf24df4..f057abe1 100644
+--- a/clap_derive/src/derives/args.rs
++++ b/clap_derive/src/derives/args.rs
+@@ -72,6 +72,13 @@ pub fn gen_for_struct(
+     generics: &Generics,
+     fields: &[(&Field, Item)],
+ ) -> TokenStream {
++    if !matches!(&*item.kind(), Kind::Command(_)) {
++        abort! { item.kind().span(),
++            "`{}` cannot be used with `command`",
++            item.kind().name(),
++        }
++    }
++
+     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+ 
+     let constructor = gen_constructor(fields);
+@@ -194,7 +201,9 @@ pub fn gen_augment(
+     let args = fields.iter().filter_map(|(field, item)| {
+         let kind = item.kind();
+         match &*kind {
+-            Kind::Subcommand(_)
++            Kind::Command(_)
++            | Kind::Value(_)
++            | Kind::Subcommand(_)
+             | Kind::Skip(_)
+             | Kind::FromGlobal(_)
+             | Kind::ExternalSubcommand => None,
+@@ -291,9 +300,16 @@ pub fn gen_augment(
+ 
+                 let id = item.id();
+                 let explicit_methods = item.field_methods(true);
++                let deprecations = if !override_required {
++                    item.deprecations()
++                } else {
++                    quote!()
++                };
+ 
+                 Some(quote_spanned! { field.span()=>
+                     let #app_var = #app_var.arg({
++                        #deprecations
++
+                         #[allow(deprecated)]
+                         let arg = clap::Arg::new(#id)
+                             #implicit_methods;
+@@ -307,9 +323,15 @@ pub fn gen_augment(
+         }
+     });
+ 
++    let deprecations = if !override_required {
++        parent_item.deprecations()
++    } else {
++        quote!()
++    };
+     let initial_app_methods = parent_item.initial_top_level_methods();
+     let final_app_methods = parent_item.final_top_level_methods();
+     quote! {{
++        #deprecations
+         let #app_var = #app_var #initial_app_methods;
+         #( #args )*
+         #subcmd
+@@ -323,9 +345,12 @@ pub fn gen_constructor(fields: &[(&Field, Item)]) -> TokenStream {
+         let kind = item.kind();
+         let arg_matches = format_ident!("__clap_arg_matches");
+         match &*kind {
+-            Kind::ExternalSubcommand => {
++            Kind::Command(_)
++            | Kind::Value(_)
++            | Kind::ExternalSubcommand => {
+                 abort! { kind.span(),
+-                    "`external_subcommand` can be used only on enum variants"
++                    "`{}` cannot be used with `arg`",
++                    kind.name(),
+                 }
+             }
+             Kind::Subcommand(ty) => {
+@@ -391,9 +416,12 @@ pub fn gen_updater(fields: &[(&Field, Item)], use_self: bool) -> TokenStream {
+         let arg_matches = format_ident!("__clap_arg_matches");
+ 
+         match &*kind {
+-            Kind::ExternalSubcommand => {
++            Kind::Command(_)
++            | Kind::Value(_)
++            | Kind::ExternalSubcommand => {
+                 abort! { kind.span(),
+-                    "`external_subcommand` can be used only on enum variants"
++                    "`{}` cannot be used with `arg`",
++                    kind.name(),
+                 }
+             }
+             Kind::Subcommand(ty) => {
+diff --git a/clap_derive/src/derives/subcommand.rs b/clap_derive/src/derives/subcommand.rs
+index 408f20de..c6a13c21 100644
+--- a/clap_derive/src/derives/subcommand.rs
++++ b/clap_derive/src/derives/subcommand.rs
+@@ -52,6 +52,13 @@ pub fn gen_for_enum(
+     generics: &Generics,
+     variants: &[(&Variant, Item)],
+ ) -> TokenStream {
++    if !matches!(&*item.kind(), Kind::Command(_)) {
++        abort! { item.kind().span(),
++            "`{}` cannot be used with `command`",
++            item.kind().name(),
++        }
++    }
++
+     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+ 
+     let from_arg_matches = gen_from_arg_matches(variants);
+@@ -143,9 +150,15 @@ fn gen_augment(
+                              or `Vec<OsString>`."
+                         ),
+                     };
++                    let deprecations = if !override_required {
++                        item.deprecations()
++                    } else {
++                        quote!()
++                    };
+                     let subcommand = match subty_if_name(ty, "Vec") {
+                         Some(subty) => {
+                             quote_spanned! { kind.span()=>
++                                #deprecations
+                                 let #app_var = #app_var.external_subcommand_value_parser(clap::value_parser!(#subty));
+                             }
+                         }
+@@ -162,11 +175,17 @@ fn gen_augment(
+                 Kind::Flatten => match variant.fields {
+                     Unnamed(FieldsUnnamed { ref unnamed, .. }) if unnamed.len() == 1 => {
+                         let ty = &unnamed[0];
++                        let deprecations = if !override_required {
++                            item.deprecations()
++                        } else {
++                            quote!()
++                        };
+                         let old_heading_var = format_ident!("__clap_old_heading");
+                         let next_help_heading = item.next_help_heading();
+                         let next_display_order = item.next_display_order();
+                         let subcommand = if override_required {
+                             quote! {
++                                #deprecations
+                                 let #old_heading_var = #app_var.get_next_help_heading().map(|s| clap::builder::Str::from(s.to_owned()));
+                                 let #app_var = #app_var #next_help_heading #next_display_order;
+                                 let #app_var = <#ty as clap::Subcommand>::augment_subcommands_for_update(#app_var);
+@@ -174,6 +193,7 @@ fn gen_augment(
+                             }
+                         } else {
+                             quote! {
++                                #deprecations
+                                 let #old_heading_var = #app_var.get_next_help_heading().map(|s| clap::builder::Str::from(s.to_owned()));
+                                 let #app_var = #app_var #next_help_heading #next_display_order;
+                                 let #app_var = <#ty as clap::Subcommand>::augment_subcommands(#app_var);
+@@ -217,10 +237,16 @@ fn gen_augment(
+                     };
+ 
+                     let name = item.cased_name();
++                    let deprecations = if !override_required {
++                        item.deprecations()
++                    } else {
++                        quote!()
++                    };
+                     let initial_app_methods = item.initial_top_level_methods();
+                     let final_from_attrs = item.final_top_level_methods();
+                     let subcommand = quote! {
+                         let #app_var = #app_var.subcommand({
++                            #deprecations;
+                             let #subcommand_var = clap::Command::new(#name);
+                             let #subcommand_var = #subcommand_var #initial_app_methods;
+                             let #subcommand_var = #arg_block;
+@@ -286,9 +312,15 @@ fn gen_augment(
+                         }
+                     };
+ 
++                    let deprecations = if !override_required {
++                        item.deprecations()
++                    } else {
++                        quote!()
++                    };
+                     let name = item.cased_name();
+                     let subcommand = quote! {
+                         let #app_var = #app_var.subcommand({
++                            #deprecations
+                             let #subcommand_var = clap::Command::new(#name);
+                             #sub_augment
+                         });
+@@ -299,12 +331,18 @@ fn gen_augment(
+         })
+         .collect();
+ 
++    let deprecations = if !override_required {
++        parent_item.deprecations()
++    } else {
++        quote!()
++    };
+     let initial_app_methods = parent_item.initial_top_level_methods();
+     let final_app_methods = parent_item.final_top_level_methods();
+     quote! {
+-            let #app_var = #app_var #initial_app_methods;
+-            #( #subcommands )*;
+-            #app_var #final_app_methods
++        #deprecations;
++        let #app_var = #app_var #initial_app_methods;
++        #( #subcommands )*;
++        #app_var #final_app_methods
+     }
+ }
+ 
+diff --git a/clap_derive/src/derives/value_enum.rs b/clap_derive/src/derives/value_enum.rs
+index 8ef32903..f53b09df 100644
+--- a/clap_derive/src/derives/value_enum.rs
++++ b/clap_derive/src/derives/value_enum.rs
+@@ -41,10 +41,17 @@ pub fn derive_value_enum(input: &DeriveInput) -> TokenStream {
+     }
+ }
+ 
+-pub fn gen_for_enum(_item: &Item, item_name: &Ident, variants: &[(&Variant, Item)]) -> TokenStream {
++pub fn gen_for_enum(item: &Item, item_name: &Ident, variants: &[(&Variant, Item)]) -> TokenStream {
++    if !matches!(&*item.kind(), Kind::Value(_)) {
++        abort! { item.kind().span(),
++            "`{}` cannot be used with `value`",
++            item.kind().name(),
++        }
++    }
++
+     let lits = lits(variants);
+     let value_variants = gen_value_variants(&lits);
+-    let to_possible_value = gen_to_possible_value(&lits);
++    let to_possible_value = gen_to_possible_value(item, &lits);
+ 
+     quote! {
+         #[allow(dead_code, unreachable_code, unused_variables, unused_braces)]
+@@ -78,12 +85,14 @@ fn lits(variants: &[(&Variant, Item)]) -> Vec<(TokenStream, Ident)> {
+                     abort!(variant.span(), "`#[derive(ValueEnum)]` only supports unit variants. Non-unit variants must be skipped");
+                 }
+                 let fields = item.field_methods(false);
++                let deprecations = item.deprecations();
+                 let name = item.cased_name();
+                 Some((
+-                    quote_spanned! { variant.span()=>
++                    quote_spanned! { variant.span()=> {
++                        #deprecations
+                         clap::builder::PossibleValue::new(#name)
+                         #fields
+-                    },
++                    }},
+                     variant.ident.clone(),
+                 ))
+             }
+@@ -101,11 +110,14 @@ fn gen_value_variants(lits: &[(TokenStream, Ident)]) -> TokenStream {
+     }
+ }
+ 
+-fn gen_to_possible_value(lits: &[(TokenStream, Ident)]) -> TokenStream {
++fn gen_to_possible_value(item: &Item, lits: &[(TokenStream, Ident)]) -> TokenStream {
+     let (lit, variant): (Vec<TokenStream>, Vec<Ident>) = lits.iter().cloned().unzip();
+ 
++    let deprecations = item.deprecations();
++
+     quote! {
+         fn to_possible_value<'a>(&self) -> ::std::option::Option<clap::builder::PossibleValue> {
++            #deprecations
+             match self {
+                 #(Self::#variant => Some(#lit),)*
+                 _ => None
+diff --git a/clap_derive/src/item.rs b/clap_derive/src/item.rs
+index 67d336d6..c1935ca5 100644
+--- a/clap_derive/src/item.rs
++++ b/clap_derive/src/item.rs
+@@ -41,6 +41,7 @@ pub struct Item {
+     ty: Option<Type>,
+     doc_comment: Vec<Method>,
+     methods: Vec<Method>,
++    deprecations: Vec<Deprecation>,
+     value_parser: Option<ValueParser>,
+     action: Option<Action>,
+     verbatim_doc_comment: bool,
+@@ -57,7 +58,8 @@ impl Item {
+         let attrs = &input.attrs;
+         let argument_casing = Sp::call_site(DEFAULT_CASING);
+         let env_casing = Sp::call_site(DEFAULT_ENV_CASING);
+-        Self::from_struct(span, attrs, name, argument_casing, env_casing)
++        let kind = Sp::new(Kind::Command(Sp::new(Ty::Other, span)), span);
++        Self::from_struct(attrs, name, argument_casing, env_casing, kind)
+     }
+ 
+     pub fn from_subcommand_enum(input: &DeriveInput, name: Name) -> Self {
+@@ -65,7 +67,8 @@ impl Item {
+         let attrs = &input.attrs;
+         let argument_casing = Sp::call_site(DEFAULT_CASING);
+         let env_casing = Sp::call_site(DEFAULT_ENV_CASING);
+-        Self::from_struct(span, attrs, name, argument_casing, env_casing)
++        let kind = Sp::new(Kind::Command(Sp::new(Ty::Other, span)), span);
++        Self::from_struct(attrs, name, argument_casing, env_casing, kind)
+     }
+ 
+     pub fn from_value_enum(input: &DeriveInput, name: Name) -> Self {
+@@ -73,17 +76,18 @@ impl Item {
+         let attrs = &input.attrs;
+         let argument_casing = Sp::call_site(DEFAULT_CASING);
+         let env_casing = Sp::call_site(DEFAULT_ENV_CASING);
+-        Self::from_struct(span, attrs, name, argument_casing, env_casing)
++        let kind = Sp::new(Kind::Value(Sp::new(Ty::Other, span)), span);
++        Self::from_struct(attrs, name, argument_casing, env_casing, kind)
+     }
+ 
+     fn from_struct(
+-        span: Span,
+         attrs: &[Attribute],
+         name: Name,
+         argument_casing: Sp<CasingStyle>,
+         env_casing: Sp<CasingStyle>,
++        kind: Sp<Kind>,
+     ) -> Self {
+-        let mut res = Self::new(span, name, None, argument_casing, env_casing);
++        let mut res = Self::new(name, None, argument_casing, env_casing, kind);
+         res.push_attrs(attrs);
+         res.push_doc_comment(attrs, "about");
+ 
+@@ -99,17 +103,8 @@ impl Item {
+                 "`action` attribute is only allowed on fields"
+             );
+         }
+-        match &*res.kind {
+-            Kind::Subcommand(_) => abort!(res.kind.span(), "subcommand is only allowed on fields"),
+-            Kind::Skip(_) => abort!(res.kind.span(), "skip is only allowed on fields"),
+-            Kind::Arg(_) => res,
+-            Kind::FromGlobal(_) => abort!(res.kind.span(), "from_global is only allowed on fields"),
+-            Kind::Flatten => abort!(res.kind.span(), "flatten is only allowed on fields"),
+-            Kind::ExternalSubcommand => abort!(
+-                res.kind.span(),
+-                "external_subcommand is only allowed on fields"
+-            ),
+-        }
++
++        res
+     }
+ 
+     pub fn from_subcommand_variant(
+@@ -118,13 +113,9 @@ impl Item {
+         env_casing: Sp<CasingStyle>,
+     ) -> Self {
+         let name = variant.ident.clone();
+-        let mut res = Self::new(
+-            variant.span(),
+-            Name::Derived(name),
+-            None,
+-            struct_casing,
+-            env_casing,
+-        );
++        let span = variant.span();
++        let kind = Sp::new(Kind::Command(Sp::new(Ty::Other, span)), span);
++        let mut res = Self::new(Name::Derived(name), None, struct_casing, env_casing, kind);
+         res.push_attrs(&variant.attrs);
+         res.push_doc_comment(&variant.attrs, "about");
+ 
+@@ -153,8 +144,6 @@ impl Item {
+                 res.doc_comment = vec![];
+             }
+ 
+-            Kind::ExternalSubcommand => (),
+-
+             Kind::Subcommand(_) => {
+                 if let Some(value_parser) = res.value_parser.as_ref() {
+                     abort!(
+@@ -205,11 +194,13 @@ impl Item {
+ 
+                 res.kind = Sp::new(Kind::Subcommand(ty), res.kind.span());
+             }
+-            Kind::Skip(_) => (),
+-            Kind::FromGlobal(_) => {
+-                abort!(res.kind.span(), "from_global is not supported on variants");
+-            }
+-            Kind::Arg(_) => (),
++
++            Kind::ExternalSubcommand
++            | Kind::FromGlobal(_)
++            | Kind::Skip(_)
++            | Kind::Command(_)
++            | Kind::Value(_)
++            | Kind::Arg(_) => (),
+         }
+ 
+         res
+@@ -220,12 +211,14 @@ impl Item {
+         argument_casing: Sp<CasingStyle>,
+         env_casing: Sp<CasingStyle>,
+     ) -> Self {
++        let span = variant.span();
++        let kind = Sp::new(Kind::Value(Sp::new(Ty::Other, span)), span);
+         let mut res = Self::new(
+-            variant.span(),
+             Name::Derived(variant.ident.clone()),
+             None,
+             argument_casing,
+             env_casing,
++            kind,
+         );
+         res.push_attrs(&variant.attrs);
+         res.push_doc_comment(&variant.attrs, "help");
+@@ -242,17 +235,8 @@ impl Item {
+                 "`action` attribute is only allowed on fields"
+             );
+         }
+-        match &*res.kind {
+-            Kind::Subcommand(_) => abort!(res.kind.span(), "subcommand is only allowed on fields"),
+-            Kind::Skip(_) => res,
+-            Kind::Arg(_) => res,
+-            Kind::FromGlobal(_) => abort!(res.kind.span(), "from_global is only allowed on fields"),
+-            Kind::Flatten => abort!(res.kind.span(), "flatten is only allowed on fields"),
+-            Kind::ExternalSubcommand => abort!(
+-                res.kind.span(),
+-                "external_subcommand is only allowed on fields"
+-            ),
+-        }
++
++        res
+     }
+ 
+     pub fn from_args_field(
+@@ -261,12 +245,14 @@ impl Item {
+         env_casing: Sp<CasingStyle>,
+     ) -> Self {
+         let name = field.ident.clone().unwrap();
++        let span = field.span();
++        let kind = Sp::new(Kind::Arg(Sp::new(Ty::Other, span)), span);
+         let mut res = Self::new(
+-            field.span(),
+             Name::Derived(name),
+             Some(field.ty.clone()),
+             struct_casing,
+             env_casing,
++            kind,
+         );
+         res.push_attrs(&field.attrs);
+         res.push_doc_comment(&field.attrs, "help");
+@@ -296,12 +282,6 @@ impl Item {
+                 res.doc_comment = vec![];
+             }
+ 
+-            Kind::ExternalSubcommand => {
+-                abort! { res.kind.span(),
+-                    "`external_subcommand` can be used only on enum variants"
+-                }
+-            }
+-
+             Kind::Subcommand(_) => {
+                 if let Some(value_parser) = res.value_parser.as_ref() {
+                     abort!(
+@@ -390,17 +370,19 @@ impl Item {
+                         .unwrap_or_else(|| field.ty.span()),
+                 );
+             }
++
++            Kind::Command(_) | Kind::Value(_) | Kind::ExternalSubcommand => {}
+         }
+ 
+         res
+     }
+ 
+     fn new(
+-        default_span: Span,
+         name: Name,
+         ty: Option<Type>,
+         casing: Sp<CasingStyle>,
+         env_casing: Sp<CasingStyle>,
++        kind: Sp<Kind>,
+     ) -> Self {
+         Self {
+             name,
+@@ -409,6 +391,7 @@ impl Item {
+             env_casing,
+             doc_comment: vec![],
+             methods: vec![],
++            deprecations: vec![],
+             value_parser: None,
+             action: None,
+             verbatim_doc_comment: false,
+@@ -416,7 +399,7 @@ impl Item {
+             next_help_heading: None,
+             is_enum: false,
+             is_positional: true,
+-            kind: Sp::new(Kind::Arg(Sp::new(Ty::Other, default_span)), default_span),
++            kind,
+         }
+     }
+ 
+@@ -437,7 +420,73 @@ impl Item {
+ 
+     fn push_attrs(&mut self, attrs: &[Attribute]) {
+         let parsed = ClapAttr::parse_all(attrs);
++
+         for attr in &parsed {
++            if let Some(AttrValue::Call(_)) = &attr.value {
++                continue;
++            }
++
++            let kind = match &attr.magic {
++                Some(MagicAttrName::FromGlobal) => {
++                    if attr.value.is_some() {
++                        let expr = attr.value_or_abort();
++                        abort!(expr, "attribute `{}` does not accept a value", attr.name);
++                    }
++                    let ty = Sp::call_site(Ty::Other);
++                    let kind = Sp::new(Kind::FromGlobal(ty), attr.name.clone().span());
++                    Some(kind)
++                }
++                Some(MagicAttrName::Subcommand) if attr.value.is_none() => {
++                    if attr.value.is_some() {
++                        let expr = attr.value_or_abort();
++                        abort!(expr, "attribute `{}` does not accept a value", attr.name);
++                    }
++                    let ty = Sp::call_site(Ty::Other);
++                    let kind = Sp::new(Kind::Subcommand(ty), attr.name.clone().span());
++                    Some(kind)
++                }
++                Some(MagicAttrName::ExternalSubcommand) if attr.value.is_none() => {
++                    if attr.value.is_some() {
++                        let expr = attr.value_or_abort();
++                        abort!(expr, "attribute `{}` does not accept a value", attr.name);
++                    }
++                    let kind = Sp::new(Kind::ExternalSubcommand, attr.name.clone().span());
++                    Some(kind)
++                }
++                Some(MagicAttrName::Flatten) if attr.value.is_none() => {
++                    if attr.value.is_some() {
++                        let expr = attr.value_or_abort();
++                        abort!(expr, "attribute `{}` does not accept a value", attr.name);
++                    }
++                    let kind = Sp::new(Kind::Flatten, attr.name.clone().span());
++                    Some(kind)
++                }
++                Some(MagicAttrName::Skip) => {
++                    let expr = attr.value.clone();
++                    let kind = Sp::new(Kind::Skip(expr), attr.name.clone().span());
++                    Some(kind)
++                }
++                _ => None,
++            };
++
++            if let Some(kind) = kind {
++                self.set_kind(kind);
++            }
++        }
++
++        for attr in &parsed {
++            match attr.kind.get() {
++                AttrKind::Clap => {}
++                AttrKind::StructOpt => {
++                    self.deprecations.push(Deprecation::attribute(
++                        "4.0.0",
++                        *attr.kind.get(),
++                        AttrKind::Clap,
++                        attr.kind.span(),
++                    ));
++                }
++            }
++
+             if let Some(AttrValue::Call(tokens)) = &attr.value {
+                 // Force raw mode with method call syntax
+                 self.push_method(attr.name.clone(), quote!(#(#tokens),*));
+@@ -458,11 +507,23 @@ impl Item {
+ 
+                 #[cfg(not(feature = "unstable-v5"))]
+                 Some(MagicAttrName::ValueParser) if attr.value.is_none() => {
++                    self.deprecations.push(Deprecation {
++                        span: attr.name.span(),
++                        id: "bare_value_parser",
++                        version: "4.0.0",
++                        description: "`#[clap(value_parser)]` is now the default and is no longer needed`".to_owned(),
++                    });
+                     self.value_parser = Some(ValueParser::Implicit(attr.name.clone()));
+                 }
+ 
+                 #[cfg(not(feature = "unstable-v5"))]
+                 Some(MagicAttrName::Action) if attr.value.is_none() => {
++                    self.deprecations.push(Deprecation {
++                        span: attr.name.span(),
++                        id: "bare_action",
++                        version: "4.0.0",
++                        description: "`#[clap(action)]` is now the default and is no longer needed`".to_owned(),
++                    });
+                     self.action = Some(Action::Implicit(attr.name.clone()));
+                 }
+ 
+@@ -473,28 +534,8 @@ impl Item {
+                     );
+                 }
+ 
+-                Some(MagicAttrName::ValueEnum) if attr.value.is_none() => self.is_enum = true,
+-
+-                Some(MagicAttrName::FromGlobal) if attr.value.is_none() => {
+-                    let ty = Sp::call_site(Ty::Other);
+-                    let kind = Sp::new(Kind::FromGlobal(ty), attr.name.clone().span());
+-                    self.set_kind(kind);
+-                }
+-
+-                Some(MagicAttrName::Subcommand) if attr.value.is_none() => {
+-                    let ty = Sp::call_site(Ty::Other);
+-                    let kind = Sp::new(Kind::Subcommand(ty), attr.name.clone().span());
+-                    self.set_kind(kind);
+-                }
+-
+-                Some(MagicAttrName::ExternalSubcommand) if attr.value.is_none() => {
+-                    let kind = Sp::new(Kind::ExternalSubcommand, attr.name.clone().span());
+-                    self.set_kind(kind);
+-                }
+-
+-                Some(MagicAttrName::Flatten) if attr.value.is_none() => {
+-                    let kind = Sp::new(Kind::Flatten, attr.name.clone().span());
+-                    self.set_kind(kind);
++                Some(MagicAttrName::ValueEnum) if attr.value.is_none() => {
++                    self.is_enum = true
+                 }
+ 
+                 Some(MagicAttrName::VerbatimDocComment) if attr.value.is_none() => {
+@@ -521,12 +562,6 @@ impl Item {
+                     }
+                 }
+ 
+-                Some(MagicAttrName::Skip) => {
+-                    let expr = attr.value.clone();
+-                    let kind = Sp::new(Kind::Skip(expr), attr.name.clone().span());
+-                    self.set_kind(kind);
+-                }
+-
+                 Some(MagicAttrName::DefaultValueT) => {
+                     let ty = if let Some(ty) = self.ty.as_ref() {
+                         ty
+@@ -791,14 +826,18 @@ impl Item {
+ 
+                 // Directives that never receive a value
+                 Some(MagicAttrName::ValueEnum)
+-                | Some(MagicAttrName::FromGlobal)
+-                | Some(MagicAttrName::Subcommand)
+-                | Some(MagicAttrName::ExternalSubcommand)
+-                | Some(MagicAttrName::Flatten)
+                 | Some(MagicAttrName::VerbatimDocComment) => {
+                     let expr = attr.value_or_abort();
+                     abort!(expr, "attribute `{}` does not accept a value", attr.name);
+                 }
++
++                // Kinds
++                Some(MagicAttrName::FromGlobal)
++                | Some(MagicAttrName::Subcommand)
++                | Some(MagicAttrName::ExternalSubcommand)
++                | Some(MagicAttrName::Flatten)
++                | Some(MagicAttrName::Skip) => {
++                }
+             }
+         }
+     }
+@@ -825,13 +864,24 @@ impl Item {
+     }
+ 
+     fn set_kind(&mut self, kind: Sp<Kind>) {
+-        if let Kind::Arg(_) = *self.kind {
+-            self.kind = kind;
+-        } else {
+-            abort!(
+-                kind.span(),
+-                "`subcommand`, `flatten`, `external_subcommand` and `skip` cannot be used together"
+-            );
++        match (self.kind.get(), kind.get()) {
++            (Kind::Arg(_), Kind::FromGlobal(_))
++            | (Kind::Arg(_), Kind::Subcommand(_))
++            | (Kind::Arg(_), Kind::Flatten)
++            | (Kind::Arg(_), Kind::Skip(_))
++            | (Kind::Command(_), Kind::Subcommand(_))
++            | (Kind::Command(_), Kind::Flatten)
++            | (Kind::Command(_), Kind::Skip(_))
++            | (Kind::Command(_), Kind::ExternalSubcommand)
++            | (Kind::Value(_), Kind::Skip(_)) => {
++                self.kind = kind;
++            }
++
++            (_, _) => {
++                let old = self.kind.name();
++                let new = kind.name();
++                abort!(kind.span(), "`{}` cannot be used with `{}`", new, old);
++            }
+         }
+     }
+ 
+@@ -876,6 +926,11 @@ impl Item {
+         }
+     }
+ 
++    pub fn deprecations(&self) -> proc_macro2::TokenStream {
++        let deprecations = &self.deprecations;
++        quote!( #(#deprecations)* )
++    }
++
+     pub fn next_display_order(&self) -> TokenStream {
+         let next_display_order = self.next_display_order.as_ref().into_iter();
+         quote!( #(#next_display_order)* )
+@@ -949,11 +1004,11 @@ impl Item {
+     }
+ 
+     pub fn casing(&self) -> Sp<CasingStyle> {
+-        self.casing.clone()
++        self.casing
+     }
+ 
+     pub fn env_casing(&self) -> Sp<CasingStyle> {
+-        self.env_casing.clone()
++        self.env_casing
+     }
+ 
+     pub fn has_explicit_methods(&self) -> bool {
+@@ -1057,6 +1112,8 @@ fn default_action(field_type: &Type, span: Span) -> Method {
+ #[derive(Clone)]
+ pub enum Kind {
+     Arg(Sp<Ty>),
++    Command(Sp<Ty>),
++    Value(Sp<Ty>),
+     FromGlobal(Sp<Ty>),
+     Subcommand(Sp<Ty>),
+     Flatten,
+@@ -1064,6 +1121,21 @@ pub enum Kind {
+     ExternalSubcommand,
+ }
+ 
++impl Kind {
++    pub fn name(&self) -> &'static str {
++        match self {
++            Self::Arg(_) => "arg",
++            Self::Command(_) => "command",
++            Self::Value(_) => "value",
++            Self::FromGlobal(_) => "from_global",
++            Self::Subcommand(_) => "subcommand",
++            Self::Flatten => "flatten",
++            Self::Skip(_) => "skip",
++            Self::ExternalSubcommand => "external_subcommand",
++        }
++    }
++}
++
+ #[derive(Clone)]
+ pub struct Method {
+     name: Ident,
+@@ -1115,6 +1187,54 @@ impl ToTokens for Method {
+     }
+ }
+ 
++#[derive(Clone)]
++pub struct Deprecation {
++    pub span: Span,
++    pub id: &'static str,
++    pub version: &'static str,
++    pub description: String,
++}
++
++impl Deprecation {
++    fn attribute(version: &'static str, old: AttrKind, new: AttrKind, span: Span) -> Self {
++        Self {
++            span,
++            id: "old_attribute",
++            version,
++            description: format!(
++                "Attribute `#[{}(...)]` has been deprecated in favor of `#[{}(...)]`",
++                old.as_str(),
++                new.as_str()
++            ),
++        }
++    }
++}
++
++impl ToTokens for Deprecation {
++    fn to_tokens(&self, ts: &mut proc_macro2::TokenStream) {
++        let tokens = if cfg!(feature = "deprecated") {
++            let Deprecation {
++                span,
++                id,
++                version,
++                description,
++            } = self;
++            let span = *span;
++            let id = Ident::new(id, span);
++
++            quote_spanned!(span=> {
++                #[deprecated(since = #version, note = #description)]
++                fn #id() {}
++                #id();
++            })
++        } else {
++            quote!()
++        };
++
++        tokens.to_tokens(ts);
++    }
++}
++
+ /// replace all `:` with `, ` when not inside the `<>`
+ ///
+ /// `"author1:author2:author3" => "author1, author2, author3"`
+diff --git a/clap_derive/src/lib.rs b/clap_derive/src/lib.rs
+index 19b96657..5322a732 100644
+--- a/clap_derive/src/lib.rs
++++ b/clap_derive/src/lib.rs
+@@ -42,7 +42,7 @@ pub fn value_enum(input: TokenStream) -> TokenStream {
+ /// receiving an instance of `clap::ArgMatches` from conducting parsing, and then
+ /// implementing a conversion code to instantiate an instance of the user
+ /// context struct.
+-#[proc_macro_derive(Parser, attributes(clap))]
++#[proc_macro_derive(Parser, attributes(clap, structopt))]
+ #[proc_macro_error]
+ pub fn parser(input: TokenStream) -> TokenStream {
+     let input: DeriveInput = parse_macro_input!(input);
+diff --git a/clap_derive/src/utils/spanned.rs b/clap_derive/src/utils/spanned.rs
+index 11415f6f..e064b53f 100644
+--- a/clap_derive/src/utils/spanned.rs
++++ b/clap_derive/src/utils/spanned.rs
+@@ -5,7 +5,7 @@ use syn::LitStr;
+ use std::ops::{Deref, DerefMut};
+ 
+ /// An entity with a span attached.
+-#[derive(Debug, Clone)]
++#[derive(Debug, Copy, Clone)]
+ pub struct Sp<T> {
+     val: T,
+     span: Span,
+@@ -23,6 +23,10 @@ impl<T> Sp<T> {
+         }
+     }
+ 
++    pub fn get(&self) -> &T {
++        &self.val
++    }
++
+     pub fn span(&self) -> Span {
+         self.span
+     }

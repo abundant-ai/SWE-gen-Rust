@@ -1,0 +1,183 @@
+diff --git a/src/iter/interleave.rs b/src/iter/interleave.rs
+index e52cdeb..ab88504 100644
+--- a/src/iter/interleave.rs
++++ b/src/iter/interleave.rs
+@@ -58,10 +58,7 @@ impl<I, J> IndexedParallelIterator for Interleave<I, J>
+     }
+ 
+     fn len(&mut self) -> usize {
+-        self.i
+-            .len()
+-            .checked_add(self.j.len())
+-            .expect("overflow")
++        self.i.len() + self.j.len()
+     }
+ 
+     fn with_producer<CB>(mut self, callback: CB) -> CB::Output
+diff --git a/src/iter/interleave_shortest.rs b/src/iter/interleave_shortest.rs
+deleted file mode 100644
+index 21d3fd4..0000000
+--- a/src/iter/interleave_shortest.rs
++++ /dev/null
+@@ -1,81 +0,0 @@
+-use super::internal::*;
+-use super::*;
+-use std::cmp;
+-use std::iter;
+-
+-/// `InterleaveShortest` is an iterator that works similarly to
+-/// `Interleave`, but this version stops returning elements once one
+-/// of the iterators run out.
+-///
+-/// This struct is created by the [`interleave_shortest()`] method on
+-/// [`IndexedParallelIterator`].
+-///
+-/// [`interleave_shortest()`]: trait.IndexedParallelIterator.html#method.interleave_shortest
+-/// [`IndexedParallelIterator`]: trait.IndexedParallelIterator.html
+-#[must_use = "iterator adaptors are lazy and do nothing unless consumed"]
+-#[derive(Debug)]
+-pub struct InterleaveShortest<I, J>
+-    where I: IndexedParallelIterator,
+-          J: IndexedParallelIterator<Item = I::Item>
+-{
+-    interleave: Interleave<Take<I>, Take<J>>
+-}
+-
+-/// Create a new `InterleaveShortest` iterator
+-///
+-/// NB: a free fn because it is NOT part of the end-user API.
+-pub fn new<I, J>(mut i: I, mut j: J) -> InterleaveShortest<I, J>
+-    where I: IndexedParallelIterator,
+-          J: IndexedParallelIterator<Item = I::Item>
+-{
+-    InterleaveShortest {
+-        interleave: if i.len() <= j.len() {
+-            // take equal lengths from both iterators
+-            let n = i.len();
+-            i.take(n).interleave(j.take(n))
+-        } else {
+-            // take one extra item from the first iterator
+-            let n = j.len();
+-            i.take(n + 1).interleave(j.take(n))
+-        }
+-    }
+-}
+-
+-
+-impl<I, J> ParallelIterator for InterleaveShortest<I, J>
+-    where I: IndexedParallelIterator,
+-          J: IndexedParallelIterator<Item = I::Item>
+-{
+-    type Item = I::Item;
+-
+-    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+-        where C: Consumer<I::Item>
+-    {
+-        bridge(self, consumer)
+-    }
+-
+-    fn opt_len(&mut self) -> Option<usize> {
+-        Some(self.len())
+-    }
+-}
+-
+-impl<I, J> IndexedParallelIterator for InterleaveShortest<I, J>
+-    where I: IndexedParallelIterator,
+-          J: IndexedParallelIterator<Item = I::Item>,
+-{
+-    fn drive<C>(self, consumer: C) -> C::Result
+-        where C: Consumer<Self::Item>
+-    {
+-        bridge(self, consumer)
+-    }
+-
+-    fn len(&mut self) -> usize {
+-        self.interleave.len()
+-    }
+-
+-    fn with_producer<CB>(mut self, callback: CB) -> CB::Output
+-        where CB: ProducerCallback<Self::Item>
+-    {
+-        self.interleave.with_producer(callback)
+-    }
+-}
+diff --git a/src/iter/mod.rs b/src/iter/mod.rs
+index 9d424bc..cde8ace 100644
+--- a/src/iter/mod.rs
++++ b/src/iter/mod.rs
+@@ -63,8 +63,6 @@ mod zip_eq;
+ pub use self::zip_eq::ZipEq;
+ mod interleave;
+ pub use self::interleave::Interleave;
+-mod interleave_shortest;
+-pub use self::interleave_shortest::InterleaveShortest;
+ 
+ mod noop;
+ mod rev;
+@@ -865,24 +863,6 @@ pub trait IndexedParallelIterator: ParallelIterator {
+         interleave::new(self, other.into_par_iter())
+     }
+ 
+-    /// Interleave elements of this iterator and the other given
+-    /// iterator, until one is exhausted.
+-    ///
+-    /// Example:
+-    ///
+-    /// ```
+-    /// use rayon::prelude::*;
+-    /// let (x, y) = (vec![1, 2, 3, 4], vec![5, 6]);
+-    /// let r: Vec<i32> = x.into_par_iter().interleave_shortest(y).collect();
+-    /// assert_eq!(r, vec![1, 5, 2, 6, 3]);
+-    /// ```
+-    fn interleave_shortest<I>(self, other: I) -> InterleaveShortest<Self, I::Iter>
+-        where I: IntoParallelIterator<Item = Self::Item>,
+-              I::Iter: IndexedParallelIterator<Item = Self::Item>
+-    {
+-        interleave_shortest::new(self, other.into_par_iter())
+-    }
+-
+     /// Lexicographically compares the elements of this `ParallelIterator` with those of
+     /// another.
+     fn cmp<I>(mut self, other: I) -> Ordering
+diff --git a/src/iter/test.rs b/src/iter/test.rs
+index 0c05a44..69d5251 100644
+--- a/src/iter/test.rs
++++ b/src/iter/test.rs
+@@ -1797,26 +1797,3 @@ fn check_interleave_uneven() {
+         assert_eq!(expected.into_iter().rev().collect::<Vec<usize>>(), res, "Case {} reversed failed", i);
+     }
+ }
+-
+-
+-#[test]
+-fn check_interleave_shortest() {
+-    let cases: Vec<(Vec<usize>, Vec<usize>, Vec<usize>)> = vec![
+-        ((0..9).collect(), vec![10], vec![0, 10, 1]),
+-        (vec![10], (0..9).collect(), vec![10, 0]),
+-        ((0..5).collect(), (5..10).collect(), (0..5).zip((5..10)).flat_map(|(i, j)| vec![i, j].into_iter()).collect()),
+-        (vec![], (0..9).collect(), vec![]),
+-        ((0..9).collect(), vec![], vec![0]),
+-        ((0..50).collect(), (50..100).collect(), (0..50).zip((50..100)).flat_map(|(i, j)| vec![i, j].into_iter()).collect()),
+-    ];
+-
+-    for (i, (xs, ys, expected)) in cases.into_iter().enumerate() {
+-        let mut res = vec![];
+-        xs.par_iter().interleave_shortest(&ys).map(|&i| i).collect_into(&mut res);
+-        assert_eq!(expected, res, "Case {} failed", i);
+-
+-        res.truncate(0);
+-        xs.par_iter().interleave_shortest(&ys).rev().map(|&i| i).collect_into(&mut res);
+-        assert_eq!(expected.into_iter().rev().collect::<Vec<usize>>(), res, "Case {} reversed failed", i);
+-    }
+-}
+diff --git a/tests/compile-fail/must_use.rs b/tests/compile-fail/must_use.rs
+index 2bf8a7b..b94e784 100644
+--- a/tests/compile-fail/must_use.rs
++++ b/tests/compile-fail/must_use.rs
+@@ -29,6 +29,4 @@ fn main() {
+     v.par_iter().with_min_len(1);           //~ ERROR must be used
+     v.par_iter().zip(&v);                   //~ ERROR must be used
+     v.par_iter().zip_eq(&v);                //~ ERROR must be used
+-    v.par_iter().interleave(&v);            //~ ERROR must be used
+-    v.par_iter().interleave_shortest(&v);   //~ ERROR must be used
+ }

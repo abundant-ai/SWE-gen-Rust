@@ -1,0 +1,123 @@
+diff --git a/axum/src/docs/routing/method_not_allowed_fallback.md b/axum/src/docs/routing/method_not_allowed_fallback.md
+new file mode 100644
+index 00000000..22905cd9
+--- /dev/null
++++ b/axum/src/docs/routing/method_not_allowed_fallback.md
+@@ -0,0 +1,38 @@
++Add a fallback [`Handler`] for the case where a route exists, but the method of the request is not supported.
++
++Sets a fallback on all previously registered [`MethodRouter`]s,
++to be called when no matching method handler is set.
++
++```rust,no_run
++use axum::{response::IntoResponse, routing::get, Router};
++
++async fn hello_world() -> impl IntoResponse {
++    "Hello, world!\n"
++}
++
++async fn default_fallback() -> impl IntoResponse {
++    "Default fallback\n"
++}
++
++async fn handle_405() -> impl IntoResponse {
++    "Method not allowed fallback"
++}
++
++#[tokio::main]
++async fn main() {
++    let router = Router::new()
++        .route("/", get(hello_world))
++        .fallback(default_fallback)
++        .method_not_allowed_fallback(handle_405);
++
++    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
++
++    axum::serve(listener, router).await.unwrap();
++}
++```
++
++The fallback only applies if there is a `MethodRouter` registered for a given path, 
++but the method used in the request is not specified. In the example, a `GET` on 
++`http://localhost:3000` causes the `hello_world` handler to react, while issuing a 
++`POST` triggers `handle_405`. Calling an entirely different route, like `http://localhost:3000/hello` 
++causes `default_fallback` to run.
+diff --git a/axum/src/routing/method_routing.rs b/axum/src/routing/method_routing.rs
+index 0e4f5ac6..cfc47e1f 100644
+--- a/axum/src/routing/method_routing.rs
++++ b/axum/src/routing/method_routing.rs
+@@ -659,6 +659,19 @@ where
+         self.fallback = Fallback::BoxedHandler(BoxedIntoRoute::from_handler(handler));
+         self
+     }
++
++    /// Add a fallback [`Handler`] if no custom one has been provided.
++    pub(crate) fn default_fallback<H, T>(self, handler: H) -> Self
++    where
++        H: Handler<T, S>,
++        T: 'static,
++        S: Send + Sync + 'static,
++    {
++        match self.fallback {
++            Fallback::Default(_) => self.fallback(handler),
++            _ => self,
++        }
++    }
+ }
+ 
+ impl MethodRouter<(), Infallible> {
+diff --git a/axum/src/routing/mod.rs b/axum/src/routing/mod.rs
+index ff43a56c..f493d297 100644
+--- a/axum/src/routing/mod.rs
++++ b/axum/src/routing/mod.rs
+@@ -354,6 +354,18 @@ where
+         .fallback_endpoint(Endpoint::Route(route))
+     }
+ 
++    #[doc = include_str!("../docs/routing/method_not_allowed_fallback.md")]
++    pub fn method_not_allowed_fallback<H, T>(self, handler: H) -> Self
++    where
++        H: Handler<T, S>,
++        T: 'static,
++    {
++        tap_inner!(self, mut this => {
++            this.path_router
++                .method_not_allowed_fallback(handler.clone())
++        })
++    }
++
+     fn fallback_endpoint(self, endpoint: Endpoint<S>) -> Self {
+         tap_inner!(self, mut this => {
+             this.fallback_router.set_fallback(endpoint);
+diff --git a/axum/src/routing/path_router.rs b/axum/src/routing/path_router.rs
+index fafb2882..293205de 100644
+--- a/axum/src/routing/path_router.rs
++++ b/axum/src/routing/path_router.rs
+@@ -1,4 +1,7 @@
+-use crate::extract::{nested_path::SetNestedPath, Request};
++use crate::{
++    extract::{nested_path::SetNestedPath, Request},
++    handler::Handler,
++};
+ use axum_core::response::IntoResponse;
+ use matchit::MatchError;
+ use std::{borrow::Cow, collections::HashMap, convert::Infallible, fmt, sync::Arc};
+@@ -110,6 +113,18 @@ where
+         Ok(())
+     }
+ 
++    pub(super) fn method_not_allowed_fallback<H, T>(&mut self, handler: H)
++    where
++        H: Handler<T, S>,
++        T: 'static,
++    {
++        for (_, endpoint) in self.routes.iter_mut() {
++            if let Endpoint::MethodRouter(rt) = endpoint {
++                *rt = rt.clone().default_fallback(handler.clone());
++            }
++        }
++    }
++
+     pub(super) fn route_service<T>(
+         &mut self,
+         path: &str,

@@ -1,0 +1,229 @@
+diff --git a/crates/tauri-runtime-cef/src/cef_impl.rs b/crates/tauri-runtime-cef/src/cef_impl.rs
+index 747370cce..44fea4f07 100644
+--- a/crates/tauri-runtime-cef/src/cef_impl.rs
++++ b/crates/tauri-runtime-cef/src/cef_impl.rs
+@@ -1167,6 +1167,30 @@ fn handle_webview_message<T: UserEvent>(
+         browser.reload()
+       }
+     }
++    WebviewMessage::GoBack => {
++      if let Some(browser) = get_browser(context, window_id, webview_id) {
++        browser.go_back()
++      }
++    }
++    WebviewMessage::CanGoBack(tx) => {
++      if let Some(browser) = get_browser(context, window_id, webview_id) {
++        let _ = tx.send(Ok(browser.can_go_back() != 0));
++      } else {
++        let _ = tx.send(Err(tauri_runtime::Error::FailedToSendMessage));
++      }
++    }
++    WebviewMessage::GoForward => {
++      if let Some(browser) = get_browser(context, window_id, webview_id) {
++        browser.go_forward()
++      }
++    }
++    WebviewMessage::CanGoForward(tx) => {
++      if let Some(browser) = get_browser(context, window_id, webview_id) {
++        let _ = tx.send(Ok(browser.can_go_forward() != 0));
++      } else {
++        let _ = tx.send(Err(tauri_runtime::Error::FailedToSendMessage));
++      }
++    }
+     WebviewMessage::Print => {
+       if let Some(host) = get_browser(context, window_id, webview_id).and_then(|b| b.host()) {
+         host.print()
+@@ -1494,7 +1518,7 @@ fn handle_webview_message<T: UserEvent>(
+       let _ = tx.send(result);
+     }
+     WebviewMessage::WithWebview(f) => {
+-      if let Some(browser_view) = get_webview(context, window_id, webview_id) {
++      if let Some(browser_view) = get_browser(context, window_id, webview_id) {
+         f(Box::new(browser_view));
+       }
+     }
+diff --git a/crates/tauri-runtime-cef/src/lib.rs b/crates/tauri-runtime-cef/src/lib.rs
+index 2548a962b..cf66c9530 100644
+--- a/crates/tauri-runtime-cef/src/lib.rs
++++ b/crates/tauri-runtime-cef/src/lib.rs
+@@ -205,6 +205,10 @@ pub enum WebviewMessage {
+   DeleteCookie(Cookie<'static>),
+   Navigate(Url),
+   Reload,
++  GoBack,
++  CanGoBack(Sender<Result<bool>>),
++  GoForward,
++  CanGoForward(Sender<Result<bool>>),
+   Print,
+   Close,
+   Show,
+@@ -1133,6 +1137,30 @@ impl<T: UserEvent> WebviewDispatch<T> for CefWebviewDispatcher<T> {
+     })
+   }
+ 
++  fn go_back(&self) -> Result<()> {
++    self.context.post_message(Message::Webview {
++      window_id: *self.window_id.lock().unwrap(),
++      webview_id: self.webview_id,
++      message: WebviewMessage::GoBack,
++    })
++  }
++
++  fn can_go_back(&self) -> Result<bool> {
++    webview_getter!(self, WebviewMessage::CanGoBack)?
++  }
++
++  fn go_forward(&self) -> Result<()> {
++    self.context.post_message(Message::Webview {
++      window_id: *self.window_id.lock().unwrap(),
++      webview_id: self.webview_id,
++      message: WebviewMessage::GoForward,
++    })
++  }
++
++  fn can_go_forward(&self) -> Result<bool> {
++    webview_getter!(self, WebviewMessage::CanGoForward)?
++  }
++
+   fn print(&self) -> Result<()> {
+     self.context.post_message(Message::Webview {
+       window_id: *self.window_id.lock().unwrap(),
+diff --git a/crates/tauri-runtime-wry/src/lib.rs b/crates/tauri-runtime-wry/src/lib.rs
+index 3c9cbf6d2..4916abc96 100644
+--- a/crates/tauri-runtime-wry/src/lib.rs
++++ b/crates/tauri-runtime-wry/src/lib.rs
+@@ -1598,6 +1598,26 @@ impl<T: UserEvent> WebviewDispatch<T> for WryWebviewDispatcher<T> {
+     )
+   }
+ 
++  fn go_back(&self) -> Result<()> {
++    // TODO: implement this
++    Err(Error::FailedToSendMessage)
++  }
++
++  fn can_go_back(&self) -> Result<bool> {
++    // TODO: implement this
++    Err(Error::FailedToSendMessage)
++  }
++
++  fn go_forward(&self) -> Result<()> {
++    // TODO: implement this
++    Err(Error::FailedToSendMessage)
++  }
++
++  fn can_go_forward(&self) -> Result<bool> {
++    // TODO: implement this
++    Err(Error::FailedToSendMessage)
++  }
++
+   fn print(&self) -> Result<()> {
+     send_user_message(
+       &self.context,
+diff --git a/crates/tauri-runtime/src/lib.rs b/crates/tauri-runtime/src/lib.rs
+index b37518604..573a9aac3 100644
+--- a/crates/tauri-runtime/src/lib.rs
++++ b/crates/tauri-runtime/src/lib.rs
+@@ -552,6 +552,14 @@ pub trait WebviewDispatch<T: UserEvent>: Debug + Clone + Send + Sync + Sized + '
+   /// Reloads the current page.
+   fn reload(&self) -> Result<()>;
+ 
++  fn go_back(&self) -> Result<()>;
++
++  fn can_go_back(&self) -> Result<bool>;
++
++  fn go_forward(&self) -> Result<()>;
++
++  fn can_go_forward(&self) -> Result<bool>;
++
+   /// Opens the dialog to prints the contents of the webview.
+   fn print(&self) -> Result<()>;
+ 
+diff --git a/crates/tauri/src/webview/mod.rs b/crates/tauri/src/webview/mod.rs
+index 48c345c4f..b7e63c0c0 100644
+--- a/crates/tauri/src/webview/mod.rs
++++ b/crates/tauri/src/webview/mod.rs
+@@ -1698,6 +1698,26 @@ tauri::Builder::default()
+     self.webview.dispatcher.reload().map_err(Into::into)
+   }
+ 
++  /// Navigates the webview back to the previous page.
++  pub fn go_back(&self) -> crate::Result<()> {
++    self.webview.dispatcher.go_back().map_err(Into::into)
++  }
++
++  /// Checks whether the webview can navigate back.
++  pub fn can_go_back(&self) -> crate::Result<bool> {
++    self.webview.dispatcher.can_go_back().map_err(Into::into)
++  }
++
++  /// Navigates the webview forward to the next page.
++  pub fn go_forward(&self) -> crate::Result<()> {
++    self.webview.dispatcher.go_forward().map_err(Into::into)
++  }
++
++  /// Checks whether the webview can navigate forward.
++  pub fn can_go_forward(&self) -> crate::Result<bool> {
++    self.webview.dispatcher.can_go_forward().map_err(Into::into)
++  }
++
+   fn is_local_url(&self, current_url: &Url) -> bool {
+     let uses_https = current_url.scheme() == "https";
+ 
+diff --git a/crates/tauri/src/webview/webview_window.rs b/crates/tauri/src/webview/webview_window.rs
+index 623c7235c..cdbef98ce 100644
+--- a/crates/tauri/src/webview/webview_window.rs
++++ b/crates/tauri/src/webview/webview_window.rs
+@@ -2317,6 +2317,26 @@ impl<R: Runtime> WebviewWindow<R> {
+     self.webview.reload()
+   }
+ 
++  /// Navigates the webview back to the previous page.
++  pub fn go_back(&self) -> crate::Result<()> {
++    self.webview.go_back()
++  }
++
++  /// Checks whether the webview can navigate back.
++  pub fn can_go_back(&self) -> crate::Result<bool> {
++    self.webview.can_go_back()
++  }
++
++  /// Navigates the webview forward to the next page.
++  pub fn go_forward(&self) -> crate::Result<()> {
++    self.webview.go_forward()
++  }
++
++  /// Checks whether the webview can navigate forward.
++  pub fn can_go_forward(&self) -> crate::Result<bool> {
++    self.webview.can_go_forward()
++  }
++
+   /// Handles this window receiving an [`crate::webview::InvokeRequest`].
+   pub fn on_message(
+     self,
+diff --git a/crates/tauri/src/test/mock_runtime.rs b/crates/tauri/src/test/mock_runtime.rs
+index b4094d2ba..3ebe7d256 100644
+--- a/crates/tauri/src/test/mock_runtime.rs
++++ b/crates/tauri/src/test/mock_runtime.rs
+@@ -606,6 +606,22 @@ impl<T: UserEvent> WebviewDispatch<T> for MockWebviewDispatcher {
+     Ok(())
+   }
+ 
++  fn go_back(&self) -> Result<()> {
++    Ok(())
++  }
++
++  fn can_go_back(&self) -> Result<bool> {
++    Ok(false)
++  }
++
++  fn go_forward(&self) -> Result<()> {
++    Ok(())
++  }
++
++  fn can_go_forward(&self) -> Result<bool> {
++    Ok(false)
++  }
++
+   fn print(&self) -> Result<()> {
+     Ok(())
+   }

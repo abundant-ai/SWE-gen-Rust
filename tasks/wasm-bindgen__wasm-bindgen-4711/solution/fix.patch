@@ -1,0 +1,150 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 00fdd3de6..bfa309bd6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,9 @@
+ * Added `new_with_value` and `grow_with_value` for `WebAssembly.Table`.
+   [#4698](https://github.com/wasm-bindgen/wasm-bindgen/pull/4698)
+ 
++* Added better support for async stack traces when building in debug mode.
++  [#4711](https://github.com/wasm-bindgen/wasm-bindgen/pull/4711)
++
+ ### Fixed
+ 
+ * Fixed multithreading JS output for targets `bundler`, `deno` and `module`.
+diff --git a/crates/futures/src/lib.rs b/crates/futures/src/lib.rs
+index 633e02386..3955bc987 100644
+--- a/crates/futures/src/lib.rs
++++ b/crates/futures/src/lib.rs
+@@ -40,7 +40,6 @@
+ 
+ extern crate alloc;
+ 
+-use alloc::boxed::Box;
+ use alloc::rc::Rc;
+ use core::cell::RefCell;
+ use core::fmt;
+@@ -90,7 +89,7 @@ pub fn spawn_local<F>(future: F)
+ where
+     F: Future<Output = ()> + 'static,
+ {
+-    task::Task::spawn(Box::pin(future));
++    task::Task::spawn(future);
+ }
+ 
+ struct Inner {
+diff --git a/crates/futures/src/task/multithread.rs b/crates/futures/src/task/multithread.rs
+index e66de91fd..520e92b22 100644
+--- a/crates/futures/src/task/multithread.rs
++++ b/crates/futures/src/task/multithread.rs
+@@ -88,7 +88,7 @@ pub(crate) struct Task {
+ }
+ 
+ impl Task {
+-    pub(crate) fn spawn(future: Pin<Box<dyn Future<Output = ()> + 'static>>) {
++    pub(crate) fn spawn(future: impl Future<Output = ()> + 'static) {
+         let atomic = AtomicWaker::new();
+         let waker = unsafe { Waker::from_raw(AtomicWaker::into_raw_waker(atomic.clone())) };
+         let this = Rc::new(Task {
+@@ -101,7 +101,10 @@ impl Task {
+             let this = Rc::clone(&this);
+             Closure::new(move |_| this.run())
+         };
+-        *this.inner.borrow_mut() = Some(Inner { future, closure });
++        *this.inner.borrow_mut() = Some(Inner {
++            future: Box::pin(future),
++            closure,
++        });
+ 
+         // Queue up the Future's work to happen on the next microtask tick.
+         crate::queue::Queue::with(move |queue| queue.schedule_task(this));
+diff --git a/crates/futures/src/task/singlethread.rs b/crates/futures/src/task/singlethread.rs
+index 733a04075..f40761c49 100644
+--- a/crates/futures/src/task/singlethread.rs
++++ b/crates/futures/src/task/singlethread.rs
+@@ -11,7 +11,31 @@ struct Inner {
+     waker: Waker,
+ }
+ 
++impl Inner {
++    fn is_ready(&mut self) -> bool {
++        let mut cx = Context::from_waker(&self.waker);
++        self.future.as_mut().poll(&mut cx).is_ready()
++    }
++}
++
++#[cfg(debug_assertions)]
++#[wasm_bindgen::prelude::wasm_bindgen]
++extern "C" {
++    type ConsoleTask;
++
++    #[wasm_bindgen(js_namespace = console, js_name = createTask, catch)]
++    fn create_task(name: &str) -> Result<ConsoleTask, wasm_bindgen::JsValue>;
++
++    #[wasm_bindgen(method)]
++    fn run(this: &ConsoleTask, poll: &mut dyn FnMut() -> bool) -> bool;
++}
++
+ pub(crate) struct Task {
++    // Console tracking for this task to avoid deeply nested stacks from individual `poll()` calls.
++    // See [Linked Stack Traces](https://developer.chrome.com/blog/devtools-modern-web-debugging#linked_stack_traces).
++    #[cfg(debug_assertions)]
++    console: Option<ConsoleTask>,
++
+     // The actual Future that we're executing as part of this task.
+     //
+     // This is an Option so that the Future can be immediately dropped when it's
+@@ -23,15 +47,20 @@ pub(crate) struct Task {
+ }
+ 
+ impl Task {
+-    pub(crate) fn spawn(future: Pin<Box<dyn Future<Output = ()> + 'static>>) {
++    pub(crate) fn spawn<F: Future<Output = ()> + 'static>(future: F) {
+         let this = Rc::new(Self {
++            #[cfg(debug_assertions)]
++            console: create_task(core::any::type_name::<F>()).ok(),
+             inner: RefCell::new(None),
+             is_queued: Cell::new(true),
+         });
+ 
+         let waker = unsafe { Waker::from_raw(Task::into_raw_waker(Rc::clone(&this))) };
+ 
+-        *this.inner.borrow_mut() = Some(Inner { future, waker });
++        *this.inner.borrow_mut() = Some(Inner {
++            future: Box::pin(future),
++            waker,
++        });
+ 
+         crate::queue::Queue::with(|queue| queue.schedule_task(this));
+     }
+@@ -113,18 +142,26 @@ impl Task {
+         // the run queue.
+         self.is_queued.set(false);
+ 
+-        let poll = {
+-            let mut cx = Context::from_waker(&inner.waker);
+-            inner.future.as_mut().poll(&mut cx)
++        // In debug mode we want to avoid deeply nested stacks from individual
++        // `poll()` calls, so we use `task.run` on a task created per future.
++        #[cfg(debug_assertions)]
++        let is_ready = match self.console.as_ref() {
++            Some(console) => console.run(&mut move || inner.is_ready()),
++            None => inner.is_ready(),
+         };
+ 
++        // In release mode we prefer to avoid the overhead of the JS wrapper
++        // and just poll directly.
++        #[cfg(not(debug_assertions))]
++        let is_ready = inner.is_ready();
++
+         // If a future has finished (`Ready`) then clean up resources associated
+         // with the future ASAP. This ensures that we don't keep anything extra
+         // alive in-memory by accident. Our own struct, `Rc<Task>` won't
+         // actually go away until all wakers referencing us go away, which may
+         // take quite some time, so ensure that the heaviest of resources are
+         // released early.
+-        if poll.is_ready() {
++        if is_ready {
+             *borrow = None;
+         }
+     }

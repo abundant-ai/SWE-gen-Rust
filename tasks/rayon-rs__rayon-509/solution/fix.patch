@@ -1,0 +1,406 @@
+diff --git a/src/iter/chunks.rs b/src/iter/chunks.rs
+new file mode 100644
+index 0000000..86b7a47
+--- /dev/null
++++ b/src/iter/chunks.rs
+@@ -0,0 +1,208 @@
++use std::cmp::min;
++
++use ::math::div_round_up;
++use super::plumbing::*;
++use super::*;
++
++/// `Chunks` is an iterator that groups elements of an underlying iterator.
++///
++/// This struct is created by the [`chunks()`] method on [`IndexedParallelIterator`]
++///
++/// [`chunks()`]: trait.IndexedParallelIterator.html#method.chunks
++/// [`IndexedParallelIterator`]: trait.IndexedParallelIterator.html
++#[must_use = "iterator adaptors are lazy and do nothing unless consumed"]
++#[derive(Debug, Clone)]
++pub struct Chunks<I>
++    where I: IndexedParallelIterator
++{
++    size: usize,
++    i: I,
++}
++
++/// Create a new `Chunks` iterator
++///
++/// NB: a free fn because it is NOT part of the end-user API.
++pub fn new<I>(i: I, size: usize) -> Chunks<I>
++    where I: IndexedParallelIterator
++{
++    Chunks { i: i, size: size }
++}
++
++impl<I> ParallelIterator for Chunks<I>
++    where I: IndexedParallelIterator
++{
++    type Item = Vec<I::Item>;
++
++    fn drive_unindexed<C>(self, consumer: C) -> C::Result
++        where C: Consumer<Vec<I::Item>>
++    {
++        bridge(self, consumer)
++    }
++
++    fn opt_len(&self) -> Option<usize> {
++        Some(self.len())
++    }
++}
++
++impl<I> IndexedParallelIterator for Chunks<I>
++    where I: IndexedParallelIterator
++{
++    fn drive<C>(self, consumer: C) -> C::Result
++        where C: Consumer<Self::Item>
++    {
++        bridge(self, consumer)
++    }
++
++    fn len(&self) -> usize {
++        div_round_up(self.i.len(), self.size)
++    }
++
++    fn with_producer<CB>(self, callback: CB) -> CB::Output
++        where CB: ProducerCallback<Self::Item>
++    {
++        let len = self.i.len();
++        return self.i.with_producer(Callback {
++            size: self.size,
++            len: len,
++            callback: callback,
++        });
++
++        struct Callback<CB> {
++            size: usize,
++            len: usize,
++            callback: CB,
++        }
++
++        impl<T, CB> ProducerCallback<T> for Callback<CB>
++            where CB: ProducerCallback<Vec<T>>
++        {
++            type Output = CB::Output;
++
++            fn callback<P>(self, base: P) -> CB::Output
++                where P: Producer<Item = T>
++            {
++                self.callback.callback(ChunkProducer {
++                    chunk_size: self.size,
++                    len: self.len,
++                    base: base,
++                })
++            }
++        }
++    }
++}
++
++struct ChunkProducer<P>
++    where P: Producer
++{
++    chunk_size: usize,
++    len: usize,
++    base: P,
++}
++
++impl<P> Producer for ChunkProducer<P>
++    where P: Producer
++{
++    type Item = Vec<P::Item>;
++    type IntoIter = ChunkSeq<P>;
++
++    fn into_iter(self) -> Self::IntoIter {
++        ChunkSeq {
++            chunk_size: self.chunk_size,
++            len: self.len,
++            inner: if self.len > 0 {
++                Some(self.base)
++            } else {
++                None
++            }
++        }
++    }
++
++    fn split_at(self, index: usize) -> (Self, Self) {
++        let elem_index = min(index * self.chunk_size, self.len);
++        let (left, right) = self.base.split_at(elem_index);
++        (ChunkProducer {
++            chunk_size: self.chunk_size,
++            len: elem_index,
++            base: left,
++        },
++        ChunkProducer {
++            chunk_size: self.chunk_size,
++            len: self.len - elem_index,
++            base: right,
++        })
++    }
++
++    fn min_len(&self) -> usize {
++        div_round_up(self.base.min_len(), self.chunk_size)
++    }
++
++    fn max_len(&self) -> usize {
++        self.base.max_len() / self.chunk_size
++    }
++}
++
++struct ChunkSeq<P> {
++    chunk_size: usize,
++    len: usize,
++    inner: Option<P>,
++}
++
++impl<P> Iterator for ChunkSeq<P>
++    where P: Producer
++{
++    type Item = Vec<P::Item>;
++
++    fn next(&mut self) -> Option<Self::Item> {
++        match self.inner.take() {
++            Some(producer) => if self.len > self.chunk_size {
++                let (left, right) = producer.split_at(self.chunk_size);
++                self.inner = Some(right);
++                self.len -= self.chunk_size;
++                Some(left.into_iter().collect())
++            } else {
++                debug_assert!(self.len > 0);
++                self.len = 0;
++                Some(producer.into_iter().collect())
++            },
++            _ => None
++        }
++    }
++
++    fn size_hint(&self) -> (usize, Option<usize>) {
++        let len = self.len();
++        (len, Some(len))
++    }
++}
++
++impl<P> ExactSizeIterator for ChunkSeq<P>
++    where P: Producer
++{
++    #[inline]
++    fn len(&self) -> usize {
++        div_round_up(self.len, self.chunk_size)
++    }
++}
++
++impl<P> DoubleEndedIterator for ChunkSeq<P>
++    where P: Producer
++{
++    fn next_back(&mut self) -> Option<Self::Item> {
++        match self.inner.take() {
++            Some(producer) => if self.len > self.chunk_size {
++                let mut size = self.len % self.chunk_size;
++                if size == 0 {
++                    size = self.chunk_size;
++                }
++                let (left, right) = producer.split_at(self.len - size);
++                self.inner = Some(left);
++                self.len -= size;
++                Some(right.into_iter().collect())
++            } else {
++                debug_assert!(self.len > 0);
++                self.len = 0;
++                Some(producer.into_iter().collect())
++            },
++            _ => None
++        }
++    }
++}
+diff --git a/src/iter/mod.rs b/src/iter/mod.rs
+index 75dc469..ef8863e 100644
+--- a/src/iter/mod.rs
++++ b/src/iter/mod.rs
+@@ -30,6 +30,8 @@ mod find;
+ mod find_first_last;
+ mod chain;
+ pub use self::chain::Chain;
++mod chunks;
++pub use self::chunks::Chunks;
+ mod collect;
+ mod enumerate;
+ pub use self::enumerate::Enumerate;
+@@ -1419,6 +1421,31 @@ pub trait IndexedParallelIterator: ParallelIterator {
+         interleave_shortest::new(self, other.into_par_iter())
+     }
+ 
++    /// Split an iterator up into fixed-size chunks.
++    ///
++    /// Returns an iterator that returns `Vec`s of the given number of elements.
++    /// If the number of elements in the iterator is not divisible by `chunk_size`,
++    /// the last chunk may be shorter than `chunk_size`.
++    ///
++    /// See also [`par_chunks()`] and [`par_chunks_mut()`] for similar behavior on
++    /// slices, without having to allocate intermediate `Vec`s for the chunks.
++    ///
++    /// [`par_chunks()`]: ../slice/trait.ParallelSlice.html#method.par_chunks
++    /// [`par_chunks_mut()`]: ../slice/trait.ParallelSliceMut.html#method.par_chunks_mut
++    ///
++    /// # Examples
++    ///
++    /// ```
++    /// use rayon::prelude::*;
++    /// let a = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
++    /// let r: Vec<Vec<i32>> = a.into_par_iter().chunks(3).collect();
++    /// assert_eq!(r, vec![vec![1,2,3], vec![4,5,6], vec![7,8,9], vec![10]]);
++    /// ```
++    fn chunks(self, chunk_size: usize) -> Chunks<Self> {
++        assert!(chunk_size != 0, "chunk_size must not be zero");
++        chunks::new(self, chunk_size)
++    }
++
+     /// Lexicographically compares the elements of this `ParallelIterator` with those of
+     /// another.
+     fn cmp<I>(self, other: I) -> Ordering
+diff --git a/src/iter/test.rs b/src/iter/test.rs
+index 0f3267d..97c3a89 100644
+--- a/src/iter/test.rs
++++ b/src/iter/test.rs
+@@ -1834,6 +1834,52 @@ fn check_interleave_shortest() {
+     }
+ }
+ 
++#[test]
++#[should_panic(expected = "chunk_size must not be zero")]
++fn check_chunks_zero_size() {
++    let _: Vec<Vec<i32>> = vec![1,2,3].into_par_iter().chunks(0).collect();
++}
++
++#[test]
++fn check_chunks_even_size() {
++    assert_eq!(vec![vec![1,2,3], vec![4,5,6], vec![7,8,9]], (1..10).into_par_iter().chunks(3).collect::<Vec<Vec<i32>>>());
++}
++
++#[test]
++fn check_chunks_empty() {
++    let v: Vec<i32> = vec![];
++    let expected: Vec<Vec<i32>> = vec![];
++    assert_eq!(expected, v.into_par_iter().chunks(2).collect::<Vec<Vec<i32>>>());
++}
++
++#[test]
++fn check_chunks_len() {
++    assert_eq!(4, (0..8).into_par_iter().chunks(2).len());
++    assert_eq!(3, (0..9).into_par_iter().chunks(3).len());
++    assert_eq!(3, (0..8).into_par_iter().chunks(3).len());
++    assert_eq!(1, (&[1]).par_iter().chunks(3).len());
++    assert_eq!(0, (0..0).into_par_iter().chunks(3).len());
++}
++
++#[test]
++fn check_chunks_uneven() {
++    let cases: Vec<(Vec<u32>, usize, Vec<Vec<u32>>)> = vec![
++        ((0..5).collect(), 3, vec![vec![0,1, 2], vec![3, 4]]),
++        (vec![1], 5, vec![vec![1]]),
++        ((0..4).collect(), 3, vec![vec![0,1, 2], vec![3]]),
++    ];
++
++    for (i, (v, n, expected)) in cases.into_iter().enumerate() {
++        let mut res: Vec<Vec<u32>> = vec![];
++        v.par_iter().chunks(n).map(|v| v.into_iter().cloned().collect()).collect_into_vec(&mut res);
++        assert_eq!(expected, res, "Case {} failed", i);
++
++        res.truncate(0);
++        v.into_par_iter().chunks(n).rev().collect_into_vec(&mut res);
++        assert_eq!(expected.into_iter().rev().collect::<Vec<Vec<u32>>>(), res, "Case {} reversed failed", i);
++    }
++}
++
+ #[test]
+ #[ignore] // it's quick enough on optimized 32-bit platforms, but otherwise... ... ...
+ #[should_panic(expected = "overflow")]
+diff --git a/src/lib.rs b/src/lib.rs
+index 82b6350..8fb99aa 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -131,6 +131,7 @@ pub mod str;
+ pub mod vec;
+ 
+ mod par_either;
++mod math;
+ mod test;
+ 
+ pub use rayon_core::current_num_threads;
+diff --git a/src/math.rs b/src/math.rs
+new file mode 100644
+index 0000000..0c319f2
+--- /dev/null
++++ b/src/math.rs
+@@ -0,0 +1,25 @@
++/// Divide `n` by `divisor`, and round up to the nearest integer
++/// if not evenly divisable.
++#[inline]
++pub fn div_round_up(n: usize, divisor: usize) -> usize {
++    debug_assert!(divisor != 0, "Division by zero!");
++    if n == 0 {
++        0
++    } else {
++        (n - 1) / divisor + 1
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn check_div_round_up() {
++        assert_eq!(0, div_round_up(0, 5));
++        assert_eq!(1, div_round_up(5, 5));
++        assert_eq!(1, div_round_up(1, 5));
++        assert_eq!(2, div_round_up(3, 2));
++        assert_eq!(usize::max_value() / 2 + 1, div_round_up(usize::max_value(), 2));
++    }
++}
+diff --git a/src/slice/mod.rs b/src/slice/mod.rs
+index c33841b..1ff15c4 100644
+--- a/src/slice/mod.rs
++++ b/src/slice/mod.rs
+@@ -16,6 +16,8 @@ use std::cmp;
+ use std::cmp::Ordering;
+ use std::fmt::{self, Debug};
+ 
++use super::math::div_round_up;
++
+ /// Parallel extensions for slices.
+ pub trait ParallelSlice<T: Sync> {
+     /// Returns a plain slice, which is used to implement the rest of the
+@@ -72,6 +74,7 @@ pub trait ParallelSlice<T: Sync> {
+     /// assert_eq!(vec![[1, 2], [3, 4]], windows);
+     /// ```
+     fn par_chunks(&self, chunk_size: usize) -> Chunks<T> {
++        assert!(chunk_size != 0, "chunk_size must not be zero");
+         Chunks {
+             chunk_size: chunk_size,
+             slice: self.as_parallel_slice(),
+@@ -107,6 +110,7 @@ pub trait ParallelSliceMut<T: Send> {
+     /// Returns a parallel iterator over at most `size` elements of
+     /// `self` at a time. The chunks are mutable and do not overlap.
+     fn par_chunks_mut(&mut self, chunk_size: usize) -> ChunksMut<T> {
++        assert!(chunk_size != 0, "chunk_size must not be zero");
+         ChunksMut {
+             chunk_size: chunk_size,
+             slice: self.as_parallel_slice_mut(),
+@@ -501,7 +505,7 @@ impl<'data, T: Sync + 'data> IndexedParallelIterator for Chunks<'data, T> {
+     }
+ 
+     fn len(&self) -> usize {
+-        (self.slice.len() + (self.chunk_size - 1)) / self.chunk_size
++        div_round_up(self.slice.len(), self.chunk_size)
+     }
+ 
+     fn with_producer<CB>(self, callback: CB) -> CB::Output
+@@ -706,7 +710,7 @@ impl<'data, T: Send + 'data> IndexedParallelIterator for ChunksMut<'data, T> {
+     }
+ 
+     fn len(&self) -> usize {
+-        (self.slice.len() + (self.chunk_size - 1)) / self.chunk_size
++        div_round_up(self.slice.len(), self.chunk_size)
+     }
+ 
+     fn with_producer<CB>(self, callback: CB) -> CB::Output

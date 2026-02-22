@@ -1,0 +1,189 @@
+diff --git a/clap_derive/src/attr.rs b/clap_derive/src/attr.rs
+index df2ab568..f97ba7d0 100644
+--- a/clap_derive/src/attr.rs
++++ b/clap_derive/src/attr.rs
+@@ -35,10 +35,7 @@ impl ClapAttr {
+                 } else if attr.path.is_ident("command") {
+                     Some(Sp::new(AttrKind::Command, attr.path.span()))
+                 } else if attr.path.is_ident("group") {
+-                    abort!(
+-                        attr.path.span(),
+-                        "`#[group()]` attributes are not supported yet"
+-                    )
++                    Some(Sp::new(AttrKind::Group, attr.path.span()))
+                 } else if attr.path.is_ident("arg") {
+                     Some(Sp::new(AttrKind::Arg, attr.path.span()))
+                 } else if attr.path.is_ident("value") {
+@@ -202,6 +199,7 @@ pub enum AttrKind {
+     Clap,
+     StructOpt,
+     Command,
++    Group,
+     Arg,
+     Value,
+ }
+@@ -212,6 +210,7 @@ impl AttrKind {
+             Self::Clap => "clap",
+             Self::StructOpt => "structopt",
+             Self::Command => "command",
++            Self::Group => "group",
+             Self::Arg => "arg",
+             Self::Value => "value",
+         }
+diff --git a/clap_derive/src/derives/args.rs b/clap_derive/src/derives/args.rs
+index c136d21d..9c99c3fb 100644
+--- a/clap_derive/src/derives/args.rs
++++ b/clap_derive/src/derives/args.rs
+@@ -315,11 +315,19 @@ pub fn gen_augment(
+     let initial_app_methods = parent_item.initial_top_level_methods();
+     let group_id = parent_item.ident().unraw().to_string();
+     let final_app_methods = parent_item.final_top_level_methods();
++    let group_app_methods = if parent_item.skip_group() {
++        quote!()
++    } else {
++        quote!(
++            .group(clap::ArgGroup::new(#group_id).multiple(true))
++        )
++    };
+     quote! {{
+         #deprecations
+         let #app_var = #app_var
+             #initial_app_methods
+-            .group(clap::ArgGroup::new(#group_id).multiple(true));
++            #group_app_methods
++            ;
+         #( #args )*
+         #app_var #final_app_methods
+     }}
+diff --git a/clap_derive/src/item.rs b/clap_derive/src/item.rs
+index 758df901..8b60b1f8 100644
+--- a/clap_derive/src/item.rs
++++ b/clap_derive/src/item.rs
+@@ -50,6 +50,7 @@ pub struct Item {
+     next_help_heading: Option<Method>,
+     is_enum: bool,
+     is_positional: bool,
++    skip_group: bool,
+     kind: Sp<Kind>,
+ }
+ 
+@@ -272,6 +273,7 @@ impl Item {
+             next_help_heading: None,
+             is_enum: false,
+             is_positional: true,
++            skip_group: false,
+             kind,
+         }
+     }
+@@ -291,7 +293,7 @@ impl Item {
+                         ),
+                     });
+                 }
+-                AttrKind::Arg | AttrKind::Clap | AttrKind::StructOpt => {}
++                AttrKind::Group | AttrKind::Arg | AttrKind::Clap | AttrKind::StructOpt => {}
+             }
+             self.name = Name::Assigned(quote!(#arg));
+         } else if name == "name" {
+@@ -309,7 +311,11 @@ impl Item {
+                         ),
+                     });
+                 }
+-                AttrKind::Command | AttrKind::Value | AttrKind::Clap | AttrKind::StructOpt => {}
++                AttrKind::Group
++                | AttrKind::Command
++                | AttrKind::Value
++                | AttrKind::Clap
++                | AttrKind::StructOpt => {}
+             }
+             self.name = Name::Assigned(quote!(#arg));
+         } else if name == "value_parser" {
+@@ -330,6 +336,7 @@ impl Item {
+                 continue;
+             }
+ 
++            let actual_attr_kind = *attr.kind.get();
+             let kind = match &attr.magic {
+                 Some(MagicAttrName::FromGlobal) => {
+                     if attr.value.is_some() {
+@@ -373,7 +380,7 @@ impl Item {
+                     let kind = Sp::new(Kind::Flatten, attr.name.clone().span());
+                     Some(kind)
+                 }
+-                Some(MagicAttrName::Skip) => {
++                Some(MagicAttrName::Skip) if actual_attr_kind != AttrKind::Group => {
+                     let expr = attr.value.clone();
+                     let kind = Sp::new(
+                         Kind::Skip(expr, self.kind.attr_kind()),
+@@ -404,6 +411,8 @@ impl Item {
+                     ));
+                 }
+ 
++                (AttrKind::Group, AttrKind::Command) => {}
++
+                 _ if attr.kind != expected_attr_kind => {
+                     abort!(
+                         attr.kind.span(),
+@@ -799,6 +808,10 @@ impl Item {
+                     self.env_casing = CasingStyle::from_lit(lit);
+                 }
+ 
++                Some(MagicAttrName::Skip) if actual_attr_kind == AttrKind::Group => {
++                    self.skip_group = true;
++                }
++
+                 None
+                 // Magic only for the default, otherwise just forward to the builder
+                 | Some(MagicAttrName::Short)
+@@ -1025,6 +1038,10 @@ impl Item {
+             .iter()
+             .any(|m| m.name != "help" && m.name != "long_help")
+     }
++
++    pub fn skip_group(&self) -> bool {
++        self.skip_group
++    }
+ }
+ 
+ #[derive(Clone)]
+diff --git a/src/_derive/mod.rs b/src/_derive/mod.rs
+index 000320eb..653f076c 100644
+--- a/src/_derive/mod.rs
++++ b/src/_derive/mod.rs
+@@ -4,6 +4,7 @@
+ //! 2. [Attributes](#attributes)
+ //!     1. [Terminology](#terminology)
+ //!     2. [Command Attributes](#command-attributes)
++//!     2. [ArgGroup Attributes](#arggroup-attributes)
+ //!     3. [Arg Attributes](#arg-attributes)
+ //!     4. [ValueEnum Attributes](#valueenum-attributes)
+ //!     5. [Possible Value Attributes](#possible-value-attributes)
+@@ -28,6 +29,7 @@
+ //! /// Doc comment
+ //! #[derive(Parser)]
+ //! #[command(CMD ATTRIBUTE)]
++//! #[group(GROUP ATTRIBUTE)]
+ //! struct Cli {
+ //!     /// Doc comment
+ //!     #[arg(ARG ATTRIBUTE)]
+@@ -46,6 +48,7 @@
+ //! /// Doc comment
+ //! #[derive(Args)]
+ //! #[command(PARENT CMD ATTRIBUTE)]
++//! #[group(GROUP ATTRIBUTE)]
+ //! struct Struct {
+ //!     /// Doc comment
+ //!     #[command(ARG ATTRIBUTE)]
+@@ -173,6 +176,13 @@
+ //! - `external_subcommand`: [`Command::allow_external_subcommand(true)`][crate::Command::allow_external_subcommands]
+ //!   - Variant must be either `Variant(Vec<String>)` or `Variant(Vec<OsString>)`
+ //!
++//! ### ArgGroup Attributes
++//!
++//! These correspond to the [`ArgGroup`][crate::ArgGroup] which is implicitly created for each
++//! `Args` derive.
++//!
++//! At the moment, only `#[group(skip)]` is supported
++//!
+ //! ### Arg Attributes
+ //!
+ //! These correspond to a [`Arg`][crate::Arg].

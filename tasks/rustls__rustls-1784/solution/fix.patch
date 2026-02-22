@@ -1,0 +1,757 @@
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index 361fbd03..d3ce6562 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -867,8 +867,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
+                     }
+                 };
+ 
+-                skxg.start()
+-                    .map_err(|_| Error::FailedToGetRandomBytes)?
++                skxg.start()?
+             }
+             _ => offered_key_share,
+         };
+diff --git a/rustls/src/client/tls12.rs b/rustls/src/client/tls12.rs
+index dd521095..88bdda32 100644
+--- a/rustls/src/client/tls12.rs
++++ b/rustls/src/client/tls12.rs
+@@ -927,9 +927,7 @@ impl State<ClientConnectionData> for ExpectServerDone<'_> {
+                 return Err(PeerMisbehaved::SelectedUnofferedKxGroup.into());
+             }
+         };
+-        let kx = skxg
+-            .start()
+-            .map_err(|_| Error::FailedToGetRandomBytes)?;
++        let kx = skxg.start()?;
+ 
+         // 5b.
+         let mut transcript = st.transcript;
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 50c3f07f..7aaf637e 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -221,9 +221,7 @@ pub(super) fn initial_key_share(
+                 .expect("No kx groups configured")
+         });
+ 
+-    group
+-        .start()
+-        .map_err(|_| Error::FailedToGetRandomBytes)
++    group.start()
+ }
+ 
+ /// This implements the horrifying TLS1.3 hack where PSK binders have a
+diff --git a/rustls/src/crypto/mod.rs b/rustls/src/crypto/mod.rs
+index 52d4de60..13818def 100644
+--- a/rustls/src/crypto/mod.rs
++++ b/rustls/src/crypto/mod.rs
+@@ -292,12 +292,6 @@ impl CryptoProvider {
+             && secure_random.fips()
+             && key_provider.fips()
+     }
+-
+-    pub(crate) fn supported_kx_group_names(&self) -> impl Iterator<Item = NamedGroup> + '_ {
+-        self.kx_groups
+-            .iter()
+-            .map(|skxg| skxg.name())
+-    }
+ }
+ 
+ static PROCESS_DEFAULT_PROVIDER: OnceCell<Arc<CryptoProvider>> = OnceCell::new();
+diff --git a/rustls/src/server/hs.rs b/rustls/src/server/hs.rs
+index 82e159bb..20eb0dfc 100644
+--- a/rustls/src/server/hs.rs
++++ b/rustls/src/server/hs.rs
+@@ -1,16 +1,18 @@
+-use crate::common_state::State;
++use crate::common_state::{Protocol, State};
+ use crate::conn::ConnectionRandoms;
+-#[cfg(feature = "tls12")]
+-use crate::enums::CipherSuite;
+-use crate::enums::{AlertDescription, HandshakeType, ProtocolVersion, SignatureScheme};
++use crate::crypto::SupportedKxGroup;
++use crate::enums::{
++    AlertDescription, CipherSuite, HandshakeType, ProtocolVersion, SignatureAlgorithm,
++    SignatureScheme,
++};
+ use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
+ use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
+ #[cfg(feature = "logging")]
+ use crate::log::{debug, trace};
+-use crate::msgs::enums::{Compression, ExtensionType};
++use crate::msgs::enums::{Compression, ExtensionType, NamedGroup};
+ #[cfg(feature = "tls12")]
+ use crate::msgs::handshake::SessionId;
+-use crate::msgs::handshake::{ClientHelloPayload, Random, ServerExtension};
++use crate::msgs::handshake::{ClientHelloPayload, KeyExchangeAlgorithm, Random, ServerExtension};
+ use crate::msgs::handshake::{ConvertProtocolNameList, ConvertServerNameList, HandshakePayload};
+ use crate::msgs::message::{Message, MessagePayload};
+ use crate::msgs::persist;
+@@ -334,63 +336,20 @@ impl ExpectClientHello {
+         };
+         let certkey = ActiveCertifiedKey::from_certified_key(&certkey);
+ 
+-        let mut suitable_suites = self
+-            .config
+-            .provider
+-            .cipher_suites
+-            .iter()
+-            .filter(|suite| {
+-                // Reduce our supported ciphersuites by the certificate.
+-                suite.usable_for_signature_algorithm(certkey.get_key().algorithm())
+-                // And version
+-                && suite.version().version == version && suite.usable_for_protocol(cx.common.protocol)
+-            })
+-            .copied()
+-            .collect::<Vec<_>>();
+-
+-        let suitable_suites_before_kx_reduce_not_empty = !suitable_suites.is_empty();
+-
+-        // And supported kx groups
+-        suites::reduce_given_kx_groups(
+-            &mut suitable_suites,
+-            client_hello.namedgroups_extension(),
+-            &self
+-                .config
+-                .provider
+-                .supported_kx_group_names()
+-                .collect::<Vec<_>>(),
+-        );
+-
+-        if suitable_suites_before_kx_reduce_not_empty && suitable_suites.is_empty() {
+-            return Err(cx.common.send_fatal_alert(
+-                AlertDescription::HandshakeFailure,
+-                PeerIncompatible::NoKxGroupsInCommon,
+-            ));
+-        }
+-
+-        // RFC 7919 (https://datatracker.ietf.org/doc/html/rfc7919#section-4) requires us to send
+-        // the InsufficientSecurity alert in case we don't recognize client's FFDHE groups (i.e.,
+-        // `suitable_suites` becomes empty). But that does not make a lot of sense (e.g., client
+-        // proposes FFDHE4096 and we only support FFDHE2048), so we ignore that requirement here,
+-        // and continue to send HandshakeFailure.
+-
+-        let suite = if self.config.ignore_client_order {
+-            suites::choose_ciphersuite_preferring_server(
+-                &client_hello.cipher_suites,
+-                &suitable_suites,
+-            )
+-        } else {
+-            suites::choose_ciphersuite_preferring_client(
++        let (suite, skxg) = self
++            .choose_suite_and_kx_group(
++                version,
++                certkey.get_key().algorithm(),
++                cx.common.protocol,
++                client_hello
++                    .namedgroups_extension()
++                    .unwrap_or(&[]),
+                 &client_hello.cipher_suites,
+-                &suitable_suites,
+-            )
+-        }
+-        .ok_or_else(|| {
+-            cx.common.send_fatal_alert(
+-                AlertDescription::HandshakeFailure,
+-                PeerIncompatible::NoCipherSuitesInCommon,
+             )
+-        })?;
++            .map_err(|incompat| {
++                cx.common
++                    .send_fatal_alert(AlertDescription::HandshakeFailure, incompat)
++            })?;
+ 
+         debug!("decided upon suite {:?}", suite);
+         cx.common.suite = Some(suite);
+@@ -427,7 +386,7 @@ impl ExpectClientHello {
+                 send_tickets: self.send_tickets,
+                 extra_exts: self.extra_exts,
+             }
+-            .handle_client_hello(cx, certkey, m, client_hello, sig_schemes),
++            .handle_client_hello(cx, certkey, m, client_hello, skxg, sig_schemes),
+             #[cfg(feature = "tls12")]
+             SupportedCipherSuite::Tls12(suite) => tls12::CompleteClientHelloHandling {
+                 config: self.config,
+@@ -444,11 +403,138 @@ impl ExpectClientHello {
+                 certkey,
+                 m,
+                 client_hello,
++                skxg,
+                 sig_schemes,
+                 tls13_enabled,
+             ),
+         }
+     }
++
++    fn choose_suite_and_kx_group(
++        &self,
++        selected_version: ProtocolVersion,
++        sig_key_algorithm: SignatureAlgorithm,
++        protocol: Protocol,
++        client_groups: &[NamedGroup],
++        client_suites: &[CipherSuite],
++    ) -> Result<(SupportedCipherSuite, &'static dyn SupportedKxGroup), PeerIncompatible> {
++        // Determine which `KeyExchangeAlgorithm`s are theoretically possible, based
++        // on the offered and supported groups.
++        let mut ecdhe_possible = false;
++        let mut ffdhe_possible = false;
++        let mut ffdhe_offered = false;
++        let mut supported_groups = Vec::with_capacity(client_groups.len());
++
++        for offered_group in client_groups {
++            let supported = self
++                .config
++                .provider
++                .kx_groups
++                .iter()
++                .find(|skxg| skxg.name() == *offered_group);
++
++            match offered_group.key_exchange_algorithm() {
++                KeyExchangeAlgorithm::DHE => {
++                    ffdhe_possible |= supported.is_some();
++                    ffdhe_offered = true;
++                }
++                KeyExchangeAlgorithm::ECDHE => {
++                    ecdhe_possible |= supported.is_some();
++                }
++            }
++
++            supported_groups.push(supported);
++        }
++
++        let first_supported_dhe_kxg = if selected_version == ProtocolVersion::TLSv1_2 {
++            // https://datatracker.ietf.org/doc/html/rfc7919#section-4 (paragraph 2)
++            let first_supported_dhe_kxg = self
++                .config
++                .provider
++                .kx_groups
++                .iter()
++                .find(|skxg| skxg.name().key_exchange_algorithm() == KeyExchangeAlgorithm::DHE);
++            ffdhe_possible |= !ffdhe_offered && first_supported_dhe_kxg.is_some();
++            first_supported_dhe_kxg
++        } else {
++            // In TLS1.3, the server may only directly negotiate a group.
++            None
++        };
++
++        if !ecdhe_possible && !ffdhe_possible {
++            return Err(PeerIncompatible::NoKxGroupsInCommon);
++        }
++
++        let mut suitable_suites_iter = self
++            .config
++            .provider
++            .cipher_suites
++            .iter()
++            .filter(|suite| {
++                // Reduce our supported ciphersuites by the certified key's algorithm.
++                suite.usable_for_signature_algorithm(sig_key_algorithm)
++                // And version
++                && suite.version().version == selected_version
++                // And protocol
++                && suite.usable_for_protocol(protocol)
++                // And key exchange groups
++                && (!ecdhe_possible || suite.usable_for_kx_algorithm(KeyExchangeAlgorithm::ECDHE))
++                && (!ffdhe_possible || suite.usable_for_kx_algorithm(KeyExchangeAlgorithm::DHE))
++            });
++
++        // RFC 7919 (https://datatracker.ietf.org/doc/html/rfc7919#section-4) requires us to send
++        // the InsufficientSecurity alert in case we don't recognize client's FFDHE groups (i.e.,
++        // `suitable_suites` becomes empty). But that does not make a lot of sense (e.g., client
++        // proposes FFDHE4096 and we only support FFDHE2048), so we ignore that requirement here,
++        // and continue to send HandshakeFailure.
++
++        let suite = if self.config.ignore_client_order {
++            suitable_suites_iter.find(|suite| client_suites.contains(&suite.suite()))
++        } else {
++            let suitable_suites = suitable_suites_iter.collect::<Vec<_>>();
++            client_suites
++                .iter()
++                .find_map(|client_suite| {
++                    suitable_suites
++                        .iter()
++                        .find(|x| *client_suite == x.suite())
++                })
++                .copied()
++        }
++        .ok_or(PeerIncompatible::NoCipherSuitesInCommon)?;
++
++        // Finally, choose a key exchange group that is compatible with the selected cipher
++        // suite.
++        let maybe_skxg = supported_groups
++            .iter()
++            .find_map(|maybe_skxg| match maybe_skxg {
++                Some(skxg) => suite
++                    .usable_for_kx_algorithm(skxg.name().key_exchange_algorithm())
++                    .then(|| *skxg),
++                None => None,
++            });
++
++        if selected_version == ProtocolVersion::TLSv1_3 {
++            // This unwrap is structurally guaranteed by the early return for `!ffdhe_possible && !ecdhe_possible`
++            return Ok((*suite, *maybe_skxg.unwrap()));
++        }
++
++        // For TLS1.2, the server can unilaterally choose a DHE group if it has one and
++        // there was no better option.
++        match maybe_skxg {
++            Some(skxg) => Ok((*suite, *skxg)),
++            None if suite.usable_for_kx_algorithm(KeyExchangeAlgorithm::DHE) => {
++                // If kx for the selected cipher suite is DHE and no DHE groups are specified in the extension,
++                // the server is free to choose DHE params, we choose the first DHE kx group of the provider.
++                if let Some(server_selected_ffdhe_skxg) = first_supported_dhe_kxg {
++                    Ok((*suite, *server_selected_ffdhe_skxg))
++                } else {
++                    Err(PeerIncompatible::NoKxGroupsInCommon)
++                }
++            }
++            None => Err(PeerIncompatible::NoKxGroupsInCommon),
++        }
++    }
+ }
+ 
+ impl State<ServerConnectionData> for ExpectClientHello {
+diff --git a/rustls/src/server/tls12.rs b/rustls/src/server/tls12.rs
+index 59e79bac..3988a8e5 100644
+--- a/rustls/src/server/tls12.rs
++++ b/rustls/src/server/tls12.rs
+@@ -40,7 +40,7 @@ pub(super) use client_hello::CompleteClientHelloHandling;
+ mod client_hello {
+     use pki_types::CertificateDer;
+ 
+-    use crate::crypto::{KeyExchangeAlgorithm, SupportedKxGroup};
++    use crate::crypto::SupportedKxGroup;
+     use crate::enums::SignatureScheme;
+     use crate::msgs::enums::ECPointFormat;
+     use crate::msgs::enums::{ClientCertificateType, Compression};
+@@ -73,6 +73,7 @@ mod client_hello {
+             server_key: ActiveCertifiedKey,
+             chm: &Message,
+             client_hello: &ClientHelloPayload,
++            selected_kxg: &'static dyn SupportedKxGroup,
+             sigschemes_ext: Vec<SignatureScheme>,
+             tls13_enabled: bool,
+         ) -> hs::NextStateOrError<'static> {
+@@ -175,8 +176,6 @@ mod client_hello {
+                 ));
+             }
+ 
+-            let group = self.pick_kx_group(client_hello, cx)?;
+-
+             let ecpoint = ECPointFormat::SUPPORTED
+                 .iter()
+                 .find(|format| ecpoints_ext.contains(format))
+@@ -220,7 +219,7 @@ mod client_hello {
+                 &mut self.transcript,
+                 cx.common,
+                 sigschemes,
+-                group,
++                selected_kxg,
+                 server_key.get_key(),
+                 &self.randoms,
+             )?;
+@@ -253,59 +252,6 @@ mod client_hello {
+             }
+         }
+ 
+-        fn pick_kx_group(
+-            &self,
+-            client_hello: &ClientHelloPayload,
+-            cx: &mut ServerContext<'_>,
+-        ) -> Result<&'static dyn SupportedKxGroup, Error> {
+-            let peer_groups_ext = client_hello.namedgroups_extension();
+-
+-            if peer_groups_ext.is_none() && self.suite.kx == KeyExchangeAlgorithm::ECDHE {
+-                return Err(cx.common.send_fatal_alert(
+-                    AlertDescription::HandshakeFailure,
+-                    PeerIncompatible::NamedGroupsExtensionRequired,
+-                ));
+-            }
+-
+-            trace!("namedgroups {:?}", peer_groups_ext);
+-
+-            let peer_kx_groups = peer_groups_ext.unwrap_or(&[]);
+-            let our_kx_groups = &self.config.provider.kx_groups;
+-
+-            let matching_kx_group = our_kx_groups.iter().find(|skxg| {
+-                skxg.name().key_exchange_algorithm() == self.suite.kx
+-                    && peer_kx_groups.contains(&skxg.name())
+-            });
+-            if let Some(&kx_group) = matching_kx_group {
+-                return Ok(kx_group);
+-            }
+-
+-            let mut send_err = || {
+-                cx.common.send_fatal_alert(
+-                    AlertDescription::HandshakeFailure,
+-                    PeerIncompatible::NoKxGroupsInCommon,
+-                )
+-            };
+-
+-            // If kx for the selected cipher suite is DHE and no DHE groups are specified in the extension,
+-            // the server is free to choose DHE params, we choose the first DHE kx group of the provider.
+-            use KeyExchangeAlgorithm::DHE;
+-            let we_get_to_choose_dhe_group = self.suite.kx == DHE
+-                && !peer_kx_groups
+-                    .iter()
+-                    .any(|g| g.key_exchange_algorithm() == DHE);
+-
+-            if !we_get_to_choose_dhe_group {
+-                return Err(send_err());
+-            }
+-            trace!("No DHE groups specified in ClientHello groups extension, server choosing DHE parameters");
+-            our_kx_groups
+-                .iter()
+-                .find(|skxg| skxg.name().key_exchange_algorithm() == DHE)
+-                .cloned()
+-                .ok_or_else(send_err)
+-        }
+-
+         fn start_resumption(
+             mut self,
+             cx: &mut ServerContext<'_>,
+@@ -456,9 +402,7 @@ mod client_hello {
+         signing_key: &dyn sign::SigningKey,
+         randoms: &ConnectionRandoms,
+     ) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+-        let kx = selected_group
+-            .start()
+-            .map_err(|_| Error::FailedToGetRandomBytes)?;
++        let kx = selected_group.start()?;
+         let kx_params = ServerKeyExchangeParams::new(&*kx);
+ 
+         let mut msg = Vec::new();
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index 35b46d8f..c82cc7e7 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -149,6 +149,7 @@ mod client_hello {
+             server_key: ActiveCertifiedKey,
+             chm: &Message,
+             client_hello: &ClientHelloPayload,
++            selected_kxg: &'static dyn SupportedKxGroup,
+             mut sigschemes_ext: Vec<SignatureScheme>,
+         ) -> hs::NextStateOrError<'static> {
+             if client_hello.compression_methods.len() != 1 {
+@@ -158,15 +159,6 @@ mod client_hello {
+                 ));
+             }
+ 
+-            let groups_ext = client_hello
+-                .namedgroups_extension()
+-                .ok_or_else(|| {
+-                    cx.common.send_fatal_alert(
+-                        AlertDescription::HandshakeFailure,
+-                        PeerIncompatible::NamedGroupsExtensionRequired,
+-                    )
+-                })?;
+-
+             sigschemes_ext.retain(SignatureScheme::supported_in_tls13);
+ 
+             let shares_ext = client_hello
+@@ -197,79 +189,56 @@ mod client_hello {
+                 });
+             }
+ 
+-            // choose a share that we support
+-            let chosen_share_and_kxg = self
+-                .config
+-                .provider
+-                .kx_groups
+-                .iter()
+-                .find_map(|group| {
+-                    shares_ext
+-                        .iter()
+-                        .find(|share| share.group == group.name())
+-                        .map(|share| (share, *group))
+-                });
++            // See if there is a KeyShare for the selected kx group.
++            let chosen_share_and_kxg = shares_ext.iter().find_map(|share| {
++                (share.group == selected_kxg.name()).then(|| (share, selected_kxg))
++            });
+ 
+             let chosen_share_and_kxg = match chosen_share_and_kxg {
+                 Some(s) => s,
+                 None => {
+-                    // We don't have a suitable key share.  Choose a suitable group and
+-                    // send a HelloRetryRequest.
+-                    let retry_group_maybe = self
+-                        .config
+-                        .provider
+-                        .kx_groups
+-                        .iter()
+-                        .find(|group| groups_ext.contains(&group.name()))
+-                        .cloned();
+-
++                    // We don't have a suitable key share.  Send a HelloRetryRequest
++                    // for the mutually_preferred_group.
+                     self.transcript.add_message(chm);
+ 
+-                    if let Some(group) = retry_group_maybe {
+-                        if self.done_retry {
+-                            return Err(cx.common.send_fatal_alert(
+-                                AlertDescription::IllegalParameter,
+-                                PeerMisbehaved::RefusedToFollowHelloRetryRequest,
+-                            ));
+-                        }
+-
+-                        emit_hello_retry_request(
+-                            &mut self.transcript,
+-                            self.suite,
+-                            client_hello.session_id,
+-                            cx.common,
+-                            group.name(),
+-                        );
+-                        emit_fake_ccs(cx.common);
+-
+-                        let skip_early_data = max_early_data_size(self.config.max_early_data_size);
+-
+-                        let next = Box::new(hs::ExpectClientHello {
+-                            config: self.config,
+-                            transcript: HandshakeHashOrBuffer::Hash(self.transcript),
+-                            #[cfg(feature = "tls12")]
+-                            session_id: SessionId::empty(),
+-                            #[cfg(feature = "tls12")]
+-                            using_ems: false,
+-                            done_retry: true,
+-                            send_tickets: self.send_tickets,
+-                            extra_exts: self.extra_exts,
+-                        });
+-
+-                        return if early_data_requested {
+-                            Ok(Box::new(ExpectAndSkipRejectedEarlyData {
+-                                skip_data_left: skip_early_data,
+-                                next,
+-                            }))
+-                        } else {
+-                            Ok(next)
+-                        };
++                    if self.done_retry {
++                        return Err(cx.common.send_fatal_alert(
++                            AlertDescription::IllegalParameter,
++                            PeerMisbehaved::RefusedToFollowHelloRetryRequest,
++                        ));
+                     }
+ 
+-                    return Err(cx.common.send_fatal_alert(
+-                        AlertDescription::HandshakeFailure,
+-                        PeerIncompatible::NoKxGroupsInCommon,
+-                    ));
++                    emit_hello_retry_request(
++                        &mut self.transcript,
++                        self.suite,
++                        client_hello.session_id,
++                        cx.common,
++                        selected_kxg.name(),
++                    );
++                    emit_fake_ccs(cx.common);
++
++                    let skip_early_data = max_early_data_size(self.config.max_early_data_size);
++
++                    let next = Box::new(hs::ExpectClientHello {
++                        config: self.config,
++                        transcript: HandshakeHashOrBuffer::Hash(self.transcript),
++                        #[cfg(feature = "tls12")]
++                        session_id: SessionId::empty(),
++                        #[cfg(feature = "tls12")]
++                        using_ems: false,
++                        done_retry: true,
++                        send_tickets: self.send_tickets,
++                        extra_exts: self.extra_exts,
++                    });
++
++                    return if early_data_requested {
++                        Ok(Box::new(ExpectAndSkipRejectedEarlyData {
++                            skip_data_left: skip_early_data,
++                            next,
++                        }))
++                    } else {
++                        Ok(next)
++                    };
+                 }
+             };
+ 
+@@ -491,9 +460,7 @@ mod client_hello {
+         // Prepare key exchange; the caller already found the matching SupportedKxGroup
+         let (share, kxgroup) = share_and_kxgroup;
+         debug_assert_eq!(kxgroup.name(), share.group);
+-        let kx = kxgroup
+-            .start()
+-            .map_err(|_| Error::FailedToGetRandomBytes)?;
++        let kx = kxgroup.start()?;
+ 
+         let kse = KeyShareEntry::new(share.group, kx.pub_key());
+         extensions.push(ServerExtension::KeyShare(kse));
+diff --git a/rustls/src/suites.rs b/rustls/src/suites.rs
+index 865af745..f66a8347 100644
+--- a/rustls/src/suites.rs
++++ b/rustls/src/suites.rs
+@@ -9,8 +9,6 @@ use crate::tls13::Tls13CipherSuite;
+ #[cfg(feature = "tls12")]
+ use crate::versions::TLS12;
+ use crate::versions::{SupportedProtocolVersion, TLS13};
+-use crate::NamedGroup;
+-use alloc::vec::Vec;
+ 
+ use core::fmt;
+ 
+@@ -149,97 +147,24 @@ impl SupportedCipherSuite {
+             Self::Tls13(_) => ALL_KEY_EXCHANGE_ALGORITHMS,
+         }
+     }
+-}
+-
+-impl fmt::Debug for SupportedCipherSuite {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        self.suite().fmt(f)
+-    }
+-}
+ 
+-// These both O(N^2)!
+-pub(crate) fn choose_ciphersuite_preferring_client(
+-    client_suites: &[CipherSuite],
+-    server_suites: &[SupportedCipherSuite],
+-) -> Option<SupportedCipherSuite> {
+-    for client_suite in client_suites {
+-        if let Some(selected) = server_suites
+-            .iter()
+-            .find(|x| *client_suite == x.suite())
+-        {
+-            return Some(*selected);
++    /// Say if the given `KeyExchangeAlgorithm` is supported by this cipher suite.
++    ///
++    /// TLS 1.3 cipher suites support all key exchange types, but TLS 1.2 suites
++    /// support only one.
++    pub(crate) fn usable_for_kx_algorithm(&self, _kxa: KeyExchangeAlgorithm) -> bool {
++        match self {
++            #[cfg(feature = "tls12")]
++            Self::Tls12(tls12) => tls12.kx == _kxa,
++            Self::Tls13(_) => true,
+         }
+     }
+-
+-    None
+ }
+ 
+-pub(crate) fn choose_ciphersuite_preferring_server(
+-    client_suites: &[CipherSuite],
+-    server_suites: &[SupportedCipherSuite],
+-) -> Option<SupportedCipherSuite> {
+-    if let Some(selected) = server_suites
+-        .iter()
+-        .find(|x| client_suites.contains(&x.suite()))
+-    {
+-        return Some(*selected);
+-    }
+-
+-    None
+-}
+-
+-/// Return a list of the ciphersuites in `all` with the suites
+-/// incompatible with the Groups extension removed.
+-pub(crate) fn reduce_given_kx_groups(
+-    all: &mut Vec<SupportedCipherSuite>,
+-    groups_ext: Option<&[NamedGroup]>,
+-    supported_groups: &[NamedGroup],
+-) {
+-    let mut ecdhe_kx_ok = false;
+-
+-    #[cfg(feature = "tls12")]
+-    let mut ext_has_ffdhe_groups = false;
+-    let mut ext_has_known_ffdhe_groups = false;
+-    for g in groups_ext.into_iter().flatten() {
+-        if g.key_exchange_algorithm() == KeyExchangeAlgorithm::DHE {
+-            #[cfg(feature = "tls12")]
+-            {
+-                ext_has_ffdhe_groups = true;
+-            }
+-            if supported_groups.contains(g) {
+-                ext_has_known_ffdhe_groups = true;
+-            }
+-        } else if supported_groups.contains(g) {
+-            ecdhe_kx_ok = true;
+-        }
+-        if ecdhe_kx_ok & ext_has_known_ffdhe_groups {
+-            break;
+-        }
++impl fmt::Debug for SupportedCipherSuite {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        self.suite().fmt(f)
+     }
+-
+-    #[cfg(feature = "tls12")]
+-    let ffdhe_kx_ok_tls12 = ext_has_known_ffdhe_groups ||
+-        // https://datatracker.ietf.org/doc/html/rfc7919#section-4 (paragraph 2)
+-        !ext_has_ffdhe_groups && supported_groups
+-                .iter()
+-                .any(|g| g.key_exchange_algorithm() == KeyExchangeAlgorithm::DHE);
+-
+-    let ffdhe_kx_ok_tls13 = ext_has_known_ffdhe_groups;
+-
+-    all.retain(|suite| {
+-        let suite_kx = suite.key_exchange_algorithms();
+-        // echde:
+-        ecdhe_kx_ok && suite_kx.contains(&KeyExchangeAlgorithm::ECDHE) ||
+-            // dhe:
+-            {
+-                let ffdhe_kx_ok = match suite {
+-                    #[cfg(feature = "tls12")]
+-                    SupportedCipherSuite::Tls12(_) => ffdhe_kx_ok_tls12,
+-                    SupportedCipherSuite::Tls13(_) => ffdhe_kx_ok_tls13,
+-                };
+-                ffdhe_kx_ok && suite_kx.contains(&KeyExchangeAlgorithm::DHE)
+-            }
+-    })
+ }
+ 
+ /// Return true if `sigscheme` is usable by any of the given suites.
+@@ -308,48 +233,8 @@ pub enum ConnectionTrafficSecrets {
+ }
+ 
+ test_for_each_provider! {
+-    use super::*;
+-    use crate::enums::CipherSuite;
+     use provider::tls13::*;
+ 
+-    #[test]
+-    fn test_client_pref() {
+-        let client = vec![
+-            CipherSuite::TLS13_AES_128_GCM_SHA256,
+-            CipherSuite::TLS13_AES_256_GCM_SHA384,
+-        ];
+-        let server = vec![TLS13_AES_256_GCM_SHA384, TLS13_AES_128_GCM_SHA256];
+-        let chosen = choose_ciphersuite_preferring_client(&client, &server);
+-        assert!(chosen.is_some());
+-        assert_eq!(chosen.unwrap(), TLS13_AES_128_GCM_SHA256);
+-    }
+-
+-    #[test]
+-    fn test_server_pref() {
+-        let client = vec![
+-            CipherSuite::TLS13_AES_128_GCM_SHA256,
+-            CipherSuite::TLS13_AES_256_GCM_SHA384,
+-        ];
+-        let server = vec![TLS13_AES_256_GCM_SHA384, TLS13_AES_128_GCM_SHA256];
+-        let chosen = choose_ciphersuite_preferring_server(&client, &server);
+-        assert!(chosen.is_some());
+-        assert_eq!(chosen.unwrap(), TLS13_AES_256_GCM_SHA384);
+-    }
+-
+-    #[test]
+-    fn test_pref_fails() {
+-        assert!(choose_ciphersuite_preferring_client(
+-            &[CipherSuite::TLS_NULL_WITH_NULL_NULL],
+-            provider::ALL_CIPHER_SUITES
+-        )
+-        .is_none());
+-        assert!(choose_ciphersuite_preferring_server(
+-            &[CipherSuite::TLS_NULL_WITH_NULL_NULL],
+-            provider::ALL_CIPHER_SUITES
+-        )
+-        .is_none());
+-    }
+-
+     #[test]
+     fn test_scs_is_debug() {
+         println!("{:?}", provider::ALL_CIPHER_SUITES);

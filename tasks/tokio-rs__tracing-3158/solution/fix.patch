@@ -1,0 +1,149 @@
+diff --git a/tracing-attributes/src/attr.rs b/tracing-attributes/src/attr.rs
+index f3d91418..f086d1c7 100644
+--- a/tracing-attributes/src/attr.rs
++++ b/tracing-attributes/src/attr.rs
+@@ -5,6 +5,7 @@ use proc_macro2::TokenStream;
+ use quote::{quote, quote_spanned, ToTokens};
+ use syn::ext::IdentExt as _;
+ use syn::parse::{Parse, ParseStream};
++use syn::token::Brace;
+ 
+ /// Arguments to `#[instrument(err(...))]` and `#[instrument(ret(...))]` which describe how the
+ /// return value event should be emitted.
+@@ -307,7 +308,7 @@ pub(crate) struct Fields(pub(crate) Punctuated<Field, Token![,]>);
+ 
+ #[derive(Clone, Debug)]
+ pub(crate) struct Field {
+-    pub(crate) name: Punctuated<Ident, Token![.]>,
++    pub(crate) name: FieldName,
+     pub(crate) value: Option<Expr>,
+     pub(crate) kind: FieldKind,
+ }
+@@ -319,6 +320,23 @@ pub(crate) enum FieldKind {
+     Value,
+ }
+ 
++#[derive(Clone, Debug)]
++pub(crate) enum FieldName {
++    Expr(Expr),
++    Punctuated(Punctuated<Ident, Token![.]>),
++}
++
++impl ToTokens for FieldName {
++    fn to_tokens(&self, tokens: &mut TokenStream) {
++        match self {
++            FieldName::Expr(expr) => {
++                Brace::default().surround(tokens, |tokens| expr.to_tokens(tokens));
++            }
++            FieldName::Punctuated(punctuated) => punctuated.to_tokens(tokens),
++        }
++    }
++}
++
+ impl Parse for Fields {
+     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+         let _ = input.parse::<kw::fields>();
+@@ -345,7 +363,18 @@ impl Parse for Field {
+             input.parse::<Token![?]>()?;
+             kind = FieldKind::Debug;
+         };
+-        let name = Punctuated::parse_separated_nonempty_with(input, Ident::parse_any)?;
++        // Parse name as either an expr between braces or a dotted identifier.
++        let name = if input.peek(syn::token::Brace) {
++            let content;
++            let _ = syn::braced!(content in input);
++            let expr = content.call(Expr::parse)?;
++            FieldName::Expr(expr)
++        } else {
++            FieldName::Punctuated(Punctuated::parse_separated_nonempty_with(
++                input,
++                Ident::parse_any,
++            )?)
++        };
+         let value = if input.peek(Token![=]) {
+             input.parse::<Token![=]>()?;
+             if input.peek(Token![%]) {
+diff --git a/tracing-attributes/src/expand.rs b/tracing-attributes/src/expand.rs
+index eb3ea5cd..a5cacd43 100644
+--- a/tracing-attributes/src/expand.rs
++++ b/tracing-attributes/src/expand.rs
+@@ -11,7 +11,7 @@ use syn::{
+ };
+ 
+ use crate::{
+-    attr::{Field, Fields, FormatMode, InstrumentArgs, Level},
++    attr::{Field, FieldName, Fields, FormatMode, InstrumentArgs, Level},
+     MaybeItemFn, MaybeItemFnRef,
+ };
+ 
+@@ -211,8 +211,16 @@ fn gen_block<B: ToTokens>(
+                 // and allow them to be formatted by the custom field.
+                 if let Some(ref fields) = args.fields {
+                     fields.0.iter().all(|Field { ref name, .. }| {
+-                        let first = name.first();
+-                        first != name.last() || !first.iter().any(|name| name == &param)
++                        match name {
++                            // #3158: Expressions cannot be evaluated at compile time and will
++                            // incur a runtime cost to de-duplicate.
++                            FieldName::Expr(_) => true,
++                            FieldName::Punctuated(punctuated) => {
++                                let first = punctuated.first();
++                                first != punctuated.last()
++                                    || !first.iter().any(|name| name == &param)
++                            }
++                        }
+                     })
+                 } else {
+                     true
+diff --git a/tracing-attributes/src/lib.rs b/tracing-attributes/src/lib.rs
+index fe5612fd..f3d71e76 100644
+--- a/tracing-attributes/src/lib.rs
++++ b/tracing-attributes/src/lib.rs
+@@ -206,19 +206,23 @@ mod expand;
+ ///
+ /// # Adding Fields
+ ///
+-/// Additional fields (key-value pairs with arbitrary data) can be passed to
++/// Additional fields (key-value pairs with arbitrary data) can be passed
+ /// to the generated span through the `fields` argument on the
+-/// `#[instrument]` macro. Strings, integers or boolean literals are accepted values
++/// `#[instrument]` macro. Arbitrary expressions are accepted as value
+ /// for each field. The name of the field must be a single valid Rust
+-/// identifier, nested (dotted) field names are not supported. Any
++/// identifier, or a constant expression that evaluates to one, enclosed in curly
++/// braces. Note that nested (dotted) field names are also supported. Any
+ /// Rust expression can be used as a field value in this manner. These
+ /// expressions will be evaluated at the beginning of the function's body, so
+ /// arguments to the function may be used in these expressions. Field names may
+ /// also be specified *without* values. Doing so will result in an [empty field]
+ /// whose value may be recorded later within the function body.
+ ///
+-/// Note that overlap between the names of fields and (non-skipped) arguments
+-/// will result in a compile error.
++/// Note that defining a field with the same name as a (non-skipped)
++/// argument will implicitly skip the argument, unless the field is provided
++/// via a constant expression (e.g. {EXPR} or {const_fn()}) as deduplicating
++/// would incur a runtime cost. In this case, the
++/// field must be explicitly skipped.
+ ///
+ /// ## Examples
+ ///
+@@ -409,8 +413,16 @@ mod expand;
+ ///
+ /// ```
+ /// # use tracing_attributes::instrument;
+-/// #[instrument(fields(foo="bar", id=1, show=true))]
+-/// fn my_function(arg: usize) {
++/// #[derive(Debug)]
++/// struct Argument;
++/// impl Argument {
++///     fn bar(&self) -> &'static str {
++///         "bar"
++///     }
++/// }
++/// const FOOBAR: &'static str = "foo.bar";
++/// #[instrument(fields(foo="bar", id=1, show=true, {FOOBAR}=%arg.bar()))]
++/// fn my_function(arg: Argument) {
+ ///     // ...
+ /// }
+ /// ```

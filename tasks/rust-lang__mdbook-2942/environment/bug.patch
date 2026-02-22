@@ -1,0 +1,326 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 49fda4dc..9d34664d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -9,10 +9,7 @@ This release also includes many new features described below.
+ 
+ We have prepared a [0.5 Migration Guide](#05-migration-guide) to help existing authors switch from 0.4.
+ 
+-The final 0.5.0 release only contains the following changes since [0.5.0-beta.2](#mdbook-050-beta2):
+-
+-- Added error handling to environment config handling. This checks that environment variables starting with `MDBOOK_` are correctly specified instead of silently ignoring. This also fixed being able to replace entire top-level tables like `MDBOOK_OUTPUT`.
+-  [#2942](https://github.com/rust-lang/mdBook/pull/2942)
++The final 0.5.0 release does not contain any changes since [0.5.0-beta.2](#mdbook-050-beta2).
+ 
+ ## 0.5 Migration Guide
+ 
+@@ -59,10 +56,6 @@ The following is a summary of the changes that may require your attention when u
+   [#2775](https://github.com/rust-lang/mdBook/pull/2775)
+ - Removed the very old legacy config support. Warnings have been displayed in previous versions on how to migrate.
+   [#2783](https://github.com/rust-lang/mdBook/pull/2783)
+-- Top-level config values set from the environment like `MDBOOK_BOOK` now *replace* the contents of the top-level table instead of merging into it.
+-  [#2942](https://github.com/rust-lang/mdBook/pull/2942)
+-- Invalid environment variables are now rejected. Previously unknown keys like `MDBOOK_FOO` would be ignored, or keys or invalid values inside objects like the `[book]` table would be ignored.
+-  [#2942](https://github.com/rust-lang/mdBook/pull/2942)
+ 
+ ### Theme changes
+ 
+diff --git a/crates/mdbook-core/src/config.rs b/crates/mdbook-core/src/config.rs
+index 3368e5f6..166e921e 100644
+--- a/crates/mdbook-core/src/config.rs
++++ b/crates/mdbook-core/src/config.rs
+@@ -123,10 +123,11 @@ impl Config {
+     ///
+     /// For example:
+     ///
+-    /// - `MDBOOK_book` -> `book`
+-    /// - `MDBOOK_BOOK` -> `book`
+-    /// - `MDBOOK_BOOK__TITLE` -> `book.title`
+-    /// - `MDBOOK_BOOK__TEXT_DIRECTION` -> `book.text-direction`
++    /// - `MDBOOK_foo` -> `foo`
++    /// - `MDBOOK_FOO` -> `foo`
++    /// - `MDBOOK_FOO__BAR` -> `foo.bar`
++    /// - `MDBOOK_FOO_BAR` -> `foo-bar`
++    /// - `MDBOOK_FOO_bar__baz` -> `foo-bar.baz`
+     ///
+     /// So by setting the `MDBOOK_BOOK__TITLE` environment variable you can
+     /// override the book's title without needing to touch your `book.toml`.
+@@ -146,7 +147,7 @@ impl Config {
+     /// The latter case may be useful in situations where `mdbook` is invoked
+     /// from a script or CI, where it sometimes isn't possible to update the
+     /// `book.toml` before building.
+-    pub fn update_from_env(&mut self) -> Result<()> {
++    pub fn update_from_env(&mut self) {
+         debug!("Updating the config from environment variables");
+ 
+         let overrides =
+@@ -161,9 +162,19 @@ impl Config {
+             let parsed_value = serde_json::from_str(&value)
+                 .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+ 
+-            self.set(key, parsed_value)?;
++            if key == "book" || key == "build" {
++                if let serde_json::Value::Object(ref map) = parsed_value {
++                    // To `set` each `key`, we wrap them as `prefix.key`
++                    for (k, v) in map {
++                        let full_key = format!("{key}.{k}");
++                        self.set(&full_key, v).expect("unreachable");
++                    }
++                    return;
++                }
++            }
++
++            self.set(key, parsed_value).expect("unreachable");
+         }
+-        Ok(())
+     }
+ 
+     /// Get a value from the configuration.
+@@ -255,39 +266,24 @@ impl Config {
+     /// `output.html.playground` will set the "playground" in the html output
+     /// table).
+     ///
+-    /// # Errors
+-    ///
+-    /// This will fail if:
+-    ///
+-    /// - The value cannot be represented as TOML.
+-    /// - The value is not a correct type.
+-    /// - The key is an unknown configuration option.
++    /// The only way this can fail is if we can't serialize `value` into a
++    /// `toml::Value`.
+     pub fn set<S: Serialize, I: AsRef<str>>(&mut self, index: I, value: S) -> Result<()> {
+         let index = index.as_ref();
+ 
+         let value = Value::try_from(value)
+             .with_context(|| "Unable to represent the item as a JSON Value")?;
+ 
+-        if index == "book" {
+-            self.book = value.try_into()?;
+-        } else if index == "build" {
+-            self.build = value.try_into()?;
+-        } else if index == "rust" {
+-            self.rust = value.try_into()?;
+-        } else if index == "output" {
+-            self.output = value;
+-        } else if index == "preprocessor" {
+-            self.preprocessor = value;
+-        } else if let Some(key) = index.strip_prefix("book.") {
+-            self.book.update_value(key, value)?;
++        if let Some(key) = index.strip_prefix("book.") {
++            self.book.update_value(key, value);
+         } else if let Some(key) = index.strip_prefix("build.") {
+-            self.build.update_value(key, value)?;
++            self.build.update_value(key, value);
+         } else if let Some(key) = index.strip_prefix("rust.") {
+-            self.rust.update_value(key, value)?;
++            self.rust.update_value(key, value);
+         } else if let Some(key) = index.strip_prefix("output.") {
+-            self.output.update_value(key, value)?;
++            self.output.update_value(key, value);
+         } else if let Some(key) = index.strip_prefix("preprocessor.") {
+-            self.preprocessor.update_value(key, value)?;
++            self.preprocessor.update_value(key, value);
+         } else {
+             bail!("invalid key `{index}`");
+         }
+@@ -707,13 +703,18 @@ pub struct SearchChapterSettings {
+ /// This is definitely not the most performant way to do things, which means you
+ /// should probably keep it away from tight loops...
+ trait Updateable<'de>: Serialize + Deserialize<'de> {
+-    fn update_value<S: Serialize>(&mut self, key: &str, value: S) -> Result<()> {
++    fn update_value<S: Serialize>(&mut self, key: &str, value: S) {
+         let mut raw = Value::try_from(&self).expect("unreachable");
+-        let value = Value::try_from(value)?;
+-        raw.insert(key, value);
+-        let updated = raw.try_into()?;
+-        *self = updated;
+-        Ok(())
++
++        if let Ok(value) = Value::try_from(value) {
++            raw.insert(key, value);
++        } else {
++            return;
++        }
++
++        if let Ok(updated) = raw.try_into() {
++            *self = updated;
++        }
+     }
+ }
+ 
+diff --git a/crates/mdbook-driver/src/mdbook.rs b/crates/mdbook-driver/src/mdbook.rs
+index e5dac902..80ae692b 100644
+--- a/crates/mdbook-driver/src/mdbook.rs
++++ b/crates/mdbook-driver/src/mdbook.rs
+@@ -56,7 +56,7 @@ impl MDBook {
+             Config::default()
+         };
+ 
+-        config.update_from_env()?;
++        config.update_from_env();
+ 
+         if tracing::enabled!(tracing::Level::TRACE) {
+             for line in format!("Config: {config:#?}").lines() {
+diff --git a/guide/src/format/configuration/environment-variables.md b/guide/src/format/configuration/environment-variables.md
+index bef0431f..0170e759 100644
+--- a/guide/src/format/configuration/environment-variables.md
++++ b/guide/src/format/configuration/environment-variables.md
+@@ -12,10 +12,11 @@ underscore (`_`) is replaced with a dash (`-`).
+ 
+ For example:
+ 
+-- `MDBOOK_book` -> `book`
+-- `MDBOOK_BOOK` -> `book`
+-- `MDBOOK_BOOK__TITLE` -> `book.title`
+-- `MDBOOK_BOOK__TEXT_DIRECTION` -> `book.text-direction`
++- `MDBOOK_foo` -> `foo`
++- `MDBOOK_FOO` -> `foo`
++- `MDBOOK_FOO__BAR` -> `foo.bar`
++- `MDBOOK_FOO_BAR` -> `foo-bar`
++- `MDBOOK_FOO_bar__baz` -> `foo-bar.baz`
+ 
+ So by setting the `MDBOOK_BOOK__TITLE` environment variable you can override the
+ book's title without needing to touch your `book.toml`.
+diff --git a/tests/testsuite/config.rs b/tests/testsuite/config.rs
+index e44649a8..f5b14875 100644
+--- a/tests/testsuite/config.rs
++++ b/tests/testsuite/config.rs
+@@ -207,137 +207,3 @@ unknown field `title`, expected `edition`
+ "#]]);
+         });
+ }
+-
+-// An invalid top-level key in the environment.
+-#[test]
+-fn env_invalid_config_key() {
+-    BookTest::from_dir("config/empty").run("build", |cmd| {
+-        cmd.env("MDBOOK_FOO", "testing")
+-            .expect_failure()
+-            .expect_stdout(str![[""]])
+-            .expect_stderr(str![[r#"
+-ERROR invalid key `foo`
+-
+-"#]]);
+-    });
+-}
+-
+-// An invalid value in the environment.
+-#[test]
+-fn env_invalid_value() {
+-    BookTest::from_dir("config/empty")
+-        .run("build", |cmd| {
+-            cmd.env("MDBOOK_BOOK", r#"{"titlez": "typo"}"#)
+-                .expect_failure()
+-                .expect_stdout(str![[""]])
+-                .expect_stderr(str![[r#"
+-ERROR unknown field `titlez`, expected one of `title`, `authors`, `description`, `src`, `language`, `text-direction`
+-
+-
+-"#]]);
+-        })
+-        .run("build", |cmd| {
+-            cmd.env("MDBOOK_BOOK__TITLE", r#"{"looks like obj": "abc"}"#)
+-                .expect_failure()
+-                .expect_stdout(str![[""]])
+-                .expect_stderr(str![[r#"
+-ERROR invalid type: map, expected a string
+-in `title`
+-
+-
+-"#]]);
+-        })
+-        // This is not valid JSON, so falls back to be interpreted as a string.
+-        .run("build", |cmd| {
+-            cmd.env("MDBOOK_BOOK__TITLE", r#"{braces}"#)
+-                .expect_stdout(str![[""]])
+-                .expect_stderr(str![[r#"
+- INFO Book building has started
+- INFO Running the html backend
+- INFO HTML book written to `[ROOT]/book`
+-
+-"#]]);
+-        })
+-        .check_file_contains("book/index.html", "<title>Chapter 1 - {braces}</title>");
+-}
+-
+-// Replacing the entire book table from the environment.
+-#[test]
+-fn env_entire_book_table() {
+-    BookTest::init(|_| {})
+-        .change_file(
+-            "book.toml",
+-            "[book]\n\
+-             title = \"config title\"\n\
+-            ",
+-        )
+-        .run("build", |cmd| {
+-            cmd.env("MDBOOK_BOOK", r#"{"description": "custom description"}"#);
+-        })
+-        // The book.toml title is removed.
+-        .check_file_contains("book/index.html", "<title>Chapter 1</title>")
+-        .check_file_contains(
+-            "book/index.html",
+-            r#"<meta name="description" content="custom description">"#,
+-        );
+-}
+-
+-// Replacing the entire output or preprocessor table from the environment.
+-#[test]
+-fn env_entire_output_preprocessor_table() {
+-    BookTest::from_dir("config/empty")
+-        .rust_program(
+-            "mdbook-my-preprocessor",
+-            r#"
+-            fn main() {
+-                let mut args = std::env::args().skip(1);
+-                if args.next().as_deref() == Some("supports") {
+-                    return;
+-                }
+-                use std::io::Read;
+-                let mut s = String::new();
+-                std::io::stdin().read_to_string(&mut s).unwrap();
+-                assert!(s.contains("custom preprocessor config"));
+-                println!("{{\"items\": []}}");
+-            }
+-            "#,
+-        )
+-        .rust_program(
+-            "mdbook-my-output",
+-            r#"
+-            fn main() {
+-                use std::io::Read;
+-                let mut s = String::new();
+-                std::io::stdin().read_to_string(&mut s).unwrap();
+-                assert!(s.contains("custom output config"));
+-                eprintln!("preprocessor saw custom config");
+-            }
+-            "#,
+-        )
+-        .run("build", |cmd| {
+-            let mut paths: Vec<_> =
+-                std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+-            paths.push(cmd.dir.clone());
+-            let path = std::env::join_paths(paths).unwrap().into_string().unwrap();
+-
+-            cmd.env(
+-                "MDBOOK_OUTPUT",
+-                r#"{"my-output": {"foo": "custom output config"}}"#,
+-            )
+-            .env(
+-                "MDBOOK_PREPROCESSOR",
+-                r#"{"my-preprocessor": {"foo": "custom preprocessor config"}}"#,
+-            )
+-            .env("PATH", path)
+-            .expect_stdout(str![[""]])
+-            .expect_stderr(str![[r#"
+- INFO Book building has started
+- INFO Running the my-output backend
+- INFO Invoking the "my-output" renderer
+-preprocessor saw custom config
+-
+-"#]]);
+-        })
+-        // No HTML output
+-        .check_file_list("book", str![[""]]);
+-}

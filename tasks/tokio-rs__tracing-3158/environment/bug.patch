@@ -1,0 +1,244 @@
+diff --git a/tracing-attributes/src/attr.rs b/tracing-attributes/src/attr.rs
+index f086d1c7..f3d91418 100644
+--- a/tracing-attributes/src/attr.rs
++++ b/tracing-attributes/src/attr.rs
+@@ -5,7 +5,6 @@ use proc_macro2::TokenStream;
+ use quote::{quote, quote_spanned, ToTokens};
+ use syn::ext::IdentExt as _;
+ use syn::parse::{Parse, ParseStream};
+-use syn::token::Brace;
+ 
+ /// Arguments to `#[instrument(err(...))]` and `#[instrument(ret(...))]` which describe how the
+ /// return value event should be emitted.
+@@ -308,7 +307,7 @@ pub(crate) struct Fields(pub(crate) Punctuated<Field, Token![,]>);
+ 
+ #[derive(Clone, Debug)]
+ pub(crate) struct Field {
+-    pub(crate) name: FieldName,
++    pub(crate) name: Punctuated<Ident, Token![.]>,
+     pub(crate) value: Option<Expr>,
+     pub(crate) kind: FieldKind,
+ }
+@@ -320,23 +319,6 @@ pub(crate) enum FieldKind {
+     Value,
+ }
+ 
+-#[derive(Clone, Debug)]
+-pub(crate) enum FieldName {
+-    Expr(Expr),
+-    Punctuated(Punctuated<Ident, Token![.]>),
+-}
+-
+-impl ToTokens for FieldName {
+-    fn to_tokens(&self, tokens: &mut TokenStream) {
+-        match self {
+-            FieldName::Expr(expr) => {
+-                Brace::default().surround(tokens, |tokens| expr.to_tokens(tokens));
+-            }
+-            FieldName::Punctuated(punctuated) => punctuated.to_tokens(tokens),
+-        }
+-    }
+-}
+-
+ impl Parse for Fields {
+     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+         let _ = input.parse::<kw::fields>();
+@@ -363,18 +345,7 @@ impl Parse for Field {
+             input.parse::<Token![?]>()?;
+             kind = FieldKind::Debug;
+         };
+-        // Parse name as either an expr between braces or a dotted identifier.
+-        let name = if input.peek(syn::token::Brace) {
+-            let content;
+-            let _ = syn::braced!(content in input);
+-            let expr = content.call(Expr::parse)?;
+-            FieldName::Expr(expr)
+-        } else {
+-            FieldName::Punctuated(Punctuated::parse_separated_nonempty_with(
+-                input,
+-                Ident::parse_any,
+-            )?)
+-        };
++        let name = Punctuated::parse_separated_nonempty_with(input, Ident::parse_any)?;
+         let value = if input.peek(Token![=]) {
+             input.parse::<Token![=]>()?;
+             if input.peek(Token![%]) {
+diff --git a/tracing-attributes/src/expand.rs b/tracing-attributes/src/expand.rs
+index a5cacd43..eb3ea5cd 100644
+--- a/tracing-attributes/src/expand.rs
++++ b/tracing-attributes/src/expand.rs
+@@ -11,7 +11,7 @@ use syn::{
+ };
+ 
+ use crate::{
+-    attr::{Field, FieldName, Fields, FormatMode, InstrumentArgs, Level},
++    attr::{Field, Fields, FormatMode, InstrumentArgs, Level},
+     MaybeItemFn, MaybeItemFnRef,
+ };
+ 
+@@ -211,16 +211,8 @@ fn gen_block<B: ToTokens>(
+                 // and allow them to be formatted by the custom field.
+                 if let Some(ref fields) = args.fields {
+                     fields.0.iter().all(|Field { ref name, .. }| {
+-                        match name {
+-                            // #3158: Expressions cannot be evaluated at compile time and will
+-                            // incur a runtime cost to de-duplicate.
+-                            FieldName::Expr(_) => true,
+-                            FieldName::Punctuated(punctuated) => {
+-                                let first = punctuated.first();
+-                                first != punctuated.last()
+-                                    || !first.iter().any(|name| name == &param)
+-                            }
+-                        }
++                        let first = name.first();
++                        first != name.last() || !first.iter().any(|name| name == &param)
+                     })
+                 } else {
+                     true
+diff --git a/tracing-attributes/src/lib.rs b/tracing-attributes/src/lib.rs
+index f3d71e76..fe5612fd 100644
+--- a/tracing-attributes/src/lib.rs
++++ b/tracing-attributes/src/lib.rs
+@@ -206,23 +206,19 @@ mod expand;
+ ///
+ /// # Adding Fields
+ ///
+-/// Additional fields (key-value pairs with arbitrary data) can be passed
++/// Additional fields (key-value pairs with arbitrary data) can be passed to
+ /// to the generated span through the `fields` argument on the
+-/// `#[instrument]` macro. Arbitrary expressions are accepted as value
++/// `#[instrument]` macro. Strings, integers or boolean literals are accepted values
+ /// for each field. The name of the field must be a single valid Rust
+-/// identifier, or a constant expression that evaluates to one, enclosed in curly
+-/// braces. Note that nested (dotted) field names are also supported. Any
++/// identifier, nested (dotted) field names are not supported. Any
+ /// Rust expression can be used as a field value in this manner. These
+ /// expressions will be evaluated at the beginning of the function's body, so
+ /// arguments to the function may be used in these expressions. Field names may
+ /// also be specified *without* values. Doing so will result in an [empty field]
+ /// whose value may be recorded later within the function body.
+ ///
+-/// Note that defining a field with the same name as a (non-skipped)
+-/// argument will implicitly skip the argument, unless the field is provided
+-/// via a constant expression (e.g. {EXPR} or {const_fn()}) as deduplicating
+-/// would incur a runtime cost. In this case, the
+-/// field must be explicitly skipped.
++/// Note that overlap between the names of fields and (non-skipped) arguments
++/// will result in a compile error.
+ ///
+ /// ## Examples
+ ///
+@@ -413,16 +409,8 @@ mod expand;
+ ///
+ /// ```
+ /// # use tracing_attributes::instrument;
+-/// #[derive(Debug)]
+-/// struct Argument;
+-/// impl Argument {
+-///     fn bar(&self) -> &'static str {
+-///         "bar"
+-///     }
+-/// }
+-/// const FOOBAR: &'static str = "foo.bar";
+-/// #[instrument(fields(foo="bar", id=1, show=true, {FOOBAR}=%arg.bar()))]
+-/// fn my_function(arg: Argument) {
++/// #[instrument(fields(foo="bar", id=1, show=true))]
++/// fn my_function(arg: usize) {
+ ///     // ...
+ /// }
+ /// ```
+diff --git a/tracing-attributes/tests/fields.rs b/tracing-attributes/tests/fields.rs
+index 7124572d..3f9dce66 100644
+--- a/tracing-attributes/tests/fields.rs
++++ b/tracing-attributes/tests/fields.rs
+@@ -37,36 +37,6 @@ fn fn_string(s: String) {
+ #[instrument(fields(keywords.impl.type.fn = _arg), skip(_arg))]
+ fn fn_keyword_ident_in_field(_arg: &str) {}
+ 
+-const CONST_FIELD_NAME: &str = "foo.bar";
+-
+-#[instrument(fields({CONST_FIELD_NAME} = "baz"))]
+-fn fn_const_field_name() {}
+-
+-const fn get_const_fn_field_name() -> &'static str {
+-    "foo.bar"
+-}
+-
+-#[instrument(fields({get_const_fn_field_name()} = "baz"))]
+-fn fn_const_fn_field_name() {}
+-
+-struct FieldNames {}
+-impl FieldNames {
+-    const FOO_BAR: &'static str = "foo.bar";
+-}
+-
+-#[instrument(fields({FieldNames::FOO_BAR} = "baz"))]
+-fn fn_struct_const_field_name() {}
+-
+-#[instrument(fields({"foo"} = "bar"))]
+-fn fn_string_field_name() {}
+-
+-const CLASHY_FIELD_NAME: &str = "s";
+-
+-#[instrument(fields({CLASHY_FIELD_NAME} = "foo"))]
+-fn fn_clashy_const_field_name(s: &str) {
+-    let _ = s;
+-}
+-
+ #[derive(Debug)]
+ struct HasField {
+     my_field: &'static str,
+@@ -189,53 +159,6 @@ fn keyword_ident_in_field_name() {
+     run_test(span, || fn_keyword_ident_in_field("test"));
+ }
+ 
+-#[test]
+-fn expr_const_field_name() {
+-    let span = expect::span().with_fields(expect::field("foo.bar").with_value(&"baz").only());
+-    run_test(span, || {
+-        fn_const_field_name();
+-    });
+-}
+-
+-#[test]
+-fn expr_const_fn_field_name() {
+-    let span = expect::span().with_fields(expect::field("foo.bar").with_value(&"baz").only());
+-    run_test(span, || {
+-        fn_const_fn_field_name();
+-    });
+-}
+-
+-#[test]
+-fn struct_const_field_name() {
+-    let span = expect::span().with_fields(expect::field("foo.bar").with_value(&"baz").only());
+-    run_test(span, || {
+-        fn_struct_const_field_name();
+-    });
+-}
+-
+-#[test]
+-fn string_field_name() {
+-    let span = expect::span().with_fields(expect::field("foo").with_value(&"bar").only());
+-    run_test(span, || {
+-        fn_string_field_name();
+-    });
+-}
+-
+-#[test]
+-fn clashy_const_field_name() {
+-    let span = expect::span().with_fields(
+-        // #3158: To be consistent with event! and span! macros, the duplicated value should be
+-        // dropped, but checking for duplicated fields would incur a significant runtime cost, as
+-        // non-trivial constants (const, const fn, ...) cannot be evaluated at compile time.
+-        expect::field("s")
+-            .with_value(&"foo")
+-            .and(expect::field("s").with_value(&"hello world")),
+-    );
+-    run_test(span, || {
+-        fn_clashy_const_field_name("hello world");
+-    });
+-}
+-
+ fn run_test<F: FnOnce() -> T, T>(span: NewSpan, fun: F) {
+     let (subscriber, handle) = subscriber::mock()
+         .new_span(span)

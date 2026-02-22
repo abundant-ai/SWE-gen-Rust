@@ -1,0 +1,184 @@
+diff --git a/rayon-core/src/configuration.rs b/rayon-core/src/configuration.rs
+index 1a484e7..d0bf608 100644
+--- a/rayon-core/src/configuration.rs
++++ b/rayon-core/src/configuration.rs
+@@ -152,26 +152,12 @@ impl Configuration {
+ /// Initialization of the global thread pool happens exactly
+ /// once. Once started, the configuration cannot be
+ /// changed. Therefore, if you call `initialize` a second time, it
+-/// will simply check that the global thread pool already has the
+-/// configuration you requested, rather than making changes.
+-///
+-/// An `Ok` result indicates that the thread pool is running with the
+-/// given configuration. Otherwise, a suitable error is returned.
++/// will return an error. An `Ok` result indicates that this
++/// is the first initialization of the thread pool.
+ pub fn initialize(config: Configuration) -> Result<(), InitError> {
+     try!(config.validate());
+-
+-    let num_threads = config.num_threads;
+-
+-    let registry = registry::get_registry_with_config(config);
+-
+-    if let Some(value) = num_threads {
+-        if value != registry.num_threads() {
+-            return Err(InitError::GlobalPoolAlreadyInitialized);
+-        }
+-    }
+-
++    let registry = try!(registry::init_global_registry(config));
+     registry.wait_until_primed();
+-
+     Ok(())
+ }
+ 
+@@ -200,4 +186,3 @@ impl fmt::Debug for Configuration {
+          .finish()
+     }
+ }
+-
+diff --git a/rayon-core/src/join/test.rs b/rayon-core/src/join/test.rs
+index a332096..a66c6b8 100644
+--- a/rayon-core/src/join/test.rs
++++ b/rayon-core/src/join/test.rs
+@@ -33,20 +33,10 @@ fn partition<T: PartialOrd + Send>(v: &mut [T]) -> usize {
+ fn sort() {
+     let mut rng = XorShiftRng::from_seed([0, 1, 2, 3]);
+     let mut data: Vec<_> = (0..6 * 1024).map(|_| rng.next_u32()).collect();
+-
+-    let result = initialize(Configuration::new());
+-
+-    match result {
+-        Ok(_) => {
+-            let mut sorted_data = data.clone();
+-            sorted_data.sort();
+-
+-            quick_sort(&mut data);
+-
+-            assert_eq!(data, sorted_data);
+-        }
+-        Err(e) => panic!("expected InitOk, but got {:?}", e),
+-    }
++    let mut sorted_data = data.clone();
++    sorted_data.sort();
++    quick_sort(&mut data);
++    assert_eq!(data, sorted_data);
+ }
+ 
+ #[test]
+diff --git a/rayon-core/src/registry.rs b/rayon-core/src/registry.rs
+index ecd4c94..b0998f9 100644
+--- a/rayon-core/src/registry.rs
++++ b/rayon-core/src/registry.rs
+@@ -3,6 +3,7 @@ use deque;
+ use deque::{Worker, Stealer, Stolen};
+ use job::{JobRef, StackJob};
+ use latch::{LatchProbe, Latch, CountLatch, LockLatch};
++use configuration::InitError;
+ #[allow(unused_imports)]
+ use log::Event::*;
+ use rand::{self, Rng};
+@@ -58,16 +59,21 @@ static THE_REGISTRY_SET: Once = ONCE_INIT;
+ /// Starts the worker threads (if that has not already happened). If
+ /// initialization has not already occurred, use the default
+ /// configuration.
+-pub fn global_registry() -> &'static Arc<Registry> {
++fn global_registry() -> &'static Arc<Registry> {
+     THE_REGISTRY_SET.call_once(|| unsafe { init_registry(Configuration::new()) });
+     unsafe { THE_REGISTRY.unwrap() }
+ }
+ 
+ /// Starts the worker threads (if that has not already happened) with
+ /// the given configuration.
+-pub fn get_registry_with_config(config: Configuration) -> &'static Registry {
+-    THE_REGISTRY_SET.call_once(|| unsafe { init_registry(config) });
+-    unsafe { THE_REGISTRY.unwrap() }
++pub fn init_global_registry(config: Configuration) -> Result<&'static Registry, InitError> {
++    let mut called = false;
++    THE_REGISTRY_SET.call_once(|| unsafe { init_registry(config); called = true; });
++    if called {
++        Ok(unsafe { THE_REGISTRY.unwrap() })
++    } else {
++        Err(InitError::GlobalPoolAlreadyInitialized)
++    }
+ }
+ 
+ /// Initializes the global registry with the given configuration.
+diff --git a/rayon-demo/src/fibonacci/mod.rs b/rayon-demo/src/fibonacci/mod.rs
+index 4612e99..1d7ec9f 100644
+--- a/rayon-demo/src/fibonacci/mod.rs
++++ b/rayon-demo/src/fibonacci/mod.rs
+@@ -16,9 +16,6 @@
+ extern crate rayon;
+ extern crate test;
+ 
+-use rayon::Configuration;
+-
+-const INIT_FAILED: &'static str = "Rayon failed to initialize";
+ const N: u32 = 32;
+ const FN: u32 = 2178309;
+ 
+@@ -51,9 +48,6 @@ fn fibonacci_recursive(b: &mut test::Bencher) {
+ /// Compute the Fibonacci number recursively, using rayon::join.
+ /// The larger branch F(N-1) is computed first.
+ fn fibonacci_join_1_2(b: &mut test::Bencher) {
+-    rayon::initialize(Configuration::new())
+-                     .expect(INIT_FAILED);
+-
+     fn fib(n: u32) -> u32 {
+         if n < 2 { return n; }
+ 
+@@ -71,9 +65,6 @@ fn fibonacci_join_1_2(b: &mut test::Bencher) {
+ /// Compute the Fibonacci number recursively, using rayon::join.
+ /// The smaller branch F(N-2) is computed first.
+ fn fibonacci_join_2_1(b: &mut test::Bencher) {
+-    rayon::initialize(Configuration::new())
+-                     .expect(INIT_FAILED);
+-
+     fn fib(n: u32) -> u32 {
+         if n < 2 { return n; }
+ 
+@@ -90,8 +81,6 @@ fn fibonacci_join_2_1(b: &mut test::Bencher) {
+ #[bench]
+ /// Compute the Fibonacci number recursively, using rayon::split to parallelize.
+ fn fibonacci_split_recursive(b: &mut test::Bencher) {
+-    rayon::initialize(Configuration::new()).expect(INIT_FAILED);
+-
+     fn fib(n: u32) -> u32 {
+         use rayon::iter::ParallelIterator;
+ 
+@@ -113,8 +102,6 @@ fn fibonacci_split_recursive(b: &mut test::Bencher) {
+ #[bench]
+ /// Compute the Fibonacci number iteratively, using rayon::split to parallelize.
+ fn fibonacci_split_iterative(b: &mut test::Bencher) {
+-    rayon::initialize(Configuration::new()).expect(INIT_FAILED);
+-
+     fn fib(n: u32) -> u32 {
+         use rayon::iter::ParallelIterator;
+ 
+@@ -135,7 +122,7 @@ fn fibonacci_split_iterative(b: &mut test::Bencher) {
+ 
+ #[bench]
+ /// Compute the Fibonacci number iteratively, just to show how silly the others
+-/// are.  Parallelism can't make up for a bad choice of algorithm.
++/// are. Parallelism can't make up for a bad choice of algorithm.
+ fn fibonacci_iterative(b: &mut test::Bencher) {
+     b.iter(|| assert_eq!(fib_iterative(test::black_box(N)), FN));
+ }
+diff --git a/rayon-demo/src/tsp/mod.rs b/rayon-demo/src/tsp/mod.rs
+index b863978..ee7dd3d 100644
+--- a/rayon-demo/src/tsp/mod.rs
++++ b/rayon-demo/src/tsp/mod.rs
+@@ -102,9 +102,9 @@ fn run_solver(datafile: &Path, seq_threshold: usize, from: usize) -> Result<(),
+ }
+ 
+ fn parse_solver(datafile: &Path) -> Result<Graph, Box<Error>> {
+-    let mut file = File::open(datafile)?;
++    let mut file = try!(File::open(datafile));
+     let mut text = String::new();
+-    file.read_to_string(&mut text)?;
+-    let graph = parser::parse_tsp_data(&text)?;
++    try!(file.read_to_string(&mut text));
++    let graph = try!(parser::parse_tsp_data(&text));
+     Ok(graph)
+ }

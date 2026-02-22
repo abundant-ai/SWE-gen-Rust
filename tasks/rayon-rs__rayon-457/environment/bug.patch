@@ -1,0 +1,371 @@
+diff --git a/src/iter/enumerate.rs b/src/iter/enumerate.rs
+index 55bad94..552f37b 100644
+--- a/src/iter/enumerate.rs
++++ b/src/iter/enumerate.rs
+@@ -95,14 +95,8 @@ impl<P> Producer for EnumerateProducer<P>
+         // Enumerate only works for IndexedParallelIterators. Since those
+         // have a max length of usize::MAX, their max index is
+         // usize::MAX - 1, so the range 0..usize::MAX includes all
+-        // possible indices.
+-        //
+-        // However, we should to use a precise end to the range, otherwise
+-        // reversing the iterator may have to walk back a long ways before
+-        // `Zip::next_back` can produce anything.
+-        let base = self.base.into_iter();
+-        let end = self.offset + base.len();
+-        (self.offset..end).zip(base)
++        // possible indices
++        (self.offset..usize::MAX).zip(self.base.into_iter())
+     }
+ 
+     fn min_len(&self) -> usize {
+diff --git a/src/iter/test.rs b/src/iter/test.rs
+index a41b721..03d1da6 100644
+--- a/src/iter/test.rs
++++ b/src/iter/test.rs
+@@ -208,19 +208,6 @@ pub fn check_enumerate() {
+     assert!(b.iter().all(|&x| x == a.len() - 1));
+ }
+ 
+-#[test]
+-pub fn check_enumerate_rev() {
+-    let a: Vec<usize> = (0..1024).rev().collect();
+-
+-    let mut b = vec![];
+-    a.par_iter()
+-        .enumerate()
+-        .rev()
+-        .map(|(i, &x)| i + x)
+-        .collect_into(&mut b);
+-    assert!(b.iter().all(|&x| x == a.len() - 1));
+-}
+-
+ #[test]
+ pub fn check_indices_after_enumerate_split() {
+     let a: Vec<i32> = (0..1024).collect();
+diff --git a/src/vec.rs b/src/vec.rs
+index 0420963..42f6839 100644
+--- a/src/vec.rs
++++ b/src/vec.rs
+@@ -108,11 +108,6 @@ impl<'data, T: 'data> Iterator for SliceDrain<'data, T> {
+     fn next(&mut self) -> Option<T> {
+         self.iter.next().map(|ptr| unsafe { std::ptr::read(ptr) })
+     }
+-
+-    fn size_hint(&self) -> (usize, Option<usize>) {
+-        let len = self.len();
+-        (len, Some(len))
+-    }
+ }
+ 
+ impl<'data, T: 'data> DoubleEndedIterator for SliceDrain<'data, T> {
+diff --git a/tests/intersperse.rs b/tests/intersperse.rs
+index 60e075b..396830b 100644
+--- a/tests/intersperse.rs
++++ b/tests/intersperse.rs
+@@ -1,6 +1,7 @@
+ extern crate rayon;
+ 
+ use rayon::prelude::*;
++use rayon::iter::internal::*;
+ 
+ #[test]
+ fn check_intersperse() {
+@@ -51,3 +52,44 @@ fn check_intersperse_rev() {
+             assert_eq!(x, if i % 2 == 0 { i / 2 } else { -1 });
+         });
+ }
++
++#[test]
++fn check_producer_splits() {
++    struct Callback(usize, usize, usize);
++
++    impl ProducerCallback<i32> for Callback {
++        type Output = Vec<i32>;
++        fn callback<P>(self, producer: P) -> Self::Output
++            where P: Producer<Item = i32>
++        {
++            println!("splitting {} {} {}", self.0, self.1, self.2);
++
++            // Splitting the outer indexes first gets us an arbitrary mid section,
++            // which we then split further to get full test coverage.
++            let (a, right) = producer.split_at(self.0);
++            let (mid, d) = right.split_at(self.2 - self.0);
++            let (b, c) = mid.split_at(self.1 - self.0);
++
++            let (a, b, c, d) = (a.into_iter(), b.into_iter(), c.into_iter(), d.into_iter());
++            assert_eq!(a.len(), self.0);
++            assert_eq!(b.len(), self.1 - self.0);
++            assert_eq!(c.len(), self.2 - self.1);
++
++            a.chain(b).chain(c).chain(d).collect()
++        }
++    }
++
++    let v = [1, 2, 3, 4, 5];
++    let vi = [1, -1, 2, -1, 3, -1, 4, -1, 5];
++
++    for i in 0 .. vi.len() + 1 {
++        for j in i .. vi.len() + 1 {
++            for k in j .. vi.len() + 1 {
++                let res = v.par_iter().cloned()
++                    .intersperse(-1)
++                    .with_producer(Callback(i, j, k));
++                assert_eq!(res, vi);
++            }
++        }
++    }
++}
+diff --git a/tests/producer_split_at.rs b/tests/producer_split_at.rs
+deleted file mode 100644
+index 53be6a0..0000000
+--- a/tests/producer_split_at.rs
++++ /dev/null
+@@ -1,247 +0,0 @@
+-#![feature(conservative_impl_trait)]
+-
+-extern crate rayon;
+-
+-use rayon::prelude::*;
+-use rayon::iter::internal::*;
+-
+-/// Stress-test indexes for `Producer::split_at`.
+-fn check<F, I>(expected: &[I::Item], mut f: F)
+-    where F: FnMut() -> I,
+-          I: IntoParallelIterator,
+-          I::Iter: IndexedParallelIterator,
+-          I::Item: PartialEq + std::fmt::Debug
+-{
+-    for (i, j, k) in triples(expected.len() + 1) {
+-        Split::forward(f(), i, j, k, expected);
+-        Split::reverse(f(), i, j, k, expected);
+-    }
+-}
+-
+-fn triples(end: usize) -> impl Iterator<Item=(usize, usize, usize)> {
+-    (0..end).flat_map(move |i| {
+-        (i..end).flat_map(move |j| {
+-            (j..end).map(move |k| (i, j, k))
+-        })
+-    })
+-}
+-
+-#[derive(Debug)]
+-struct Split {
+-    i: usize,
+-    j: usize,
+-    k: usize,
+-    reverse: bool
+-}
+-
+-impl Split {
+-    fn forward<I>(iter: I, i: usize, j: usize, k: usize, expected: &[I::Item])
+-        where I: IntoParallelIterator,
+-              I::Iter: IndexedParallelIterator,
+-              I::Item: PartialEq + std::fmt::Debug
+-    {
+-        let result = iter.into_par_iter()
+-            .with_producer(Split { i, j, k, reverse: false });
+-        assert_eq!(result, expected);
+-    }
+-
+-    fn reverse<I>(iter: I, i: usize, j: usize, k: usize, expected: &[I::Item])
+-        where I: IntoParallelIterator,
+-              I::Iter: IndexedParallelIterator,
+-              I::Item: PartialEq + std::fmt::Debug
+-    {
+-        let result = iter.into_par_iter()
+-            .with_producer(Split { i, j, k, reverse: true });
+-        assert!(result.iter().eq(expected.iter().rev()));
+-    }
+-}
+-
+-impl<T> ProducerCallback<T> for Split {
+-    type Output = Vec<T>;
+-
+-    fn callback<P>(self, producer: P) -> Self::Output
+-        where P: Producer<Item = T>
+-    {
+-        println!("{:?}", self);
+-
+-        // Splitting the outer indexes first gets us an arbitrary mid section,
+-        // which we then split further to get full test coverage.
+-        let (left, d) = producer.split_at(self.k);
+-        let (a, mid) = left.split_at(self.i);
+-        let (b, c) = mid.split_at(self.j - self.i);
+-
+-        let a = a.into_iter();
+-        let b = b.into_iter();
+-        let c = c.into_iter();
+-        let d = d.into_iter();
+-
+-        check_len(&a, self.i);
+-        check_len(&b, self.j - self.i);
+-        check_len(&c, self.k - self.j);
+-
+-        let chain = a.chain(b).chain(c).chain(d);
+-        if self.reverse {
+-            chain.rev().collect()
+-        } else {
+-            chain.collect()
+-        }
+-    }
+-}
+-
+-fn check_len<I: ExactSizeIterator>(iter: &I, len: usize) {
+-    assert_eq!(iter.size_hint(), (len, Some(len)));
+-    assert_eq!(iter.len(), len);
+-}
+-
+-
+-// **** Base Producers ****
+-
+-#[test]
+-fn option() {
+-    let v = vec![42];
+-    check(&v, || Some(42));
+-}
+-
+-#[test]
+-fn range() {
+-    let v: Vec<_> = (0..10).collect();
+-    check(&v, || 0..10);
+-}
+-
+-#[test]
+-fn repeatn() {
+-    let v: Vec<_> = std::iter::repeat(1).take(5).collect();
+-    check(&v, || rayon::iter::repeatn(1, 5));
+-}
+-
+-#[test]
+-fn slice_iter() {
+-    let s: Vec<_> = (0..10).collect();
+-    let v: Vec<_> = s.iter().collect();
+-    check(&v, || &s);
+-}
+-
+-#[test]
+-fn slice_iter_mut() {
+-    let mut s: Vec<_> = (0..10).collect();
+-    let mut v: Vec<_> = s.clone();
+-    let expected: Vec<_> = v.iter_mut().collect();
+-
+-    for (i, j, k) in triples(expected.len() + 1) {
+-        Split::forward(s.par_iter_mut(), i, j, k, &expected);
+-        Split::reverse(s.par_iter_mut(), i, j, k, &expected);
+-    }
+-}
+-
+-#[test]
+-fn slice_chunks() {
+-    let s: Vec<_> = (0..10).collect();
+-    let v: Vec<_> = s.chunks(2).collect();
+-    check(&v, || s.par_chunks(2));
+-}
+-
+-#[test]
+-fn slice_chunks_mut() {
+-    let mut s: Vec<_> = (0..10).collect();
+-    let mut v: Vec<_> = s.clone();
+-    let expected: Vec<_> = v.chunks_mut(2).collect();
+-
+-    for (i, j, k) in triples(expected.len() + 1) {
+-        Split::forward(s.par_chunks_mut(2), i, j, k, &expected);
+-        Split::reverse(s.par_chunks_mut(2), i, j, k, &expected);
+-    }
+-}
+-
+-#[test]
+-fn slice_windows() {
+-    let s: Vec<_> = (0..10).collect();
+-    let v: Vec<_> = s.windows(2).collect();
+-    check(&v, || s.par_windows(2));
+-}
+-
+-#[test]
+-fn vec() {
+-    let v: Vec<_> = (0..10).collect();
+-    check(&v, || v.clone());
+-}
+-
+-
+-// **** Adaptors ****
+-
+-#[test]
+-fn chain() {
+-    let v: Vec<_> = (0..10).collect();
+-    check(&v, || (0..5).into_par_iter().chain(5..10));
+-}
+-
+-#[test]
+-fn cloned() {
+-    let v: Vec<_> = (0..10).collect();
+-    check(&v, || v.par_iter().cloned());
+-}
+-
+-#[test]
+-fn enumerate() {
+-    let v: Vec<_> = (0..10).enumerate().collect();
+-    check(&v, || (0..10).into_par_iter().enumerate());
+-}
+-
+-#[test]
+-fn inspect() {
+-    let v: Vec<_> = (0..10).collect();
+-    check(&v, || (0..10).into_par_iter().inspect(|_| ()));
+-}
+-
+-#[test]
+-fn interleave() {
+-    let v = [0, 10, 1, 11, 2, 12, 3, 4];
+-    check(&v, || (0..5).into_par_iter().interleave(10..13));
+-    check(&v[..6], || (0..3).into_par_iter().interleave(10..13));
+-
+-    let v = [0, 10, 1, 11, 2, 12, 13, 14];
+-    check(&v, || (0..3).into_par_iter().interleave(10..15));
+-}
+-
+-#[test]
+-fn intersperse() {
+-    let v = [0, -1, 1, -1, 2, -1, 3, -1, 4];
+-    check(&v, || (0..5).into_par_iter().intersperse(-1));
+-}
+-
+-#[test]
+-fn map() {
+-    let v: Vec<_> = (0..10).collect();
+-    check(&v, || v.par_iter().map(Clone::clone));
+-}
+-
+-#[test]
+-fn map_with() {
+-    let v: Vec<_> = (0..10).collect();
+-    check(&v, || v.par_iter().map_with(vec![0], |_, &x| x));
+-}
+-
+-#[test]
+-fn rev() {
+-    let v: Vec<_> = (0..10).rev().collect();
+-    check(&v, || (0..10).into_par_iter().rev());
+-}
+-
+-#[test]
+-fn with_max_len() {
+-    let v: Vec<_> = (0..10).collect();
+-    check(&v, || (0..10).into_par_iter().with_max_len(1));
+-}
+-
+-#[test]
+-fn with_min_len() {
+-    let v: Vec<_> = (0..10).collect();
+-    check(&v, || (0..10).into_par_iter().with_min_len(1));
+-}
+-
+-#[test]
+-fn zip() {
+-    let v: Vec<_> = (0..10).zip(10..20).collect();
+-    check(&v, || (0..10).into_par_iter().zip(10..20));
+-    check(&v[..5], || (0..5).into_par_iter().zip(10..20));
+-    check(&v[..5], || (0..10).into_par_iter().zip(10..15));
+-}

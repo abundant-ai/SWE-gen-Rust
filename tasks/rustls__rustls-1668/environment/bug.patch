@@ -1,0 +1,183 @@
+diff --git a/rustls/src/client/tls12.rs b/rustls/src/client/tls12.rs
+index d572ffda..b3acad6c 100644
+--- a/rustls/src/client/tls12.rs
++++ b/rustls/src/client/tls12.rs
+@@ -1040,18 +1040,6 @@ impl State<ClientConnectionData> for ExpectFinished {
+             _fin_verified,
+         }))
+     }
+-
+-    // we could not decrypt the encrypted handshake message with session resumption
+-    // this might mean that the ticket was invalid for some reason, so we remove it
+-    // from the store to restart a session from scratch
+-    fn handle_decrypt_error(&self) {
+-        if self.resuming {
+-            self.config
+-                .resumption
+-                .store
+-                .remove_tls12_session(&self.server_name);
+-        }
+-    }
+ }
+ 
+ // -- Traffic transit state --
+diff --git a/rustls/src/common_state.rs b/rustls/src/common_state.rs
+index 0f0f55ee..f738ba12 100644
+--- a/rustls/src/common_state.rs
++++ b/rustls/src/common_state.rs
+@@ -630,8 +630,6 @@ pub(crate) trait State<Data>: Send + Sync {
+     fn extract_secrets(&self) -> Result<PartiallyExtractedSecrets, Error> {
+         Err(Error::HandshakeNotComplete)
+     }
+-
+-    fn handle_decrypt_error(&self) {}
+ }
+ 
+ pub(crate) struct Context<'a, Data> {
+diff --git a/rustls/src/conn.rs b/rustls/src/conn.rs
+index 6fc35acc..31c4db37 100644
+--- a/rustls/src/conn.rs
++++ b/rustls/src/conn.rs
+@@ -453,7 +453,7 @@ impl<Data> ConnectionCommon<Data> {
+     pub(crate) fn first_handshake_message(&mut self) -> Result<Option<Message>, Error> {
+         match self
+             .core
+-            .deframe(None)?
++            .deframe()?
+             .map(Message::try_from)
+         {
+             Some(Ok(msg)) => Ok(Some(msg)),
+@@ -635,7 +635,7 @@ impl<Data> ConnectionCore<Data> {
+             }
+         };
+ 
+-        while let Some(msg) = self.deframe(Some(&*state))? {
++        while let Some(msg) = self.deframe()? {
+             match self.process_msg(msg, state) {
+                 Ok(new) => state = new,
+                 Err(e) => {
+@@ -650,7 +650,7 @@ impl<Data> ConnectionCore<Data> {
+     }
+ 
+     /// Pull a message out of the deframer and send any messages that need to be sent as a result.
+-    fn deframe(&mut self, state: Option<&dyn State<Data>>) -> Result<Option<PlainMessage>, Error> {
++    fn deframe(&mut self) -> Result<Option<PlainMessage>, Error> {
+         match self.message_deframer.pop(
+             &mut self.common_state.record_layer,
+             self.common_state.negotiated_version,
+@@ -690,14 +690,9 @@ impl<Data> ConnectionCore<Data> {
+             Err(err @ Error::PeerSentOversizedRecord) => Err(self
+                 .common_state
+                 .send_fatal_alert(AlertDescription::RecordOverflow, err)),
+-            Err(err @ Error::DecryptError) => {
+-                if let Some(state) = state {
+-                    state.handle_decrypt_error();
+-                }
+-                Err(self
+-                    .common_state
+-                    .send_fatal_alert(AlertDescription::BadRecordMac, err))
+-            }
++            Err(err @ Error::DecryptError) => Err(self
++                .common_state
++                .send_fatal_alert(AlertDescription::BadRecordMac, err)),
+             Err(e) => Err(e),
+         }
+     }
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index 4d3fbea1..31740e30 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -5649,61 +5649,3 @@ fn test_client_construction_requires_64_bytes_of_random_material() {
+     ClientConnection::new(Arc::new(client_config), server_name("localhost"))
+         .expect("check how much random material ClientConnection::new consumes");
+ }
+-
+-#[cfg(feature = "tls12")]
+-#[test]
+-fn test_client_removes_tls12_session_if_server_sends_undecryptable_first_message() {
+-    fn inject_corrupt_finished_message(msg: &mut Message) -> Altered {
+-        if let MessagePayload::ChangeCipherSpec(_) = msg.payload {
+-            // interdict "real" ChangeCipherSpec with its encoding, plus a faulty encrypted Finished.
+-            let mut raw_change_cipher_spec = [0x14u8, 0x03, 0x03, 0x00, 0x01, 0x01].to_vec();
+-            let mut corrupt_finished = [0x16, 0x03, 0x03, 0x00, 0x28].to_vec();
+-            corrupt_finished.extend([0u8; 0x28]);
+-
+-            let mut both = vec![];
+-            both.append(&mut raw_change_cipher_spec);
+-            both.append(&mut corrupt_finished);
+-
+-            Altered::Raw(both)
+-        } else {
+-            Altered::InPlace
+-        }
+-    }
+-
+-    let mut client_config =
+-        make_client_config_with_versions(KeyType::Rsa, &[&rustls::version::TLS12]);
+-    let storage = Arc::new(ClientStorage::new());
+-    client_config.resumption = Resumption::store(storage.clone());
+-    let client_config = Arc::new(client_config);
+-    let server_config = Arc::new(make_server_config(KeyType::Rsa));
+-
+-    // successful handshake to allow resumption
+-    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+-    do_handshake(&mut client, &mut server);
+-
+-    // resumption
+-    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+-    transfer(&mut client, &mut server);
+-    server.process_new_packets().unwrap();
+-    let mut client = client.into();
+-    transfer_altered(
+-        &mut server.into(),
+-        inject_corrupt_finished_message,
+-        &mut client,
+-    );
+-
+-    // discard storage operations up to this point, to observe the one we want to test for.
+-    storage.ops_and_reset();
+-
+-    // client cannot decrypt faulty Finished, and deletes saved session in case
+-    // server resumption is buggy.
+-    assert_eq!(
+-        Some(Error::DecryptError),
+-        client.process_new_packets().err()
+-    );
+-
+-    assert!(matches!(
+-        storage.ops()[0],
+-        ClientStorageOp::RemoveTls12Session(_)
+-    ));
+-}
+diff --git a/rustls/tests/common/mod.rs b/rustls/tests/common/mod.rs
+index de4ac7af..f2d0946f 100644
+--- a/rustls/tests/common/mod.rs
++++ b/rustls/tests/common/mod.rs
+@@ -176,21 +176,12 @@ where
+         let mut reader = Reader::init(&buf[..sz]);
+         while reader.any_left() {
+             let message = OpaqueMessage::read(&mut reader).unwrap();
+-
+-            // this is a bit of a falsehood: we don't know whether message
+-            // is encrypted.  it is quite unlikely that a genuine encrypted
+-            // message can be decoded by `Message::try_from`.
+-            let plain = message.into_plain_message();
+-
+-            let message_enc = match Message::try_from(plain.clone()) {
+-                Ok(mut message) => match filter(&mut message) {
+-                    Altered::InPlace => PlainMessage::from(message)
+-                        .into_unencrypted_opaque()
+-                        .encode(),
+-                    Altered::Raw(data) => data,
+-                },
+-                // pass through encrypted/undecodable messages
+-                Err(_) => plain.into_unencrypted_opaque().encode(),
++            let mut message = Message::try_from(message.into_plain_message()).unwrap();
++            let message_enc = match filter(&mut message) {
++                Altered::InPlace => PlainMessage::from(message)
++                    .into_unencrypted_opaque()
++                    .encode(),
++                Altered::Raw(data) => data,
+             };
+ 
+             let message_enc_reader: &mut dyn io::Read = &mut &message_enc[..];

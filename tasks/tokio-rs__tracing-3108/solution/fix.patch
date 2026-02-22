@@ -1,0 +1,162 @@
+diff --git a/tracing-attributes/src/expand.rs b/tracing-attributes/src/expand.rs
+index f01c12a1..01389a3f 100644
+--- a/tracing-attributes/src/expand.rs
++++ b/tracing-attributes/src/expand.rs
+@@ -1,6 +1,7 @@
+ use std::iter;
+ 
+ use proc_macro2::TokenStream;
++use quote::TokenStreamExt;
+ use quote::{quote, quote_spanned, ToTokens};
+ use syn::visit_mut::VisitMut;
+ use syn::{
+@@ -29,6 +30,7 @@ pub(crate) fn gen_function<'a, B: ToTokens + 'a>(
+         inner_attrs,
+         vis,
+         sig,
++        brace_token,
+         block,
+     } = input;
+ 
+@@ -44,9 +46,12 @@ pub(crate) fn gen_function<'a, B: ToTokens + 'a>(
+             syn::Generics {
+                 params: gen_params,
+                 where_clause,
+-                ..
++                lt_token,
++                gt_token,
+             },
+-        ..
++        fn_token,
++        paren_token,
++        variadic,
+     } = sig;
+ 
+     let warnings = args.warnings();
+@@ -65,9 +70,14 @@ pub(crate) fn gen_function<'a, B: ToTokens + 'a>(
+     // exactly that way for it to do its magic.
+     let fake_return_edge = quote_spanned! {return_span=>
+         #[allow(
+-            unknown_lints, unreachable_code, clippy::diverging_sub_expression,
+-            clippy::let_unit_value, clippy::unreachable, clippy::let_with_type_underscore,
+-            clippy::empty_loop
++            unknown_lints,
++            unreachable_code,
++            clippy::diverging_sub_expression,
++            clippy::empty_loop,
++            clippy::let_unit_value,
++            clippy::let_with_type_underscore,
++            clippy::needless_return,
++            clippy::unreachable
+         )]
+         if false {
+             let __tracing_attr_fake_return: #return_type = loop {};
+@@ -90,16 +100,27 @@ pub(crate) fn gen_function<'a, B: ToTokens + 'a>(
+         self_type,
+     );
+ 
+-    quote!(
++    let mut result = quote!(
+         #(#outer_attrs) *
+-        #vis #constness #asyncness #unsafety #abi fn #ident<#gen_params>(#params) #output
+-        #where_clause
+-        {
+-            #(#inner_attrs) *
+-            #warnings
+-            #body
+-        }
+-    )
++        #vis #constness #asyncness #unsafety #abi #fn_token #ident
++        #lt_token #gen_params #gt_token
++    );
++
++    paren_token.surround(&mut result, |tokens| {
++        params.to_tokens(tokens);
++        variadic.to_tokens(tokens);
++    });
++
++    output.to_tokens(&mut result);
++    where_clause.to_tokens(&mut result);
++
++    brace_token.surround(&mut result, |tokens| {
++        tokens.append_all(inner_attrs);
++        warnings.to_tokens(tokens);
++        body.to_tokens(tokens);
++    });
++
++    result
+ }
+ 
+ /// Instrument a block
+diff --git a/tracing-attributes/src/lib.rs b/tracing-attributes/src/lib.rs
+index 372a8393..71910d9a 100644
+--- a/tracing-attributes/src/lib.rs
++++ b/tracing-attributes/src/lib.rs
+@@ -80,8 +80,10 @@
+ )]
+ 
+ use proc_macro2::TokenStream;
++use quote::TokenStreamExt;
+ use quote::{quote, ToTokens};
+ use syn::parse::{Parse, ParseStream};
++use syn::token::Brace;
+ use syn::{Attribute, ItemFn, Signature, Visibility};
+ 
+ mod attr;
+@@ -428,6 +430,7 @@ struct MaybeItemFn {
+     inner_attrs: Vec<Attribute>,
+     vis: Visibility,
+     sig: Signature,
++    brace_token: Brace,
+     block: TokenStream,
+ }
+ 
+@@ -438,6 +441,7 @@ impl MaybeItemFn {
+             inner_attrs: &self.inner_attrs,
+             vis: &self.vis,
+             sig: &self.sig,
++            brace_token: &self.brace_token,
+             block: &self.block,
+         }
+     }
+@@ -451,12 +455,15 @@ impl Parse for MaybeItemFn {
+         let vis: Visibility = input.parse()?;
+         let sig: Signature = input.parse()?;
+         let inner_attrs = input.call(Attribute::parse_inner)?;
+-        let block: TokenStream = input.parse()?;
++        let block;
++        let brace_token = syn::braced!(block in input);
++        let block: TokenStream = block.call(|buffer| buffer.parse())?;
+         Ok(Self {
+             outer_attrs,
+             inner_attrs,
+             vis,
+             sig,
++            brace_token,
+             block,
+         })
+     }
+@@ -474,12 +481,15 @@ impl From<ItemFn> for MaybeItemFn {
+         let (outer_attrs, inner_attrs) = attrs
+             .into_iter()
+             .partition(|attr| attr.style == syn::AttrStyle::Outer);
++        let mut block_tokens = TokenStream::new();
++        block_tokens.append_all(block.stmts);
+         Self {
+             outer_attrs,
+             inner_attrs,
+             vis,
+             sig,
+-            block: block.to_token_stream(),
++            brace_token: block.brace_token,
++            block: block_tokens,
+         }
+     }
+ }
+@@ -492,5 +502,6 @@ struct MaybeItemFnRef<'a, B: ToTokens> {
+     inner_attrs: &'a Vec<Attribute>,
+     vis: &'a Visibility,
+     sig: &'a Signature,
++    brace_token: &'a Brace,
+     block: &'a B,
+ }

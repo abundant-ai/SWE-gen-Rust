@@ -1,0 +1,296 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 6f4f001..a2b6200 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -24,7 +24,7 @@ jobs:
+     strategy:
+       fail-fast: false
+       matrix:
+-        rust: [nightly, beta, stable, 1.81.0, 1.70.0]
++        rust: [nightly, beta, stable, 1.70.0]
+     timeout-minutes: 45
+     steps:
+       - uses: actions/checkout@v4
+@@ -38,9 +38,7 @@ jobs:
+       - name: Enable nightly-only tests
+         run: echo RUSTFLAGS=${RUSTFLAGS}\ --cfg=thiserror_nightly_testing >> $GITHUB_ENV
+         if: matrix.rust == 'nightly'
+-      - run: cargo test --workspace --exclude thiserror_no_std_test
+-      - run: cargo test --manifest-path tests/no-std/Cargo.toml
+-        if: matrix.rust != '1.70.0'
++      - run: cargo test --all
+       - uses: actions/upload-artifact@v4
+         if: matrix.rust == 'nightly' && always()
+         with:
+diff --git a/Cargo.toml b/Cargo.toml
+index dd8f11c..23f3609 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -11,22 +11,6 @@ license = "MIT OR Apache-2.0"
+ repository = "https://github.com/dtolnay/thiserror"
+ rust-version = "1.61"
+ 
+-[features]
+-default = ["std"]
+-
+-# Std feature enables support for formatting std::path::{Path, PathBuf}
+-# conveniently in an error message.
+-#
+-#     #[derive(Error, Debug)]
+-#     #[error("failed to create configuration file {path}")]
+-#     pub struct MyError {
+-#         pub path: PathBuf,
+-#         pub source: std::io::Error,
+-#     }
+-#
+-# Without std, this would need to be written #[error("... {}", path.display())].
+-std = []
+-
+ [dependencies]
+ thiserror-impl = { version = "=1.0.68", path = "impl" }
+ 
+@@ -37,7 +21,7 @@ rustversion = "1.0.13"
+ trybuild = { version = "1.0.81", features = ["diff"] }
+ 
+ [workspace]
+-members = ["impl", "tests/no-std"]
++members = ["impl"]
+ 
+ [package.metadata.docs.rs]
+ targets = ["x86_64-unknown-linux-gnu"]
+diff --git a/build.rs b/build.rs
+index 5d795e4..8495ef3 100644
+--- a/build.rs
++++ b/build.rs
+@@ -57,14 +57,7 @@ fn main() {
+         println!("cargo:rerun-if-env-changed=RUSTC_BOOTSTRAP");
+     }
+ 
+-    // core::error::Error stabilized in Rust 1.81
+-    // https://blog.rust-lang.org/2024/09/05/Rust-1.81.0.html#coreerrorerror
+-    let rustc = rustc_minor_version();
+-    if cfg!(not(feature = "std")) && rustc.map_or(false, |rustc| rustc < 81) {
+-        println!("cargo:rustc-cfg=feature=\"std\"");
+-    }
+-
+-    let rustc = match rustc {
++    let rustc = match rustc_minor_version() {
+         Some(rustc) => rustc,
+         None => return,
+     };
+diff --git a/build/probe.rs b/build/probe.rs
+index ee126d4..5fbadcb 100644
+--- a/build/probe.rs
++++ b/build/probe.rs
+@@ -2,7 +2,6 @@
+ // member access API. If the current toolchain is able to compile it, then
+ // thiserror is able to provide backtrace support.
+ 
+-#![no_std]
+ #![feature(error_generic_member_access)]
+ 
+ use core::error::{Error, Request};
+diff --git a/src/aserror.rs b/src/aserror.rs
+index d66463a..1bced57 100644
+--- a/src/aserror.rs
++++ b/src/aserror.rs
+@@ -1,5 +1,5 @@
+-use core::error::Error;
+ use core::panic::UnwindSafe;
++use std::error::Error;
+ 
+ #[doc(hidden)]
+ pub trait AsDynError<'a>: Sealed {
+diff --git a/src/display.rs b/src/display.rs
+index 7ccdd81..7a62ae2 100644
+--- a/src/display.rs
++++ b/src/display.rs
+@@ -1,5 +1,4 @@
+ use core::fmt::Display;
+-#[cfg(feature = "std")]
+ use std::path::{self, Path, PathBuf};
+ 
+ #[doc(hidden)]
+@@ -22,7 +21,6 @@ where
+     }
+ }
+ 
+-#[cfg(feature = "std")]
+ impl<'a> AsDisplay<'a> for Path {
+     type Target = path::Display<'a>;
+ 
+@@ -32,7 +30,6 @@ impl<'a> AsDisplay<'a> for Path {
+     }
+ }
+ 
+-#[cfg(feature = "std")]
+ impl<'a> AsDisplay<'a> for PathBuf {
+     type Target = path::Display<'a>;
+ 
+@@ -45,37 +42,5 @@ impl<'a> AsDisplay<'a> for PathBuf {
+ #[doc(hidden)]
+ pub trait Sealed {}
+ impl<T: Display> Sealed for &T {}
+-#[cfg(feature = "std")]
+ impl Sealed for Path {}
+-#[cfg(feature = "std")]
+ impl Sealed for PathBuf {}
+-
+-// Add a synthetic second impl of AsDisplay to prevent the "single applicable
+-// impl" rule from making too weird inference decision based on the single impl
+-// for &T, which could lead to code that compiles with thiserror's std feature
+-// off but breaks under feature unification when std is turned on by an
+-// unrelated crate.
+-#[cfg(not(feature = "std"))]
+-mod placeholder {
+-    use super::{AsDisplay, Sealed};
+-    use core::fmt::{self, Display};
+-
+-    pub struct Placeholder;
+-
+-    impl<'a> AsDisplay<'a> for Placeholder {
+-        type Target = Self;
+-
+-        #[inline]
+-        fn as_display(&'a self) -> Self::Target {
+-            Placeholder
+-        }
+-    }
+-
+-    impl Display for Placeholder {
+-        fn fmt(&self, _formatter: &mut fmt::Formatter) -> fmt::Result {
+-            unreachable!()
+-        }
+-    }
+-
+-    impl Sealed for Placeholder {}
+-}
+diff --git a/src/lib.rs b/src/lib.rs
+index fec22cd..17975e8 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -258,7 +258,6 @@
+ //!
+ //!   [`anyhow`]: https://github.com/dtolnay/anyhow
+ 
+-#![no_std]
+ #![doc(html_root_url = "https://docs.rs/thiserror/1.0.68")]
+ #![allow(
+     clippy::module_name_repetitions,
+@@ -271,11 +270,6 @@
+ #[cfg(all(thiserror_nightly_testing, not(error_generic_member_access)))]
+ compile_error!("Build script probe failed to compile.");
+ 
+-#[cfg(feature = "std")]
+-extern crate std;
+-#[cfg(feature = "std")]
+-extern crate std as core;
+-
+ mod aserror;
+ mod display;
+ #[cfg(error_generic_member_access)]
+@@ -293,9 +287,9 @@ pub mod __private {
+     #[cfg(error_generic_member_access)]
+     #[doc(hidden)]
+     pub use crate::provide::ThiserrorProvide;
+-    #[doc(hidden)]
+-    pub use core::error::Error;
+-    #[cfg(all(feature = "std", not(thiserror_no_backtrace_type)))]
++    #[cfg(not(thiserror_no_backtrace_type))]
+     #[doc(hidden)]
+     pub use std::backtrace::Backtrace;
++    #[doc(hidden)]
++    pub use std::error::Error;
+ }
+diff --git a/src/provide.rs b/src/provide.rs
+index 4b2f06a..7b4e922 100644
+--- a/src/provide.rs
++++ b/src/provide.rs
+@@ -1,4 +1,4 @@
+-use core::error::{Error, Request};
++use std::error::{Error, Request};
+ 
+ #[doc(hidden)]
+ pub trait ThiserrorProvide: Sealed {
+diff --git a/tests/no-std/Cargo.toml b/tests/no-std/Cargo.toml
+deleted file mode 100644
+index 8b03d2f..0000000
+--- a/tests/no-std/Cargo.toml
++++ /dev/null
+@@ -1,12 +0,0 @@
+-[package]
+-name = "thiserror_no_std_test"
+-version = "0.0.0"
+-authors = ["David Tolnay <dtolnay@gmail.com>"]
+-edition = "2021"
+-publish = false
+-
+-[lib]
+-path = "test.rs"
+-
+-[dependencies]
+-thiserror = { path = "../..", default-features = false }
+diff --git a/tests/no-std/test.rs b/tests/no-std/test.rs
+deleted file mode 100644
+index da7899c..0000000
+--- a/tests/no-std/test.rs
++++ /dev/null
+@@ -1,58 +0,0 @@
+-#![no_std]
+-
+-use thiserror::Error;
+-
+-#[derive(Error, Debug)]
+-pub enum Error {
+-    #[error("Error::E")]
+-    E(#[from] SourceError),
+-}
+-
+-#[derive(Error, Debug)]
+-#[error("SourceError {field}")]
+-pub struct SourceError {
+-    pub field: i32,
+-}
+-
+-#[cfg(test)]
+-mod tests {
+-    use crate::{Error, SourceError};
+-    use core::error::Error as _;
+-    use core::fmt::{self, Write};
+-    use core::mem;
+-
+-    struct Buf<'a>(&'a mut [u8]);
+-
+-    impl Write for Buf<'_> {
+-        fn write_str(&mut self, s: &str) -> fmt::Result {
+-            if s.len() <= self.0.len() {
+-                let (out, rest) = mem::take(&mut self.0).split_at_mut(s.len());
+-                out.copy_from_slice(s.as_bytes());
+-                self.0 = rest;
+-                Ok(())
+-            } else {
+-                Err(fmt::Error)
+-            }
+-        }
+-    }
+-
+-    #[test]
+-    fn test() {
+-        let source = SourceError { field: -1 };
+-        let error = Error::from(source);
+-
+-        let source = error
+-            .source()
+-            .unwrap()
+-            .downcast_ref::<SourceError>()
+-            .unwrap();
+-
+-        let mut msg = [b'~'; 17];
+-        write!(Buf(&mut msg), "{error}").unwrap();
+-        assert_eq!(msg, *b"Error::E~~~~~~~~~");
+-
+-        let mut msg = [b'~'; 17];
+-        write!(Buf(&mut msg), "{source}").unwrap();
+-        assert_eq!(msg, *b"SourceError -1~~~");
+-    }
+-}

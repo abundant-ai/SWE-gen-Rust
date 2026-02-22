@@ -1,0 +1,207 @@
+diff --git a/README.md b/README.md
+index a6a38720..c17e2e40 100644
+--- a/README.md
++++ b/README.md
+@@ -12,7 +12,7 @@ This crate allows you to parse and modify toml
+ documents, while preserving comments, spaces and
+ relative order or items.
+ 
+-# Example
++## Example
+ 
+ ```rust
+ extern crate toml_edit;
+@@ -27,6 +27,13 @@ fn main() {
+ }
+ ```
+ 
++## Safety
++
++Due to internal unsafe usage, `mem::swap`ping two `Table`s or `ArrayOfTables` is considered unsafe 
++(it won't do what you'd expect, see [test_safety](./tests/test_safety.rs)).
++
++Swapping `Value`s is fine though.
++
+ ## License
+ 
+ Licensed under either of
+diff --git a/src/key.rs b/src/key.rs
+index e47560e4..764dace5 100644
+--- a/src/key.rs
++++ b/src/key.rs
+@@ -1,3 +1,4 @@
++use std::str::FromStr;
+ use decor::InternalString;
+ use parser;
+ use nom;
+@@ -23,53 +24,36 @@ use nom;
+ /// 3. Literal quoted keys (`'literal key'`)
+ ///
+ /// For details see [toml spec](https://github.com/toml-lang/toml/#keyvalue-pair).
++///
++/// To parse a key use `FromStr` trait implementation: `"string".parse::<Key>()`.
+ #[derive(Debug, Eq, PartialEq, PartialOrd, Ord, Hash, Clone)]
+ pub struct Key {
+     key: InternalString,
+     raw: InternalString,
+ }
+ 
+-/// Parses and unwraps the key from a &str
+-///
+-/// ```
+-/// # #[macro_use]
+-/// # extern crate toml_edit;
+-/// # use toml_edit::Key;
+-/// #
+-/// # fn main() {
+-/// let version = parse_key!("version");
+-/// assert_eq!(version.get(), "version");
+-/// # }
+-/// ```
+-#[macro_export]
+-macro_rules! parse_key {
+-    ($e:expr) => (
+-        {
+-            let key = Key::parse($e);
+-            assert!(key.is_some());
+-            key.unwrap()
+-        }
+-    );
+-}
+-
++impl FromStr for Key {
++    type Err = parser::Error;
+ 
+-impl Key {
+     /// Parses the key from a &str
+-    pub fn parse(s: &str) -> Option<Self> {
++    fn from_str(s: &str) -> Result<Self, Self::Err> {
+         let parsed = parser::key(parser::Span::new(s));
+         match parsed {
+             nom::IResult::Done(i, (key, raw)) => if i.fragment.is_empty() {
+-                Some(Key {
++                Ok(Self {
+                     key: key,
+                     raw: raw.fragment.into(),
+                 })
+             } else {
+-                None
++                Err(Self::Err::new(parser::ErrorKind::Unknown, i))
+             },
+-            _ => None,
++            nom::IResult::Error(e) => Err(parser::to_error(&e)),
++            _ => unreachable!("key should be complete"),
+         }
+     }
++}
+ 
++impl Key {
+     pub fn get(&self) -> &str {
+         &self.key
+     }
+diff --git a/src/lib.rs b/src/lib.rs
+index 0ff90c39..9afc55e6 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -7,6 +7,12 @@
+ //! documents, while preserving comments, spaces and
+ //! relative order or items.
+ //!
++//! # Safety
++//!
++//! `mem::swap`ing `Table`s or `ArrayOfTables` is considered unsafe.
++//!
++//! Swapping `Value`s is fine.
++//!
+ //! # Example
+ //!
+ //! ```rust
+@@ -41,7 +47,6 @@ mod array_of_tables;
+ mod table;
+ mod document;
+ 
+-pub use display::*;
+ pub use value::{Array, InlineTable, Value};
+ pub use key::Key;
+ pub use parser::Error;
+diff --git a/src/parser/mod.rs b/src/parser/mod.rs
+index bac1511b..37c56f14 100644
+--- a/src/parser/mod.rs
++++ b/src/parser/mod.rs
+@@ -18,6 +18,9 @@ mod document;
+ mod key;
+ 
+ pub(crate) use self::key::key;
++pub(crate) use self::value::value;
++pub(crate) use self::errors::ErrorKind;
++pub(crate) use self::errors::to_error;
+ 
+ use nom_locate::LocatedSpan;
+ use nom::InputLength;
+diff --git a/src/table.rs b/src/table.rs
+index c7675c7a..e7fe7c66 100644
+--- a/src/table.rs
++++ b/src/table.rs
+@@ -202,12 +202,12 @@ impl Table {
+             .last()
+             .map(|p| *p as *const Table)
+             .unwrap_or(self as *const Table);
+-        let header = self.child_header(key.get(), HeaderKind::Standard);
++        let header = self.child_header(key.raw(), HeaderKind::Standard);
+         self.insert_table_with_header(key.get(), header, after_ptr)
+     }
+ 
+     pub fn append_table(&mut self, key: Key) -> TableEntry {
+-        let header = self.child_header(key.get(), HeaderKind::Standard);
++        let header = self.child_header(key.raw(), HeaderKind::Standard);
+         self.append_table_with_header(key.get(), header)
+     }
+ 
+@@ -219,7 +219,7 @@ impl Table {
+     }
+ 
+     pub fn insert_array(&mut self, key: Key) -> TableEntry {
+-        let child_key = self.child_key(key.get());
++        let child_key = self.child_key(key.raw());
+         match self.entry(key.get()) {
+             TableEntry::Vacant(me) => TableEntry::Array(me.insert_array_assume_vacant(&child_key)),
+             otherwise => otherwise,
+diff --git a/src/value.rs b/src/value.rs
+index 55a5933c..565d554c 100644
+--- a/src/value.rs
++++ b/src/value.rs
+@@ -1,9 +1,12 @@
++use std::str::FromStr;
+ use chrono::{self, FixedOffset};
+ use formatted;
+ use linked_hash_map::LinkedHashMap;
+ use std::slice::Iter;
+ use decor::{Decor, Formatted, InternalString, Repr};
+ use key::Key;
++use parser;
++use nom;
+ 
+ 
+ /// Representation of a TOML Value (as part of a Key/Value Pair).
+@@ -326,3 +329,21 @@ pub(crate) fn sort_key_value_pairs(pairs: &mut KeyValuePairs) {
+         pairs.get_refresh(&key);
+     }
+ }
++
++impl FromStr for Value {
++    type Err = parser::Error;
++
++    /// Parses the value from a &str
++    fn from_str(s: &str) -> Result<Self, Self::Err> {
++        let parsed = parser::value(parser::Span::new(s));
++        match parsed {
++            nom::IResult::Done(i, value) => if i.fragment.is_empty() {
++                Ok(value)
++            } else {
++                Err(Self::Err::new(parser::ErrorKind::InvalidValue, i))
++            },
++            nom::IResult::Error(e) => Err(parser::to_error(&e)),
++            _ => unreachable!("value should be complete"),
++        }
++    }
++}

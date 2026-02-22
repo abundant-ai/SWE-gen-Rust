@@ -1,0 +1,264 @@
+diff --git a/README.md b/README.md
+index 5082f95..54e736d 100644
+--- a/README.md
++++ b/README.md
+@@ -70,7 +70,7 @@ pub enum DataStoreError {
+   ```rust
+   #[derive(Error, Debug)]
+   pub enum Error {
+-      #[error("invalid rdo_lookahead_frames {0} (expected < {max})", max = i32::MAX)]
++      #[error("invalid rdo_lookahead_frames {0} (expected < {})", i32::MAX)]
+       InvalidLookahead(u32),
+   }
+   ```
+diff --git a/impl/src/ast.rs b/impl/src/ast.rs
+index df9cf69..0f9fbeb 100644
+--- a/impl/src/ast.rs
++++ b/impl/src/ast.rs
+@@ -60,7 +60,7 @@ impl<'a> Struct<'a> {
+         let span = attrs.span().unwrap_or_else(Span::call_site);
+         let fields = Field::multiple_from_syn(&data.fields, &scope, span)?;
+         if let Some(display) = &mut attrs.display {
+-            display.expand_shorthand(&fields)?;
++            display.expand_shorthand(&fields);
+         }
+         Ok(Struct {
+             attrs,
+@@ -85,7 +85,7 @@ impl<'a> Enum<'a> {
+                     display.clone_from(&attrs.display);
+                 }
+                 if let Some(display) = &mut variant.attrs.display {
+-                    display.expand_shorthand(&variant.fields)?;
++                    display.expand_shorthand(&variant.fields);
+                 } else if variant.attrs.transparent.is_none() {
+                     variant.attrs.transparent = attrs.transparent;
+                 }
+diff --git a/impl/src/fmt.rs b/impl/src/fmt.rs
+index 4a3a064..d555c24 100644
+--- a/impl/src/fmt.rs
++++ b/impl/src/fmt.rs
+@@ -2,29 +2,22 @@ use crate::ast::Field;
+ use crate::attr::{Display, Trait};
+ use crate::scan_expr::scan_expr;
+ use crate::unraw::{IdentUnraw, MemberUnraw};
+-use proc_macro2::{Delimiter, TokenStream, TokenTree};
++use proc_macro2::{TokenStream, TokenTree};
+ use quote::{format_ident, quote, quote_spanned};
+ use std::collections::{BTreeSet as Set, HashMap as Map};
+-use std::iter;
+ use syn::ext::IdentExt;
+ use syn::parse::discouraged::Speculative;
+-use syn::parse::{Error, ParseStream, Parser, Result};
+-use syn::{Expr, Ident, Index, LitStr, Token};
++use syn::parse::{ParseStream, Parser};
++use syn::{Expr, Ident, Index, LitStr, Result, Token};
+ 
+ impl Display<'_> {
+     // Transform `"error {var}"` to `"error {}", var`.
+-    pub fn expand_shorthand(&mut self, fields: &[Field]) -> Result<()> {
++    pub fn expand_shorthand(&mut self, fields: &[Field]) {
+         let raw_args = self.args.clone();
+-        let FmtArguments {
+-            named: mut named_args,
+-            first_unnamed,
+-        } = explicit_named_args.parse2(raw_args).unwrap();
+-
++        let mut named_args = explicit_named_args.parse2(raw_args).unwrap().named;
+         let mut member_index = Map::new();
+-        let mut extra_positional_arguments_allowed = true;
+         for (i, field) in fields.iter().enumerate() {
+             member_index.insert(&field.member, i);
+-            extra_positional_arguments_allowed &= matches!(&field.member, MemberUnraw::Named(_));
+         }
+ 
+         let span = self.fmt.span();
+@@ -55,20 +48,14 @@ impl Display<'_> {
+             }
+             let next = match read.chars().next() {
+                 Some(next) => next,
+-                None => return Ok(()),
++                None => return,
+             };
+             let member = match next {
+                 '0'..='9' => {
+                     let int = take_int(&mut read);
+-                    if !extra_positional_arguments_allowed {
+-                        if let Some(first_unnamed) = &first_unnamed {
+-                            let msg = "ambiguous reference to positional arguments by number in a tuple struct; change this to a named argument";
+-                            return Err(Error::new_spanned(first_unnamed, msg));
+-                        }
+-                    }
+                     let member = match int.parse::<u32>() {
+                         Ok(index) => MemberUnraw::Unnamed(Index { index, span }),
+-                        Err(_) => return Ok(()),
++                        Err(_) => return,
+                     };
+                     if !member_index.contains_key(&member) {
+                         out += int;
+@@ -99,7 +86,7 @@ impl Display<'_> {
+             if let Some(&field) = member_index.get(&member) {
+                 let end_spec = match read.find('}') {
+                     Some(end_spec) => end_spec,
+-                    None => return Ok(()),
++                    None => return,
+                 };
+                 let bound = match read[..end_spec].chars().next_back() {
+                     Some('?') => Trait::Debug,
+@@ -127,13 +114,12 @@ impl Display<'_> {
+         self.args = args;
+         self.has_bonus_display = has_bonus_display;
+         self.implied_bounds = implied_bounds;
+-        Ok(())
+     }
+ }
+ 
+ struct FmtArguments {
+     named: Set<IdentUnraw>,
+-    first_unnamed: Option<TokenStream>,
++    unnamed: bool,
+ }
+ 
+ #[allow(clippy::unnecessary_wraps)]
+@@ -153,7 +139,7 @@ fn explicit_named_args(input: ParseStream) -> Result<FmtArguments> {
+     input.parse::<TokenStream>().unwrap();
+     Ok(FmtArguments {
+         named: Set::new(),
+-        first_unnamed: None,
++        unnamed: false,
+     })
+ }
+ 
+@@ -161,7 +147,7 @@ fn try_explicit_named_args(input: ParseStream) -> Result<FmtArguments> {
+     let mut syn_full = None;
+     let mut args = FmtArguments {
+         named: Set::new(),
+-        first_unnamed: None,
++        unnamed: false,
+     };
+ 
+     while !input.is_empty() {
+@@ -169,28 +155,21 @@ fn try_explicit_named_args(input: ParseStream) -> Result<FmtArguments> {
+         if input.is_empty() {
+             break;
+         }
+-
+-        let mut begin_unnamed = None;
+         if input.peek(Ident::peek_any) && input.peek2(Token![=]) && !input.peek2(Token![==]) {
+             let ident: IdentUnraw = input.parse()?;
+             input.parse::<Token![=]>()?;
+             args.named.insert(ident);
+         } else {
+-            begin_unnamed = Some(input.fork());
+-        }
+-
+-        let ahead = input.fork();
+-        if *syn_full.get_or_insert_with(is_syn_full) && ahead.parse::<Expr>().is_ok() {
+-            input.advance_to(&ahead);
+-        } else {
+-            scan_expr(input)?;
++            args.unnamed = true;
+         }
+-
+-        if let Some(begin_unnamed) = begin_unnamed {
+-            if args.first_unnamed.is_none() {
+-                args.first_unnamed = Some(between(&begin_unnamed, input));
++        if *syn_full.get_or_insert_with(is_syn_full) {
++            let ahead = input.fork();
++            if ahead.parse::<Expr>().is_ok() {
++                input.advance_to(&ahead);
++                continue;
+             }
+         }
++        scan_expr(input)?;
+     }
+ 
+     Ok(args)
+@@ -199,7 +178,7 @@ fn try_explicit_named_args(input: ParseStream) -> Result<FmtArguments> {
+ fn fallback_explicit_named_args(input: ParseStream) -> Result<FmtArguments> {
+     let mut args = FmtArguments {
+         named: Set::new(),
+-        first_unnamed: None,
++        unnamed: false,
+     };
+ 
+     while !input.is_empty() {
+@@ -261,29 +240,3 @@ fn take_ident<'a>(read: &mut &'a str) -> &'a str {
+     *read = rest;
+     ident
+ }
+-
+-fn between<'a>(begin: ParseStream<'a>, end: ParseStream<'a>) -> TokenStream {
+-    let end = end.cursor();
+-    let mut cursor = begin.cursor();
+-    let mut tokens = TokenStream::new();
+-
+-    while cursor < end {
+-        let (tt, next) = cursor.token_tree().unwrap();
+-
+-        if end < next {
+-            if let Some((inside, _span, _after)) = cursor.group(Delimiter::None) {
+-                cursor = inside;
+-                continue;
+-            }
+-            if tokens.is_empty() {
+-                tokens.extend(iter::once(tt));
+-            }
+-            break;
+-        }
+-
+-        tokens.extend(iter::once(tt));
+-        cursor = next;
+-    }
+-
+-    tokens
+-}
+diff --git a/src/lib.rs b/src/lib.rs
+index e8b014c..30715fe 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -67,7 +67,7 @@
+ //!   #
+ //!   #[derive(Error, Debug)]
+ //!   pub enum Error {
+-//!       #[error("invalid rdo_lookahead_frames {0} (expected < {max})", max = i32::MAX)]
++//!       #[error("invalid rdo_lookahead_frames {0} (expected < {})", i32::MAX)]
+ //!       InvalidLookahead(u32),
+ //!   }
+ //!   ```
+diff --git a/tests/test_display.rs b/tests/test_display.rs
+index 91fe9e0..27bb72c 100644
+--- a/tests/test_display.rs
++++ b/tests/test_display.rs
+@@ -131,7 +131,7 @@ fn test_nested() {
+ #[test]
+ fn test_match() {
+     #[derive(Error, Debug)]
+-    #[error("{intro}: {0}", intro = match .1 {
++    #[error("{}: {0}", match .1 {
+         Some(n) => format!("error occurred with {}", n),
+         None => "there was an empty error".to_owned(),
+     })]
+diff --git a/tests/ui/numbered-positional-tuple.rs b/tests/ui/numbered-positional-tuple.rs
+deleted file mode 100644
+index 6deb658..0000000
+--- a/tests/ui/numbered-positional-tuple.rs
++++ /dev/null
+@@ -1,7 +0,0 @@
+-use thiserror::Error;
+-
+-#[derive(Error, Debug)]
+-#[error("invalid rdo_lookahead_frames {0} (expected < {})", i32::MAX)]
+-pub struct Error(u32);
+-
+-fn main() {}
+diff --git a/tests/ui/numbered-positional-tuple.stderr b/tests/ui/numbered-positional-tuple.stderr
+deleted file mode 100644
+index ab13371..0000000
+--- a/tests/ui/numbered-positional-tuple.stderr
++++ /dev/null
+@@ -1,5 +0,0 @@
+-error: ambiguous reference to positional arguments by number in a tuple struct; change this to a named argument
+- --> tests/ui/numbered-positional-tuple.rs:4:61
+-  |
+-4 | #[error("invalid rdo_lookahead_frames {0} (expected < {})", i32::MAX)]
+-  |                                                             ^^^^^^^^

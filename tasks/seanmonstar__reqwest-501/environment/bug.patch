@@ -1,0 +1,283 @@
+diff --git a/src/async_impl/client.rs b/src/async_impl/client.rs
+index f9a4ce2..7703715 100644
+--- a/src/async_impl/client.rs
++++ b/src/async_impl/client.rs
+@@ -26,7 +26,6 @@ use hyper::client::ResponseFuture;
+ use mime;
+ #[cfg(feature = "default-tls")]
+ use native_tls::TlsConnector;
+-use tokio::{clock, timer::Delay};
+ 
+ 
+ use super::request::{Request, RequestBuilder};
+@@ -213,15 +212,14 @@ impl ClientBuilder {
+ 
+         Ok(Client {
+             inner: Arc::new(ClientRef {
+-                cookie_store,
+                 gzip: config.gzip,
+                 hyper: hyper_client,
+                 headers: config.headers,
+                 redirect_policy: config.redirect_policy,
+                 referer: config.referer,
+-                request_timeout: config.timeout,
+                 proxies,
+                 proxies_maybe_http_auth,
++                cookie_store,
+             }),
+         })
+     }
+@@ -343,20 +341,16 @@ impl ClientBuilder {
+         self
+     }
+ 
+-    /// Enables a request timeout.
+-    ///
+-    /// The timeout is applied from the when the request starts connecting
+-    /// until the response headers are received. Bodies are not affected.
+-    ///
+-    /// Default is no timeout.
++    // Currently not used, so hide from docs.
++    #[doc(hidden)]
+     pub fn timeout(mut self, timeout: Duration) -> ClientBuilder {
+         self.config.timeout = Some(timeout);
+         self
+     }
+ 
+     /// Sets the maximum idle connection per host allowed in the pool.
+-    ///
+-    /// Default is usize::MAX (no limit).
++    //
++    // Default is usize::MAX (no limit).
+     pub fn max_idle_per_host(mut self, max: usize) -> ClientBuilder {
+         self.config.max_idle_per_host = max;
+         self
+@@ -591,10 +585,6 @@ impl Client {
+ 
+         let in_flight = self.inner.hyper.request(req);
+ 
+-        let timeout = self.inner.request_timeout.map(|dur| {
+-            Delay::new(clock::now() + dur)
+-        });
+-
+         Pending {
+             inner: PendingInner::Request(PendingRequest {
+                 method: method,
+@@ -607,7 +597,6 @@ impl Client {
+                 client: self.inner.clone(),
+ 
+                 in_flight: in_flight,
+-                timeout,
+             }),
+         }
+     }
+@@ -665,18 +654,17 @@ impl fmt::Debug for ClientBuilder {
+ }
+ 
+ struct ClientRef {
+-    cookie_store: Option<RwLock<cookie::CookieStore>>,
+     gzip: bool,
+     headers: HeaderMap,
+     hyper: HyperClient,
+     redirect_policy: RedirectPolicy,
+     referer: bool,
+-    request_timeout: Option<Duration>,
+     proxies: Arc<Vec<Proxy>>,
+     proxies_maybe_http_auth: bool,
++    cookie_store: Option<RwLock<cookie::CookieStore>>,
+ }
+ 
+-pub(super) struct Pending {
++pub struct Pending {
+     inner: PendingInner,
+ }
+ 
+@@ -696,7 +684,6 @@ struct PendingRequest {
+     client: Arc<ClientRef>,
+ 
+     in_flight: ResponseFuture,
+-    timeout: Option<Delay>,
+ }
+ 
+ impl Pending {
+@@ -724,12 +711,6 @@ impl Future for PendingRequest {
+     type Error = ::Error;
+ 
+     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+-        if let Some(ref mut delay) = self.timeout {
+-            if let Async::Ready(()) = try_!(delay.poll(), &self.url) {
+-                return Err(::error::timedout(Some(self.url.clone())));
+-            }
+-        }
+-
+         loop {
+             let res = match try_!(self.in_flight.poll(), &self.url) {
+                 Async::Ready(res) => res,
+diff --git a/src/error.rs b/src/error.rs
+index a9241e6..b7e88f2 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -150,8 +150,7 @@ impl Error {
+             Kind::RedirectLoop |
+             Kind::ClientError(_) |
+             Kind::ServerError(_) |
+-            Kind::UnknownProxyScheme |
+-            Kind::Timer => None,
++            Kind::UnknownProxyScheme => None,
+         }
+     }
+ 
+@@ -276,7 +275,6 @@ impl fmt::Display for Error {
+                 fmt::Display::fmt(code, f)
+             }
+             Kind::UnknownProxyScheme => f.write_str("Unknown proxy scheme"),
+-            Kind::Timer => f.write_str("timer unavailable"),
+         }
+     }
+ }
+@@ -305,7 +303,6 @@ impl StdError for Error {
+             Kind::ClientError(_) => "Client Error",
+             Kind::ServerError(_) => "Server Error",
+             Kind::UnknownProxyScheme => "Unknown proxy scheme",
+-            Kind::Timer => "timer unavailable",
+         }
+     }
+ 
+@@ -332,8 +329,7 @@ impl StdError for Error {
+             Kind::RedirectLoop |
+             Kind::ClientError(_) |
+             Kind::ServerError(_) |
+-            Kind::UnknownProxyScheme |
+-            Kind::Timer => None,
++            Kind::UnknownProxyScheme => None,
+         }
+     }
+ }
+@@ -361,7 +357,6 @@ pub(crate) enum Kind {
+     ClientError(StatusCode),
+     ServerError(StatusCode),
+     UnknownProxyScheme,
+-    Timer,
+ }
+ 
+ 
+@@ -438,12 +433,6 @@ where T: Into<Kind> {
+     }
+ }
+ 
+-impl From<::tokio::timer::Error> for Kind {
+-    fn from(_err: ::tokio::timer::Error) -> Kind {
+-        Kind::Timer
+-    }
+-}
+-
+ fn io_timeout() -> io::Error {
+     io::Error::new(io::ErrorKind::TimedOut, "timed out")
+ }
+diff --git a/tests/async.rs b/tests/async.rs
+index e944606..7c30e12 100644
+--- a/tests/async.rs
++++ b/tests/async.rs
+@@ -7,27 +7,24 @@ extern crate tokio;
+ #[macro_use]
+ mod support;
+ 
+-use std::io::Write;
+-use std::time::Duration;
+-
+-use futures::{Future, Stream};
+-use tokio::runtime::current_thread::Runtime;
+-
+ use reqwest::async::Client;
+ use reqwest::async::multipart::{Form, Part};
++use futures::{Future, Stream};
++use std::io::Write;
++use std::time::Duration;
+ 
+ #[test]
+-fn gzip_response() {
+-    gzip_case(10_000, 4096);
++fn async_test_gzip_response() {
++    test_gzip(10_000, 4096);
+ }
+ 
+ #[test]
+-fn gzip_single_byte_chunks() {
+-    gzip_case(10, 1);
++fn async_test_gzip_single_byte_chunks() {
++    test_gzip(10, 1);
+ }
+ 
+ #[test]
+-fn multipart() {
++fn async_test_multipart() {
+     let _ = env_logger::try_init();
+ 
+     let stream = futures::stream::once::<_, hyper::Error>(Ok(hyper::Chunk::from("part1 part2".to_owned())));
+@@ -81,7 +78,7 @@ fn multipart() {
+ 
+     let url = format!("http://{}/multipart/1", server.addr());
+ 
+-    let mut rt = Runtime::new().expect("new rt");
++    let mut rt = tokio::runtime::current_thread::Runtime::new().expect("new rt");
+ 
+     let client = Client::new();
+ 
+@@ -98,47 +95,7 @@ fn multipart() {
+     rt.block_on(res_future).unwrap();
+ }
+ 
+-#[test]
+-fn request_timeout() {
+-    let _ = env_logger::try_init();
+-
+-    let server = server! {
+-        request: b"\
+-            GET /slow HTTP/1.1\r\n\
+-            user-agent: $USERAGENT\r\n\
+-            accept: */*\r\n\
+-            accept-encoding: gzip\r\n\
+-            host: $HOST\r\n\
+-            \r\n\
+-            ",
+-        response: b"\
+-            HTTP/1.1 200 OK\r\n\
+-            Content-Length: 5\r\n\
+-            \r\n\
+-            Hello\
+-            ",
+-        read_timeout: Duration::from_secs(2)
+-    };
+-
+-    let mut rt = Runtime::new().expect("new rt");
+-
+-    let client = Client::builder()
+-        .timeout(Duration::from_millis(500))
+-        .build()
+-        .unwrap();
+-
+-    let url = format!("http://{}/slow", server.addr());
+-    let fut = client
+-        .get(&url)
+-        .send();
+-
+-    let err = rt.block_on(fut).unwrap_err();
+-
+-    assert!(err.is_timeout());
+-    assert_eq!(err.url().map(|u| u.as_str()), Some(url.as_str()));
+-}
+-
+-fn gzip_case(response_size: usize, chunk_size: usize) {
++fn test_gzip(response_size: usize, chunk_size: usize) {
+     let content: String = (0..response_size).into_iter().map(|i| format!("test {}", i)).collect();
+     let mut encoder = ::libflate::gzip::Encoder::new(Vec::new()).unwrap();
+     match encoder.write(content.as_bytes()) {
+@@ -171,7 +128,7 @@ fn gzip_case(response_size: usize, chunk_size: usize) {
+         response: response
+     };
+ 
+-    let mut rt = Runtime::new().expect("new rt");
++    let mut rt = tokio::runtime::current_thread::Runtime::new().expect("new rt");
+ 
+     let client = Client::new();
+ 

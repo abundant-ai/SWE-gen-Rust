@@ -1,0 +1,198 @@
+diff --git a/axum-extra/src/routing/resource.rs b/axum-extra/src/routing/resource.rs
+index 2ab3b9d9..697d312e 100644
+--- a/axum-extra/src/routing/resource.rs
++++ b/axum-extra/src/routing/resource.rs
+@@ -109,7 +109,10 @@ where
+         T: 'static,
+     {
+         let path = self.show_update_destroy_path();
+-        self.route(&path, on(MethodFilter::PUT | MethodFilter::PATCH, handler))
++        self.route(
++            &path,
++            on(MethodFilter::PUT.or(MethodFilter::PATCH), handler),
++        )
+     }
+ 
+     /// Add a handler at `DELETE /{resource_name}/:{resource_name}_id`.
+diff --git a/axum/CHANGELOG.md b/axum/CHANGELOG.md
+index b0b9c68f..2ea35c09 100644
+--- a/axum/CHANGELOG.md
++++ b/axum/CHANGELOG.md
+@@ -55,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ - **fixed:** Don't remove the `Sec-WebSocket-Key` header in `WebSocketUpgrade` ([#1972])
+ - **added:** Add `axum::extract::Query::try_from_uri` ([#2058])
+ - **added:** Implement `IntoResponse` for `Box<str>` and `Box<[u8]>` ([#2035])
++- **breaking:** Simplify `MethodFilter`. It no longer uses bitflags ([#2073])
+ 
+ [#1664]: https://github.com/tokio-rs/axum/pull/1664
+ [#1751]: https://github.com/tokio-rs/axum/pull/1751
+@@ -66,6 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ [#1956]: https://github.com/tokio-rs/axum/pull/1956
+ [#1972]: https://github.com/tokio-rs/axum/pull/1972
+ [#2058]: https://github.com/tokio-rs/axum/pull/2058
++[#2073]: https://github.com/tokio-rs/axum/pull/2073
+ 
+ # 0.6.17 (25. April, 2023)
+ 
+diff --git a/axum/Cargo.toml b/axum/Cargo.toml
+index 7fa7af7e..7cd575fb 100644
+--- a/axum/Cargo.toml
++++ b/axum/Cargo.toml
+@@ -33,7 +33,6 @@ __private_docs = ["tower/full", "dep:tower-http"]
+ [dependencies]
+ async-trait = "0.1.67"
+ axum-core = { path = "../axum-core", version = "0.3.4" }
+-bitflags = "1.0"
+ bytes = "1.0"
+ futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+ http = "0.2.9"
+diff --git a/axum/src/form.rs b/axum/src/form.rs
+index 7258f60c..cd30f0e8 100644
+--- a/axum/src/form.rs
++++ b/axum/src/form.rs
+@@ -235,7 +235,7 @@ mod tests {
+         let app = Router::new().route(
+             "/",
+             on(
+-                MethodFilter::GET | MethodFilter::POST,
++                MethodFilter::GET.or(MethodFilter::POST),
+                 |_: Form<Payload>| async {},
+             ),
+         );
+diff --git a/axum/src/response/sse.rs b/axum/src/response/sse.rs
+index 3f849b92..55947f1b 100644
+--- a/axum/src/response/sse.rs
++++ b/axum/src/response/sse.rs
+@@ -372,13 +372,35 @@ impl Event {
+     }
+ }
+ 
+-bitflags::bitflags! {
+-    #[derive(Default)]
+-    struct EventFlags: u8 {
+-        const HAS_DATA  = 0b0001;
+-        const HAS_EVENT = 0b0010;
+-        const HAS_RETRY = 0b0100;
+-        const HAS_ID    = 0b1000;
++#[derive(Default, Debug, Copy, Clone, PartialEq)]
++struct EventFlags(u8);
++
++impl EventFlags {
++    const HAS_DATA: Self = Self::from_bits(0b0001);
++    const HAS_EVENT: Self = Self::from_bits(0b0010);
++    const HAS_RETRY: Self = Self::from_bits(0b0100);
++    const HAS_ID: Self = Self::from_bits(0b1000);
++
++    const fn bits(&self) -> u8 {
++        let bits = self;
++        bits.0
++    }
++
++    const fn from_bits(bits: u8) -> Self {
++        let bits = bits;
++        Self(bits)
++    }
++
++    const fn contains(&self, other: Self) -> bool {
++        let same = self;
++        let other = other;
++        same.bits() & other.bits() == other.bits()
++    }
++
++    fn insert(&mut self, other: Self) {
++        let same = self;
++        let other = other;
++        *same = Self::from_bits(same.bits() | other.bits());
+     }
+ }
+ 
+diff --git a/axum/src/routing/method_filter.rs b/axum/src/routing/method_filter.rs
+index ca9b0c06..227ad7bc 100644
+--- a/axum/src/routing/method_filter.rs
++++ b/axum/src/routing/method_filter.rs
+@@ -1,29 +1,50 @@
+-use bitflags::bitflags;
+ use http::Method;
+ use std::{
+     fmt,
+     fmt::{Debug, Formatter},
+ };
+ 
+-bitflags! {
+-    /// A filter that matches one or more HTTP methods.
+-    pub struct MethodFilter: u16 {
+-        /// Match `DELETE` requests.
+-        const DELETE =  0b000000010;
+-        /// Match `GET` requests.
+-        const GET =     0b000000100;
+-        /// Match `HEAD` requests.
+-        const HEAD =    0b000001000;
+-        /// Match `OPTIONS` requests.
+-        const OPTIONS = 0b000010000;
+-        /// Match `PATCH` requests.
+-        const PATCH =   0b000100000;
+-        /// Match `POST` requests.
+-        const POST =    0b001000000;
+-        /// Match `PUT` requests.
+-        const PUT =     0b010000000;
+-        /// Match `TRACE` requests.
+-        const TRACE =   0b100000000;
++/// A filter that matches one or more HTTP methods.
++#[derive(Debug, Copy, Clone, PartialEq)]
++pub struct MethodFilter(u16);
++
++impl MethodFilter {
++    /// Match `DELETE` requests.
++    pub const DELETE: Self = Self::from_bits(0b000000010);
++    /// Match `GET` requests.
++    pub const GET: Self = Self::from_bits(0b000000100);
++    /// Match `HEAD` requests.
++    pub const HEAD: Self = Self::from_bits(0b000001000);
++    /// Match `OPTIONS` requests.
++    pub const OPTIONS: Self = Self::from_bits(0b000010000);
++    /// Match `PATCH` requests.
++    pub const PATCH: Self = Self::from_bits(0b000100000);
++    /// Match `POST` requests.
++    pub const POST: Self = Self::from_bits(0b001000000);
++    /// Match `PUT` requests.
++    pub const PUT: Self = Self::from_bits(0b010000000);
++    /// Match `TRACE` requests.
++    pub const TRACE: Self = Self::from_bits(0b100000000);
++
++    const fn bits(&self) -> u16 {
++        let bits = self;
++        bits.0
++    }
++
++    const fn from_bits(bits: u16) -> Self {
++        let bits = bits;
++        Self(bits)
++    }
++
++    pub(crate) const fn contains(&self, other: Self) -> bool {
++        let same = self;
++        let other = other;
++        same.bits() & other.bits() == other.bits()
++    }
++
++    /// Performs the OR operation between the [`MethodFilter`] in `self` with `other`.
++    pub const fn or(self, other: Self) -> Self {
++        Self(self.0 | other.0)
+     }
+ }
+ 
+diff --git a/deny.toml b/deny.toml
+index 23347652..8f8c1940 100644
+--- a/deny.toml
++++ b/deny.toml
+@@ -28,7 +28,9 @@ skip-tree = [
+     # until 1.0 is out we're pulling in both 0.14 and 1.0-rc.x
+     { name = "hyper" },
+     # pulled in by tracing-subscriber
+-    { name = "regex-syntax" }
++    { name = "regex-syntax" },
++    # pulled in by tracing-subscriber
++    { name = "regex-automata" },
+ ]
+ 
+ [sources]

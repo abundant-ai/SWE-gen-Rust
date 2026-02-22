@@ -1,0 +1,653 @@
+diff --git a/src/compile_fail/must_use.rs b/src/compile_fail/must_use.rs
+index 4ffe44c..7a92f8c 100644
+--- a/src/compile_fail/must_use.rs
++++ b/src/compile_fail/must_use.rs
+@@ -39,9 +39,7 @@ must_use! {
+     filter              /** v.par_iter().filter(|_| true); */
+     filter_map          /** v.par_iter().filter_map(|x| *x); */
+     flat_map            /** v.par_iter().flat_map(|x| *x); */
+-    flat_map_iter       /** v.par_iter().flat_map_iter(|x| *x); */
+     flatten             /** v.par_iter().flatten(); */
+-    flatten_iter        /** v.par_iter().flatten_iter(); */
+     fold                /** v.par_iter().fold(|| 0, |x, _| x); */
+     fold_with           /** v.par_iter().fold_with(0, |x, _| x); */
+     try_fold            /** v.par_iter().try_fold(|| 0, |x, _| Some(x)); */
+diff --git a/src/iter/flat_map.rs b/src/iter/flat_map.rs
+index f264e1e..66f95c0 100644
+--- a/src/iter/flat_map.rs
++++ b/src/iter/flat_map.rs
+@@ -3,7 +3,7 @@ use super::*;
+ 
+ use std::fmt::{self, Debug};
+ 
+-/// `FlatMap` maps each element to a parallel iterator, then flattens these iterators together.
++/// `FlatMap` maps each element to an iterator, then flattens these iterators together.
+ /// This struct is created by the [`flat_map()`] method on [`ParallelIterator`]
+ ///
+ /// [`flat_map()`]: trait.ParallelIterator.html#method.flat_map
+@@ -40,7 +40,10 @@ where
+     where
+         C: UnindexedConsumer<Self::Item>,
+     {
+-        let consumer = FlatMapConsumer::new(consumer, &self.map_op);
++        let consumer = FlatMapConsumer {
++            base: consumer,
++            map_op: &self.map_op,
++        };
+         self.base.drive_unindexed(consumer)
+     }
+ }
+@@ -123,9 +126,10 @@ where
+     fn consume(self, item: T) -> Self {
+         let map_op = self.map_op;
+         let par_iter = map_op(item).into_par_iter();
+-        let consumer = self.base.split_off_left();
+-        let result = par_iter.drive_unindexed(consumer);
++        let result = par_iter.drive_unindexed(self.base.split_off_left());
+ 
++        // We expect that `previous` is `None`, because we drive
++        // the cost up so high, but just in case.
+         let previous = match self.previous {
+             None => Some(result),
+             Some(previous) => {
+diff --git a/src/iter/flat_map_iter.rs b/src/iter/flat_map_iter.rs
+deleted file mode 100644
+index c76cf68..0000000
+--- a/src/iter/flat_map_iter.rs
++++ /dev/null
+@@ -1,147 +0,0 @@
+-use super::plumbing::*;
+-use super::*;
+-
+-use std::fmt::{self, Debug};
+-
+-/// `FlatMapIter` maps each element to a serial iterator, then flattens these iterators together.
+-/// This struct is created by the [`flat_map_iter()`] method on [`ParallelIterator`]
+-///
+-/// [`flat_map_iter()`]: trait.ParallelIterator.html#method.flat_map_iter
+-/// [`ParallelIterator`]: trait.ParallelIterator.html
+-#[must_use = "iterator adaptors are lazy and do nothing unless consumed"]
+-#[derive(Clone)]
+-pub struct FlatMapIter<I: ParallelIterator, F> {
+-    base: I,
+-    map_op: F,
+-}
+-
+-impl<I: ParallelIterator + Debug, F> Debug for FlatMapIter<I, F> {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        f.debug_struct("FlatMapIter")
+-            .field("base", &self.base)
+-            .finish()
+-    }
+-}
+-
+-impl<I: ParallelIterator, F> FlatMapIter<I, F> {
+-    /// Creates a new `FlatMapIter` iterator.
+-    pub(super) fn new(base: I, map_op: F) -> Self {
+-        FlatMapIter { base, map_op }
+-    }
+-}
+-
+-impl<I, F, SI> ParallelIterator for FlatMapIter<I, F>
+-where
+-    I: ParallelIterator,
+-    F: Fn(I::Item) -> SI + Sync + Send,
+-    SI: IntoIterator,
+-    SI::Item: Send,
+-{
+-    type Item = SI::Item;
+-
+-    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+-    where
+-        C: UnindexedConsumer<Self::Item>,
+-    {
+-        let consumer = FlatMapIterConsumer::new(consumer, &self.map_op);
+-        self.base.drive_unindexed(consumer)
+-    }
+-}
+-
+-/// ////////////////////////////////////////////////////////////////////////
+-/// Consumer implementation
+-
+-struct FlatMapIterConsumer<'f, C, F> {
+-    base: C,
+-    map_op: &'f F,
+-}
+-
+-impl<'f, C, F> FlatMapIterConsumer<'f, C, F> {
+-    fn new(base: C, map_op: &'f F) -> Self {
+-        FlatMapIterConsumer { base, map_op }
+-    }
+-}
+-
+-impl<'f, T, U, C, F> Consumer<T> for FlatMapIterConsumer<'f, C, F>
+-where
+-    C: UnindexedConsumer<U::Item>,
+-    F: Fn(T) -> U + Sync,
+-    U: IntoIterator,
+-{
+-    type Folder = FlatMapIterFolder<'f, C::Folder, F>;
+-    type Reducer = C::Reducer;
+-    type Result = C::Result;
+-
+-    fn split_at(self, index: usize) -> (Self, Self, C::Reducer) {
+-        let (left, right, reducer) = self.base.split_at(index);
+-        (
+-            FlatMapIterConsumer::new(left, self.map_op),
+-            FlatMapIterConsumer::new(right, self.map_op),
+-            reducer,
+-        )
+-    }
+-
+-    fn into_folder(self) -> Self::Folder {
+-        FlatMapIterFolder {
+-            base: self.base.into_folder(),
+-            map_op: self.map_op,
+-        }
+-    }
+-
+-    fn full(&self) -> bool {
+-        self.base.full()
+-    }
+-}
+-
+-impl<'f, T, U, C, F> UnindexedConsumer<T> for FlatMapIterConsumer<'f, C, F>
+-where
+-    C: UnindexedConsumer<U::Item>,
+-    F: Fn(T) -> U + Sync,
+-    U: IntoIterator,
+-{
+-    fn split_off_left(&self) -> Self {
+-        FlatMapIterConsumer::new(self.base.split_off_left(), self.map_op)
+-    }
+-
+-    fn to_reducer(&self) -> Self::Reducer {
+-        self.base.to_reducer()
+-    }
+-}
+-
+-struct FlatMapIterFolder<'f, C, F> {
+-    base: C,
+-    map_op: &'f F,
+-}
+-
+-impl<'f, T, U, C, F> Folder<T> for FlatMapIterFolder<'f, C, F>
+-where
+-    C: Folder<U::Item>,
+-    F: Fn(T) -> U,
+-    U: IntoIterator,
+-{
+-    type Result = C::Result;
+-
+-    fn consume(self, item: T) -> Self {
+-        let map_op = self.map_op;
+-        let base = self.base.consume_iter(map_op(item));
+-        FlatMapIterFolder { base, map_op }
+-    }
+-
+-    fn consume_iter<I>(self, iter: I) -> Self
+-    where
+-        I: IntoIterator<Item = T>,
+-    {
+-        let map_op = self.map_op;
+-        let iter = iter.into_iter().flat_map(map_op);
+-        let base = self.base.consume_iter(iter);
+-        FlatMapIterFolder { base, map_op }
+-    }
+-
+-    fn complete(self) -> Self::Result {
+-        self.base.complete()
+-    }
+-
+-    fn full(&self) -> bool {
+-        self.base.full()
+-    }
+-}
+diff --git a/src/iter/flatten.rs b/src/iter/flatten.rs
+index 29d88f9..8fb4e08 100644
+--- a/src/iter/flatten.rs
++++ b/src/iter/flatten.rs
+@@ -1,8 +1,9 @@
+ use super::plumbing::*;
+ use super::*;
+ 
+-/// `Flatten` turns each element to a parallel iterator, then flattens these iterators
+-/// together. This struct is created by the [`flatten()`] method on [`ParallelIterator`].
++/// `Flatten` turns each element to an iterator, then flattens these iterators
++/// together. This struct is created by the [`flatten()`] method on
++/// [`ParallelIterator`].
+ ///
+ /// [`flatten()`]: trait.ParallelIterator.html#method.flatten
+ /// [`ParallelIterator`]: trait.ParallelIterator.html
+@@ -12,10 +13,10 @@ pub struct Flatten<I: ParallelIterator> {
+     base: I,
+ }
+ 
+-impl<I> Flatten<I>
++impl<I, PI> Flatten<I>
+ where
+-    I: ParallelIterator,
+-    I::Item: IntoParallelIterator,
++    I: ParallelIterator<Item = PI>,
++    PI: IntoParallelIterator + Send,
+ {
+     /// Creates a new `Flatten` iterator.
+     pub(super) fn new(base: I) -> Self {
+@@ -23,118 +24,21 @@ where
+     }
+ }
+ 
+-impl<I> ParallelIterator for Flatten<I>
++impl<I, PI> ParallelIterator for Flatten<I>
+ where
+-    I: ParallelIterator,
+-    I::Item: IntoParallelIterator,
++    I: ParallelIterator<Item = PI>,
++    PI: IntoParallelIterator + Send,
+ {
+-    type Item = <I::Item as IntoParallelIterator>::Item;
++    type Item = PI::Item;
+ 
+     fn drive_unindexed<C>(self, consumer: C) -> C::Result
+     where
+         C: UnindexedConsumer<Self::Item>,
+     {
+-        let consumer = FlattenConsumer::new(consumer);
+-        self.base.drive_unindexed(consumer)
+-    }
+-}
+-
+-/// ////////////////////////////////////////////////////////////////////////
+-/// Consumer implementation
+-
+-struct FlattenConsumer<C> {
+-    base: C,
+-}
+-
+-impl<C> FlattenConsumer<C> {
+-    fn new(base: C) -> Self {
+-        FlattenConsumer { base }
+-    }
+-}
+-
+-impl<T, C> Consumer<T> for FlattenConsumer<C>
+-where
+-    C: UnindexedConsumer<T::Item>,
+-    T: IntoParallelIterator,
+-{
+-    type Folder = FlattenFolder<C, C::Result>;
+-    type Reducer = C::Reducer;
+-    type Result = C::Result;
+-
+-    fn split_at(self, index: usize) -> (Self, Self, C::Reducer) {
+-        let (left, right, reducer) = self.base.split_at(index);
+-        (
+-            FlattenConsumer::new(left),
+-            FlattenConsumer::new(right),
+-            reducer,
+-        )
+-    }
+-
+-    fn into_folder(self) -> Self::Folder {
+-        FlattenFolder {
+-            base: self.base,
+-            previous: None,
+-        }
+-    }
+-
+-    fn full(&self) -> bool {
+-        self.base.full()
+-    }
+-}
+-
+-impl<T, C> UnindexedConsumer<T> for FlattenConsumer<C>
+-where
+-    C: UnindexedConsumer<T::Item>,
+-    T: IntoParallelIterator,
+-{
+-    fn split_off_left(&self) -> Self {
+-        FlattenConsumer::new(self.base.split_off_left())
+-    }
+-
+-    fn to_reducer(&self) -> Self::Reducer {
+-        self.base.to_reducer()
+-    }
+-}
+-
+-struct FlattenFolder<C, R> {
+-    base: C,
+-    previous: Option<R>,
+-}
+-
+-impl<T, C> Folder<T> for FlattenFolder<C, C::Result>
+-where
+-    C: UnindexedConsumer<T::Item>,
+-    T: IntoParallelIterator,
+-{
+-    type Result = C::Result;
+-
+-    fn consume(self, item: T) -> Self {
+-        let par_iter = item.into_par_iter();
+-        let consumer = self.base.split_off_left();
+-        let result = par_iter.drive_unindexed(consumer);
+-
+-        let previous = match self.previous {
+-            None => Some(result),
+-            Some(previous) => {
+-                let reducer = self.base.to_reducer();
+-                Some(reducer.reduce(previous, result))
+-            }
+-        };
+-
+-        FlattenFolder {
+-            base: self.base,
+-            previous,
++        fn id<T>(x: T) -> T {
++            x
+         }
+-    }
+-
+-    fn complete(self) -> Self::Result {
+-        match self.previous {
+-            Some(previous) => previous,
+-            None => self.base.into_folder().complete(),
+-        }
+-    }
+ 
+-    fn full(&self) -> bool {
+-        self.base.full()
++        self.base.flat_map(id).drive_unindexed(consumer)
+     }
+ }
+diff --git a/src/iter/flatten_iter.rs b/src/iter/flatten_iter.rs
+deleted file mode 100644
+index 3ce0a3c..0000000
+--- a/src/iter/flatten_iter.rs
++++ /dev/null
+@@ -1,132 +0,0 @@
+-use super::plumbing::*;
+-use super::*;
+-
+-/// `FlattenIter` turns each element to a serial iterator, then flattens these iterators
+-/// together. This struct is created by the [`flatten_iter()`] method on [`ParallelIterator`].
+-///
+-/// [`flatten_iter()`]: trait.ParallelIterator.html#method.flatten_iter
+-/// [`ParallelIterator`]: trait.ParallelIterator.html
+-#[must_use = "iterator adaptors are lazy and do nothing unless consumed"]
+-#[derive(Debug, Clone)]
+-pub struct FlattenIter<I: ParallelIterator> {
+-    base: I,
+-}
+-
+-impl<I> FlattenIter<I>
+-where
+-    I: ParallelIterator,
+-    I::Item: IntoIterator,
+-    <I::Item as IntoIterator>::Item: Send,
+-{
+-    /// Creates a new `FlattenIter` iterator.
+-    pub(super) fn new(base: I) -> Self {
+-        FlattenIter { base }
+-    }
+-}
+-
+-impl<I> ParallelIterator for FlattenIter<I>
+-where
+-    I: ParallelIterator,
+-    I::Item: IntoIterator,
+-    <I::Item as IntoIterator>::Item: Send,
+-{
+-    type Item = <I::Item as IntoIterator>::Item;
+-
+-    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+-    where
+-        C: UnindexedConsumer<Self::Item>,
+-    {
+-        let consumer = FlattenIterConsumer::new(consumer);
+-        self.base.drive_unindexed(consumer)
+-    }
+-}
+-
+-/// ////////////////////////////////////////////////////////////////////////
+-/// Consumer implementation
+-
+-struct FlattenIterConsumer<C> {
+-    base: C,
+-}
+-
+-impl<C> FlattenIterConsumer<C> {
+-    fn new(base: C) -> Self {
+-        FlattenIterConsumer { base }
+-    }
+-}
+-
+-impl<T, C> Consumer<T> for FlattenIterConsumer<C>
+-where
+-    C: UnindexedConsumer<T::Item>,
+-    T: IntoIterator,
+-{
+-    type Folder = FlattenIterFolder<C::Folder>;
+-    type Reducer = C::Reducer;
+-    type Result = C::Result;
+-
+-    fn split_at(self, index: usize) -> (Self, Self, C::Reducer) {
+-        let (left, right, reducer) = self.base.split_at(index);
+-        (
+-            FlattenIterConsumer::new(left),
+-            FlattenIterConsumer::new(right),
+-            reducer,
+-        )
+-    }
+-
+-    fn into_folder(self) -> Self::Folder {
+-        FlattenIterFolder {
+-            base: self.base.into_folder(),
+-        }
+-    }
+-
+-    fn full(&self) -> bool {
+-        self.base.full()
+-    }
+-}
+-
+-impl<T, C> UnindexedConsumer<T> for FlattenIterConsumer<C>
+-where
+-    C: UnindexedConsumer<T::Item>,
+-    T: IntoIterator,
+-{
+-    fn split_off_left(&self) -> Self {
+-        FlattenIterConsumer::new(self.base.split_off_left())
+-    }
+-
+-    fn to_reducer(&self) -> Self::Reducer {
+-        self.base.to_reducer()
+-    }
+-}
+-
+-struct FlattenIterFolder<C> {
+-    base: C,
+-}
+-
+-impl<T, C> Folder<T> for FlattenIterFolder<C>
+-where
+-    C: Folder<T::Item>,
+-    T: IntoIterator,
+-{
+-    type Result = C::Result;
+-
+-    fn consume(self, item: T) -> Self {
+-        let base = self.base.consume_iter(item);
+-        FlattenIterFolder { base }
+-    }
+-
+-    fn consume_iter<I>(self, iter: I) -> Self
+-    where
+-        I: IntoIterator<Item = T>,
+-    {
+-        let iter = iter.into_iter().flatten();
+-        let base = self.base.consume_iter(iter);
+-        FlattenIterFolder { base }
+-    }
+-
+-    fn complete(self) -> Self::Result {
+-        self.base.complete()
+-    }
+-
+-    fn full(&self) -> bool {
+-        self.base.full()
+-    }
+-}
+diff --git a/src/iter/mod.rs b/src/iter/mod.rs
+index 48305a7..ff4c5dd 100644
+--- a/src/iter/mod.rs
++++ b/src/iter/mod.rs
+@@ -115,9 +115,7 @@ mod filter_map;
+ mod find;
+ mod find_first_last;
+ mod flat_map;
+-mod flat_map_iter;
+ mod flatten;
+-mod flatten_iter;
+ mod fold;
+ mod for_each;
+ mod from_par_iter;
+@@ -160,9 +158,7 @@ pub use self::{
+     filter::Filter,
+     filter_map::FilterMap,
+     flat_map::FlatMap,
+-    flat_map_iter::FlatMapIter,
+     flatten::Flatten,
+-    flatten_iter::FlattenIter,
+     fold::{Fold, FoldWith},
+     inspect::Inspect,
+     interleave::Interleave,
+@@ -823,10 +819,8 @@ pub trait ParallelIterator: Sized + Send {
+         FilterMap::new(self, filter_op)
+     }
+ 
+-    /// Applies `map_op` to each item of this iterator to get nested parallel iterators,
+-    /// producing a new parallel iterator that flattens these back into one.
+-    ///
+-    /// See also [`flat_map_iter`](#method.flat_map_iter).
++    /// Applies `map_op` to each item of this iterator to get nested iterators,
++    /// producing a new iterator that flattens these back into one.
+     ///
+     /// # Examples
+     ///
+@@ -849,56 +843,7 @@ pub trait ParallelIterator: Sized + Send {
+         FlatMap::new(self, map_op)
+     }
+ 
+-    /// Applies `map_op` to each item of this iterator to get nested serial iterators,
+-    /// producing a new parallel iterator that flattens these back into one.
+-    ///
+-    /// # `flat_map_iter` versus `flat_map`
+-    ///
+-    /// These two methods are similar but behave slightly differently. With [`flat_map`],
+-    /// each of the nested iterators must be a parallel iterator, and they will be further
+-    /// split up with nested parallelism. With `flat_map_iter`, each nested iterator is a
+-    /// sequential `Iterator`, and we only parallelize _between_ them, while the items
+-    /// produced by each nested iterator are processed sequentially.
+-    ///
+-    /// When choosing between these methods, consider whether nested parallelism suits the
+-    /// potential iterators at hand. If there's little computation involved, or its length
+-    /// is much less than the outer parallel iterator, then it may perform better to avoid
+-    /// the overhead of parallelism, just flattening sequentially with `flat_map_iter`.
+-    /// If there is a lot of computation, potentially outweighing the outer parallel
+-    /// iterator, then the nested parallelism of `flat_map` may be worthwhile.
+-    ///
+-    /// [`flat_map`]: #method.flat_map
+-    ///
+-    /// # Examples
+-    ///
+-    /// ```
+-    /// use rayon::prelude::*;
+-    /// use std::cell::RefCell;
+-    ///
+-    /// let a = [[1, 2], [3, 4], [5, 6], [7, 8]];
+-    ///
+-    /// let par_iter = a.par_iter().flat_map_iter(|a| {
+-    ///     // The serial iterator doesn't have to be thread-safe, just its items.
+-    ///     let cell_iter = RefCell::new(a.iter().cloned());
+-    ///     std::iter::from_fn(move || cell_iter.borrow_mut().next())
+-    /// });
+-    ///
+-    /// let vec: Vec<_> = par_iter.collect();
+-    ///
+-    /// assert_eq!(&vec[..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+-    /// ```
+-    fn flat_map_iter<F, SI>(self, map_op: F) -> FlatMapIter<Self, F>
+-    where
+-        F: Fn(Self::Item) -> SI + Sync + Send,
+-        SI: IntoIterator,
+-        SI::Item: Send,
+-    {
+-        FlatMapIter::new(self, map_op)
+-    }
+-
+-    /// An adaptor that flattens parallel-iterable `Item`s into one large iterator.
+-    ///
+-    /// See also [`flatten_iter`](#method.flatten_iter).
++    /// An adaptor that flattens iterable `Item`s into one large iterator
+     ///
+     /// # Examples
+     ///
+@@ -917,30 +862,6 @@ pub trait ParallelIterator: Sized + Send {
+         Flatten::new(self)
+     }
+ 
+-    /// An adaptor that flattens serial-iterable `Item`s into one large iterator.
+-    ///
+-    /// See also [`flatten`](#method.flatten) and the analagous comparison of
+-    /// [`flat_map_iter` versus `flat_map`](#flat_map_iter-versus-flat_map).
+-    ///
+-    /// # Examples
+-    ///
+-    /// ```
+-    /// use rayon::prelude::*;
+-    ///
+-    /// let x: Vec<Vec<_>> = vec![vec![1, 2], vec![3, 4]];
+-    /// let iters: Vec<_> = x.into_iter().map(Vec::into_iter).collect();
+-    /// let y: Vec<_> = iters.into_par_iter().flatten_iter().collect();
+-    ///
+-    /// assert_eq!(y, vec![1, 2, 3, 4]);
+-    /// ```
+-    fn flatten_iter(self) -> FlattenIter<Self>
+-    where
+-        Self::Item: IntoIterator,
+-        <Self::Item as IntoIterator>::Item: Send,
+-    {
+-        FlattenIter::new(self)
+-    }
+-
+     /// Reduces the items in the iterator into one item using `op`.
+     /// The argument `identity` should be a closure that can produce
+     /// "identity" value which may be inserted into the sequence as
+diff --git a/tests/clones.rs b/tests/clones.rs
+index d78c25c..b158fef 100644
+--- a/tests/clones.rs
++++ b/tests/clones.rs
+@@ -117,9 +117,7 @@ fn clone_adaptors() {
+     check(v.par_iter().filter(|_| true));
+     check(v.par_iter().filter_map(|x| *x));
+     check(v.par_iter().flat_map(|x| *x));
+-    check(v.par_iter().flat_map_iter(|x| *x));
+     check(v.par_iter().flatten());
+-    check(v.par_iter().flatten_iter());
+     check(v.par_iter().with_max_len(1).fold(|| 0, |x, _| x));
+     check(v.par_iter().with_max_len(1).fold_with(0, |x, _| x));
+     check(v.par_iter().with_max_len(1).try_fold(|| 0, |_, &x| x));
+diff --git a/tests/debug.rs b/tests/debug.rs
+index a87f949..843c0ac 100644
+--- a/tests/debug.rs
++++ b/tests/debug.rs
+@@ -129,9 +129,7 @@ fn debug_adaptors() {
+     check(v.par_iter().filter(|_| true));
+     check(v.par_iter().filter_map(Some));
+     check(v.par_iter().flat_map(Some));
+-    check(v.par_iter().flat_map_iter(Some));
+     check(v.par_iter().map(Some).flatten());
+-    check(v.par_iter().map(Some).flatten_iter());
+     check(v.par_iter().fold(|| 0, |x, _| x));
+     check(v.par_iter().fold_with(0, |x, _| x));
+     check(v.par_iter().try_fold(|| 0, |x, _| Some(x)));

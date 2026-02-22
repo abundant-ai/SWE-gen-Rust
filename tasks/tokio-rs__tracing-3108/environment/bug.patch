@@ -1,0 +1,375 @@
+diff --git a/tracing-attributes/src/expand.rs b/tracing-attributes/src/expand.rs
+index 01389a3f..f01c12a1 100644
+--- a/tracing-attributes/src/expand.rs
++++ b/tracing-attributes/src/expand.rs
+@@ -1,7 +1,6 @@
+ use std::iter;
+ 
+ use proc_macro2::TokenStream;
+-use quote::TokenStreamExt;
+ use quote::{quote, quote_spanned, ToTokens};
+ use syn::visit_mut::VisitMut;
+ use syn::{
+@@ -30,7 +29,6 @@ pub(crate) fn gen_function<'a, B: ToTokens + 'a>(
+         inner_attrs,
+         vis,
+         sig,
+-        brace_token,
+         block,
+     } = input;
+ 
+@@ -46,12 +44,9 @@ pub(crate) fn gen_function<'a, B: ToTokens + 'a>(
+             syn::Generics {
+                 params: gen_params,
+                 where_clause,
+-                lt_token,
+-                gt_token,
++                ..
+             },
+-        fn_token,
+-        paren_token,
+-        variadic,
++        ..
+     } = sig;
+ 
+     let warnings = args.warnings();
+@@ -70,14 +65,9 @@ pub(crate) fn gen_function<'a, B: ToTokens + 'a>(
+     // exactly that way for it to do its magic.
+     let fake_return_edge = quote_spanned! {return_span=>
+         #[allow(
+-            unknown_lints,
+-            unreachable_code,
+-            clippy::diverging_sub_expression,
+-            clippy::empty_loop,
+-            clippy::let_unit_value,
+-            clippy::let_with_type_underscore,
+-            clippy::needless_return,
+-            clippy::unreachable
++            unknown_lints, unreachable_code, clippy::diverging_sub_expression,
++            clippy::let_unit_value, clippy::unreachable, clippy::let_with_type_underscore,
++            clippy::empty_loop
+         )]
+         if false {
+             let __tracing_attr_fake_return: #return_type = loop {};
+@@ -100,27 +90,16 @@ pub(crate) fn gen_function<'a, B: ToTokens + 'a>(
+         self_type,
+     );
+ 
+-    let mut result = quote!(
++    quote!(
+         #(#outer_attrs) *
+-        #vis #constness #asyncness #unsafety #abi #fn_token #ident
+-        #lt_token #gen_params #gt_token
+-    );
+-
+-    paren_token.surround(&mut result, |tokens| {
+-        params.to_tokens(tokens);
+-        variadic.to_tokens(tokens);
+-    });
+-
+-    output.to_tokens(&mut result);
+-    where_clause.to_tokens(&mut result);
+-
+-    brace_token.surround(&mut result, |tokens| {
+-        tokens.append_all(inner_attrs);
+-        warnings.to_tokens(tokens);
+-        body.to_tokens(tokens);
+-    });
+-
+-    result
++        #vis #constness #asyncness #unsafety #abi fn #ident<#gen_params>(#params) #output
++        #where_clause
++        {
++            #(#inner_attrs) *
++            #warnings
++            #body
++        }
++    )
+ }
+ 
+ /// Instrument a block
+diff --git a/tracing-attributes/src/lib.rs b/tracing-attributes/src/lib.rs
+index 71910d9a..372a8393 100644
+--- a/tracing-attributes/src/lib.rs
++++ b/tracing-attributes/src/lib.rs
+@@ -80,10 +80,8 @@
+ )]
+ 
+ use proc_macro2::TokenStream;
+-use quote::TokenStreamExt;
+ use quote::{quote, ToTokens};
+ use syn::parse::{Parse, ParseStream};
+-use syn::token::Brace;
+ use syn::{Attribute, ItemFn, Signature, Visibility};
+ 
+ mod attr;
+@@ -430,7 +428,6 @@ struct MaybeItemFn {
+     inner_attrs: Vec<Attribute>,
+     vis: Visibility,
+     sig: Signature,
+-    brace_token: Brace,
+     block: TokenStream,
+ }
+ 
+@@ -441,7 +438,6 @@ impl MaybeItemFn {
+             inner_attrs: &self.inner_attrs,
+             vis: &self.vis,
+             sig: &self.sig,
+-            brace_token: &self.brace_token,
+             block: &self.block,
+         }
+     }
+@@ -455,15 +451,12 @@ impl Parse for MaybeItemFn {
+         let vis: Visibility = input.parse()?;
+         let sig: Signature = input.parse()?;
+         let inner_attrs = input.call(Attribute::parse_inner)?;
+-        let block;
+-        let brace_token = syn::braced!(block in input);
+-        let block: TokenStream = block.call(|buffer| buffer.parse())?;
++        let block: TokenStream = input.parse()?;
+         Ok(Self {
+             outer_attrs,
+             inner_attrs,
+             vis,
+             sig,
+-            brace_token,
+             block,
+         })
+     }
+@@ -481,15 +474,12 @@ impl From<ItemFn> for MaybeItemFn {
+         let (outer_attrs, inner_attrs) = attrs
+             .into_iter()
+             .partition(|attr| attr.style == syn::AttrStyle::Outer);
+-        let mut block_tokens = TokenStream::new();
+-        block_tokens.append_all(block.stmts);
+         Self {
+             outer_attrs,
+             inner_attrs,
+             vis,
+             sig,
+-            brace_token: block.brace_token,
+-            block: block_tokens,
++            block: block.to_token_stream(),
+         }
+     }
+ }
+@@ -502,6 +492,5 @@ struct MaybeItemFnRef<'a, B: ToTokens> {
+     inner_attrs: &'a Vec<Attribute>,
+     vis: &'a Visibility,
+     sig: &'a Signature,
+-    brace_token: &'a Brace,
+     block: &'a B,
+ }
+diff --git a/tracing-attributes/tests/async_fn.rs b/tracing-attributes/tests/async_fn.rs
+index 437adfa7..31d705c6 100644
+--- a/tracing-attributes/tests/async_fn.rs
++++ b/tracing-attributes/tests/async_fn.rs
+@@ -30,17 +30,14 @@ async fn test_ret_impl_trait_err(n: i32) -> Result<impl Iterator<Item = i32>, &'
+ }
+ 
+ #[instrument]
+-#[allow(dead_code)]
+ async fn test_async_fn_empty() {}
+ 
+ #[instrument]
+-#[allow(dead_code)]
+ async unsafe fn test_async_unsafe_fn_empty() {}
+ 
+ // Reproduces a compile error when an instrumented function body contains inner
+ // attributes (https://github.com/tokio-rs/tracing/issues/2294).
+ #[deny(unused_variables)]
+-#[allow(dead_code, clippy::mixed_attributes_style)]
+ #[instrument]
+ async fn repro_async_2294() {
+     #![allow(unused_variables)]
+@@ -53,7 +50,6 @@ async fn repro_async_2294() {
+ // with the rustfmt-generated formatting, the lint will not be triggered!
+ #[rustfmt::skip]
+ #[deny(clippy::suspicious_else_formatting)]
+-#[allow(dead_code)]
+ async fn repro_1613(var: bool) {
+     println!(
+         "{}",
+@@ -65,7 +61,6 @@ async fn repro_1613(var: bool) {
+ // and https://github.com/rust-lang/rust-clippy/issues/7760
+ #[instrument]
+ #[deny(clippy::suspicious_else_formatting)]
+-#[allow(dead_code)]
+ async fn repro_1613_2() {
+     // hello world
+     // else
+diff --git a/tracing-attributes/tests/dead_code.rs b/tracing-attributes/tests/dead_code.rs
+deleted file mode 100644
+index 6a3e05d4..00000000
+--- a/tracing-attributes/tests/dead_code.rs
++++ /dev/null
+@@ -1,10 +0,0 @@
+-use tracing_attributes::instrument;
+-
+-#[deny(unfulfilled_lint_expectations)]
+-#[expect(dead_code)]
+-#[instrument]
+-fn unused() {}
+-
+-#[expect(dead_code)]
+-#[instrument]
+-async fn unused_async() {}
+diff --git a/tracing-attributes/tests/err.rs b/tracing-attributes/tests/err.rs
+index c55565b1..3ff9f056 100644
+--- a/tracing-attributes/tests/err.rs
++++ b/tracing-attributes/tests/err.rs
+@@ -15,7 +15,6 @@ fn err() -> Result<u8, TryFromIntError> {
+ }
+ 
+ #[instrument(err)]
+-#[allow(dead_code)]
+ fn err_suspicious_else() -> Result<u8, TryFromIntError> {
+     {}
+     u8::try_from(1234)
+diff --git a/tracing-attributes/tests/instrument.rs b/tracing-attributes/tests/instrument.rs
+index 30adbbd5..e4c588b7 100644
+--- a/tracing-attributes/tests/instrument.rs
++++ b/tracing-attributes/tests/instrument.rs
+@@ -6,7 +6,6 @@ use tracing_mock::*;
+ // Reproduces a compile error when an instrumented function body contains inner
+ // attributes (https://github.com/tokio-rs/tracing/issues/2294).
+ #[deny(unused_variables)]
+-#[allow(dead_code, clippy::mixed_attributes_style)]
+ #[instrument]
+ fn repro_2294() {
+     #![allow(unused_variables)]
+@@ -318,7 +317,6 @@ fn user_tracing_module() {
+ 
+     // Reproduces https://github.com/tokio-rs/tracing/issues/3119
+     #[instrument(fields(f = Empty))]
+-    #[allow(dead_code)]
+     fn my_fn() {
+         assert_eq!("test", tracing::my_other_fn());
+     }
+diff --git a/tracing-attributes/tests/ui/async_instrument.rs b/tracing-attributes/tests/ui/async_instrument.rs
+index 03b3e18a..5b245746 100644
+--- a/tracing-attributes/tests/ui/async_instrument.rs
++++ b/tracing-attributes/tests/ui/async_instrument.rs
+@@ -10,6 +10,7 @@ async fn simple_mismatch() -> String {
+     ""
+ }
+ 
++// FIXME: this span is still pretty poor
+ #[tracing::instrument]
+ async fn opaque_unsatisfied() -> impl std::fmt::Display {
+     ("",)
+diff --git a/tracing-attributes/tests/ui/async_instrument.stderr b/tracing-attributes/tests/ui/async_instrument.stderr
+index 4debb830..e0aa0d62 100644
+--- a/tracing-attributes/tests/ui/async_instrument.stderr
++++ b/tracing-attributes/tests/ui/async_instrument.stderr
+@@ -25,80 +25,77 @@ note: return type inferred to be `String` here
+    |                               ^^^^^^
+ 
+ error[E0277]: `(&str,)` doesn't implement `std::fmt::Display`
+-  --> tests/ui/async_instrument.rs:14:57
++  --> tests/ui/async_instrument.rs:14:1
+    |
+-14 |   async fn opaque_unsatisfied() -> impl std::fmt::Display {
+-   |  _________________________________________________________-
+-15 | |     ("",)
+-16 | | }
+-   | | ^
+-   | | |
+-   | |_`(&str,)` cannot be formatted with the default formatter
+-   |   return type was inferred to be `(&str,)` here
++14 | #[tracing::instrument]
++   | ^^^^^^^^^^^^^^^^^^^^^^
++   | |
++   | `(&str,)` cannot be formatted with the default formatter
++   | return type was inferred to be `(&str,)` here
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `(&str,)`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
++   = note: this error originates in the attribute macro `tracing::instrument` (in Nightly builds, run with -Z macro-backtrace for more info)
+ 
+ error[E0277]: `(&str,)` doesn't implement `std::fmt::Display`
+-  --> tests/ui/async_instrument.rs:14:34
++  --> tests/ui/async_instrument.rs:15:34
+    |
+-14 | async fn opaque_unsatisfied() -> impl std::fmt::Display {
++15 | async fn opaque_unsatisfied() -> impl std::fmt::Display {
+    |                                  ^^^^^^^^^^^^^^^^^^^^^^ `(&str,)` cannot be formatted with the default formatter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `(&str,)`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+ 
+ error[E0308]: mismatched types
+-  --> tests/ui/async_instrument.rs:22:5
++  --> tests/ui/async_instrument.rs:23:5
+    |
+-22 |     ""
++23 |     ""
+    |     ^^ expected `Wrapper<_>`, found `&str`
+    |
+    = note: expected struct `Wrapper<_>`
+            found reference `&'static str`
+ note: return type inferred to be `Wrapper<_>` here
+-  --> tests/ui/async_instrument.rs:21:36
++  --> tests/ui/async_instrument.rs:22:36
+    |
+-21 | async fn mismatch_with_opaque() -> Wrapper<impl std::fmt::Display> {
++22 | async fn mismatch_with_opaque() -> Wrapper<impl std::fmt::Display> {
+    |                                    ^^^^^^^
+ help: try wrapping the expression in `Wrapper`
+    |
+-22 |     Wrapper("")
++23 |     Wrapper("")
+    |     ++++++++  +
+ 
+ error[E0308]: mismatched types
+-  --> tests/ui/async_instrument.rs:28:16
++  --> tests/ui/async_instrument.rs:29:16
+    |
+-28 |         return "";
++29 |         return "";
+    |                ^^ expected `()`, found `&str`
+    |
+ note: return type inferred to be `()` here
+-  --> tests/ui/async_instrument.rs:26:10
++  --> tests/ui/async_instrument.rs:27:10
+    |
+-26 | async fn early_return_unit() {
++27 | async fn early_return_unit() {
+    |          ^^^^^^^^^^^^^^^^^
+ 
+ error[E0308]: mismatched types
+-  --> tests/ui/async_instrument.rs:35:16
++  --> tests/ui/async_instrument.rs:36:16
+    |
+-35 |         return "";
++36 |         return "";
+    |                ^^- help: try using a conversion method: `.to_string()`
+    |                |
+    |                expected `String`, found `&str`
+    |
+ note: return type inferred to be `String` here
+-  --> tests/ui/async_instrument.rs:33:28
++  --> tests/ui/async_instrument.rs:34:28
+    |
+-33 | async fn early_return() -> String {
++34 | async fn early_return() -> String {
+    |                            ^^^^^^
+ 
+ error[E0308]: mismatched types
+-  --> tests/ui/async_instrument.rs:40:1
+-   |
+-40 | #[tracing::instrument]
+-   | ^^^^^^^^^^^^^^^^^^^^^^ expected `i32`, found `()`
+-41 | async fn extra_semicolon() -> i32 {
+-42 |     1;
+-   |      - help: remove this semicolon to return this value
+-   |
+-   = note: this error originates in the attribute macro `tracing::instrument` (in Nightly builds, run with -Z macro-backtrace for more info)
++  --> tests/ui/async_instrument.rs:42:35
++   |
++42 |   async fn extra_semicolon() -> i32 {
++   |  ___________________________________^
++43 | |     1;
++   | |      - help: remove this semicolon to return this value
++44 | | }
++   | |_^ expected `i32`, found `()`

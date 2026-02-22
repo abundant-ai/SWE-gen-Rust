@@ -1,0 +1,108 @@
+diff --git a/crates/ide-db/src/imports/insert_use.rs b/crates/ide-db/src/imports/insert_use.rs
+index f26952fa15..da8525d1fb 100644
+--- a/crates/ide-db/src/imports/insert_use.rs
++++ b/crates/ide-db/src/imports/insert_use.rs
+@@ -94,7 +94,7 @@ impl ImportScope {
+                     .item_list()
+                     .map(ImportScopeKind::Module)
+                     .map(|kind| ImportScope { kind, required_cfgs });
+-            } else if let Some(has_attrs) = ast::AnyHasAttrs::cast(syntax) {
++            } else if let Some(has_attrs) = ast::AnyHasAttrs::cast(syntax.clone()) {
+                 if block.is_none()
+                     && let Some(b) = ast::BlockExpr::cast(has_attrs.syntax().clone())
+                     && let Some(b) = sema.original_ast_node(b)
+@@ -105,11 +105,34 @@ impl ImportScope {
+                     .attrs()
+                     .any(|attr| attr.as_simple_call().is_some_and(|(ident, _)| ident == "cfg"))
+                 {
+-                    if let Some(b) = block {
+-                        return Some(ImportScope {
+-                            kind: ImportScopeKind::Block(b),
+-                            required_cfgs,
++                    if let Some(b) = block.clone() {
++                        let current_cfgs = has_attrs.attrs().filter(|attr| {
++                            attr.as_simple_call().is_some_and(|(ident, _)| ident == "cfg")
+                         });
++
++                        let total_cfgs: Vec<_> =
++                            required_cfgs.iter().cloned().chain(current_cfgs).collect();
++
++                        let parent = syntax.parent();
++                        let mut can_merge = false;
++                        if let Some(parent) = parent {
++                            can_merge = parent.children().filter_map(ast::Use::cast).any(|u| {
++                                let u_attrs = u.attrs().filter(|attr| {
++                                    attr.as_simple_call().is_some_and(|(ident, _)| ident == "cfg")
++                                });
++                                crate::imports::merge_imports::eq_attrs(
++                                    u_attrs,
++                                    total_cfgs.iter().cloned(),
++                                )
++                            });
++                        }
++
++                        if !can_merge {
++                            return Some(ImportScope {
++                                kind: ImportScopeKind::Block(b),
++                                required_cfgs,
++                            });
++                        }
+                     }
+                     required_cfgs.extend(has_attrs.attrs().filter(|attr| {
+                         attr.as_simple_call().is_some_and(|(ident, _)| ident == "cfg")
+@@ -546,7 +569,9 @@ fn insert_use_(scope: &ImportScope, use_item: ast::Use, group_imports: bool) {
+         // skip the curly brace
+         .skip(l_curly.is_some() as usize)
+         .take_while(|child| match child {
+-            NodeOrToken::Node(node) => is_inner_attribute(node.clone()),
++            NodeOrToken::Node(node) => {
++                is_inner_attribute(node.clone()) && ast::Item::cast(node.clone()).is_none()
++            }
+             NodeOrToken::Token(token) => {
+                 [SyntaxKind::WHITESPACE, SyntaxKind::COMMENT, SyntaxKind::SHEBANG]
+                     .contains(&token.kind())
+@@ -667,7 +692,9 @@ fn insert_use_with_editor_(
+         // skip the curly brace
+         .skip(l_curly.is_some() as usize)
+         .take_while(|child| match child {
+-            NodeOrToken::Node(node) => is_inner_attribute(node.clone()),
++            NodeOrToken::Node(node) => {
++                is_inner_attribute(node.clone()) && ast::Item::cast(node.clone()).is_none()
++            }
+             NodeOrToken::Token(token) => {
+                 [SyntaxKind::WHITESPACE, SyntaxKind::COMMENT, SyntaxKind::SHEBANG]
+                     .contains(&token.kind())
+diff --git a/crates/ide-db/src/imports/merge_imports.rs b/crates/ide-db/src/imports/merge_imports.rs
+index 635ed7368c..3301719f5c 100644
+--- a/crates/ide-db/src/imports/merge_imports.rs
++++ b/crates/ide-db/src/imports/merge_imports.rs
+@@ -4,7 +4,7 @@ use std::cmp::Ordering;
+ use itertools::{EitherOrBoth, Itertools};
+ use parser::T;
+ use syntax::{
+-    Direction, SyntaxElement, algo,
++    Direction, SyntaxElement, ToSmolStr, algo,
+     ast::{
+         self, AstNode, HasAttrs, HasName, HasVisibility, PathSegmentKind, edit_in_place::Removable,
+         make,
+@@ -691,14 +691,12 @@ pub fn eq_attrs(
+     attrs0: impl Iterator<Item = ast::Attr>,
+     attrs1: impl Iterator<Item = ast::Attr>,
+ ) -> bool {
+-    // FIXME order of attributes should not matter
+-    let attrs0 = attrs0
+-        .flat_map(|attr| attr.syntax().descendants_with_tokens())
+-        .flat_map(|it| it.into_token());
+-    let attrs1 = attrs1
+-        .flat_map(|attr| attr.syntax().descendants_with_tokens())
+-        .flat_map(|it| it.into_token());
+-    stdx::iter_eq_by(attrs0, attrs1, |tok, tok2| tok.text() == tok2.text())
++    let mut attrs0: Vec<_> = attrs0.map(|attr| attr.syntax().text().to_smolstr()).collect();
++    let mut attrs1: Vec<_> = attrs1.map(|attr| attr.syntax().text().to_smolstr()).collect();
++    attrs0.sort_unstable();
++    attrs1.sort_unstable();
++
++    attrs0 == attrs1
+ }
+ 
+ fn path_is_self(path: &ast::Path) -> bool {

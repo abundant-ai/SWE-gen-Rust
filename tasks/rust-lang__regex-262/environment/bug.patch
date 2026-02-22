@@ -1,0 +1,517 @@
+diff --git a/regex-syntax/src/lib.rs b/regex-syntax/src/lib.rs
+index ee96045..3aaab9a 100644
+--- a/regex-syntax/src/lib.rs
++++ b/regex-syntax/src/lib.rs
+@@ -1336,9 +1336,6 @@ pub enum ErrorKind {
+     /// This never returned if the parser is permitted to allow expressions
+     /// that match arbitrary bytes.
+     InvalidUtf8,
+-    /// A character class was constructed such that it is empty.
+-    /// e.g., `[^\d\D]`.
+-    EmptyClass,
+     /// Hints that destructuring should not be exhaustive.
+     ///
+     /// This enum may grow additional variants, so this makes sure clients
+@@ -1401,7 +1398,6 @@ impl ErrorKind {
+             FlagNotAllowed(_) => "flag not allowed",
+             UnicodeNotAllowed => "Unicode features not allowed",
+             InvalidUtf8 => "matching arbitrary bytes is not allowed",
+-            EmptyClass => "empty character class",
+             __Nonexhaustive => unreachable!(),
+         }
+     }
+@@ -1511,8 +1507,6 @@ impl fmt::Display for ErrorKind {
+                            (u) flag is not set."),
+             InvalidUtf8 =>
+                 write!(f, "Matching arbitrary bytes is not allowed."),
+-            EmptyClass =>
+-                write!(f, "Empty character classes are not allowed."),
+             __Nonexhaustive => unreachable!(),
+         }
+     }
+diff --git a/regex-syntax/src/parser.rs b/regex-syntax/src/parser.rs
+index 1d10572..29bc483 100644
+--- a/regex-syntax/src/parser.rs
++++ b/regex-syntax/src/parser.rs
+@@ -581,18 +581,12 @@ impl Parser {
+                     _ => unreachable!(),
+                 },
+                 start => {
+-                    if !self.flags.unicode {
+-                        let _ = try!(self.codepoint_to_one_byte(start));
+-                    }
+                     self.bump();
+                     try!(self.parse_class_range(&mut class, start));
+                 }
+             }
+         }
+         class = self.class_transform(negated, class).canonicalize();
+-        if class.is_empty() {
+-            return Err(self.err(ErrorKind::EmptyClass));
+-        }
+         Ok(Build::Expr(if self.flags.unicode {
+             Expr::Class(class)
+         } else {
+@@ -645,13 +639,7 @@ impl Parser {
+                 // Because `parse_escape` can never return `LeftParen`.
+                 _ => unreachable!(),
+             },
+-            _ => {
+-                let c = self.bump();
+-                if !self.flags.unicode {
+-                    let _ = try!(self.codepoint_to_one_byte(c));
+-                }
+-                c
+-            }
++            _ => self.bump(),
+         };
+         if end < start {
+             // e.g., [z-a]
+@@ -1289,7 +1277,7 @@ mod tests {
+         ErrorKind,
+     };
+     use unicode::regex::{PERLD, PERLS, PERLW};
+-    use super::{LOWER, UPPER, WORD, Flags, Parser, ascii_class};
++    use super::{LOWER, UPPER, Flags, Parser, ascii_class};
+ 
+     static YI: &'static [(char, char)] = &[
+         ('\u{a000}', '\u{a48c}'), ('\u{a490}', '\u{a4c6}'),
+@@ -2014,8 +2002,6 @@ mod tests {
+ 
+         assert_eq!(pb(r"(?-u)[a]"), Expr::ClassBytes(bclass(&[(b'a', b'a')])));
+         assert_eq!(pb(r"(?-u)[\x00]"), Expr::ClassBytes(bclass(&[(0, 0)])));
+-        assert_eq!(pb(r"(?-u)[\xFF]"),
+-                   Expr::ClassBytes(bclass(&[(0xFF, 0xFF)])));
+         assert_eq!(pb("(?-u)[\n]"),
+                    Expr::ClassBytes(bclass(&[(b'\n', b'\n')])));
+         assert_eq!(pb(r"(?-u)[\n]"),
+@@ -2141,10 +2127,10 @@ mod tests {
+ 
+     #[test]
+     fn class_multiple_class_negate_negate() {
+-        let nperlw = class(PERLW).negate();
++        let nperld = class(PERLD).negate();
+         let nyi = class(YI).negate();
+-        let cls = CharClass::empty().merge(nperlw).merge(nyi);
+-        assert_eq!(p(r"[^\W\P{Yi}]"), Expr::Class(cls.negate()));
++        let cls = CharClass::empty().merge(nperld).merge(nyi);
++        assert_eq!(p(r"[^\D\P{Yi}]"), Expr::Class(cls.negate()));
+     }
+ 
+     #[test]
+@@ -2163,10 +2149,10 @@ mod tests {
+ 
+     #[test]
+     fn class_multiple_class_negate_negate_casei() {
+-        let nperlw = class(PERLW).negate();
++        let nperld = class(PERLD).negate();
+         let nyi = class(YI).negate();
+-        let class = CharClass::empty().merge(nperlw).merge(nyi);
+-        assert_eq!(p(r"(?i)[^\W\P{Yi}]"),
++        let class = CharClass::empty().merge(nperld).merge(nyi);
++        assert_eq!(p(r"(?i)[^\D\P{Yi}]"),
+                    Expr::Class(class.case_fold().negate()));
+     }
+ 
+@@ -2250,10 +2236,10 @@ mod tests {
+ 
+     #[test]
+     fn ascii_classes_negate_multiple() {
+-        let (nlower, nword) = (class(LOWER).negate(), class(WORD).negate());
+-        let cls = CharClass::empty().merge(nlower).merge(nword);
+-        assert_eq!(p("[[:^lower:][:^word:]]"), Expr::Class(cls.clone()));
+-        assert_eq!(p("[^[:^lower:][:^word:]]"), Expr::Class(cls.negate()));
++        let (nlower, nupper) = (class(LOWER).negate(), class(UPPER).negate());
++        let cls = CharClass::empty().merge(nlower).merge(nupper);
++        assert_eq!(p("[[:^lower:][:^upper:]]"), Expr::Class(cls.clone()));
++        assert_eq!(p("[^[:^lower:][:^upper:]]"), Expr::Class(cls.negate()));
+     }
+ 
+     #[test]
+@@ -2416,13 +2402,6 @@ mod tests {
+         test_err!(r"☃(?-u:\pL)", 9, ErrorKind::UnicodeNotAllowed, flags);
+     }
+ 
+-    #[test]
+-    fn unicode_class_literal_not_allowed() {
+-        let flags = Flags { allow_bytes: true, .. Flags::default() };
+-        test_err!(r"(?-u)[☃]", 6, ErrorKind::UnicodeNotAllowed, flags);
+-        test_err!(r"(?-u)[☃-☃]", 6, ErrorKind::UnicodeNotAllowed, flags);
+-    }
+-
+     #[test]
+     fn unicode_hex_not_allowed() {
+         let flags = Flags { allow_bytes: true, .. Flags::default() };
+@@ -2746,7 +2725,6 @@ mod tests {
+     fn error_class_empty_range() {
+         test_err!("[]", 2, ErrorKind::UnexpectedClassEof);
+         test_err!("[^]", 3, ErrorKind::UnexpectedClassEof);
+-        test_err!(r"[^\d\D]", 7, ErrorKind::EmptyClass);
+     }
+ 
+     #[test]
+diff --git a/src/backtrack.rs b/src/backtrack.rs
+index 3c06254..b0e0e02 100644
+--- a/src/backtrack.rs
++++ b/src/backtrack.rs
+@@ -242,7 +242,9 @@ impl<'a, 'm, 'r, 's, I: Input> Bounded<'a, 'm, 'r, 's, I> {
+                     ip = inst.goto1;
+                 }
+                 EmptyLook(ref inst) => {
+-                    if self.input.is_empty_match(at, inst) {
++                    let prev = self.input.previous_char(at);
++                    let next = self.input.next_char(at);
++                    if inst.matches(prev, next) {
+                         ip = inst.goto;
+                     } else {
+                         return false;
+diff --git a/src/compile.rs b/src/compile.rs
+index 9db743f..32df4b3 100644
+--- a/src/compile.rs
++++ b/src/compile.rs
+@@ -372,7 +372,6 @@ impl Compiler {
+     }
+ 
+     fn c_class(&mut self, ranges: &[ClassRange]) -> Result {
+-        assert!(!ranges.is_empty());
+         if self.compiled.uses_bytes() {
+             CompileClass {
+                 c: self,
+diff --git a/src/dfa.rs b/src/dfa.rs
+index 0216f25..d216f2c 100644
+--- a/src/dfa.rs
++++ b/src/dfa.rs
+@@ -1847,7 +1847,7 @@ mod tests {
+             expected == got && state.flags() == StateFlags(flags)
+         }
+         QuickCheck::new()
+-            .gen(StdGen::new(self::rand::thread_rng(), 10_000))
++            .gen(StdGen::new(self::rand::thread_rng(), 70_000))
+             .quickcheck(p as fn(Vec<u32>, u8) -> bool);
+     }
+ 
+diff --git a/src/exec.rs b/src/exec.rs
+index 65a3935..87c3e84 100644
+--- a/src/exec.rs
++++ b/src/exec.rs
+@@ -589,11 +589,7 @@ impl<'c> ExecNoSync<'c> {
+                 lits.find_start(&text[start..])
+                     .map(|(s, e)| (start + s, start + e))
+             }
+-            AnchoredEnd => {
+-                let lits = &self.ro.suffixes;
+-                lits.find_end(&text[start..])
+-                    .map(|(s, e)| (start + s, start + e))
+-            }
++            AnchoredEnd => self.ro.suffixes.find_end(&text),
+         }
+     }
+ 
+@@ -921,7 +917,7 @@ impl<'c> ExecNoSync<'c> {
+                 matches,
+                 slots,
+                 quit_after_match,
+-                ByteInput::new(text, self.ro.nfa.only_utf8),
++                ByteInput::new(text),
+                 start)
+         } else {
+             pikevm::Fsm::exec(
+@@ -949,7 +945,7 @@ impl<'c> ExecNoSync<'c> {
+                 &self.cache,
+                 matches,
+                 slots,
+-                ByteInput::new(text, self.ro.nfa.only_utf8),
++                ByteInput::new(text),
+                 start)
+         } else {
+             backtrack::Bounded::exec(
+diff --git a/src/input.rs b/src/input.rs
+index a8547d5..f96a6be 100644
+--- a/src/input.rs
++++ b/src/input.rs
+@@ -16,9 +16,8 @@ use std::u32;
+ 
+ use syntax;
+ 
+-use literals::LiteralSearcher;
+-use prog::InstEmptyLook;
+ use utf8::{decode_utf8, decode_last_utf8};
++use literals::LiteralSearcher;
+ 
+ /// Represents a location in the input.
+ #[derive(Clone, Copy, Debug)]
+@@ -84,10 +83,6 @@ pub trait Input {
+     /// If no such character could be decoded, then `Char` is absent.
+     fn previous_char(&self, at: InputAt) -> Char;
+ 
+-    /// Return true if the given empty width instruction matches at the
+-    /// input position given.
+-    fn is_empty_match(&self, at: InputAt, empty: &InstEmptyLook) -> bool;
+-
+     /// Scan the input for a matching prefix.
+     fn prefix_at(
+         &self,
+@@ -109,10 +104,6 @@ impl<'a, T: Input> Input for &'a T {
+ 
+     fn previous_char(&self, at: InputAt) -> Char { (**self).previous_char(at) }
+ 
+-    fn is_empty_match(&self, at: InputAt, empty: &InstEmptyLook) -> bool {
+-        (**self).is_empty_match(at, empty)
+-    }
+-
+     fn prefix_at(
+         &self,
+         prefixes: &LiteralSearcher,
+@@ -164,38 +155,6 @@ impl<'t> Input for CharInput<'t> {
+         decode_last_utf8(&self[..at.pos()]).map(|(c, _)| c).into()
+     }
+ 
+-    fn is_empty_match(&self, at: InputAt, empty: &InstEmptyLook) -> bool {
+-        use prog::EmptyLook::*;
+-        match empty.look {
+-            StartLine => {
+-                let c = self.previous_char(at);
+-                c.is_none() || c == '\n'
+-            }
+-            EndLine => {
+-                let c = self.next_char(at);
+-                c.is_none() || c == '\n'
+-            }
+-            StartText => self.previous_char(at).is_none(),
+-            EndText => self.next_char(at).is_none(),
+-            WordBoundary => {
+-                let (c1, c2) = (self.previous_char(at), self.next_char(at));
+-                c1.is_word_char() != c2.is_word_char()
+-            }
+-            NotWordBoundary => {
+-                let (c1, c2) = (self.previous_char(at), self.next_char(at));
+-                c1.is_word_char() == c2.is_word_char()
+-            }
+-            WordBoundaryAscii => {
+-                let (c1, c2) = (self.previous_char(at), self.next_char(at));
+-                c1.is_word_byte() != c2.is_word_byte()
+-            }
+-            NotWordBoundaryAscii => {
+-                let (c1, c2) = (self.previous_char(at), self.next_char(at));
+-                c1.is_word_byte() == c2.is_word_byte()
+-            }
+-        }
+-    }
+-
+     fn prefix_at(
+         &self,
+         prefixes: &LiteralSearcher,
+@@ -219,18 +178,12 @@ impl<'t> Input for CharInput<'t> {
+ /// easy access to necessary Unicode decoding (used for word boundary look
+ /// ahead/look behind).
+ #[derive(Clone, Copy, Debug)]
+-pub struct ByteInput<'t> {
+-    text: &'t [u8],
+-    only_utf8: bool,
+-}
++pub struct ByteInput<'t>(&'t [u8]);
+ 
+ impl<'t> ByteInput<'t> {
+     /// Return a new byte-based input reader for the given string.
+-    pub fn new(text: &'t [u8], only_utf8: bool) -> ByteInput<'t> {
+-        ByteInput {
+-            text: text,
+-            only_utf8: only_utf8,
+-        }
++    pub fn new(s: &'t [u8]) -> ByteInput<'t> {
++        ByteInput(s)
+     }
+ }
+ 
+@@ -238,7 +191,7 @@ impl<'t> ops::Deref for ByteInput<'t> {
+     type Target = [u8];
+ 
+     fn deref(&self) -> &[u8] {
+-        self.text
++        self.0
+     }
+ }
+ 
+@@ -260,58 +213,6 @@ impl<'t> Input for ByteInput<'t> {
+         decode_last_utf8(&self[..at.pos()]).map(|(c, _)| c).into()
+     }
+ 
+-    fn is_empty_match(&self, at: InputAt, empty: &InstEmptyLook) -> bool {
+-        use prog::EmptyLook::*;
+-        match empty.look {
+-            StartLine => {
+-                let c = self.previous_char(at);
+-                c.is_none() || c == '\n'
+-            }
+-            EndLine => {
+-                let c = self.next_char(at);
+-                c.is_none() || c == '\n'
+-            }
+-            StartText => self.previous_char(at).is_none(),
+-            EndText => self.next_char(at).is_none(),
+-            WordBoundary => {
+-                let (c1, c2) = (self.previous_char(at), self.next_char(at));
+-                c1.is_word_char() != c2.is_word_char()
+-            }
+-            NotWordBoundary => {
+-                let (c1, c2) = (self.previous_char(at), self.next_char(at));
+-                c1.is_word_char() == c2.is_word_char()
+-            }
+-            WordBoundaryAscii => {
+-                let (c1, c2) = (self.previous_char(at), self.next_char(at));
+-                if self.only_utf8 {
+-                    // If we must match UTF-8, then we can't match word
+-                    // boundaries at invalid UTF-8.
+-                    if c1.is_none() && !at.is_start() {
+-                        return false;
+-                    }
+-                    if c2.is_none() && !at.is_end() {
+-                        return false;
+-                    }
+-                }
+-                c1.is_word_byte() != c2.is_word_byte()
+-            }
+-            NotWordBoundaryAscii => {
+-                let (c1, c2) = (self.previous_char(at), self.next_char(at));
+-                if self.only_utf8 {
+-                    // If we must match UTF-8, then we can't match word
+-                    // boundaries at invalid UTF-8.
+-                    if c1.is_none() && !at.is_start() {
+-                        return false;
+-                    }
+-                    if c2.is_none() && !at.is_end() {
+-                        return false;
+-                    }
+-                }
+-                c1.is_word_byte() == c2.is_word_byte()
+-            }
+-        }
+-    }
+-
+     fn prefix_at(
+         &self,
+         prefixes: &LiteralSearcher,
+@@ -321,11 +222,11 @@ impl<'t> Input for ByteInput<'t> {
+     }
+ 
+     fn len(&self) -> usize {
+-        self.text.len()
++        self.0.len()
+     }
+ 
+     fn as_bytes(&self) -> &[u8] {
+-        &self.text
++        self.0
+     }
+ }
+ 
+@@ -375,7 +276,7 @@ impl Char {
+     pub fn is_word_byte(self) -> bool {
+         match char::from_u32(self.0) {
+             None => false,
+-            Some(c) if c <= '\u{7F}' => syntax::is_word_byte(c as u8),
++            Some(c) if c <= '\u{FF}' => syntax::is_word_byte(c as u8),
+             Some(_) => false,
+         }
+     }
+diff --git a/src/pikevm.rs b/src/pikevm.rs
+index b96f0e7..a18011b 100644
+--- a/src/pikevm.rs
++++ b/src/pikevm.rs
+@@ -322,7 +322,9 @@ impl<'r, I: Input> Fsm<'r, I> {
+             nlist.set.insert(ip);
+             match self.prog[ip] {
+                 EmptyLook(ref inst) => {
+-                    if self.input.is_empty_match(at, inst) {
++                    let prev = self.input.previous_char(at);
++                    let next = self.input.next_char(at);
++                    if inst.matches(prev, next) {
+                         ip = inst.goto;
+                     }
+                 }
+diff --git a/src/prog.rs b/src/prog.rs
+index 36f2aff..cad12fb 100644
+--- a/src/prog.rs
++++ b/src/prog.rs
+@@ -351,6 +351,24 @@ pub enum EmptyLook {
+     NotWordBoundaryAscii,
+ }
+ 
++impl InstEmptyLook {
++    /// Tests whether the pair of characters matches this zero-width
++    /// instruction.
++    pub fn matches(&self, c1: Char, c2: Char) -> bool {
++        use self::EmptyLook::*;
++        match self.look {
++            StartLine => c1.is_none() || c1 == '\n',
++            EndLine => c2.is_none() || c2 == '\n',
++            StartText => c1.is_none(),
++            EndText => c2.is_none(),
++            WordBoundary => c1.is_word_char() != c2.is_word_char(),
++            NotWordBoundary => c1.is_word_char() == c2.is_word_char(),
++            WordBoundaryAscii => c1.is_word_byte() != c2.is_word_byte(),
++            NotWordBoundaryAscii => c1.is_word_byte() == c2.is_word_byte(),
++        }
++    }
++}
++
+ /// Representation of the Char instruction.
+ #[derive(Clone, Debug)]
+ pub struct InstChar {
+diff --git a/src/re_builder.rs b/src/re_builder.rs
+index ca030b3..62f3d2d 100644
+--- a/src/re_builder.rs
++++ b/src/re_builder.rs
+@@ -67,10 +67,6 @@ impl RegexBuilder {
+     }
+ 
+     /// Consume the builder and compile the regular expression.
+-    ///
+-    /// Note that calling `as_str` on the resulting `Regex` will produce the
+-    /// pattern given to `new` verbatim. Notably, it will not incorporate any
+-    /// of the flags set on this builder.
+     pub fn compile(self) -> Result<Regex, Error> {
+         ExecBuilder::new_options(self.0)
+             .only_utf8($only_utf8)
+diff --git a/tests/api.rs b/tests/api.rs
+index 0be0329..e6c3a27 100644
+--- a/tests/api.rs
++++ b/tests/api.rs
+@@ -239,4 +239,3 @@ split!(split1, r"\s+", "a b\nc\td\n\t e",
+        &[t!("a"), t!("b"), t!("c"), t!("d"), t!("e")]);
+ split!(split2, r"\b", "a b c",
+        &[t!(""), t!("a"), t!(" "), t!("b"), t!(" "), t!("c")]);
+-split!(split3, r"a$", "a", &[t!("")]);
+diff --git a/tests/misc.rs b/tests/misc.rs
+index 293cddb..4fba750 100644
+--- a/tests/misc.rs
++++ b/tests/misc.rs
+@@ -13,7 +13,6 @@ use regex::Regex;
+ mat!(prefix_literal_match, r"^abc", r"abc", Some((0, 3)));
+ mat!(prefix_literal_nomatch, r"^abc", r"zabc", None);
+ mat!(one_literal_edge, r"abc", r"xxxxxab", None);
+-matiter!(terminates, r"a$", r"a", (0, 1));
+ 
+ #[test]
+ fn eq() {
+diff --git a/tests/word_boundary_ascii.rs b/tests/word_boundary_ascii.rs
+index 9beb7c0..c127e8a 100644
+--- a/tests/word_boundary_ascii.rs
++++ b/tests/word_boundary_ascii.rs
+@@ -2,7 +2,6 @@
+ // For Unicode word boundaries, the tests are precisely inverted.
+ matiter!(ascii1, r"\bx\b", "áxβ", (2, 3));
+ matiter!(ascii2, r"\Bx\B", "áxβ");
+-matiter!(ascii3, r"\B", "0\u{7EF5E}", (2, 2), (3, 3), (4, 4), (5, 5));
+ 
+ // We can still get Unicode mode in byte regexes.
+ matiter!(unicode1, r"(?u:\b)x(?u:\b)", "áxβ");
+diff --git a/tests/word_boundary_unicode.rs b/tests/word_boundary_unicode.rs
+index 43612a9..42bcba5 100644
+--- a/tests/word_boundary_unicode.rs
++++ b/tests/word_boundary_unicode.rs
+@@ -5,4 +5,3 @@ matiter!(unicode2, r"\Bx\B", "áxβ", (2, 3));
+ 
+ matiter!(ascii1, r"(?-u:\b)x(?-u:\b)", "áxβ", (2, 3));
+ matiter!(ascii2, r"(?-u:\B)x(?-u:\B)", "áxβ");
+-matiter!(ascii3, r"(?-u:\B)", "0\u{7EF5E}", (5, 5));

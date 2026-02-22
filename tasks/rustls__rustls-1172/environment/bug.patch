@@ -1,0 +1,767 @@
+diff --git a/README.md b/README.md
+index ebd35834..c7e2f11e 100644
+--- a/README.md
++++ b/README.md
+@@ -67,7 +67,7 @@ If you'd like to help out, please see [CONTRIBUTING.md](CONTRIBUTING.md).
+   - The minimum supported Rust version is now 1.56.0 due to several dependencies
+     requiring it.
+ * 0.20.6 (2022-05-18)
+-  - 0.20.5 included a change to track more context for the `Error::InvalidMessage`
++  - 0.20.5 included a change to track more context for the `Error::CorruptMessage`
+     which made API-incompatible changes to the `Error` type. We yanked 0.20.5
+     and have reverted that change as part of 0.20.6.
+ * 0.20.5 (2022-05-14)
+diff --git a/examples/tests/badssl.rs b/examples/tests/badssl.rs
+index ecd216ac..346862d0 100644
+--- a/examples/tests/badssl.rs
++++ b/examples/tests/badssl.rs
+@@ -101,7 +101,7 @@ mod online {
+     fn too_many_sans() {
+         connect("10000-sans.badssl.com")
+             .fails()
+-            .expect(r"TLS error: InvalidMessage\(HandshakePayloadTooLarge\)")
++            .expect(r"TLS error: CorruptMessagePayload\(Handshake\)")
+             .go()
+             .unwrap();
+     }
+diff --git a/rustls/examples/internal/bogo_shim.rs b/rustls/examples/internal/bogo_shim.rs
+index bed68cf5..e7db6a2f 100644
+--- a/rustls/examples/internal/bogo_shim.rs
++++ b/rustls/examples/internal/bogo_shim.rs
+@@ -9,7 +9,6 @@ use env_logger;
+ use rustls;
+ 
+ use rustls::internal::msgs::codec::Codec;
+-use rustls::internal::msgs::enums::KeyUpdateRequest;
+ use rustls::internal::msgs::persist;
+ use rustls::quic::{self, ClientQuicExt, QuicExt, ServerQuicExt};
+ use rustls::server::ClientHello;
+@@ -593,7 +592,7 @@ fn quit_err(why: &str) -> ! {
+ 
+ fn handle_err(err: rustls::Error) -> ! {
+     use rustls::{AlertDescription, ContentType};
+-    use rustls::{Error, InvalidMessage, PeerMisbehaved};
++    use rustls::{Error, PeerMisbehaved};
+     use std::{thread, time};
+ 
+     println!("TLS error: {:?}", err);
+@@ -611,22 +610,13 @@ fn handle_err(err: rustls::Error) -> ! {
+         Error::AlertReceived(AlertDescription::InternalError) => {
+             quit(":PEER_ALERT_INTERNAL_ERROR:")
+         }
+-        Error::InvalidMessage(InvalidMessage::MissingPayload(ContentType::Alert)) => {
+-            quit(":BAD_ALERT:")
+-        }
+-        Error::InvalidMessage(InvalidMessage::MissingPayload(ContentType::ChangeCipherSpec)) => {
++        Error::CorruptMessagePayload(ContentType::Alert) => quit(":BAD_ALERT:"),
++        Error::CorruptMessagePayload(ContentType::ChangeCipherSpec) => {
+             quit(":BAD_CHANGE_CIPHER_SPEC:")
+         }
+-        Error::InvalidMessage(InvalidMessage::MissingPayload(ContentType::Handshake)) => {
+-            quit(":BAD_HANDSHAKE_MSG:")
+-        }
+-        Error::InvalidMessage(InvalidMessage::InvalidKeyUpdate(KeyUpdateRequest::Unknown(42))) => {
+-            quit(":BAD_HANDSHAKE_MSG:")
+-        }
+-        Error::InvalidMessage(InvalidMessage::InvalidCertRequest)
+-        | Error::InvalidMessage(InvalidMessage::InvalidDhParams)
+-        | Error::InvalidMessage(InvalidMessage::MissingKeyExchange) => quit(":BAD_HANDSHAKE_MSG:"),
+-        Error::InvalidMessage(_) => quit(":GARBAGE:"),
++        Error::CorruptMessagePayload(ContentType::Handshake) => quit(":BAD_HANDSHAKE_MSG:"),
++        Error::CorruptMessagePayload(ContentType::Unknown(42)) => quit(":GARBAGE:"),
++        Error::CorruptMessage => quit(":GARBAGE:"),
+         Error::DecryptError => quit(":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:"),
+         Error::PeerIncompatible(_) => quit(":INCOMPATIBLE:"),
+         Error::PeerMisbehaved(PeerMisbehaved::TooMuchEarlyDataReceived) => {
+@@ -774,8 +764,7 @@ fn exec(opts: &Options, mut sess: Connection, count: usize) {
+             let mut one_byte = [0u8];
+             let mut cursor = io::Cursor::new(&mut one_byte[..]);
+             sess.write_tls(&mut cursor).unwrap();
+-            conn.write_all(&one_byte)
+-                .expect("IO error");
++            conn.write(&one_byte).expect("IO error");
+ 
+             quench_writes = true;
+         }
+diff --git a/rustls/src/client/tls12.rs b/rustls/src/client/tls12.rs
+index e9227008..2f8630f9 100644
+--- a/rustls/src/client/tls12.rs
++++ b/rustls/src/client/tls12.rs
+@@ -1,9 +1,8 @@
+ use crate::check::{inappropriate_handshake_message, inappropriate_message};
+ use crate::conn::{CommonState, ConnectionRandoms, Side, State};
+ use crate::enums::ProtocolVersion;
+-use crate::error::{Error, InvalidMessage, PeerMisbehaved};
++use crate::error::{Error, PeerMisbehaved};
+ use crate::hash_hs::HandshakeHash;
+-use crate::kx;
+ #[cfg(feature = "logging")]
+ use crate::log::{debug, trace};
+ use crate::msgs::base::{Payload, PayloadU8};
+@@ -23,7 +22,7 @@ use crate::suites::PartiallyExtractedSecrets;
+ use crate::suites::SupportedCipherSuite;
+ use crate::ticketer::TimeBase;
+ use crate::tls12::{self, ConnectionSecrets, Tls12CipherSuite};
+-use crate::verify;
++use crate::{kx, verify};
+ 
+ use super::client_conn::ClientConnectionData;
+ use super::hs::ClientContext;
+@@ -406,7 +405,7 @@ impl State<ClientConnectionData> for ExpectServerKx {
+             .ok_or_else(|| {
+                 cx.common
+                     .send_fatal_alert(AlertDescription::DecodeError);
+-                InvalidMessage::MissingKeyExchange
++                Error::CorruptMessagePayload(ContentType::Handshake)
+             })?;
+ 
+         // Save the signature and signed parameters for later verification.
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 86ed1cf1..9e6f1c15 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -5,7 +5,7 @@ use crate::conn::Protocol;
+ use crate::conn::Side;
+ use crate::conn::{CommonState, ConnectionRandoms, State};
+ use crate::enums::{ProtocolVersion, SignatureScheme};
+-use crate::error::{Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
++use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
+ use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
+ use crate::kx;
+ #[cfg(feature = "logging")]
+@@ -522,7 +522,7 @@ impl State<ClientConnectionData> for ExpectCertificateRequest {
+             warn!("Server sent non-empty certreq context");
+             cx.common
+                 .send_fatal_alert(AlertDescription::DecodeError);
+-            return Err(InvalidMessage::InvalidCertRequest.into());
++            return Err(Error::CorruptMessagePayload(ContentType::Handshake));
+         }
+ 
+         let tls13_sign_schemes = sign::supported_sign_tls13();
+@@ -588,7 +588,7 @@ impl State<ClientConnectionData> for ExpectCertificate {
+             warn!("certificate with non-empty context during handshake");
+             cx.common
+                 .send_fatal_alert(AlertDescription::DecodeError);
+-            return Err(InvalidMessage::InvalidCertRequest.into());
++            return Err(Error::CorruptMessagePayload(ContentType::Handshake));
+         }
+ 
+         if cert_chain.any_entry_has_duplicate_extension()
+diff --git a/rustls/src/conn.rs b/rustls/src/conn.rs
+index af30c4c0..a89ecfe8 100644
+--- a/rustls/src/conn.rs
++++ b/rustls/src/conn.rs
+@@ -1,5 +1,6 @@
+ use crate::enums::ProtocolVersion;
+ use crate::error::{Error, PeerMisbehaved};
++use crate::key;
+ #[cfg(feature = "logging")]
+ use crate::log::{debug, error, trace, warn};
+ use crate::msgs::alert::AlertMessagePayload;
+@@ -21,7 +22,6 @@ use crate::suites::{ExtractedSecrets, PartiallyExtractedSecrets};
+ #[cfg(feature = "tls12")]
+ use crate::tls12::ConnectionSecrets;
+ use crate::vecbuf::ChunkVecBuffer;
+-use crate::{key, InvalidMessage};
+ #[cfg(feature = "quic")]
+ use std::collections::VecDeque;
+ 
+@@ -666,7 +666,7 @@ impl<Data> ConnectionCommon<Data> {
+                 Ok(Some(message))
+             }
+             Ok(None) => Ok(None),
+-            Err(err @ Error::InvalidMessage(_)) => {
++            Err(err @ Error::CorruptMessage | err @ Error::CorruptMessagePayload(_)) => {
+                 #[cfg(feature = "quic")]
+                 if self.common_state.is_quic() {
+                     self.common_state.quic.alert = Some(AlertDescription::DecodeError);
+@@ -1329,7 +1329,7 @@ impl CommonState {
+             KeyUpdateRequest::UpdateRequested => Ok(self.queued_key_update_message.is_none()),
+             _ => {
+                 self.send_fatal_alert(AlertDescription::IllegalParameter);
+-                Err(InvalidMessage::InvalidKeyUpdate(*key_update_request).into())
++                Err(Error::CorruptMessagePayload(ContentType::Handshake))
+             }
+         }
+     }
+diff --git a/rustls/src/error.rs b/rustls/src/error.rs
+index 717d5861..a547ec6b 100644
+--- a/rustls/src/error.rs
++++ b/rustls/src/error.rs
+@@ -1,4 +1,4 @@
+-use crate::msgs::enums::{AlertDescription, ContentType, HandshakeType, KeyUpdateRequest};
++use crate::msgs::enums::{AlertDescription, ContentType, HandshakeType};
+ use crate::rand;
+ 
+ use std::error::Error as StdError;
+@@ -31,8 +31,11 @@ pub enum Error {
+         got_type: HandshakeType,
+     },
+ 
++    /// The peer sent us a syntactically incorrect TLS message.
++    CorruptMessage,
++
+     /// The peer sent us a TLS message with invalid contents.
+-    InvalidMessage(InvalidMessage),
++    CorruptMessagePayload(ContentType),
+ 
+     /// The peer didn't give us any certificates.
+     NoCertificatesPresented,
+@@ -91,42 +94,6 @@ pub enum Error {
+     BadMaxFragmentSize,
+ }
+ 
+-/// A corrupt TLS message payload that resulted in an error.
+-#[non_exhaustive]
+-#[derive(Debug, Clone, Copy)]
+-pub enum InvalidMessage {
+-    /// The peer sent us a syntactically incorrect TLS message.
+-    IncorrectFrame,
+-    /// An advertised message was larger then expected.
+-    HandshakePayloadTooLarge,
+-    /// A message was zero-length when its record kind forbids it.
+-    InvalidEmptyPayload,
+-    /// A TLS message payload was larger then allowed by the specification.
+-    MessageTooLarge,
+-    /// An unknown content type was encountered during message decoding.
+-    InvalidContentType,
+-    /// An unknown TLS protocol was encountered during message decoding.
+-    UnknownProtocolVersion,
+-    /// Decoding a message payload for a [ContentType] failed because a different
+-    /// type was encountered.
+-    MissingPayload(ContentType),
+-    /// A peer did not advertise its supported key exchange groups.
+-    MissingKeyExchange,
+-    /// Context was incorrectly attached to a certificate request during a handshake.
+-    InvalidCertRequest,
+-    /// A peer sent an unexpected key update request.
+-    InvalidKeyUpdate(KeyUpdateRequest),
+-    /// A peer's DH params could not be decoded
+-    InvalidDhParams,
+-}
+-
+-impl From<InvalidMessage> for Error {
+-    #[inline]
+-    fn from(e: InvalidMessage) -> Self {
+-        Self::InvalidMessage(e)
+-    }
+-}
+-
+ #[non_exhaustive]
+ #[allow(missing_docs)]
+ #[derive(Debug, PartialEq, Clone)]
+@@ -331,7 +298,7 @@ impl fmt::Display for Error {
+                 got_type,
+                 join::<HandshakeType>(expect_types)
+             ),
+-            Self::InvalidMessage(ref typ) => {
++            Self::CorruptMessagePayload(ref typ) => {
+                 write!(f, "received corrupt message of type {:?}", typ)
+             }
+             Self::PeerIncompatible(ref why) => write!(f, "peer is incompatible: {:?}", why),
+@@ -340,6 +307,7 @@ impl fmt::Display for Error {
+             Self::InvalidCertificate(ref err) => {
+                 write!(f, "invalid peer certificate: {:?}", err)
+             }
++            Self::CorruptMessage => write!(f, "received corrupt message"),
+             Self::NoCertificatesPresented => write!(f, "peer sent no certificates"),
+             Self::UnsupportedNameType => write!(f, "presented server name type wasn't supported"),
+             Self::DecryptError => write!(f, "cannot decrypt peer's message"),
+@@ -375,7 +343,7 @@ impl From<rand::GetRandomFailed> for Error {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{Error, InvalidMessage};
++    use super::Error;
+ 
+     #[test]
+     fn smoke() {
+@@ -391,7 +359,8 @@ mod tests {
+                 expect_types: vec![HandshakeType::ClientHello, HandshakeType::Finished],
+                 got_type: HandshakeType::ServerHello,
+             },
+-            Error::InvalidMessage(InvalidMessage::IncorrectFrame),
++            Error::CorruptMessage,
++            Error::CorruptMessagePayload(ContentType::Alert),
+             Error::NoCertificatesPresented,
+             Error::DecryptError,
+             super::PeerIncompatible::Tls12NotOffered.into(),
+diff --git a/rustls/src/lib.rs b/rustls/src/lib.rs
+index 36734da4..8def5798 100644
+--- a/rustls/src/lib.rs
++++ b/rustls/src/lib.rs
+@@ -371,7 +371,7 @@ pub use crate::conn::{
+     CommonState, Connection, ConnectionCommon, IoState, Reader, Side, SideData, Writer,
+ };
+ pub use crate::enums::{CipherSuite, ProtocolVersion, SignatureScheme};
+-pub use crate::error::{CertificateError, Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
++pub use crate::error::{CertificateError, Error, PeerIncompatible, PeerMisbehaved};
+ pub use crate::key::{Certificate, PrivateKey};
+ pub use crate::key_log::{KeyLog, NoKeyLog};
+ pub use crate::key_log_file::KeyLogFile;
+diff --git a/rustls/src/msgs/deframer.rs b/rustls/src/msgs/deframer.rs
+index d05a628a..02008689 100644
+--- a/rustls/src/msgs/deframer.rs
++++ b/rustls/src/msgs/deframer.rs
+@@ -8,7 +8,7 @@ use crate::error::{Error, PeerMisbehaved};
+ use crate::msgs::codec;
+ use crate::msgs::message::{MessageError, OpaqueMessage};
+ use crate::record_layer::{Decrypted, RecordLayer};
+-use crate::{InvalidMessage, ProtocolVersion};
++use crate::ProtocolVersion;
+ 
+ /// This deframer works to reconstruct TLS messages from a stream of arbitrary-sized reads.
+ ///
+@@ -16,10 +16,10 @@ use crate::{InvalidMessage, ProtocolVersion};
+ /// QUIC connections will call `push()` to append handshake payload data directly.
+ #[derive(Default)]
+ pub struct MessageDeframer {
+-    /// Set if the peer is not talking TLS, but some other
++    /// Set to true if the peer is not talking TLS, but some other
+     /// protocol.  The caller should abort the connection, because
+     /// the deframer cannot recover.
+-    last_error: Option<Error>,
++    desynced: bool,
+ 
+     /// Buffer of data read from the socket, in the process of being parsed into messages.
+     ///
+@@ -40,8 +40,8 @@ impl MessageDeframer {
+     /// failed, `Ok(None)` if no full message is buffered or if trial decryption failed, and
+     /// `Ok(Some(_))` if a valid message was found and decrypted successfully.
+     pub fn pop(&mut self, record_layer: &mut RecordLayer) -> Result<Option<Deframed>, Error> {
+-        if let Some(last_err) = self.last_error.clone() {
+-            return Err(last_err);
++        if self.desynced {
++            return Err(Error::CorruptMessage);
+         } else if self.used == 0 {
+             return Ok(None);
+         }
+@@ -70,20 +70,12 @@ impl MessageDeframer {
+             let mut rd = codec::Reader::init(&self.buf[start..self.used]);
+             let m = match OpaqueMessage::read(&mut rd) {
+                 Ok(m) => m,
+-                Err(msg_err) => {
+-                    let err_kind = match msg_err {
+-                        MessageError::TooShortForHeader | MessageError::TooShortForLength => {
+-                            return Ok(None)
+-                        }
+-                        MessageError::InvalidEmptyPayload => InvalidMessage::InvalidEmptyPayload,
+-                        MessageError::MessageTooLarge => InvalidMessage::MessageTooLarge,
+-                        MessageError::InvalidContentType => InvalidMessage::InvalidContentType,
+-                        MessageError::UnknownProtocolVersion => {
+-                            InvalidMessage::UnknownProtocolVersion
+-                        }
+-                    };
+-
+-                    return Err(self.set_err(err_kind));
++                Err(MessageError::TooShortForHeader | MessageError::TooShortForLength) => {
++                    return Ok(None)
++                }
++                Err(_) => {
++                    self.desynced = true;
++                    return Err(Error::CorruptMessage);
+                 }
+             };
+ 
+@@ -114,9 +106,10 @@ impl MessageDeframer {
+                 // This was rejected early data, discard it. If we currently have a handshake
+                 // payload in progress, this counts as interleaved, so we error out.
+                 Ok(None) if self.joining_hs.is_some() => {
+-                    return Err(self.set_err(
+-                        PeerMisbehaved::RejectedEarlyDataInterleavedWithHandshakeMessage,
+-                    ));
++                    self.desynced = true;
++                    return Err(
++                        PeerMisbehaved::RejectedEarlyDataInterleavedWithHandshakeMessage.into(),
++                    );
+                 }
+                 Ok(None) => {
+                     self.discard(end);
+@@ -130,7 +123,8 @@ impl MessageDeframer {
+                 // types.  That is, if a handshake message is split over two or more
+                 // records, there MUST NOT be any other records between them."
+                 // https://www.rfc-editor.org/rfc/rfc8446#section-5.1
+-                return Err(self.set_err(PeerMisbehaved::MessageInterleavedWithHandshakeMessage));
++                self.desynced = true;
++                return Err(PeerMisbehaved::MessageInterleavedWithHandshakeMessage.into());
+             }
+ 
+             // If it's not a handshake message, just return it -- no joining necessary.
+@@ -185,15 +179,6 @@ impl MessageDeframer {
+         }))
+     }
+ 
+-    /// Fuses this deframer's error and returns the set value.
+-    ///
+-    /// Any future calls to `pop` will return `err` again.
+-    fn set_err(&mut self, err: impl Into<Error>) -> Error {
+-        let err = err.into();
+-        self.last_error = Some(err.clone());
+-        err
+-    }
+-
+     /// Allow pushing handshake messages directly into the buffer.
+     #[cfg(feature = "quic")]
+     pub fn push(&mut self, version: ProtocolVersion, payload: &[u8]) -> Result<(), Error> {
+@@ -398,7 +383,7 @@ fn payload_size(buf: &[u8]) -> Result<Option<usize>, Error> {
+     let (header, _) = buf.split_at(HEADER_SIZE);
+     match codec::u24::decode(&header[1..]) {
+         Some(len) if len.0 > MAX_HANDSHAKE_SIZE => {
+-            Err(InvalidMessage::HandshakePayloadTooLarge.into())
++            Err(Error::CorruptMessagePayload(ContentType::Handshake))
+         }
+         Some(len) => Ok(Some(HEADER_SIZE + usize::from(len))),
+         _ => Ok(None),
+@@ -432,7 +417,7 @@ mod tests {
+     use super::MessageDeframer;
+     use crate::msgs::message::{Message, OpaqueMessage};
+     use crate::record_layer::RecordLayer;
+-    use crate::{ContentType, Error, InvalidMessage};
++    use crate::{ContentType, Error};
+ 
+     use std::io;
+ 
+@@ -535,7 +520,7 @@ mod tests {
+         let mut rl = RecordLayer::new();
+         pop_first(&mut d, &mut rl);
+         assert!(!d.has_pending());
+-        assert!(d.last_error.is_none());
++        assert!(!d.desynced);
+     }
+ 
+     #[test]
+@@ -552,7 +537,7 @@ mod tests {
+         assert!(d.has_pending());
+         pop_second(&mut d, &mut rl);
+         assert!(!d.has_pending());
+-        assert!(d.last_error.is_none());
++        assert!(!d.desynced);
+     }
+ 
+     #[test]
+@@ -565,7 +550,7 @@ mod tests {
+         let mut rl = RecordLayer::new();
+         pop_first(&mut d, &mut rl);
+         assert!(!d.has_pending());
+-        assert!(d.last_error.is_none());
++        assert!(!d.desynced);
+     }
+ 
+     #[test]
+@@ -579,7 +564,7 @@ mod tests {
+         pop_first(&mut d, &mut rl);
+         pop_second(&mut d, &mut rl);
+         assert!(!d.has_pending());
+-        assert!(d.last_error.is_none());
++        assert!(!d.desynced);
+     }
+ 
+     #[test]
+@@ -595,7 +580,7 @@ mod tests {
+         pop_first(&mut d, &mut rl);
+         pop_second(&mut d, &mut rl);
+         assert!(!d.has_pending());
+-        assert!(d.last_error.is_none());
++        assert!(!d.desynced);
+     }
+ 
+     #[test]
+@@ -611,7 +596,7 @@ mod tests {
+         pop_second(&mut d, &mut rl);
+         pop_first(&mut d, &mut rl);
+         assert!(!d.has_pending());
+-        assert!(d.last_error.is_none());
++        assert!(!d.desynced);
+     }
+ 
+     #[test]
+@@ -627,7 +612,7 @@ mod tests {
+         let mut rl = RecordLayer::new();
+         pop_first(&mut d, &mut rl);
+         assert!(!d.has_pending());
+-        assert!(d.last_error.is_none());
++        assert!(!d.desynced);
+     }
+ 
+     #[test]
+@@ -639,10 +624,7 @@ mod tests {
+         );
+ 
+         let mut rl = RecordLayer::new();
+-        assert!(matches!(
+-            d.pop(&mut rl).unwrap_err(),
+-            Error::InvalidMessage(InvalidMessage::InvalidContentType)
+-        ));
++        assert!(matches!(d.pop(&mut rl).unwrap_err(), Error::CorruptMessage));
+     }
+ 
+     #[test]
+@@ -654,10 +636,7 @@ mod tests {
+         );
+ 
+         let mut rl = RecordLayer::new();
+-        assert!(matches!(
+-            d.pop(&mut rl).unwrap_err(),
+-            Error::InvalidMessage(InvalidMessage::UnknownProtocolVersion)
+-        ));
++        assert!(matches!(d.pop(&mut rl).unwrap_err(), Error::CorruptMessage));
+     }
+ 
+     #[test]
+@@ -669,10 +648,7 @@ mod tests {
+         );
+ 
+         let mut rl = RecordLayer::new();
+-        assert!(matches!(
+-            d.pop(&mut rl).unwrap_err(),
+-            Error::InvalidMessage(InvalidMessage::MessageTooLarge)
+-        ));
++        assert!(matches!(d.pop(&mut rl).unwrap_err(), Error::CorruptMessage));
+     }
+ 
+     #[test]
+@@ -688,7 +664,7 @@ mod tests {
+         assert_eq!(m.typ, ContentType::ApplicationData);
+         assert_eq!(m.payload.0.len(), 0);
+         assert!(!d.has_pending());
+-        assert!(d.last_error.is_none());
++        assert!(!d.desynced);
+     }
+ 
+     #[test]
+@@ -700,16 +676,9 @@ mod tests {
+         );
+ 
+         let mut rl = RecordLayer::new();
+-        assert!(matches!(
+-            d.pop(&mut rl).unwrap_err(),
+-            Error::InvalidMessage(InvalidMessage::InvalidEmptyPayload)
+-        ));
+-        // CorruptMessage has been fused, and returns the same error upon every read
+-        // afterwards.
+-        assert!(matches!(
+-            d.pop(&mut rl).unwrap_err(),
+-            Error::InvalidMessage(InvalidMessage::InvalidEmptyPayload)
+-        ));
++        assert!(matches!(d.pop(&mut rl).unwrap_err(), Error::CorruptMessage));
++        // CorruptMessage has been fused
++        assert!(matches!(d.pop(&mut rl).unwrap_err(), Error::CorruptMessage));
+     }
+ 
+     #[test]
+diff --git a/rustls/src/msgs/message.rs b/rustls/src/msgs/message.rs
+index e02b07d4..6d1b2e60 100644
+--- a/rustls/src/msgs/message.rs
++++ b/rustls/src/msgs/message.rs
+@@ -6,7 +6,6 @@ use crate::msgs::ccs::ChangeCipherSpecPayload;
+ use crate::msgs::codec::{Codec, Reader};
+ use crate::msgs::enums::{AlertDescription, AlertLevel, ContentType, HandshakeType};
+ use crate::msgs::handshake::HandshakeMessagePayload;
+-use crate::InvalidMessage;
+ 
+ #[derive(Debug)]
+ pub enum MessagePayload {
+@@ -55,7 +54,7 @@ impl MessagePayload {
+             _ => None,
+         };
+ 
+-        parsed.ok_or(InvalidMessage::MissingPayload(typ).into())
++        parsed.ok_or(Error::CorruptMessagePayload(typ))
+     }
+ 
+     pub fn content_type(&self) -> ContentType {
+@@ -85,34 +84,34 @@ impl OpaqueMessage {
+     /// become valid if we read more data) and invalid data.
+     pub fn read(r: &mut Reader) -> Result<Self, MessageError> {
+         let typ = ContentType::read(r).ok_or(MessageError::TooShortForHeader)?;
+-        // Don't accept any new content-types.
+-        if let ContentType::Unknown(_) = typ {
+-            return Err(MessageError::InvalidContentType);
+-        }
+-
+         let version = ProtocolVersion::read(r).ok_or(MessageError::TooShortForHeader)?;
+-        // Accept only versions 0x03XX for any XX.
+-        match version {
+-            ProtocolVersion::Unknown(ref v) if (v & 0xff00) != 0x0300 => {
+-                return Err(MessageError::UnknownProtocolVersion);
+-            }
+-            _ => {}
+-        };
+-
+         let len = u16::read(r).ok_or(MessageError::TooShortForHeader)?;
+ 
+         // Reject undersize messages
+         //  implemented per section 5.1 of RFC8446 (TLSv1.3)
+         //              per section 6.2.1 of RFC5246 (TLSv1.2)
+         if typ != ContentType::ApplicationData && len == 0 {
+-            return Err(MessageError::InvalidEmptyPayload);
++            return Err(MessageError::IllegalLength);
+         }
+ 
+         // Reject oversize messages
+         if len >= Self::MAX_PAYLOAD {
+-            return Err(MessageError::MessageTooLarge);
++            return Err(MessageError::IllegalLength);
+         }
+ 
++        // Don't accept any new content-types.
++        if let ContentType::Unknown(_) = typ {
++            return Err(MessageError::IllegalContentType);
++        }
++
++        // Accept only versions 0x03XX for any XX.
++        match version {
++            ProtocolVersion::Unknown(ref v) if (v & 0xff00) != 0x0300 => {
++                return Err(MessageError::IllegalProtocolVersion);
++            }
++            _ => {}
++        };
++
+         let mut sub = r
+             .sub(len as usize)
+             .ok_or(MessageError::TooShortForLength)?;
+@@ -285,8 +284,7 @@ impl<'a> BorrowedPlainMessage<'a> {
+ pub enum MessageError {
+     TooShortForHeader,
+     TooShortForLength,
+-    InvalidEmptyPayload,
+-    MessageTooLarge,
+-    InvalidContentType,
+-    UnknownProtocolVersion,
++    IllegalLength,
++    IllegalContentType,
++    IllegalProtocolVersion,
+ }
+diff --git a/rustls/src/tls12/mod.rs b/rustls/src/tls12/mod.rs
+index 596111c0..68bb9253 100644
+--- a/rustls/src/tls12/mod.rs
++++ b/rustls/src/tls12/mod.rs
+@@ -1,14 +1,14 @@
+ use crate::cipher::{MessageDecrypter, MessageEncrypter};
+ use crate::conn::{CommonState, ConnectionRandoms, Side};
+ use crate::enums::{CipherSuite, SignatureScheme};
++use crate::kx;
+ use crate::msgs::codec::{Codec, Reader};
+-use crate::msgs::enums::AlertDescription;
++use crate::msgs::enums::{AlertDescription, ContentType};
+ use crate::msgs::handshake::KeyExchangeAlgorithm;
+ use crate::suites::{BulkAlgorithm, CipherSuiteCommon, SupportedCipherSuite};
+ #[cfg(feature = "secret_extraction")]
+ use crate::suites::{ConnectionTrafficSecrets, PartiallyExtractedSecrets};
+ use crate::Error;
+-use crate::{kx, InvalidMessage};
+ 
+ use ring::aead;
+ use ring::digest::Digest;
+@@ -500,7 +500,7 @@ pub(crate) fn decode_ecdh_params<T: Codec>(
+ ) -> Result<T, Error> {
+     decode_ecdh_params_::<T>(kx_params).ok_or_else(|| {
+         common.send_fatal_alert(AlertDescription::DecodeError);
+-        Error::InvalidMessage(InvalidMessage::InvalidDhParams)
++        Error::CorruptMessagePayload(ContentType::Handshake)
+     })
+ }
+ 
+diff --git a/rustls/tests/client_cert_verifier.rs b/rustls/tests/client_cert_verifier.rs
+index dd3ab4a0..5953d53d 100644
+--- a/rustls/tests/client_cert_verifier.rs
++++ b/rustls/tests/client_cert_verifier.rs
+@@ -13,9 +13,11 @@ use crate::common::{
+ use rustls::client::WebPkiVerifier;
+ use rustls::internal::msgs::base::PayloadU16;
+ use rustls::server::{ClientCertVerified, ClientCertVerifier};
++use rustls::AlertDescription;
++use rustls::ContentType;
+ use rustls::{
+-    AlertDescription, Certificate, ClientConnection, ContentType, DistinguishedNames, Error,
+-    InvalidMessage, ServerConfig, ServerConnection, SignatureScheme,
++    Certificate, ClientConnection, DistinguishedNames, Error, ServerConfig, ServerConnection,
++    SignatureScheme,
+ };
+ use std::sync::Arc;
+ 
+@@ -102,8 +104,8 @@ fn client_verifier_no_schemes() {
+             let err = do_handshake_until_error(&mut client, &mut server);
+             assert_debug_eq(
+                 err,
+-                Err(ErrorFromPeer::Client(Error::InvalidMessage(
+-                    InvalidMessage::MissingPayload(ContentType::Handshake),
++                Err(ErrorFromPeer::Client(Error::CorruptMessagePayload(
++                    ContentType::Handshake,
+                 ))),
+             );
+         }
+diff --git a/rustls/tests/server_cert_verifier.rs b/rustls/tests/server_cert_verifier.rs
+index eab7e835..097f5e42 100644
+--- a/rustls/tests/server_cert_verifier.rs
++++ b/rustls/tests/server_cert_verifier.rs
+@@ -11,7 +11,8 @@ use rustls::client::{
+     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier, WebPkiVerifier,
+ };
+ use rustls::internal::msgs::handshake::DigitallySignedStruct;
+-use rustls::{AlertDescription, Certificate, Error, InvalidMessage, SignatureScheme};
++use rustls::AlertDescription;
++use rustls::{Certificate, Error, SignatureScheme};
+ use std::sync::Arc;
+ 
+ #[test]
+@@ -38,7 +39,7 @@ fn client_can_override_certificate_verification() {
+ fn client_can_override_certificate_verification_and_reject_certificate() {
+     for kt in ALL_KEY_TYPES.iter() {
+         let verifier = Arc::new(MockServerVerifier::rejects_certificate(
+-            Error::InvalidMessage(InvalidMessage::HandshakePayloadTooLarge),
++            Error::CorruptMessage,
+         ));
+ 
+         let server_config = Arc::new(make_server_config(*kt));
+@@ -55,9 +56,7 @@ fn client_can_override_certificate_verification_and_reject_certificate() {
+             assert_debug_eq(
+                 errs,
+                 Err(vec![
+-                    ErrorFromPeer::Client(Error::InvalidMessage(
+-                        InvalidMessage::HandshakePayloadTooLarge,
+-                    )),
++                    ErrorFromPeer::Client(Error::CorruptMessage),
+                     ErrorFromPeer::Server(Error::AlertReceived(AlertDescription::BadCertificate)),
+                 ]),
+             );
+@@ -71,7 +70,7 @@ fn client_can_override_certificate_verification_and_reject_tls12_signatures() {
+     for kt in ALL_KEY_TYPES.iter() {
+         let mut client_config = make_client_config_with_versions(*kt, &[&rustls::version::TLS12]);
+         let verifier = Arc::new(MockServerVerifier::rejects_tls12_signatures(
+-            Error::InvalidMessage(InvalidMessage::HandshakePayloadTooLarge),
++            Error::CorruptMessage,
+         ));
+ 
+         client_config
+@@ -86,9 +85,7 @@ fn client_can_override_certificate_verification_and_reject_tls12_signatures() {
+         assert_debug_eq(
+             errs,
+             Err(vec![
+-                ErrorFromPeer::Client(Error::InvalidMessage(
+-                    InvalidMessage::HandshakePayloadTooLarge,
+-                )),
++                ErrorFromPeer::Client(Error::CorruptMessage),
+                 ErrorFromPeer::Server(Error::AlertReceived(AlertDescription::BadCertificate)),
+             ]),
+         );
+@@ -100,7 +97,7 @@ fn client_can_override_certificate_verification_and_reject_tls13_signatures() {
+     for kt in ALL_KEY_TYPES.iter() {
+         let mut client_config = make_client_config_with_versions(*kt, &[&rustls::version::TLS13]);
+         let verifier = Arc::new(MockServerVerifier::rejects_tls13_signatures(
+-            Error::InvalidMessage(InvalidMessage::HandshakePayloadTooLarge),
++            Error::CorruptMessage,
+         ));
+ 
+         client_config
+@@ -115,9 +112,7 @@ fn client_can_override_certificate_verification_and_reject_tls13_signatures() {
+         assert_debug_eq(
+             errs,
+             Err(vec![
+-                ErrorFromPeer::Client(Error::InvalidMessage(
+-                    InvalidMessage::HandshakePayloadTooLarge,
+-                )),
++                ErrorFromPeer::Client(Error::CorruptMessage),
+                 ErrorFromPeer::Server(Error::AlertReceived(AlertDescription::BadCertificate)),
+             ]),
+         );

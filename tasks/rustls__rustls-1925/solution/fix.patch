@@ -1,0 +1,127 @@
+diff --git a/README.md b/README.md
+index fc34e369..b521a7a5 100644
+--- a/README.md
++++ b/README.md
+@@ -92,7 +92,7 @@ x86, x86-64, LoongArch64, 32-bit & 64-bit Little Endian MIPS, 32-bit PowerPC (Bi
+ support WebAssembly.
+ For more information, see [the supported `ring` target platforms][ring-target-platforms].
+ 
+-Rustls requires Rust 1.61 or later.
++Rustls requires Rust 1.63 or later.
+ 
+ [ring-target-platforms]: https://github.com/briansmith/ring/blob/2e8363b433fa3b3962c877d9ed2e9145612f3160/include/ring-core/target.h#L18-L64
+ 
+diff --git a/rustls/Cargo.toml b/rustls/Cargo.toml
+index 6cdf3f46..2643f6ce 100644
+--- a/rustls/Cargo.toml
++++ b/rustls/Cargo.toml
+@@ -1,8 +1,8 @@
+ [package]
+ name = "rustls"
+-version = "0.21.11"
++version = "0.21.12"
+ edition = "2021"
+-rust-version = "1.61"
++rust-version = "1.63"
+ license = "Apache-2.0 OR ISC OR MIT"
+ readme = "../README.md"
+ description = "Rustls is a modern TLS library written in Rust."
+diff --git a/rustls/src/lib.rs b/rustls/src/lib.rs
+index 79851194..c2f5fcec 100644
+--- a/rustls/src/lib.rs
++++ b/rustls/src/lib.rs
+@@ -65,7 +65,7 @@
+ //! support WebAssembly.
+ //! For more information, see [the supported `ring` target platforms][ring-target-platforms].
+ //!
+-//! Rustls requires Rust 1.61 or later.
++//! Rustls requires Rust 1.63 or later.
+ //!
+ //! [ring-target-platforms]: https://github.com/briansmith/ring/blob/2e8363b433fa3b3962c877d9ed2e9145612f3160/include/ring-core/target.h#L18-L64
+ //!
+diff --git a/rustls/src/msgs/handshake.rs b/rustls/src/msgs/handshake.rs
+index f8be007e..f14e41d8 100644
+--- a/rustls/src/msgs/handshake.rs
++++ b/rustls/src/msgs/handshake.rs
+@@ -16,6 +16,8 @@ use crate::verify::DigitallySignedStruct;
+ 
+ use std::collections;
+ use std::fmt;
++use std::net::IpAddr;
++use std::str::FromStr;
+ 
+ /// Create a newtype wrapper around a given type.
+ ///
+@@ -211,6 +213,7 @@ impl TlsListElement for SignatureScheme {
+ #[derive(Clone, Debug)]
+ pub enum ServerNamePayload {
+     HostName(DnsName),
++    IpAddress(PayloadU16),
+     Unknown(Payload),
+ }
+ 
+@@ -221,15 +224,12 @@ impl ServerNamePayload {
+ 
+     fn read_hostname(r: &mut Reader) -> Result<Self, InvalidMessage> {
+         let raw = PayloadU16::read(r)?;
+-
+         match DnsName::try_from_ascii(&raw.0) {
+             Ok(dns_name) => Ok(Self::HostName(dns_name)),
+             Err(_) => {
+-                warn!(
+-                    "Illegal SNI hostname received {:?}",
+-                    String::from_utf8_lossy(&raw.0)
+-                );
+-                Err(InvalidMessage::InvalidServerName)
++                let _ = IpAddr::from_str(&String::from_utf8_lossy(&raw.0))
++                    .map_err(|_| InvalidMessage::InvalidServerName)?;
++                Ok(Self::IpAddress(raw))
+             }
+         }
+     }
+@@ -240,6 +240,7 @@ impl ServerNamePayload {
+                 (name.as_ref().len() as u16).encode(bytes);
+                 bytes.extend_from_slice(name.as_ref().as_bytes());
+             }
++            Self::IpAddress(ref r) => r.encode(bytes),
+             Self::Unknown(ref r) => r.encode(bytes),
+         }
+     }
+@@ -897,7 +898,23 @@ impl ClientHelloPayload {
+     pub fn get_sni_extension(&self) -> Option<&[ServerName]> {
+         let ext = self.find_extension(ExtensionType::ServerName)?;
+         match *ext {
+-            ClientExtension::ServerName(ref req) => Some(req),
++            // Does this comply with RFC6066?
++            //
++            // [RFC6066][] specifies that literal IP addresses are illegal in
++            // `ServerName`s with a `name_type` of `host_name`.
++            //
++            // Some clients incorrectly send such extensions: we choose to
++            // successfully parse these (into `ServerNamePayload::IpAddress`)
++            // but then act like the client sent no `server_name` extension.
++            //
++            // [RFC6066]: https://datatracker.ietf.org/doc/html/rfc6066#section-3
++            ClientExtension::ServerName(ref req)
++                if !req
++                    .iter()
++                    .any(|name| matches!(name.payload, ServerNamePayload::IpAddress(_))) =>
++            {
++                Some(req)
++            }
+             _ => None,
+         }
+     }
+diff --git a/rustls/src/tls13/mod.rs b/rustls/src/tls13/mod.rs
+index ebfa572f..31ba45fe 100644
+--- a/rustls/src/tls13/mod.rs
++++ b/rustls/src/tls13/mod.rs
+@@ -84,7 +84,7 @@ impl Tls13CipherSuite {
+ 
+     /// Can a session using suite self resume from suite prev?
+     pub fn can_resume_from(&self, prev: &'static Self) -> Option<&'static Self> {
+-        (prev.hash_algorithm() == self.hash_algorithm()).then(|| prev)
++        (prev.hash_algorithm() == self.hash_algorithm()).then_some(prev)
+     }
+ }
+ 

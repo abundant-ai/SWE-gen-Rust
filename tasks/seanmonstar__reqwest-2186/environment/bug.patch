@@ -1,0 +1,356 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 1b314b9..957186a 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -83,7 +83,7 @@ jobs:
+           - "feat.: stream"
+           - "feat.: socks/default-tls"
+           - "feat.: socks/rustls-tls"
+-          - "feat.: hickory-dns"
++          - "feat.: trust-dns"
+ 
+         include:
+           - name: linux / stable
+@@ -151,8 +151,8 @@ jobs:
+             features: "--features socks"
+           - name: "feat.: socks/rustls-tls"
+             features: "--features socks,rustls-tls"
+-          - name: "feat.: hickory-dns"
+-            features: "--features hickory-dns"
++          - name: "feat.: trust-dns"
++            features: "--features trust-dns"
+ 
+     steps:
+       - name: Checkout
+diff --git a/Cargo.toml b/Cargo.toml
+index 8d576e1..fae97a9 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -57,9 +57,7 @@ json = ["serde_json"]
+ 
+ multipart = ["mime_guess"]
+ 
+-# Deprecated, remove this feature while bumping minor versions.
+-trust-dns = ["hickory-dns"]
+-hickory-dns = ["hickory-resolver"]
++trust-dns = ["trust-dns-resolver"]
+ 
+ stream = ["tokio/fs", "tokio-util", "wasm-streams"]
+ 
+@@ -139,8 +137,8 @@ tokio-util = { version = "0.7.1", default-features = false, features = ["codec",
+ ## socks
+ tokio-socks = { version = "0.5.1", optional = true }
+ 
+-## hickory-dns
+-hickory-resolver = { version = "0.24", optional = true, features = ["tokio-runtime"] }
++## trust-dns
++trust-dns-resolver = { version = "0.23", optional = true, features = ["tokio-runtime"] }
+ 
+ # HTTP/3 experimental support
+ h3 = { version = "0.0.3", optional = true }
+diff --git a/src/async_impl/client.rs b/src/async_impl/client.rs
+index b247624..8acecc5 100644
+--- a/src/async_impl/client.rs
++++ b/src/async_impl/client.rs
+@@ -33,8 +33,8 @@ use crate::async_impl::h3_client::{H3Client, H3ResponseFuture};
+ use crate::connect::Connector;
+ #[cfg(feature = "cookies")]
+ use crate::cookie;
+-#[cfg(feature = "hickory-dns")]
+-use crate::dns::hickory::HickoryDnsResolver;
++#[cfg(feature = "trust-dns")]
++use crate::dns::trust_dns::TrustDnsResolver;
+ use crate::dns::{gai::GaiResolver, DnsResolverWithOverrides, DynResolver, Resolve};
+ use crate::error;
+ use crate::into_url::try_uri;
+@@ -135,7 +135,7 @@ struct Config {
+     nodelay: bool,
+     #[cfg(feature = "cookies")]
+     cookie_store: Option<Arc<dyn cookie::CookieStore>>,
+-    hickory_dns: bool,
++    trust_dns: bool,
+     error: Option<crate::Error>,
+     https_only: bool,
+     #[cfg(feature = "http3")]
+@@ -218,7 +218,7 @@ impl ClientBuilder {
+                 http2_keep_alive_while_idle: false,
+                 local_address: None,
+                 nodelay: true,
+-                hickory_dns: cfg!(feature = "hickory-dns"),
++                trust_dns: cfg!(feature = "trust-dns"),
+                 #[cfg(feature = "cookies")]
+                 cookie_store: None,
+                 https_only: false,
+@@ -267,12 +267,12 @@ impl ClientBuilder {
+                 headers.get(USER_AGENT).cloned()
+             }
+ 
+-            let mut resolver: Arc<dyn Resolve> = match config.hickory_dns {
++            let mut resolver: Arc<dyn Resolve> = match config.trust_dns {
+                 false => Arc::new(GaiResolver::new()),
+-                #[cfg(feature = "hickory-dns")]
+-                true => Arc::new(HickoryDnsResolver::default()),
+-                #[cfg(not(feature = "hickory-dns"))]
+-                true => unreachable!("hickory-dns shouldn't be enabled unless the feature is"),
++                #[cfg(feature = "trust-dns")]
++                true => Arc::new(TrustDnsResolver::default()),
++                #[cfg(not(feature = "trust-dns"))]
++                true => unreachable!("trust-dns shouldn't be enabled unless the feature is"),
+             };
+             if let Some(dns_resolver) = config.dns_resolver {
+                 resolver = dns_resolver;
+@@ -1526,67 +1526,32 @@ impl ClientBuilder {
+         self
+     }
+ 
+-    /// Enables the [hickory-dns](hickory_resolver) async resolver instead of a default threadpool
+-    /// using `getaddrinfo`.
++    /// Enables the [trust-dns](trust_dns_resolver) async resolver instead of a default threadpool using `getaddrinfo`.
+     ///
+-    /// If the `hickory-dns` feature is turned on, the default option is enabled.
++    /// If the `trust-dns` feature is turned on, the default option is enabled.
+     ///
+     /// # Optional
+     ///
+-    /// This requires the optional `hickory-dns` feature to be enabled
+-    #[cfg(feature = "hickory-dns")]
+-    #[cfg_attr(docsrs, doc(cfg(feature = "hickory-dns")))]
+-    #[deprecated(note = "use `hickory_dns` instead")]
++    /// This requires the optional `trust-dns` feature to be enabled
++    #[cfg(feature = "trust-dns")]
++    #[cfg_attr(docsrs, doc(cfg(feature = "trust-dns")))]
+     pub fn trust_dns(mut self, enable: bool) -> ClientBuilder {
+-        self.config.hickory_dns = enable;
++        self.config.trust_dns = enable;
+         self
+     }
+ 
+-    /// Enables the [hickory-dns](hickory_resolver) async resolver instead of a default threadpool
+-    /// using `getaddrinfo`.
++    /// Disables the trust-dns async resolver.
+     ///
+-    /// If the `hickory-dns` feature is turned on, the default option is enabled.
+-    ///
+-    /// # Optional
+-    ///
+-    /// This requires the optional `hickory-dns` feature to be enabled
+-    #[cfg(feature = "hickory-dns")]
+-    #[cfg_attr(docsrs, doc(cfg(feature = "hickory-dns")))]
+-    pub fn hickory_dns(mut self, enable: bool) -> ClientBuilder {
+-        self.config.hickory_dns = enable;
+-        self
+-    }
+-
+-    /// Disables the hickory-dns async resolver.
+-    ///
+-    /// This method exists even if the optional `hickory-dns` feature is not enabled.
+-    /// This can be used to ensure a `Client` doesn't use the hickory-dns async resolver
+-    /// even if another dependency were to enable the optional `hickory-dns` feature.
+-    #[deprecated(note = "use `no_hickory_dns` instead")]
++    /// This method exists even if the optional `trust-dns` feature is not enabled.
++    /// This can be used to ensure a `Client` doesn't use the trust-dns async resolver
++    /// even if another dependency were to enable the optional `trust-dns` feature.
+     pub fn no_trust_dns(self) -> ClientBuilder {
+-        #[cfg(feature = "hickory-dns")]
+-        {
+-            self.hickory_dns(false)
+-        }
+-
+-        #[cfg(not(feature = "hickory-dns"))]
+-        {
+-            self
+-        }
+-    }
+-
+-    /// Disables the hickory-dns async resolver.
+-    ///
+-    /// This method exists even if the optional `hickory-dns` feature is not enabled.
+-    /// This can be used to ensure a `Client` doesn't use the hickory-dns async resolver
+-    /// even if another dependency were to enable the optional `hickory-dns` feature.
+-    pub fn no_hickory_dns(self) -> ClientBuilder {
+-        #[cfg(feature = "hickory-dns")]
++        #[cfg(feature = "trust-dns")]
+         {
+-            self.hickory_dns(false)
++            self.trust_dns(false)
+         }
+ 
+-        #[cfg(not(feature = "hickory-dns"))]
++        #[cfg(not(feature = "trust-dns"))]
+         {
+             self
+         }
+diff --git a/src/blocking/client.rs b/src/blocking/client.rs
+index 8a419c2..689e6a0 100644
+--- a/src/blocking/client.rs
++++ b/src/blocking/client.rs
+@@ -789,50 +789,26 @@ impl ClientBuilder {
+         self.with_inner(move |inner| inner.use_preconfigured_tls(tls))
+     }
+ 
+-    /// Enables the [hickory-dns](hickory_resolver) async resolver instead of a default threadpool using `getaddrinfo`.
++    /// Enables the [trust-dns](trust_dns_resolver) async resolver instead of a default threadpool using `getaddrinfo`.
+     ///
+-    /// If the `hickory-dns` feature is turned on, the default option is enabled.
++    /// If the `trust-dns` feature is turned on, the default option is enabled.
+     ///
+     /// # Optional
+     ///
+-    /// This requires the optional `hickory-dns` feature to be enabled
+-    #[cfg(feature = "hickory-dns")]
+-    #[cfg_attr(docsrs, doc(cfg(feature = "hickory-dns")))]
+-    #[deprecated(note = "use `hickory_dns` instead", since = "0.12.0")]
++    /// This requires the optional `trust-dns` feature to be enabled
++    #[cfg(feature = "trust-dns")]
++    #[cfg_attr(docsrs, doc(cfg(feature = "trust-dns")))]
+     pub fn trust_dns(self, enable: bool) -> ClientBuilder {
+-        self.with_inner(|inner| inner.hickory_dns(enable))
++        self.with_inner(|inner| inner.trust_dns(enable))
+     }
+ 
+-    /// Enables the [hickory-dns](hickory_resolver) async resolver instead of a default threadpool using `getaddrinfo`.
++    /// Disables the trust-dns async resolver.
+     ///
+-    /// If the `hickory-dns` feature is turned on, the default option is enabled.
+-    ///
+-    /// # Optional
+-    ///
+-    /// This requires the optional `hickory-dns` feature to be enabled
+-    #[cfg(feature = "hickory-dns")]
+-    #[cfg_attr(docsrs, doc(cfg(feature = "hickory-dns")))]
+-    pub fn hickory_dns(self, enable: bool) -> ClientBuilder {
+-        self.with_inner(|inner| inner.hickory_dns(enable))
+-    }
+-
+-    /// Disables the hickory-dns async resolver.
+-    ///
+-    /// This method exists even if the optional `hickory-dns` feature is not enabled.
+-    /// This can be used to ensure a `Client` doesn't use the hickory-dns async resolver
+-    /// even if another dependency were to enable the optional `hickory-dns` feature.
+-    #[deprecated(note = "use `no_hickory_dns` instead", since = "0.12.0")]
++    /// This method exists even if the optional `trust-dns` feature is not enabled.
++    /// This can be used to ensure a `Client` doesn't use the trust-dns async resolver
++    /// even if another dependency were to enable the optional `trust-dns` feature.
+     pub fn no_trust_dns(self) -> ClientBuilder {
+-        self.with_inner(|inner| inner.no_hickory_dns())
+-    }
+-
+-    /// Disables the hickory-dns async resolver.
+-    ///
+-    /// This method exists even if the optional `hickory-dns` feature is not enabled.
+-    /// This can be used to ensure a `Client` doesn't use the hickory-dns async resolver
+-    /// even if another dependency were to enable the optional `hickory-dns` feature.
+-    pub fn no_hickory_dns(self) -> ClientBuilder {
+-        self.with_inner(|inner| inner.no_hickory_dns())
++        self.with_inner(|inner| inner.no_trust_dns())
+     }
+ 
+     /// Restrict the Client to be used with HTTPS only requests.
+diff --git a/src/dns/mod.rs b/src/dns/mod.rs
+index f3e2212..40cdabf 100644
+--- a/src/dns/mod.rs
++++ b/src/dns/mod.rs
+@@ -4,6 +4,6 @@ pub use resolve::{Addrs, Resolve, Resolving};
+ pub(crate) use resolve::{DnsResolverWithOverrides, DynResolver};
+ 
+ pub(crate) mod gai;
+-#[cfg(feature = "hickory-dns")]
+-pub(crate) mod hickory;
+ pub(crate) mod resolve;
++#[cfg(feature = "trust-dns")]
++pub(crate) mod trust_dns;
+diff --git a/src/dns/hickory.rs b/src/dns/trust_dns.rs
+similarity index 85%
+rename from src/dns/hickory.rs
+rename to src/dns/trust_dns.rs
+index 7ee46bc..a253260 100644
+--- a/src/dns/hickory.rs
++++ b/src/dns/trust_dns.rs
+@@ -1,8 +1,8 @@
+-//! DNS resolution via the [hickory-resolver](https://github.com/hickory-dns/hickory-dns) crate
++//! DNS resolution via the [trust_dns_resolver](https://github.com/bluejekyll/trust-dns) crate
+ 
+-use hickory_resolver::{lookup_ip::LookupIpIntoIter, system_conf, TokioAsyncResolver};
+ use hyper::client::connect::dns::Name;
+ use once_cell::sync::OnceCell;
++use trust_dns_resolver::{lookup_ip::LookupIpIntoIter, system_conf, TokioAsyncResolver};
+ 
+ use std::io;
+ use std::net::SocketAddr;
+@@ -12,7 +12,7 @@ use super::{Addrs, Resolve, Resolving};
+ 
+ /// Wrapper around an `AsyncResolver`, which implements the `Resolve` trait.
+ #[derive(Debug, Default, Clone)]
+-pub(crate) struct HickoryDnsResolver {
++pub(crate) struct TrustDnsResolver {
+     /// Since we might not have been called in the context of a
+     /// Tokio Runtime in initialization, so we must delay the actual
+     /// construction of the resolver.
+@@ -23,7 +23,7 @@ struct SocketAddrs {
+     iter: LookupIpIntoIter,
+ }
+ 
+-impl Resolve for HickoryDnsResolver {
++impl Resolve for TrustDnsResolver {
+     fn resolve(&self, name: Name) -> Resolving {
+         let resolver = self.clone();
+         Box::pin(async move {
+diff --git a/src/lib.rs b/src/lib.rs
+index 62298db..f3da39a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -195,7 +195,7 @@
+ //! - **multipart**: Provides functionality for multipart forms.
+ //! - **stream**: Adds support for `futures::Stream`.
+ //! - **socks**: Provides SOCKS5 proxy support.
+-//! - **hickory-dns**: Enables a hickory-dns async resolver instead of default
++//! - **trust-dns**: Enables a trust-dns async resolver instead of default
+ //!   threadpool using `getaddrinfo`.
+ //!
+ //! ## Unstable Features
+diff --git a/tests/client.rs b/tests/client.rs
+index e7fe96d..51fc282 100644
+--- a/tests/client.rs
++++ b/tests/client.rs
+@@ -229,9 +229,9 @@ async fn overridden_dns_resolution_with_gai_multiple() {
+     assert_eq!("Hello", text);
+ }
+ 
+-#[cfg(feature = "hickory-dns")]
++#[cfg(feature = "trust-dns")]
+ #[tokio::test]
+-async fn overridden_dns_resolution_with_hickory_dns() {
++async fn overridden_dns_resolution_with_trust_dns() {
+     let _ = env_logger::builder().is_test(true).try_init();
+     let server = server::http(move |_req| async { http::Response::new("Hello".into()) });
+ 
+@@ -242,7 +242,7 @@ async fn overridden_dns_resolution_with_hickory_dns() {
+     );
+     let client = reqwest::Client::builder()
+         .resolve(overridden_domain, server.addr())
+-        .hickory_dns(true)
++        .trust_dns(true)
+         .build()
+         .expect("client builder");
+     let req = client.get(&url);
+@@ -253,9 +253,9 @@ async fn overridden_dns_resolution_with_hickory_dns() {
+     assert_eq!("Hello", text);
+ }
+ 
+-#[cfg(feature = "hickory-dns")]
++#[cfg(feature = "trust-dns")]
+ #[tokio::test]
+-async fn overridden_dns_resolution_with_hickory_dns_multiple() {
++async fn overridden_dns_resolution_with_trust_dns_multiple() {
+     let _ = env_logger::builder().is_test(true).try_init();
+     let server = server::http(move |_req| async { http::Response::new("Hello".into()) });
+ 
+@@ -277,7 +277,7 @@ async fn overridden_dns_resolution_with_hickory_dns_multiple() {
+                 server.addr(),
+             ],
+         )
+-        .hickory_dns(true)
++        .trust_dns(true)
+         .build()
+         .expect("client builder");
+     let req = client.get(&url);

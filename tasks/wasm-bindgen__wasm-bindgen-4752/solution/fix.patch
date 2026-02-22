@@ -1,0 +1,236 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 45fc324d2..d03b8e87d 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -32,6 +32,9 @@
+ * New `JsValue.is_null_or_undefined()` method and intrinsic.
+   [#4751](https://github.com/wasm-bindgen/wasm-bindgen/pull/4751)
+ 
++* Support for `Option<JsValue>` in function arguments and return.
++  [#4752](https://github.com/wasm-bindgen/wasm-bindgen/pull/4752)
++
+ ### Fixed
+ 
+ * Fixed multithreading JS output for targets `bundler`, `deno` and `module`.
+diff --git a/crates/cli-support/src/intrinsic.rs b/crates/cli-support/src/intrinsic.rs
+index 6e1194634..82bcbeb7c 100644
+--- a/crates/cli-support/src/intrinsic.rs
++++ b/crates/cli-support/src/intrinsic.rs
+@@ -42,7 +42,8 @@ intrinsics! {
+         IsFunction = "__wbindgen_is_function",
+         IsUndefined = "__wbindgen_is_undefined",
+         IsNull = "__wbindgen_is_null",
+-        IsNullOrUndefined = "__wbindgen_is_null_or_undefined",
++        ObjectIsNullOrUndefined = "__wbindgen_object_is_null_or_undefined",
++        ObjectIsUndefined = "__wbindgen_object_is_undefined",
+         IsObject = "__wbindgen_is_object",
+         IsSymbol = "__wbindgen_is_symbol",
+         IsString = "__wbindgen_is_string",
+diff --git a/crates/cli-support/src/js/mod.rs b/crates/cli-support/src/js/mod.rs
+index b8c15f24a..6a1abd13a 100644
+--- a/crates/cli-support/src/js/mod.rs
++++ b/crates/cli-support/src/js/mod.rs
+@@ -3609,11 +3609,16 @@ wasm = wasmInstance.exports;
+                 format!("{} === null", args[0])
+             }
+ 
+-            Intrinsic::IsNullOrUndefined => {
++            Intrinsic::ObjectIsNullOrUndefined => {
+                 assert_eq!(args.len(), 1);
+                 format!("{} == null", args[0])
+             }
+ 
++            Intrinsic::ObjectIsUndefined => {
++                assert_eq!(args.len(), 1);
++                format!("{} === undefined", args[0])
++            }
++
+             Intrinsic::IsObject => {
+                 assert_eq!(args.len(), 1);
+                 prelude.push_str(&format!("const val = {};\n", args[0]));
+diff --git a/crates/cli-support/src/wit/mod.rs b/crates/cli-support/src/wit/mod.rs
+index 2752f807f..7c731d1e6 100644
+--- a/crates/cli-support/src/wit/mod.rs
++++ b/crates/cli-support/src/wit/mod.rs
+@@ -145,10 +145,16 @@ impl<'a> Context<'a> {
+             AuxImport::Intrinsic(Intrinsic::ObjectDropRef),
+         )?;
+         self.add_aux_import_to_import_map(
+-            "__wbindgen_is_null_or_undefined",
++            "__wbindgen_object_is_null_or_undefined",
+             vec![Descriptor::Ref(Box::new(Descriptor::Externref))],
+             Descriptor::Boolean,
+-            AuxImport::Intrinsic(Intrinsic::IsNullOrUndefined),
++            AuxImport::Intrinsic(Intrinsic::ObjectIsNullOrUndefined),
++        )?;
++        self.add_aux_import_to_import_map(
++            "__wbindgen_object_is_undefined",
++            vec![Descriptor::Ref(Box::new(Descriptor::Externref))],
++            Descriptor::Boolean,
++            AuxImport::Intrinsic(Intrinsic::ObjectIsUndefined),
+         )?;
+         for import in imports_to_delete {
+             self.module.imports.delete(import);
+diff --git a/src/convert/impls.rs b/src/convert/impls.rs
+index 33f5c7fd4..8d05f6247 100644
+--- a/src/convert/impls.rs
++++ b/src/convert/impls.rs
+@@ -8,7 +8,7 @@ use crate::convert::traits::{WasmAbi, WasmPrimitive};
+ use crate::convert::TryFromJsValue;
+ use crate::convert::{FromWasmAbi, IntoWasmAbi, LongRefFromWasmAbi, RefFromWasmAbi};
+ use crate::convert::{OptionFromWasmAbi, OptionIntoWasmAbi, ReturnWasmAbi};
+-use crate::{Clamped, JsError, JsValue, UnwrapThrowExt};
++use crate::{Clamped, JsError, JsValue, UnwrapThrowExt, __wbindgen_object_is_undefined};
+ 
+ // Primitive types can always be passed over the ABI.
+ impl<T: WasmPrimitive> WasmAbi for T {
+@@ -465,6 +465,20 @@ impl LongRefFromWasmAbi for JsValue {
+     }
+ }
+ 
++impl OptionIntoWasmAbi for JsValue {
++    #[inline]
++    fn none() -> u32 {
++        crate::__rt::JSIDX_UNDEFINED
++    }
++}
++
++impl OptionFromWasmAbi for JsValue {
++    #[inline]
++    fn is_none(js: &u32) -> bool {
++        unsafe { __wbindgen_object_is_undefined(*js) }
++    }
++}
++
+ impl<T: OptionIntoWasmAbi> IntoWasmAbi for Option<T> {
+     type Abi = T::Abi;
+ 
+diff --git a/src/externref.rs b/src/externref.rs
+index 413123188..386725a0f 100644
+--- a/src/externref.rs
++++ b/src/externref.rs
+@@ -1,4 +1,5 @@
+ use crate::JsValue;
++use crate::__rt;
+ 
+ use alloc::slice;
+ use alloc::vec::Vec;
+@@ -118,8 +119,8 @@ fn internal_error(_msg: &str) -> ! {
+ // Management of `externref` is always thread local since an `externref` value
+ // can't cross threads in wasm. Indices as a result are always thread-local.
+ #[cfg_attr(target_feature = "atomics", thread_local)]
+-static HEAP_SLAB: crate::__rt::ThreadLocalWrapper<RefCell<Slab>> =
+-    crate::__rt::ThreadLocalWrapper(RefCell::new(Slab::new()));
++static HEAP_SLAB: __rt::ThreadLocalWrapper<RefCell<Slab>> =
++    __rt::ThreadLocalWrapper(RefCell::new(Slab::new()));
+ 
+ #[no_mangle]
+ pub extern "C" fn __externref_table_alloc() -> usize {
+@@ -128,7 +129,7 @@ pub extern "C" fn __externref_table_alloc() -> usize {
+ 
+ #[no_mangle]
+ pub extern "C" fn __externref_table_dealloc(idx: usize) {
+-    if idx < super::JSIDX_RESERVED as usize {
++    if idx < __rt::JSIDX_RESERVED as usize {
+         return;
+     }
+     // clear this value from the table so while the table slot is un-allocated
+diff --git a/src/lib.rs b/src/lib.rs
+index d6f055dd7..c676d7ee3 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -155,25 +155,18 @@ pub struct JsValue {
+     _marker: PhantomData<*mut u8>, // not at all threadsafe
+ }
+ 
+-const JSIDX_OFFSET: u32 = 128; // keep in sync with js/mod.rs
+-const JSIDX_UNDEFINED: u32 = JSIDX_OFFSET;
+-const JSIDX_NULL: u32 = JSIDX_OFFSET + 1;
+-const JSIDX_TRUE: u32 = JSIDX_OFFSET + 2;
+-const JSIDX_FALSE: u32 = JSIDX_OFFSET + 3;
+-const JSIDX_RESERVED: u32 = JSIDX_OFFSET + 4;
+-
+ impl JsValue {
+     /// The `null` JS value constant.
+-    pub const NULL: JsValue = JsValue::_new(JSIDX_NULL);
++    pub const NULL: JsValue = JsValue::_new(__rt::JSIDX_NULL);
+ 
+     /// The `undefined` JS value constant.
+-    pub const UNDEFINED: JsValue = JsValue::_new(JSIDX_UNDEFINED);
++    pub const UNDEFINED: JsValue = JsValue::_new(__rt::JSIDX_UNDEFINED);
+ 
+     /// The `true` JS value constant.
+-    pub const TRUE: JsValue = JsValue::_new(JSIDX_TRUE);
++    pub const TRUE: JsValue = JsValue::_new(__rt::JSIDX_TRUE);
+ 
+     /// The `false` JS value constant.
+-    pub const FALSE: JsValue = JsValue::_new(JSIDX_FALSE);
++    pub const FALSE: JsValue = JsValue::_new(__rt::JSIDX_FALSE);
+ 
+     #[inline]
+     const fn _new(idx: u32) -> JsValue {
+@@ -376,7 +369,7 @@ impl JsValue {
+     /// Tests whether this JS value is `null` or `undefined`
+     #[inline]
+     pub fn is_null_or_undefined(&self) -> bool {
+-        unsafe { __wbindgen_is_null_or_undefined(self.idx) }
++        unsafe { __wbindgen_object_is_null_or_undefined(self.idx) }
+     }
+ 
+     /// Tests whether the type of this JS value is `symbol`
+@@ -1114,7 +1107,7 @@ impl TryFromJsValue for () {
+ 
+ impl<T: TryFromJsValue> TryFromJsValue for Option<T> {
+     fn try_from_js_value_ref(value: &JsValue) -> Option<Self> {
+-        if value.is_null_or_undefined() {
++        if value.is_undefined() {
+             Some(None)
+         } else {
+             T::try_from_js_value_ref(value).map(Some)
+@@ -1264,7 +1257,8 @@ externs! {
+     extern "C" {
+         fn __wbindgen_object_clone_ref(idx: u32) -> u32;
+         fn __wbindgen_object_drop_ref(idx: u32) -> ();
+-        fn __wbindgen_is_null_or_undefined(idx: u32) -> bool;
++        fn __wbindgen_object_is_null_or_undefined(idx: u32) -> bool;
++        fn __wbindgen_object_is_undefined(idx: u32) -> bool;
+ 
+         fn __wbindgen_describe(v: u32) -> ();
+         fn __wbindgen_describe_cast(func: *const (), prims: *const ()) -> *const ();
+@@ -1289,12 +1283,16 @@ impl Drop for JsValue {
+     fn drop(&mut self) {
+         unsafe {
+             // We definitely should never drop anything in the stack area
+-            debug_assert!(self.idx >= JSIDX_OFFSET, "free of stack slot {}", self.idx);
++            debug_assert!(
++                self.idx >= __rt::JSIDX_OFFSET,
++                "free of stack slot {}",
++                self.idx
++            );
+ 
+             // Otherwise if we're not dropping one of our reserved values,
+             // actually call the intrinsic. See #1054 for eventually removing
+             // this branch.
+-            if self.idx >= JSIDX_RESERVED {
++            if self.idx >= __rt::JSIDX_RESERVED {
+                 __wbindgen_object_drop_ref(self.idx);
+             }
+         }
+diff --git a/src/rt/mod.rs b/src/rt/mod.rs
+index 94383cb8a..0567fe8c3 100644
+--- a/src/rt/mod.rs
++++ b/src/rt/mod.rs
+@@ -93,6 +93,13 @@ pub fn wbg_cast<From: IntoWasmAbi, To: FromWasmAbi>(value: From) -> To {
+     unsafe { To::from_abi(breaks_if_inlined::<From, To>(prim1, prim2, prim3, prim4).join()) }
+ }
+ 
++pub(crate) const JSIDX_OFFSET: u32 = 128; // keep in sync with js/mod.rs
++pub(crate) const JSIDX_UNDEFINED: u32 = JSIDX_OFFSET;
++pub(crate) const JSIDX_NULL: u32 = JSIDX_OFFSET + 1;
++pub(crate) const JSIDX_TRUE: u32 = JSIDX_OFFSET + 2;
++pub(crate) const JSIDX_FALSE: u32 = JSIDX_OFFSET + 3;
++pub(crate) const JSIDX_RESERVED: u32 = JSIDX_OFFSET + 4;
++
+ pub(crate) struct ThreadLocalWrapper<T>(pub(crate) T);
+ 
+ #[cfg(not(target_feature = "atomics"))]

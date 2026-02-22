@@ -1,0 +1,239 @@
+diff --git a/README.md b/README.md
+index 5f42cbdc..3ac82fbb 100644
+--- a/README.md
++++ b/README.md
+@@ -22,6 +22,11 @@ If you'd like to help out, please see [CONTRIBUTING.md](CONTRIBUTING.md).
+ 
+ * Next release
+   - Planned: removal of unused signature verification schemes at link-time.
++* 0.20.8 (TBD)
++  - Yield an error from `ConnectionCommon::read_tls()` if buffers are full.
++    Both a full deframer buffer and a full incoming plaintext buffer will
++    now cause an error to be returned. Callers should call `process_new_packets()`
++    and read out the `writer()` after each successful call to `read_tls()`.
+ * 0.20.7 (2022-10-18)
+   - Expose secret extraction API under the `secret_extraction` cargo feature.
+     This is designed to enable switching from rustls to kTLS (kernel TLS
+diff --git a/rustls/examples/internal/bench.rs b/rustls/examples/internal/bench.rs
+index 4e80e750..5ef69d05 100644
+--- a/rustls/examples/internal/bench.rs
++++ b/rustls/examples/internal/bench.rs
+@@ -54,22 +54,24 @@ where
+     duration_nanos(end.duration_since(start))
+ }
+ 
+-fn transfer<L, R, LS, RS>(left: &mut L, right: &mut R) -> f64
++fn transfer<L, R, LS, RS>(left: &mut L, right: &mut R, expect_data: Option<usize>) -> f64
+ where
+     L: DerefMut + Deref<Target = ConnectionCommon<LS>>,
+     R: DerefMut + Deref<Target = ConnectionCommon<RS>>,
+     LS: SideData,
+     RS: SideData,
+ {
+-    let mut buf = [0u8; 262144];
++    let mut tls_buf = [0u8; 262144];
+     let mut read_time = 0f64;
++    let mut data_left = expect_data;
++    let mut data_buf = [0u8; 8192];
+ 
+     loop {
+         let mut sz = 0;
+ 
+         while left.wants_write() {
+             let written = left
+-                .write_tls(&mut buf[sz..].as_mut())
++                .write_tls(&mut tls_buf[sz..].as_mut())
+                 .unwrap();
+             if written == 0 {
+                 break;
+@@ -85,7 +87,7 @@ where
+         let mut offs = 0;
+         loop {
+             let start = Instant::now();
+-            match right.read_tls(&mut buf[offs..sz].as_ref()) {
++            match right.read_tls(&mut tls_buf[offs..sz].as_ref()) {
+                 Ok(read) => {
+                     right.process_new_packets().unwrap();
+                     offs += read;
+@@ -95,6 +97,21 @@ where
+                 }
+             }
+ 
++            if let Some(left) = &mut data_left {
++                loop {
++                    let sz = match right.reader().read(&mut data_buf) {
++                        Ok(sz) => sz,
++                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
++                        Err(err) => panic!("failed to read data: {}", err),
++                    };
++
++                    *left -= sz;
++                    if *left == 0 {
++                        break;
++                    }
++                }
++            }
++
+             let end = Instant::now();
+             read_time += duration_nanos(end.duration_since(start));
+             if sz == offs {
+@@ -104,22 +121,6 @@ where
+     }
+ }
+ 
+-fn drain<C, S>(d: &mut C, expect_len: usize)
+-where
+-    C: DerefMut + Deref<Target = ConnectionCommon<S>>,
+-    S: SideData,
+-{
+-    let mut left = expect_len;
+-    let mut buf = [0u8; 8192];
+-    loop {
+-        let sz = d.reader().read(&mut buf).unwrap();
+-        left -= sz;
+-        if left == 0 {
+-            break;
+-        }
+-    }
+-}
+-
+ #[derive(PartialEq, Clone, Copy)]
+ enum ClientAuth {
+     No,
+@@ -393,16 +394,16 @@ fn bench_handshake(params: &BenchmarkParam, clientauth: ClientAuth, resume: Resu
+         let mut server = ServerConnection::new(Arc::clone(&server_config)).unwrap();
+ 
+         server_time += time(|| {
+-            transfer(&mut client, &mut server);
++            transfer(&mut client, &mut server, None);
+         });
+         client_time += time(|| {
+-            transfer(&mut server, &mut client);
++            transfer(&mut server, &mut client, None);
+         });
+         server_time += time(|| {
+-            transfer(&mut client, &mut server);
++            transfer(&mut client, &mut server, None);
+         });
+         client_time += time(|| {
+-            transfer(&mut server, &mut client);
++            transfer(&mut server, &mut client, None);
+         });
+     }
+ 
+@@ -436,8 +437,8 @@ fn bench_handshake(params: &BenchmarkParam, clientauth: ClientAuth, resume: Resu
+ 
+ fn do_handshake_step(client: &mut ClientConnection, server: &mut ServerConnection) -> bool {
+     if server.is_handshaking() || client.is_handshaking() {
+-        transfer(client, server);
+-        transfer(server, client);
++        transfer(client, server, None);
++        transfer(server, client, None);
+         true
+     } else {
+         false
+@@ -482,8 +483,7 @@ fn bench_bulk(params: &BenchmarkParam, plaintext_size: u64, max_fragment_size: O
+             server.writer().write_all(&buf).unwrap();
+         });
+ 
+-        time_recv += transfer(&mut server, &mut client);
+-        drain(&mut client, buf.len());
++        time_recv += transfer(&mut server, &mut client, Some(buf.len()));
+     }
+ 
+     let mfs_str = format!(
+@@ -550,12 +550,7 @@ fn bench_memory(params: &BenchmarkParam, conn_count: u64) {
+         .iter_mut()
+         .zip(servers.iter_mut())
+     {
+-        transfer(client, server);
+-        let mut buf = [0u8; 1024];
+-        server
+-            .reader()
+-            .read_exact(&mut buf)
+-            .unwrap();
++        transfer(client, server, Some(1024));
+     }
+ }
+ 
+diff --git a/rustls/src/conn.rs b/rustls/src/conn.rs
+index 43755346..e273d0e3 100644
+--- a/rustls/src/conn.rs
++++ b/rustls/src/conn.rs
+@@ -709,22 +709,33 @@ impl<Data> ConnectionCommon<Data> {
+             .send_some_plaintext(buf)
+     }
+ 
+-    /// Read TLS content from `rd`.  This method does internal
+-    /// buffering, so `rd` can supply TLS messages in arbitrary-
+-    /// sized chunks (like a socket or pipe might).
++    /// Read TLS content from `rd` into the internal buffer.
+     ///
+-    /// You should call [`process_new_packets`] each time a call to
+-    /// this function succeeds.
++    /// Due to the internal buffering, `rd` can supply TLS messages in arbitrary-sized chunks (like
++    /// a socket or pipe might).
+     ///
+-    /// The returned error only relates to IO on `rd`.  TLS-level
+-    /// errors are emitted from [`process_new_packets`].
++    /// You should call [`process_new_packets()`] each time a call to this function succeeds in order
++    /// to empty the incoming TLS data buffer.
+     ///
+-    /// This function returns `Ok(0)` when the underlying `rd` does
+-    /// so.  This typically happens when a socket is cleanly closed,
+-    /// or a file is at EOF.
++    /// This function returns `Ok(0)` when the underlying `rd` does so. This typically happens when
++    /// a socket is cleanly closed, or a file is at EOF. Errors may result from the IO done through
++    /// `rd`; additionally, errors of `ErrorKind::Other` are emitted to signal backpressure:
+     ///
+-    /// [`process_new_packets`]: Connection::process_new_packets
++    /// * In order to empty the incoming TLS data buffer, you should call [`process_new_packets()`]
++    ///   each time a call to this function succeeds.
++    /// * In order to empty the incoming plaintext data buffer, you should empty it through
++    ///   the [`reader()`] after the call to [`process_new_packets()`].
++    ///
++    /// [`process_new_packets()`]: ConnectionCommon::process_new_packets
++    /// [`reader()`]: ConnectionCommon::reader
+     pub fn read_tls(&mut self, rd: &mut dyn io::Read) -> Result<usize, io::Error> {
++        if self.received_plaintext.is_full() {
++            return Err(io::Error::new(
++                io::ErrorKind::Other,
++                "received plaintext buffer full",
++            ));
++        }
++
+         let res = self.message_deframer.read(rd);
+         if let Ok(0) = res {
+             self.common_state.has_seen_eof = true;
+@@ -868,7 +879,7 @@ impl CommonState {
+             received_middlebox_ccs: 0,
+             peer_certificates: None,
+             message_fragmenter: MessageFragmenter::default(),
+-            received_plaintext: ChunkVecBuffer::new(Some(0)),
++            received_plaintext: ChunkVecBuffer::new(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT)),
+             sendable_plaintext: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
+             sendable_tls: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
+ 
+@@ -1440,4 +1451,5 @@ pub(crate) enum Side {
+ /// Data specific to the peer's side (client or server).
+ pub trait SideData {}
+ 
++const DEFAULT_RECEIVED_PLAINTEXT_LIMIT: usize = 16 * 1024;
+ const DEFAULT_BUFFER_LIMIT: usize = 64 * 1024;
+diff --git a/rustls/src/vecbuf.rs b/rustls/src/vecbuf.rs
+index 4017757a..6126edd9 100644
+--- a/rustls/src/vecbuf.rs
++++ b/rustls/src/vecbuf.rs
+@@ -36,6 +36,12 @@ impl ChunkVecBuffer {
+         self.chunks.is_empty()
+     }
+ 
++    pub(crate) fn is_full(&self) -> bool {
++        self.limit
++            .map(|limit| self.len() > limit)
++            .unwrap_or_default()
++    }
++
+     /// How many bytes we're storing
+     pub(crate) fn len(&self) -> usize {
+         let mut len = 0;

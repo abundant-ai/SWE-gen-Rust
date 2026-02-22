@@ -1,0 +1,221 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index de8d3490d..00fdd3de6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -19,6 +19,9 @@
+ * Fixed post-processing failures in case Std has debug assertions enabled.
+   [#4705](https://github.com/wasm-bindgen/wasm-bindgen/pull/4705)
+ 
++* Fixed JS memory leak in `wasm_bindgen::Closure`.
++  [#4709](https://github.dev/wasm-bindgen/wasm-bindgen/pull/4709)
++
+ ### Removed
+ 
+ * Internal crate `wasm-bindgen-backend` will no longer be published.
+diff --git a/crates/cli-support/src/intrinsic.rs b/crates/cli-support/src/intrinsic.rs
+index a3b6a68d9..5055ba57f 100644
+--- a/crates/cli-support/src/intrinsic.rs
++++ b/crates/cli-support/src/intrinsic.rs
+@@ -71,7 +71,6 @@ intrinsics! {
+         GT = "__wbindgen_gt",
+         ObjectCloneRef = "__wbindgen_object_clone_ref",
+         ObjectDropRef = "__wbindgen_object_drop_ref",
+-        CallbackDrop = "__wbindgen_cb_drop",
+         BigIntGetAsI64 = "__wbindgen_bigint_get_as_i64",
+         NumberGet = "__wbindgen_number_get",
+         StringGet = "__wbindgen_string_get",
+diff --git a/crates/cli-support/src/js/mod.rs b/crates/cli-support/src/js/mod.rs
+index ae1f3c09f..c328087d2 100644
+--- a/crates/cli-support/src/js/mod.rs
++++ b/crates/cli-support/src/js/mod.rs
+@@ -2379,15 +2379,17 @@ wasm = wasmInstance.exports;
+                     try {{
+                         return f(a, state.b, ...args);
+                     }} finally {{
+-                        if (--state.cnt === 0) {{
+-                            state.dtor(a, state.b);
+-                            CLOSURE_DTORS.unregister(state);
+-                        }} else {{
+-                            state.a = a;
+-                        }}
++                        state.a = a;
++                        real._wbg_cb_unref();
++                    }}
++                }};
++                real._wbg_cb_unref = () => {{
++                    if (--state.cnt === 0) {{
++                        state.dtor(state.a, state.b);
++                        state.a = 0;
++                        CLOSURE_DTORS.unregister(state);
+                     }}
+                 }};
+-                real.original = state;
+                 CLOSURE_DTORS.register(real, state, state);
+                 return real;
+             }}
+@@ -2435,13 +2437,16 @@ wasm = wasmInstance.exports;
+                     try {{
+                         return f(state.a, state.b, ...args);
+                     }} finally {{
+-                        if (--state.cnt === 0) {{
+-                            state.dtor(state.a, state.b); state.a = 0;
+-                            CLOSURE_DTORS.unregister(state);
+-                        }}
++                        real._wbg_cb_unref();
++                    }}
++                }};
++                real._wbg_cb_unref = () => {{
++                    if (--state.cnt === 0) {{
++                        state.dtor(state.a, state.b);
++                        state.a = 0;
++                        CLOSURE_DTORS.unregister(state);
+                     }}
+                 }};
+-                real.original = state;
+                 CLOSURE_DTORS.register(real, state, state);
+                 return real;
+             }}
+@@ -3775,16 +3780,6 @@ wasm = wasmInstance.exports;
+                 args[0].clone()
+             }
+ 
+-            Intrinsic::CallbackDrop => {
+-                assert_eq!(args.len(), 1);
+-                prelude.push_str(&format!("const obj = {}.original;\n", args[0]));
+-                prelude.push_str("if (obj.cnt-- == 1) {\n");
+-                prelude.push_str("obj.a = 0;\n");
+-                prelude.push_str("return true;\n");
+-                prelude.push_str("}\n");
+-                "false".to_string()
+-            }
+-
+             Intrinsic::NumberGet => {
+                 assert_eq!(args.len(), 1);
+                 prelude.push_str(&format!("const obj = {};\n", args[0]));
+diff --git a/src/closure.rs b/src/closure.rs
+index e9660371b..cd068c154 100644
+--- a/src/closure.rs
++++ b/src/closure.rs
+@@ -14,6 +14,15 @@ use core::mem::{self, ManuallyDrop};
+ use crate::convert::*;
+ use crate::describe::*;
+ use crate::JsValue;
++use core::marker::PhantomData;
++
++#[wasm_bindgen_macro::wasm_bindgen(wasm_bindgen = crate)]
++extern "C" {
++    type JsClosure;
++
++    #[wasm_bindgen(method)]
++    fn _wbg_cb_unref(js: &JsClosure);
++}
+ 
+ /// A handle to both a closure in Rust as well as JS closure which will invoke
+ /// the Rust closure.
+@@ -238,8 +247,8 @@ use crate::JsValue;
+ /// }
+ /// ```
+ pub struct Closure<T: ?Sized> {
+-    js: ManuallyDrop<JsValue>,
+-    data: OwnedClosure<T>,
++    js: JsClosure,
++    _marker: PhantomData<T>,
+ }
+ 
+ impl<T> Closure<T>
+@@ -272,12 +281,9 @@ where
+     /// A more direct version of `Closure::new` which creates a `Closure` from
+     /// a `Box<dyn Fn>`/`Box<dyn FnMut>`, which is how it's kept internally.
+     pub fn wrap(data: Box<T>) -> Closure<T> {
+-        let data = OwnedClosure {
+-            inner: ManuallyDrop::new(data),
+-        };
+         Self {
+-            js: ManuallyDrop::new(crate::__rt::wbg_cast(&data)),
+-            data,
++            js: crate::__rt::wbg_cast(OwnedClosure(data)),
++            _marker: PhantomData,
+         }
+     }
+ 
+@@ -301,9 +307,11 @@ where
+         JsValue::_new(idx)
+     }
+ 
+-    /// Same as `into_js_value`, but doesn't return a value.
++    /// Same as `mem::forget(self)`.
++    ///
++    /// This can be used to fully relinquish closure ownership to the JS.
+     pub fn forget(self) {
+-        drop(self.into_js_value());
++        mem::forget(self);
+     }
+ 
+     /// Create a `Closure` from a function that can only be called once.
+@@ -392,9 +400,7 @@ impl<T: ?Sized> AsRef<JsValue> for Closure<T> {
+ /// Internal representation of the actual owned closure which we send to the JS
+ /// in the constructor to convert it into a JavaScript value.
+ #[repr(transparent)]
+-struct OwnedClosure<T: ?Sized> {
+-    inner: ManuallyDrop<Box<T>>,
+-}
++struct OwnedClosure<T: ?Sized>(Box<T>);
+ 
+ unsafe extern "C" fn destroy<T: ?Sized>(a: usize, b: usize) {
+     // This can be called by the JS glue in erroneous situations
+@@ -408,7 +414,7 @@ unsafe extern "C" fn destroy<T: ?Sized>(a: usize, b: usize) {
+     drop(mem::transmute_copy::<_, Box<T>>(&(a, b)));
+ }
+ 
+-impl<T> WasmDescribe for &OwnedClosure<T>
++impl<T> WasmDescribe for OwnedClosure<T>
+ where
+     T: WasmClosure + ?Sized,
+ {
+@@ -421,14 +427,14 @@ where
+     }
+ }
+ 
+-impl<T> IntoWasmAbi for &OwnedClosure<T>
++impl<T> IntoWasmAbi for OwnedClosure<T>
+ where
+     T: WasmClosure + ?Sized,
+ {
+     type Abi = WasmSlice;
+ 
+     fn into_abi(self) -> WasmSlice {
+-        let (a, b): (usize, usize) = unsafe { mem::transmute_copy(self) };
++        let (a, b): (usize, usize) = unsafe { mem::transmute_copy(&ManuallyDrop::new(self)) };
+         WasmSlice {
+             ptr: a as u32,
+             len: b as u32,
+@@ -491,13 +497,9 @@ where
+     T: ?Sized,
+ {
+     fn drop(&mut self) {
+-        // this will implicitly drop our strong reference in addition to
+-        // invalidating all future invocations of the closure
+-        if super::__wbindgen_cb_drop(&self.js) {
+-            unsafe {
+-                ManuallyDrop::drop(&mut self.data.inner);
+-            }
+-        }
++        // Decrease refcount on the JS side, this will automatically free
++        // the Rust data if we're the last owner.
++        self.js._wbg_cb_unref();
+     }
+ }
+ 
+diff --git a/src/lib.rs b/src/lib.rs
+index 568e7ec60..0f9fcab88 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1125,8 +1125,6 @@ extern "C" {
+     fn __wbindgen_throw(msg: &str) /* -> ! */;
+     fn __wbindgen_rethrow(js: JsValue) /* -> ! */;
+ 
+-    fn __wbindgen_cb_drop(js: &JsValue) -> bool;
+-
+     fn __wbindgen_jsval_eq(a: &JsValue, b: &JsValue) -> bool;
+     fn __wbindgen_jsval_loose_eq(a: &JsValue, b: &JsValue) -> bool;
+ 

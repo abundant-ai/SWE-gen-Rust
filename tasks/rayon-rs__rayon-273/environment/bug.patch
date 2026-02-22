@@ -1,0 +1,477 @@
+diff --git a/rayon-core/src/configuration.rs b/rayon-core/src/configuration.rs
+index 2c3e2fd..7b6550a 100644
+--- a/rayon-core/src/configuration.rs
++++ b/rayon-core/src/configuration.rs
+@@ -1,20 +1,53 @@
+ #[allow(unused_imports)]
+ use log::Event::*;
+ use std::any::Any;
+-use std::env;
+ use std::error::Error;
+-use std::str::FromStr;
+ use std::fmt;
+ use std::sync::Arc;
+ use registry;
+-use num_cpus;
++
++/// Custom error type for the rayon thread pool configuration.
++#[derive(Debug,PartialEq)]
++pub enum InitError {
++    /// Error if number of threads is set to zero.
++    NumberOfThreadsZero,
++
++    /// Error if the gloal thread pool is initialized multiple times
++    /// and the configuration is not equal for all configurations.
++    GlobalPoolAlreadyInitialized,
++}
++
++impl fmt::Display for InitError {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        match *self {
++            InitError::NumberOfThreadsZero => {
++                write!(f,
++                       "The number of threads was set to zero but must be greater than zero.")
++            }
++            InitError::GlobalPoolAlreadyInitialized => {
++                write!(f,
++                       "The gobal thread pool has already been initialized with a different \
++                        configuration. Only one valid configuration is allowed.")
++            }
++        }
++    }
++}
++
++impl Error for InitError {
++    fn description(&self) -> &str {
++        match *self {
++            InitError::NumberOfThreadsZero => "number of threads set to zero",
++            InitError::GlobalPoolAlreadyInitialized => {
++                "global thread pool has already been initialized"
++            }
++        }
++    }
++}
+ 
+ /// Contains the rayon thread pool configuration.
+ pub struct Configuration {
+-    /// The number of threads in the rayon thread pool.
+-    /// If zero will use the RAYON_RS_NUM_CPUS environment variable.
+-    /// If RAYON_RS_NUM_CPUS is invalid or zero will use the default.
+-    num_threads: usize,
++    /// The number of threads in the rayon thread pool. Must not be zero.
++    num_threads: Option<usize>,
+ 
+     /// Custom closure, if any, to handle a panic that we cannot propagate
+     /// anywhere else.
+@@ -35,7 +68,7 @@ impl Configuration {
+     /// Creates and return a valid rayon thread pool configuration, but does not initialize it.
+     pub fn new() -> Configuration {
+         Configuration {
+-            num_threads: 0,
++            num_threads: None,
+             get_thread_name: None,
+             panic_handler: None,
+             stack_size: None,
+@@ -44,15 +77,8 @@ impl Configuration {
+ 
+     /// Get the number of threads that will be used for the thread
+     /// pool. See `set_num_threads` for more information.
+-    pub fn num_threads(&self) -> usize {
+-        if self.num_threads > 0 {
+-            self.num_threads
+-        } else {
+-            match env::var("RAYON_RS_NUM_CPUS").ok().and_then(|s| usize::from_str(&s).ok()) {
+-                Some(x) if x > 0 => x,
+-                _ => num_cpus::get(),
+-            }
+-        }
++    pub fn num_threads(&self) -> Option<usize> {
++        self.num_threads
+     }
+ 
+     /// Get the thread name for the thread with the given index.
+@@ -69,12 +95,11 @@ impl Configuration {
+     }
+ 
+     /// Set the number of threads to be used in the rayon threadpool.
+-    /// If `num_threads` is 0 or you do not call this function,
+-    /// rayon will use the RAYON_RS_NUM_CPUS environment variable.
+-    /// If RAYON_RS_NUM_CPUS is invalid or is zero, a suitable default will be used.
+-    /// Currently, the default is one thread per logical CPU.
++    /// The argument `num_threads` must not be zero. If you do not
++    /// call this function, rayon will select a suitable default
++    /// (currently, the default is one thread per logical CPU).
+     pub fn set_num_threads(mut self, num_threads: usize) -> Configuration {
+-        self.num_threads = num_threads;
++        self.num_threads = Some(num_threads);
+         self
+     }
+ 
+@@ -114,6 +139,18 @@ impl Configuration {
+         self.stack_size = Some(stack_size);
+         self
+     }
++
++
++    /// Checks whether the configuration is valid.
++    pub fn validate(&self) -> Result<(), InitError> {
++        if let Some(value) = self.num_threads {
++            if value == 0 {
++                return Err(InitError::NumberOfThreadsZero);
++            }
++        }
++
++        Ok(())
++    }
+ }
+ 
+ /// Initializes the global thread pool. This initialization is
+@@ -133,7 +170,8 @@ impl Configuration {
+ /// changed. Therefore, if you call `initialize` a second time, it
+ /// will return an error. An `Ok` result indicates that this
+ /// is the first initialization of the thread pool.
+-pub fn initialize(config: Configuration) -> Result<(), Box<Error>> {
++pub fn initialize(config: Configuration) -> Result<(), InitError> {
++    try!(config.validate());
+     let registry = try!(registry::init_global_registry(config));
+     registry.wait_until_primed();
+     Ok(())
+diff --git a/rayon-core/src/future/test.rs b/rayon-core/src/future/test.rs
+index c660be4..7d584ab 100644
+--- a/rayon-core/src/future/test.rs
++++ b/rayon-core/src/future/test.rs
+@@ -147,7 +147,7 @@ fn panicy_unpark() {
+ 
+         // this should trigger the future `a_rx` to be awoken
+         // and executing in a Rayon background thread
+-        a_tx.send(22).unwrap();
++        a_tx.complete(22);
+ 
+         // now we wait for `rf` to complete; when it does, it will
+         // also signal the `PanicUnpark` to wake up (that is
+@@ -194,7 +194,7 @@ fn double_unpark() {
+             }
+         }
+ 
+-        a_tx.send(22).unwrap();
++        a_tx.complete(22);
+ 
+         // just hold onto `rf` to ensure that nothing is cancelled
+         _tag = Some(spawn.into_inner());
+diff --git a/rayon-core/src/join/test.rs b/rayon-core/src/join/test.rs
+index 03ee4b5..a66c6b8 100644
+--- a/rayon-core/src/join/test.rs
++++ b/rayon-core/src/join/test.rs
+@@ -44,11 +44,21 @@ fn sort_in_pool() {
+     let mut rng = XorShiftRng::from_seed([0, 1, 2, 3]);
+     let mut data: Vec<_> = (0..12 * 1024).map(|_| rng.next_u32()).collect();
+ 
+-    let pool = ThreadPool::new(Configuration::new()).unwrap();
+-    let mut sorted_data = data.clone();
+-    sorted_data.sort();
+-    pool.install(|| quick_sort(&mut data));
+-    assert_eq!(data, sorted_data);
++    let result = ThreadPool::new(Configuration::new());
++
++    match result {
++        Ok(pool) => {
++            let mut sorted_data = data.clone();
++            sorted_data.sort();
++
++            pool.install(|| {
++                quick_sort(&mut data);
++            });
++
++            assert_eq!(data, sorted_data);
++        }
++        Err(_) => panic!("expected Ok() but got Err()"),
++    }
+ }
+ 
+ #[test]
+diff --git a/rayon-core/src/lib.rs b/rayon-core/src/lib.rs
+index 9c91045..afd981b 100644
+--- a/rayon-core/src/lib.rs
++++ b/rayon-core/src/lib.rs
+@@ -37,6 +37,7 @@ mod util;
+ 
+ pub use configuration::Configuration;
+ pub use configuration::PanicHandler;
++pub use configuration::InitError;
+ pub use configuration::dump_stats;
+ pub use configuration::initialize;
+ pub use thread_pool::ThreadPool;
+diff --git a/rayon-core/src/registry.rs b/rayon-core/src/registry.rs
+index b12ff7c..082cd66 100644
+--- a/rayon-core/src/registry.rs
++++ b/rayon-core/src/registry.rs
+@@ -3,37 +3,25 @@ use deque;
+ use deque::{Worker, Stealer, Stolen};
+ use job::{JobRef, StackJob};
+ use latch::{LatchProbe, Latch, CountLatch, LockLatch};
++use configuration::InitError;
+ #[allow(unused_imports)]
+ use log::Event::*;
+ use rand::{self, Rng};
+ use sleep::Sleep;
+ use std::any::Any;
+-use std::error::Error;
+ use std::cell::{Cell, UnsafeCell};
++use std::env;
++use std::str::FromStr;
+ use std::sync::{Arc, Mutex, Once, ONCE_INIT};
+ use std::thread;
+ use std::mem;
+-use std::fmt;
+ use std::u32;
+ use std::usize;
+ use unwind;
+ use util::leak;
++use num_cpus;
+ 
+-/// Error if the gloal thread pool is initialized multiple times.
+-#[derive(Debug,PartialEq)]
+-struct GlobalPoolAlreadyInitialized;
+-
+-impl fmt::Display for GlobalPoolAlreadyInitialized {
+-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+-        f.write_str(self.description())
+-    }
+-}
+-
+-impl Error for GlobalPoolAlreadyInitialized {
+-    fn description(&self) -> &str {
+-        "The global thread pool has already been initialized."
+-    }
+-}
++/// ////////////////////////////////////////////////////////////////////////
+ 
+ pub struct Registry {
+     thread_infos: Vec<ThreadInfo>,
+@@ -78,13 +66,13 @@ fn global_registry() -> &'static Arc<Registry> {
+ 
+ /// Starts the worker threads (if that has not already happened) with
+ /// the given configuration.
+-pub fn init_global_registry(config: Configuration) -> Result<&'static Registry, Box<Error>> {
++pub fn init_global_registry(config: Configuration) -> Result<&'static Registry, InitError> {
+     let mut called = false;
+     THE_REGISTRY_SET.call_once(|| unsafe { init_registry(config); called = true; });
+     if called {
+         Ok(unsafe { THE_REGISTRY.unwrap() })
+     } else {
+-        Err(Box::new(GlobalPoolAlreadyInitialized))
++        Err(InitError::GlobalPoolAlreadyInitialized)
+     }
+ }
+ 
+@@ -99,10 +87,20 @@ unsafe fn init_registry(config: Configuration) {
+ 
+ impl Registry {
+     pub fn new(mut configuration: Configuration) -> Arc<Registry> {
+-        let n_threads = configuration.num_threads();
++        debug_assert!(configuration.validate().is_ok());
++
++        let limit_value = match configuration.num_threads() {
++            Some(value) => value,
++            None => {
++                match env::var("RAYON_RS_NUM_CPUS") {
++                    Ok(s) => usize::from_str(&s).expect("invalid value for RAYON_RS_NUM_CPUS"),
++                    Err(_) => num_cpus::get(),
++                }
++            }
++        };
+ 
+         let (inj_worker, inj_stealer) = deque::new();
+-        let (workers, stealers): (Vec<_>, Vec<_>) = (0..n_threads).map(|_| deque::new()).unzip();
++        let (workers, stealers): (Vec<_>, Vec<_>) = (0..limit_value).map(|_| deque::new()).unzip();
+ 
+         let registry = Arc::new(Registry {
+             thread_infos: stealers.into_iter()
+diff --git a/rayon-core/src/test.rs b/rayon-core/src/test.rs
+index 0c41fbd..645adf1 100644
+--- a/rayon-core/src/test.rs
++++ b/rayon-core/src/test.rs
+@@ -3,8 +3,25 @@
+ extern crate compiletest_rs as compiletest;
+ 
+ use configuration::*;
++use std::error::Error;
+ use thread_pool::*;
+ 
++#[test]
++fn error_in_pool() {
++    let result = ThreadPool::new(Configuration::new().set_num_threads(0));
++
++    match result {
++        Ok(_) => panic!("expected Err(), but got Ok()"),
++        Err(error) => assert_eq!(error, InitError::NumberOfThreadsZero),
++    }
++}
++
++#[test]
++fn coerce_to_box_error() {
++    // check that coercion succeeds
++    let _: Box<Error> = From::from(InitError::NumberOfThreadsZero);
++}
++
+ #[test]
+ fn worker_thread_index() {
+     let pool = ThreadPool::new(Configuration::new().set_num_threads(22)).unwrap();
+diff --git a/rayon-core/src/thread_pool/mod.rs b/rayon-core/src/thread_pool/mod.rs
+index efae972..353d591 100644
+--- a/rayon-core/src/thread_pool/mod.rs
++++ b/rayon-core/src/thread_pool/mod.rs
+@@ -1,4 +1,4 @@
+-use configuration::Configuration;
++use configuration::{Configuration, InitError};
+ #[cfg(feature = "unstable")]
+ use future::{Future, RayonFuture};
+ use latch::LockLatch;
+@@ -8,7 +8,6 @@ use job::StackJob;
+ #[cfg(feature = "unstable")]
+ use spawn_async;
+ use std::sync::Arc;
+-use std::error::Error;
+ use registry::{Registry, WorkerThread};
+ 
+ mod test;
+@@ -21,7 +20,8 @@ impl ThreadPool {
+     /// Constructs a new thread pool with the given configuration. If
+     /// the configuration is not valid, returns a suitable `Err`
+     /// result.  See `InitError` for more details.
+-    pub fn new(configuration: Configuration) -> Result<ThreadPool, Box<Error>> {
++    pub fn new(configuration: Configuration) -> Result<ThreadPool, InitError> {
++        try!(configuration.validate());
+         Ok(ThreadPool { registry: Registry::new(configuration) })
+     }
+ 
+diff --git a/src/iter/collect/test.rs b/src/iter/collect/test.rs
+index 2348d77..c6a4f0e 100644
+--- a/src/iter/collect/test.rs
++++ b/src/iter/collect/test.rs
+@@ -1,5 +1,4 @@
+ #![cfg(test)]
+-#![allow(unused_assignments)]
+ 
+ // These tests are primarily targeting "abusive" producers that will
+ // try to drive the "collect consumer" incorrectly. These should
+@@ -44,7 +43,7 @@ fn left_produces_items_with_no_complete() {
+     let mut collect = Collect::new(&mut v, 4);
+     {
+         let consumer = collect.as_consumer();
+-        let (left_consumer, right_consumer, _) = consumer.split_at(2);
++        let (left_consumer, right_consumer, reducer) = consumer.split_at(2);
+         let mut left_folder = left_consumer.into_folder();
+         let mut right_folder = right_consumer.into_folder();
+         left_folder = left_folder.consume(0).consume(1);
+@@ -63,7 +62,7 @@ fn right_produces_items_with_no_complete() {
+     let mut collect = Collect::new(&mut v, 4);
+     {
+         let consumer = collect.as_consumer();
+-        let (left_consumer, right_consumer, _) = consumer.split_at(2);
++        let (left_consumer, right_consumer, reducer) = consumer.split_at(2);
+         let mut left_folder = left_consumer.into_folder();
+         let mut right_folder = right_consumer.into_folder();
+         left_folder = left_folder.consume(0).consume(1);
+@@ -97,7 +96,7 @@ fn left_produces_too_many_items() {
+     let mut collect = Collect::new(&mut v, 4);
+     {
+         let consumer = collect.as_consumer();
+-        let (left_consumer, right_consumer, _) = consumer.split_at(2);
++        let (left_consumer, right_consumer, reducer) = consumer.split_at(2);
+         let mut left_folder = left_consumer.into_folder();
+         let mut right_folder = right_consumer.into_folder();
+         left_folder = left_folder.consume(0).consume(1).consume(2);
+@@ -116,7 +115,7 @@ fn right_produces_too_many_items() {
+     let mut collect = Collect::new(&mut v, 4);
+     {
+         let consumer = collect.as_consumer();
+-        let (left_consumer, right_consumer, _) = consumer.split_at(2);
++        let (left_consumer, right_consumer, reducer) = consumer.split_at(2);
+         let mut left_folder = left_consumer.into_folder();
+         let mut right_folder = right_consumer.into_folder();
+         left_folder = left_folder.consume(0).consume(1);
+@@ -136,7 +135,7 @@ fn left_produces_fewer_items() {
+     let mut collect = Collect::new(&mut v, 4);
+     {
+         let consumer = collect.as_consumer();
+-        let (left_consumer, right_consumer, _) = consumer.split_at(2);
++        let (left_consumer, right_consumer, reducer) = consumer.split_at(2);
+         let mut left_folder = left_consumer.into_folder();
+         let mut right_folder = right_consumer.into_folder();
+         left_folder = left_folder.consume(0);
+@@ -156,7 +155,7 @@ fn right_produces_fewer_items() {
+     let mut collect = Collect::new(&mut v, 4);
+     {
+         let consumer = collect.as_consumer();
+-        let (left_consumer, right_consumer, _) = consumer.split_at(2);
++        let (left_consumer, right_consumer, reducer) = consumer.split_at(2);
+         let mut left_folder = left_consumer.into_folder();
+         let mut right_folder = right_consumer.into_folder();
+         left_folder = left_folder.consume(0).consume(1);
+diff --git a/src/lib.rs b/src/lib.rs
+index 0f16898..43fa5b1 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -32,6 +32,7 @@ pub use iter::split;
+ pub use rayon_core::current_num_threads;
+ pub use rayon_core::Configuration;
+ pub use rayon_core::PanicHandler;
++pub use rayon_core::InitError;
+ pub use rayon_core::dump_stats;
+ pub use rayon_core::initialize;
+ pub use rayon_core::ThreadPool;
+diff --git a/tests/run-pass/double_init_fail.rs b/tests/run-pass/double_init_fail.rs
+index d3911a2..7d4eee9 100644
+--- a/tests/run-pass/double_init_fail.rs
++++ b/tests/run-pass/double_init_fail.rs
+@@ -4,7 +4,7 @@ use rayon::*;
+ 
+ fn main() {
+     let result1 = initialize(Configuration::new());
+-    assert_eq!(result1.unwrap(), ());
+-    let err = initialize(Configuration::new()).unwrap_err();
+-    assert!(err.description() == "The global thread pool has already been initialized.");
++    assert_eq!(result1, Ok(()));
++    let result2 = initialize(Configuration::new());
++    assert_eq!(result2, Err(InitError::GlobalPoolAlreadyInitialized));
+ }
+diff --git a/tests/run-pass/init_fail_zero_threads.rs b/tests/run-pass/init_fail_zero_threads.rs
+new file mode 100644
+index 0000000..b38307d
+--- /dev/null
++++ b/tests/run-pass/init_fail_zero_threads.rs
+@@ -0,0 +1,9 @@
++extern crate rayon;
++
++use rayon::*;
++
++fn main() {
++    let result = initialize(Configuration::new().set_num_threads(0));
++
++    assert_eq!(result, Err(InitError::NumberOfThreadsZero));
++}
+diff --git a/tests/run-pass/init_zero_threads.rs b/tests/run-pass/init_zero_threads.rs
+deleted file mode 100644
+index 034948f..0000000
+--- a/tests/run-pass/init_zero_threads.rs
++++ /dev/null
+@@ -1,7 +0,0 @@
+-extern crate rayon;
+-
+-use rayon::*;
+-
+-fn main() {
+-    initialize(Configuration::new().set_num_threads(0)).unwrap();
+-}
+diff --git a/tests/run-pass/stack_overflow_crash.rs b/tests/run-pass/stack_overflow_crash.rs
+index 5bca28b..af7993f 100644
+--- a/tests/run-pass/stack_overflow_crash.rs
++++ b/tests/run-pass/stack_overflow_crash.rs
+@@ -48,4 +48,4 @@ fn main() {
+             force_stack_overflow(32);
+         });
+     }
+-}
++}
+\ No newline at end of file

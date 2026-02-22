@@ -1,0 +1,700 @@
+diff --git a/src/iter/cloned.rs b/src/iter/cloned.rs
+new file mode 100644
+index 0000000..ce2c125
+--- /dev/null
++++ b/src/iter/cloned.rs
+@@ -0,0 +1,185 @@
++use super::internal::*;
++use super::*;
++
++use std::iter;
++
++/// `Cloned` is an iterator that clones the elements of an underlying iterator.
++///
++/// This struct is created by the [`cloned()`] method on [`ParallelIterator`]
++///
++/// [`cloned()`]: trait.ParallelIterator.html#method.cloned
++/// [`ParallelIterator`]: trait.ParallelIterator.html
++pub struct Cloned<I: ParallelIterator> {
++    base: I,
++}
++
++/// Create a new `Cloned` iterator.
++///
++/// NB: a free fn because it is NOT part of the end-user API.
++pub fn new<I>(base: I) -> Cloned<I>
++    where I: ParallelIterator
++{
++    Cloned { base: base }
++}
++
++impl<'a, T, I> ParallelIterator for Cloned<I>
++    where I: ParallelIterator<Item = &'a T>,
++          T: 'a + Clone + Send + Sync
++{
++    type Item = T;
++
++    fn drive_unindexed<C>(self, consumer: C) -> C::Result
++        where C: UnindexedConsumer<Self::Item>
++    {
++        let consumer1 = ClonedConsumer::new(consumer);
++        self.base.drive_unindexed(consumer1)
++    }
++
++    fn opt_len(&mut self) -> Option<usize> {
++        self.base.opt_len()
++    }
++}
++
++impl<'a, T, I> IndexedParallelIterator for Cloned<I>
++    where I: IndexedParallelIterator<Item = &'a T>,
++          T: 'a + Clone + Send + Sync
++{
++    fn drive<C>(self, consumer: C) -> C::Result
++        where C: Consumer<Self::Item>
++    {
++        let consumer1 = ClonedConsumer::new(consumer);
++        self.base.drive(consumer1)
++    }
++
++    fn len(&mut self) -> usize {
++        self.base.len()
++    }
++
++    fn with_producer<CB>(self, callback: CB) -> CB::Output
++        where CB: ProducerCallback<Self::Item>
++    {
++        return self.base.with_producer(Callback { callback: callback });
++
++        struct Callback<CB> {
++            callback: CB,
++        }
++
++        impl<'a, T, CB> ProducerCallback<&'a T> for Callback<CB>
++            where CB: ProducerCallback<T>,
++                  T: 'a + Clone + Send
++        {
++            type Output = CB::Output;
++
++            fn callback<P>(self, base: P) -> CB::Output
++                where P: Producer<Item = &'a T>
++            {
++                let producer = ClonedProducer { base: base };
++                self.callback.callback(producer)
++            }
++        }
++    }
++}
++
++/// ////////////////////////////////////////////////////////////////////////
++
++struct ClonedProducer<P> {
++    base: P,
++}
++
++impl<'a, T, P> Producer for ClonedProducer<P>
++    where P: Producer<Item = &'a T>,
++          T: 'a + Clone
++{
++    type Item = T;
++    type IntoIter = iter::Cloned<P::IntoIter>;
++
++    fn into_iter(self) -> Self::IntoIter {
++        self.base.into_iter().cloned()
++    }
++
++    fn min_len(&self) -> usize {
++        self.base.min_len()
++    }
++
++    fn max_len(&self) -> usize {
++        self.base.max_len()
++    }
++
++    fn split_at(self, index: usize) -> (Self, Self) {
++        let (left, right) = self.base.split_at(index);
++        (ClonedProducer { base: left }, ClonedProducer { base: right })
++    }
++}
++
++
++/// ////////////////////////////////////////////////////////////////////////
++/// Consumer implementation
++
++struct ClonedConsumer<C> {
++    base: C,
++}
++
++impl<C> ClonedConsumer<C> {
++    fn new(base: C) -> Self {
++        ClonedConsumer { base: base }
++    }
++}
++
++impl<'a, T, C> Consumer<&'a T> for ClonedConsumer<C>
++    where C: Consumer<T>,
++          T: 'a + Clone
++{
++    type Folder = ClonedFolder<C::Folder>;
++    type Reducer = C::Reducer;
++    type Result = C::Result;
++
++    fn split_at(self, index: usize) -> (Self, Self, Self::Reducer) {
++        let (left, right, reducer) = self.base.split_at(index);
++        (ClonedConsumer::new(left), ClonedConsumer::new(right), reducer)
++    }
++
++    fn into_folder(self) -> Self::Folder {
++        ClonedFolder { base: self.base.into_folder() }
++    }
++
++    fn full(&self) -> bool {
++        self.base.full()
++    }
++}
++
++impl<'a, T, C> UnindexedConsumer<&'a T> for ClonedConsumer<C>
++    where C: UnindexedConsumer<T>,
++          T: 'a + Clone
++{
++    fn split_off_left(&self) -> Self {
++        ClonedConsumer::new(self.base.split_off_left())
++    }
++
++    fn to_reducer(&self) -> Self::Reducer {
++        self.base.to_reducer()
++    }
++}
++
++
++struct ClonedFolder<F> {
++    base: F,
++}
++
++impl<'a, T, F> Folder<&'a T> for ClonedFolder<F>
++    where F: Folder<T>,
++          T: 'a + Clone
++{
++    type Result = F::Result;
++
++    fn consume(self, item: &'a T) -> Self {
++        ClonedFolder { base: self.base.consume(item.clone()) }
++    }
++
++    fn complete(self) -> F::Result {
++        self.base.complete()
++    }
++
++    fn full(&self) -> bool {
++        self.base.full()
++    }
++}
+diff --git a/src/iter/inspect.rs b/src/iter/inspect.rs
+new file mode 100644
+index 0000000..53c498f
+--- /dev/null
++++ b/src/iter/inspect.rs
+@@ -0,0 +1,220 @@
++use super::internal::*;
++use super::*;
++
++use std::iter;
++
++
++/// `Inspect` is an iterator that calls a function with a reference to each
++/// element before yielding it.
++///
++/// This struct is created by the [`inspect()`] method on [`ParallelIterator`]
++///
++/// [`inspect()`]: trait.ParallelIterator.html#method.inspect
++/// [`ParallelIterator`]: trait.ParallelIterator.html
++pub struct Inspect<I: ParallelIterator, F> {
++    base: I,
++    inspect_op: F,
++}
++
++/// Create a new `Inspect` iterator.
++///
++/// NB: a free fn because it is NOT part of the end-user API.
++pub fn new<I, F>(base: I, inspect_op: F) -> Inspect<I, F>
++    where I: ParallelIterator
++{
++    Inspect {
++        base: base,
++        inspect_op: inspect_op,
++    }
++}
++
++impl<I, F> ParallelIterator for Inspect<I, F>
++    where I: ParallelIterator,
++          F: Fn(&I::Item) + Sync
++{
++    type Item = I::Item;
++
++    fn drive_unindexed<C>(self, consumer: C) -> C::Result
++        where C: UnindexedConsumer<Self::Item>
++    {
++        let consumer1 = InspectConsumer::new(consumer, &self.inspect_op);
++        self.base.drive_unindexed(consumer1)
++    }
++
++    fn opt_len(&mut self) -> Option<usize> {
++        self.base.opt_len()
++    }
++}
++
++impl<I, F> IndexedParallelIterator for Inspect<I, F>
++    where I: IndexedParallelIterator,
++          F: Fn(&I::Item) + Sync
++{
++    fn drive<C>(self, consumer: C) -> C::Result
++        where C: Consumer<Self::Item>
++    {
++        let consumer1 = InspectConsumer::new(consumer, &self.inspect_op);
++        self.base.drive(consumer1)
++    }
++
++    fn len(&mut self) -> usize {
++        self.base.len()
++    }
++
++    fn with_producer<CB>(self, callback: CB) -> CB::Output
++        where CB: ProducerCallback<Self::Item>
++    {
++        return self.base
++                   .with_producer(Callback {
++                                      callback: callback,
++                                      inspect_op: self.inspect_op,
++                                  });
++
++        struct Callback<CB, F> {
++            callback: CB,
++            inspect_op: F,
++        }
++
++        impl<T, F, CB> ProducerCallback<T> for Callback<CB, F>
++            where CB: ProducerCallback<T>,
++                  F: Fn(&T) + Sync
++        {
++            type Output = CB::Output;
++
++            fn callback<P>(self, base: P) -> CB::Output
++                where P: Producer<Item = T>
++            {
++                let producer = InspectProducer {
++                    base: base,
++                    inspect_op: &self.inspect_op,
++                };
++                self.callback.callback(producer)
++            }
++        }
++    }
++}
++
++/// ////////////////////////////////////////////////////////////////////////
++
++struct InspectProducer<'f, P, F: 'f> {
++    base: P,
++    inspect_op: &'f F,
++}
++
++impl<'f, P, F> Producer for InspectProducer<'f, P, F>
++    where P: Producer,
++          F: Fn(&P::Item) + Sync
++{
++    type Item = P::Item;
++    type IntoIter = iter::Inspect<P::IntoIter, &'f F>;
++
++    fn into_iter(self) -> Self::IntoIter {
++        self.base.into_iter().inspect(self.inspect_op)
++    }
++
++    fn min_len(&self) -> usize {
++        self.base.min_len()
++    }
++
++    fn max_len(&self) -> usize {
++        self.base.max_len()
++    }
++
++    fn split_at(self, index: usize) -> (Self, Self) {
++        let (left, right) = self.base.split_at(index);
++        (InspectProducer {
++             base: left,
++             inspect_op: self.inspect_op,
++         },
++         InspectProducer {
++             base: right,
++             inspect_op: self.inspect_op,
++         })
++    }
++}
++
++
++/// ////////////////////////////////////////////////////////////////////////
++/// Consumer implementation
++
++struct InspectConsumer<'f, C, F: 'f> {
++    base: C,
++    inspect_op: &'f F,
++}
++
++impl<'f, C, F> InspectConsumer<'f, C, F> {
++    fn new(base: C, inspect_op: &'f F) -> Self {
++        InspectConsumer {
++            base: base,
++            inspect_op: inspect_op,
++        }
++    }
++}
++
++impl<'f, T, C, F> Consumer<T> for InspectConsumer<'f, C, F>
++    where C: Consumer<T>,
++          F: Fn(&T) + Sync
++{
++    type Folder = InspectFolder<'f, C::Folder, F>;
++    type Reducer = C::Reducer;
++    type Result = C::Result;
++
++    fn split_at(self, index: usize) -> (Self, Self, Self::Reducer) {
++        let (left, right, reducer) = self.base.split_at(index);
++        (InspectConsumer::new(left, self.inspect_op),
++         InspectConsumer::new(right, self.inspect_op),
++         reducer)
++    }
++
++    fn into_folder(self) -> Self::Folder {
++        InspectFolder {
++            base: self.base.into_folder(),
++            inspect_op: self.inspect_op,
++        }
++    }
++
++    fn full(&self) -> bool {
++        self.base.full()
++    }
++}
++
++impl<'f, T, C, F> UnindexedConsumer<T> for InspectConsumer<'f, C, F>
++    where C: UnindexedConsumer<T>,
++          F: Fn(&T) + Sync
++{
++    fn split_off_left(&self) -> Self {
++        InspectConsumer::new(self.base.split_off_left(), &self.inspect_op)
++    }
++
++    fn to_reducer(&self) -> Self::Reducer {
++        self.base.to_reducer()
++    }
++}
++
++struct InspectFolder<'f, C, F: 'f> {
++    base: C,
++    inspect_op: &'f F,
++}
++
++impl<'f, T, C, F> Folder<T> for InspectFolder<'f, C, F>
++    where C: Folder<T>,
++          F: Fn(&T)
++{
++    type Result = C::Result;
++
++    fn consume(self, item: T) -> Self {
++        (self.inspect_op)(&item);
++        InspectFolder {
++            base: self.base.consume(item),
++            inspect_op: self.inspect_op,
++        }
++    }
++
++    fn complete(self) -> C::Result {
++        self.base.complete()
++    }
++
++    fn full(&self) -> bool {
++        self.base.full()
++    }
++}
+diff --git a/src/iter/map.rs b/src/iter/map.rs
+index 69fb267..850edf7 100644
+--- a/src/iter/map.rs
++++ b/src/iter/map.rs
+@@ -1,56 +1,15 @@
+ use super::internal::*;
+ use super::*;
+ 
+-/// Specifies a "map operator", transforming values into something else.
+-///
+-/// Implementing this trait is not permitted outside of `rayon`.
+-pub trait MapOp<In>: Sync {
+-    type Output: Send;
+-    fn map(&self, value: In) -> Self::Output;
+-    private_decl!{}
+-}
+-
+-pub struct MapFn<F>(pub F);
++use std::iter;
+ 
+-impl<F, In, Out> MapOp<In> for MapFn<F>
+-    where F: Fn(In) -> Out + Sync,
+-          Out: Send
+-{
+-    type Output = Out;
+-    fn map(&self, value: In) -> Out {
+-        (self.0)(value)
+-    }
+-    private_impl!{}
+-}
+-
+-pub struct MapCloned;
+-
+-impl<'a, T> MapOp<&'a T> for MapCloned
+-    where T: Clone + Send
+-{
+-    type Output = T;
+-    fn map(&self, value: &'a T) -> T {
+-        value.clone()
+-    }
+-    private_impl!{}
+-}
+-
+-pub struct MapInspect<F>(pub F);
+-
+-impl<F, In> MapOp<In> for MapInspect<F>
+-    where F: Fn(&In) + Sync,
+-          In: Send
+-{
+-    type Output = In;
+-    fn map(&self, value: In) -> In {
+-        (self.0)(&value);
+-        value
+-    }
+-    private_impl!{}
+-}
+-
+-/// ////////////////////////////////////////////////////////////////////////
+ 
++/// `Map` is an iterator that transforms the elements of an underlying iterator.
++///
++/// This struct is created by the [`map()`] method on [`ParallelIterator`]
++///
++/// [`map()`]: trait.ParallelIterator.html#method.map
++/// [`ParallelIterator`]: trait.ParallelIterator.html
+ pub struct Map<I: ParallelIterator, F> {
+     base: I,
+     map_op: F,
+@@ -68,9 +27,10 @@ pub fn new<I, F>(base: I, map_op: F) -> Map<I, F>
+     }
+ }
+ 
+-impl<I, F> ParallelIterator for Map<I, F>
++impl<I, F, R> ParallelIterator for Map<I, F>
+     where I: ParallelIterator,
+-          F: MapOp<I::Item>
++          F: Fn(I::Item) -> R + Sync,
++          R: Send
+ {
+     type Item = F::Output;
+ 
+@@ -86,9 +46,10 @@ impl<I, F> ParallelIterator for Map<I, F>
+     }
+ }
+ 
+-impl<I, F> IndexedParallelIterator for Map<I, F>
++impl<I, F, R> IndexedParallelIterator for Map<I, F>
+     where I: IndexedParallelIterator,
+-          F: MapOp<I::Item>
++          F: Fn(I::Item) -> R + Sync,
++          R: Send
+ {
+     fn drive<C>(self, consumer: C) -> C::Result
+         where C: Consumer<Self::Item>
+@@ -114,9 +75,10 @@ impl<I, F> IndexedParallelIterator for Map<I, F>
+             map_op: F,
+         }
+ 
+-        impl<T, F, CB> ProducerCallback<T> for Callback<CB, F>
+-            where F: MapOp<T>,
+-                  CB: ProducerCallback<F::Output>
++        impl<T, F, R, CB> ProducerCallback<T> for Callback<CB, F>
++            where CB: ProducerCallback<R>,
++                  F: Fn(T) -> R + Sync,
++                  R: Send
+         {
+             type Output = CB::Output;
+ 
+@@ -140,18 +102,16 @@ struct MapProducer<'f, P, F: 'f> {
+     map_op: &'f F,
+ }
+ 
+-impl<'f, P, F> Producer for MapProducer<'f, P, F>
++impl<'f, P, F, R> Producer for MapProducer<'f, P, F>
+     where P: Producer,
+-          F: MapOp<P::Item>
++          F: Fn(P::Item) -> R + Sync,
++          R: Send
+ {
+     type Item = F::Output;
+-    type IntoIter = MapIter<'f, P::IntoIter, F>;
++    type IntoIter = iter::Map<P::IntoIter, &'f F>;
+ 
+     fn into_iter(self) -> Self::IntoIter {
+-        MapIter {
+-            base: self.base.into_iter(),
+-            map_op: self.map_op,
+-        }
++        self.base.into_iter().map(self.map_op)
+     }
+ 
+     fn min_len(&self) -> usize {
+@@ -174,39 +134,6 @@ impl<'f, P, F> Producer for MapProducer<'f, P, F>
+     }
+ }
+ 
+-pub struct MapIter<'f, T, F: 'f> {
+-    base: T,
+-    map_op: &'f F,
+-}
+-
+-impl<'f, T, F> Iterator for MapIter<'f, T, F>
+-    where T: Iterator,
+-          F: MapOp<T::Item>
+-{
+-    type Item = F::Output;
+-    fn next(&mut self) -> Option<Self::Item> {
+-        self.base.next().map(|value| self.map_op.map(value))
+-    }
+-}
+-
+-impl<'f, T, F> DoubleEndedIterator for MapIter<'f, T, F>
+-    where T: DoubleEndedIterator,
+-          F: MapOp<T::Item>
+-{
+-    fn next_back(&mut self) -> Option<Self::Item> {
+-        self.base.next_back().map(|value| self.map_op.map(value))
+-    }
+-}
+-
+-impl<'f, T, F> ExactSizeIterator for MapIter<'f, T, F>
+-    where T: ExactSizeIterator,
+-          F: MapOp<T::Item>
+-{
+-    fn len(&self) -> usize {
+-        self.base.len()
+-    }
+-}
+-
+ 
+ /// ////////////////////////////////////////////////////////////////////////
+ /// Consumer implementation
+@@ -225,9 +152,10 @@ impl<'f, C, F> MapConsumer<'f, C, F> {
+     }
+ }
+ 
+-impl<'f, T, C, F> Consumer<T> for MapConsumer<'f, C, F>
++impl<'f, T, R, C, F> Consumer<T> for MapConsumer<'f, C, F>
+     where C: Consumer<F::Output>,
+-          F: MapOp<T>
++          F: Fn(T) -> R + Sync,
++          R: Send
+ {
+     type Folder = MapFolder<'f, C::Folder, F>;
+     type Reducer = C::Reducer;
+@@ -250,9 +178,10 @@ impl<'f, T, C, F> Consumer<T> for MapConsumer<'f, C, F>
+     }
+ }
+ 
+-impl<'f, T, C, F> UnindexedConsumer<T> for MapConsumer<'f, C, F>
++impl<'f, T, R, C, F> UnindexedConsumer<T> for MapConsumer<'f, C, F>
+     where C: UnindexedConsumer<F::Output>,
+-          F: MapOp<T>
++          F: Fn(T) -> R + Sync,
++          R: Send
+ {
+     fn split_off_left(&self) -> Self {
+         MapConsumer::new(self.base.split_off_left(), &self.map_op)
+@@ -268,19 +197,17 @@ struct MapFolder<'f, C, F: 'f> {
+     map_op: &'f F,
+ }
+ 
+-impl<'f, T, C, F> Folder<T> for MapFolder<'f, C, F>
++impl<'f, T, R, C, F> Folder<T> for MapFolder<'f, C, F>
+     where C: Folder<F::Output>,
+-          F: MapOp<T>
++          F: Fn(T) -> R
+ {
+     type Result = C::Result;
+ 
+     fn consume(self, item: T) -> Self {
+-        let map_op = self.map_op;
+-        let mapped_item = map_op.map(item);
+-        let base = self.base.consume(mapped_item);
++        let mapped_item = (self.map_op)(item);
+         MapFolder {
+-            base: base,
+-            map_op: map_op,
++            base: self.base.consume(mapped_item),
++            map_op: self.map_op,
+         }
+     }
+ 
+diff --git a/src/iter/mod.rs b/src/iter/mod.rs
+index ea5c27a..07ece3d 100644
+--- a/src/iter/mod.rs
++++ b/src/iter/mod.rs
+@@ -53,7 +53,7 @@ pub use self::splitter::{split, Split};
+ mod take;
+ pub use self::take::Take;
+ mod map;
+-pub use self::map::{Map, MapOp, MapFn, MapCloned, MapInspect};
++pub use self::map::Map;
+ mod zip;
+ pub use self::zip::Zip;
+ mod noop;
+@@ -63,6 +63,10 @@ mod len;
+ pub use self::len::{MinLen, MaxLen};
+ mod sum;
+ mod product;
++mod cloned;
++pub use self::cloned::Cloned;
++mod inspect;
++pub use self::inspect::Inspect;
+ 
+ #[cfg(test)]
+ mod test;
+@@ -128,29 +132,29 @@ pub trait ParallelIterator: Sized {
+ 
+     /// Applies `map_op` to each item of this iterator, producing a new
+     /// iterator with the results.
+-    fn map<F, R>(self, map_op: F) -> Map<Self, MapFn<F>>
++    fn map<F, R>(self, map_op: F) -> Map<Self, F>
+         where F: Fn(Self::Item) -> R + Sync,
+               R: Send
+     {
+-        map::new(self, MapFn(map_op))
++        map::new(self, map_op)
+     }
+ 
+     /// Creates an iterator which clones all of its elements.  This may be
+     /// useful when you have an iterator over `&T`, but you need `T`.
+-    fn cloned<'a, T>(self) -> Map<Self, MapCloned>
++    fn cloned<'a, T>(self) -> Cloned<Self>
+         where T: 'a + Clone + Send,
+               Self: ParallelIterator<Item = &'a T>
+     {
+-        map::new(self, MapCloned)
++        cloned::new(self)
+     }
+ 
+     /// Applies `inspect_op` to a reference to each item of this iterator,
+     /// producing a new iterator passing through the original items.  This is
+     /// often useful for debugging to see what's happening in iterator stages.
+-    fn inspect<OP>(self, inspect_op: OP) -> Map<Self, MapInspect<OP>>
++    fn inspect<OP>(self, inspect_op: OP) -> Inspect<Self, OP>
+         where OP: Fn(&Self::Item) + Sync
+     {
+-        map::new(self, MapInspect(inspect_op))
++        inspect::new(self, inspect_op)
+     }
+ 
+     /// Applies `filter_op` to each item of this iterator, producing a new

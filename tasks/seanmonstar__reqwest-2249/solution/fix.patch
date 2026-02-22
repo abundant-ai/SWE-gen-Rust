@@ -1,0 +1,238 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 428f370..3d08601 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,3 +1,7 @@
++## Unreleased
++
++- Implement `danger_accept_invalid_hostnames` for `rustls`.
++
+ ## v0.12.5
+ 
+ - Add `blocking::ClientBuilder::dns_resolver()` method to change DNS resolver in blocking client.
+diff --git a/src/async_impl/client.rs b/src/async_impl/client.rs
+index b321a60..3bb6502 100644
+--- a/src/async_impl/client.rs
++++ b/src/async_impl/client.rs
+@@ -91,7 +91,7 @@ struct Config {
+     // NOTE: When adding a new field, update `fmt::Debug for ClientBuilder`
+     accepts: Accepts,
+     headers: HeaderMap,
+-    #[cfg(feature = "native-tls")]
++    #[cfg(feature = "__tls")]
+     hostname_verification: bool,
+     #[cfg(feature = "__tls")]
+     certs_verification: bool,
+@@ -188,7 +188,7 @@ impl ClientBuilder {
+                 error: None,
+                 accepts: Accepts::default(),
+                 headers,
+-                #[cfg(feature = "native-tls")]
++                #[cfg(feature = "__tls")]
+                 hostname_verification: true,
+                 #[cfg(feature = "__tls")]
+                 certs_verification: true,
+@@ -388,10 +388,7 @@ impl ClientBuilder {
+                         }
+                     }
+ 
+-                    #[cfg(feature = "native-tls")]
+-                    {
+-                        tls.danger_accept_invalid_hostnames(!config.hostname_verification);
+-                    }
++                    tls.danger_accept_invalid_hostnames(!config.hostname_verification);
+ 
+                     tls.danger_accept_invalid_certs(!config.certs_verification);
+ 
+@@ -500,7 +497,7 @@ impl ClientBuilder {
+                 }
+                 #[cfg(feature = "__rustls")]
+                 TlsBackend::Rustls => {
+-                    use crate::tls::NoVerifier;
++                    use crate::tls::{IgnoreHostname, NoVerifier};
+ 
+                     // Set root certificates.
+                     let mut root_cert_store = rustls::RootCertStore::empty();
+@@ -578,10 +575,25 @@ impl ClientBuilder {
+                         });
+ 
+                     // Build TLS config
++                    let signature_algorithms = provider.signature_verification_algorithms;
+                     let config_builder = rustls::ClientConfig::builder_with_provider(provider)
+                         .with_protocol_versions(&versions)
+-                        .map_err(|_| crate::error::builder("invalid TLS versions"))?
+-                        .with_root_certificates(root_cert_store);
++                        .map_err(|_| crate::error::builder("invalid TLS versions"))?;
++
++                    let config_builder = if !config.certs_verification {
++                        config_builder
++                            .dangerous()
++                            .with_custom_certificate_verifier(Arc::new(NoVerifier))
++                    } else if !config.hostname_verification {
++                        config_builder
++                            .dangerous()
++                            .with_custom_certificate_verifier(Arc::new(IgnoreHostname::new(
++                                root_cert_store,
++                                signature_algorithms,
++                            )))
++                    } else {
++                        config_builder.with_root_certificates(root_cert_store)
++                    };
+ 
+                     // Finalize TLS config
+                     let mut tls = if let Some(id) = config.identity {
+@@ -590,12 +602,6 @@ impl ClientBuilder {
+                         config_builder.with_no_client_auth()
+                     };
+ 
+-                    // Certificate verifier
+-                    if !config.certs_verification {
+-                        tls.dangerous()
+-                            .set_certificate_verifier(Arc::new(NoVerifier));
+-                    }
+-
+                     tls.enable_sni = config.tls_sni;
+ 
+                     // ALPN protocol
+@@ -1476,9 +1482,17 @@ impl ClientBuilder {
+     ///
+     /// # Optional
+     ///
+-    /// This requires the optional `native-tls` feature to be enabled.
+-    #[cfg(feature = "native-tls")]
+-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
++    /// This requires the optional `default-tls`, `native-tls`, or `rustls-tls(-...)`
++    /// feature to be enabled.
++    #[cfg(feature = "__tls")]
++    #[cfg_attr(
++        docsrs,
++        doc(cfg(any(
++            feature = "default-tls",
++            feature = "native-tls",
++            feature = "rustls-tls"
++        )))
++    )]
+     pub fn danger_accept_invalid_hostnames(
+         mut self,
+         accept_invalid_hostname: bool,
+@@ -2243,7 +2257,7 @@ impl Config {
+             f.field("tcp_nodelay", &true);
+         }
+ 
+-        #[cfg(feature = "native-tls")]
++        #[cfg(feature = "__tls")]
+         {
+             if !self.hostname_verification {
+                 f.field("danger_accept_invalid_hostnames", &true);
+diff --git a/src/blocking/client.rs b/src/blocking/client.rs
+index 9e67729..d4b973e 100644
+--- a/src/blocking/client.rs
++++ b/src/blocking/client.rs
+@@ -670,9 +670,17 @@ impl ClientBuilder {
+     ///
+     /// # Optional
+     ///
+-    /// This requires the optional `native-tls` feature to be enabled.
+-    #[cfg(feature = "native-tls")]
+-    #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
++    /// This requires the optional `default-tls`, `native-tls`, or `rustls-tls(-...)`
++    /// feature to be enabled.
++    #[cfg(feature = "__tls")]
++    #[cfg_attr(
++        docsrs,
++        doc(cfg(any(
++            feature = "default-tls",
++            feature = "native-tls",
++            feature = "rustls-tls"
++        )))
++    )]
+     pub fn danger_accept_invalid_hostnames(self, accept_invalid_hostname: bool) -> ClientBuilder {
+         self.with_inner(|inner| inner.danger_accept_invalid_hostnames(accept_invalid_hostname))
+     }
+diff --git a/src/tls.rs b/src/tls.rs
+index 8f979b1..83f3fee 100644
+--- a/src/tls.rs
++++ b/src/tls.rs
+@@ -47,7 +47,9 @@
+ #[cfg(feature = "__rustls")]
+ use rustls::{
+     client::danger::HandshakeSignatureValid, client::danger::ServerCertVerified,
+-    client::danger::ServerCertVerifier, DigitallySignedStruct, Error as TLSError, SignatureScheme,
++    client::danger::ServerCertVerifier, crypto::WebPkiSupportedAlgorithms,
++    server::ParsedCertificate, DigitallySignedStruct, Error as TLSError, RootCertStore,
++    SignatureScheme,
+ };
+ #[cfg(feature = "__rustls")]
+ use rustls_pki_types::{ServerName, UnixTime};
+@@ -571,6 +573,71 @@ impl ServerCertVerifier for NoVerifier {
+     }
+ }
+ 
++#[cfg(feature = "__rustls")]
++#[derive(Debug)]
++pub(crate) struct IgnoreHostname {
++    roots: RootCertStore,
++    signature_algorithms: WebPkiSupportedAlgorithms,
++}
++
++#[cfg(feature = "__rustls")]
++impl IgnoreHostname {
++    pub(crate) fn new(
++        roots: RootCertStore,
++        signature_algorithms: WebPkiSupportedAlgorithms,
++    ) -> Self {
++        Self {
++            roots,
++            signature_algorithms,
++        }
++    }
++}
++
++#[cfg(feature = "__rustls")]
++impl ServerCertVerifier for IgnoreHostname {
++    fn verify_server_cert(
++        &self,
++        end_entity: &rustls_pki_types::CertificateDer<'_>,
++        intermediates: &[rustls_pki_types::CertificateDer<'_>],
++        _server_name: &ServerName<'_>,
++        _ocsp_response: &[u8],
++        now: UnixTime,
++    ) -> Result<ServerCertVerified, TLSError> {
++        let cert = ParsedCertificate::try_from(end_entity)?;
++
++        rustls::client::verify_server_cert_signed_by_trust_anchor(
++            &cert,
++            &self.roots,
++            intermediates,
++            now,
++            self.signature_algorithms.all,
++        )?;
++        Ok(ServerCertVerified::assertion())
++    }
++
++    fn verify_tls12_signature(
++        &self,
++        message: &[u8],
++        cert: &rustls_pki_types::CertificateDer<'_>,
++        dss: &DigitallySignedStruct,
++    ) -> Result<HandshakeSignatureValid, TLSError> {
++        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.signature_algorithms)
++    }
++
++    fn verify_tls13_signature(
++        &self,
++        message: &[u8],
++        cert: &rustls_pki_types::CertificateDer<'_>,
++        dss: &DigitallySignedStruct,
++    ) -> Result<HandshakeSignatureValid, TLSError> {
++        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.signature_algorithms)
++    }
++
++    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
++        self.signature_algorithms.supported_schemes()
++    }
++}
++
+ /// Hyper extension carrying extra TLS layer information.
+ /// Made available to clients on responses when `tls_info` is set.
+ #[derive(Clone)]

@@ -1,0 +1,167 @@
+diff --git a/src/key.rs b/src/key.rs
+index 15ad2e0c..7a2e6471 100644
+--- a/src/key.rs
++++ b/src/key.rs
+@@ -38,17 +38,15 @@ impl FromStr for Key {
+ 
+     /// Parses a key from a &str
+     fn from_str(s: &str) -> Result<Self, Self::Err> {
+-        let parsed = parser::key().parse(combine::State::new(s));
+-        match parsed {
+-            Ok((_, ref rest)) if !rest.input.is_empty() => {
+-                Err(Self::Err::from_unparsed(rest.positioner, s))
+-            }
+-            Ok(((raw, key), _)) => Ok(Key {
+-                raw: raw.into(),
+-                key: key,
+-            }),
+-            Err(e) => Err(Self::Err::new(e, s)),
+-        }
++        parser::key()
++            .parse(combine::State::new(s))
++            .map(|((raw, key), _)| {
++                Key {
++                    raw: raw.into(),
++                    key: key,
++                }
++            })
++            .map_err(|e| Self::Err::new(e, s))
+     }
+ }
+ 
+diff --git a/src/parser/document.rs b/src/parser/document.rs
+index 17211b49..ce732ca5 100644
+--- a/src/parser/document.rs
++++ b/src/parser/document.rs
+@@ -117,7 +117,7 @@ impl TomlParser {
+         let parser = RefCell::new(Self::default());
+         let input = State::new(s);
+ 
+-        let parsed = parse_ws(&parser)
++        parse_ws(&parser)
+             .with(choice((
+                 eof(),
+                 skip_many1(
+@@ -129,14 +129,9 @@ impl TomlParser {
+                     )).skip(parse_ws(&parser)),
+                 ),
+             )))
+-            .parse(input);
+-        match parsed {
+-            Ok((_, ref rest)) if !rest.input.is_empty() => {
+-                Err(TomlError::from_unparsed(rest.positioner, s))
+-            }
+-            Ok(..) => Ok(parser.into_inner().document),
+-            Err(e) => Err(TomlError::new(e, s)),
+-        }
++            .parse(input)
++            .map(move |_| parser.into_inner().document)
++            .map_err(|e| TomlError::new(e, s))
+     }
+ 
+     fn on_ws(&mut self, w: &str) {
+diff --git a/src/parser/errors.rs b/src/parser/errors.rs
+index 46a20986..671f2041 100644
+--- a/src/parser/errors.rs
++++ b/src/parser/errors.rs
+@@ -17,13 +17,6 @@ impl TomlError {
+             message: format!("{}", FancyError::new(error, input)),
+         }
+     }
+-
+-    pub(crate) fn from_unparsed(pos: SourcePosition, input: &str) -> Self {
+-        Self::new(
+-            ParseError::new(pos, CustomError::UnparsedLine.into()),
+-            input,
+-        )
+-    }
+ }
+ 
+ /// Displays a TOML parse error
+@@ -107,7 +100,6 @@ pub(crate) enum CustomError {
+     MixedArrayType { got: String, expected: String },
+     DuplicateKey { key: String, table: String },
+     InvalidHexEscape(u32),
+-    UnparsedLine,
+ }
+ 
+ impl StdError for CustomError {
+@@ -129,7 +121,6 @@ impl Display for CustomError {
+             CustomError::InvalidHexEscape(ref h) => {
+                 writeln!(f, "Invalid hex escape code: {:x} ", h)
+             }
+-            CustomError::UnparsedLine => writeln!(f, "Could not parse the line"),
+         }
+     }
+ }
+diff --git a/src/parser/mod.rs b/src/parser/mod.rs
+index 05e94687..1d24769e 100644
+--- a/src/parser/mod.rs
++++ b/src/parser/mod.rs
+@@ -470,15 +470,5 @@ that
+ 
+             assert_eq!(&doc.to_string(), document);
+         }
+-
+-        let invalid_inputs = [
+-            r#" hello = 'darkness' # my old friend
+-$"#,
+-        ];
+-        for document in &invalid_inputs {
+-            let doc = TomlParser::parse(document);
+-
+-            assert!(doc.is_err());
+-        }
+     }
+ }
+diff --git a/src/value.rs b/src/value.rs
+index e23b2cdb..3709cf90 100644
+--- a/src/value.rs
++++ b/src/value.rs
+@@ -354,13 +354,9 @@ impl FromStr for Value {
+ 
+     /// Parses a value from a &str
+     fn from_str(s: &str) -> Result<Self, Self::Err> {
+-        let parsed = parser::value().parse(combine::State::new(s));
+-        match parsed {
+-            Ok((_, ref rest)) if !rest.input.is_empty() => {
+-                Err(Self::Err::from_unparsed(rest.positioner, s))
+-            }
+-            Ok((value, _)) => Ok(value),
+-            Err(e) => Err(Self::Err::new(e, s)),
+-        }
++        parser::value()
++            .parse(combine::State::new(s))
++            .map(|p| p.0)
++            .map_err(|e| Self::Err::new(e, s))
+     }
+ }
+diff --git a/tests/test_parse.rs b/tests/test_parse.rs
+index 06b2ae88..a085e265 100644
+--- a/tests/test_parse.rs
++++ b/tests/test_parse.rs
+@@ -39,11 +39,9 @@ macro_rules! parse_error {
+ #[test]
+ fn test_parse_error() {
+     parse_error!(r#"["", 2]"#, Value, "Mixed types in array");
+-    parse_error!("'hello'bla", Value, "Could not parse the line");
+     parse_error!(r#"{a = 2"#, Value, "Expected `}`");
+ 
+     parse_error!("\n", Key, "Unexpected `\n`");
+-    parse_error!("'hello key'bla", Key, "Could not parse the line");
+     parse_error!("", Key, "Unexpected `end of input`");
+ }
+ 
+@@ -51,10 +49,8 @@ fn test_parse_error() {
+ fn test_key_from_str() {
+     test_key!("a", "a");
+     test_key!(r#"'hello key'"#, "hello key");
+-    test_key!(
+-        r#""Jos\u00E9\U000A0000\n\t\r\f\b\\\/\"""#,
+-        "Jos\u{00E9}\u{A0000}\n\t\r\u{c}\u{8}\\/\""
+-    );
++    test_key!(r#"'hello key'bla"#, "hello key");
++    test_key!(r#""Jos\u00E9""#, "Jos\u{00E9}");
+ }
+ 
+ // wat?

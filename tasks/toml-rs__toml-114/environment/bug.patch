@@ -1,0 +1,246 @@
+diff --git a/src/parser/mod.rs b/src/parser/mod.rs
+index 55834b40..3bca29e3 100644
+--- a/src/parser/mod.rs
++++ b/src/parser/mod.rs
+@@ -80,12 +80,8 @@ mod tests {
+     macro_rules! parsed_value_eq {
+         ($input:expr) => {
+             let parsed = value::value().easy_parse(Stream::new(*$input));
+-            let (v, rest) = match parsed {
+-                Ok(parsed) => parsed,
+-                Err(err) => {
+-                    panic!("Unexpected error for {:?}: {}", $input, err);
+-                }
+-            };
++            assert!(parsed.is_ok());
++            let (v, rest) = parsed.unwrap();
+             assert_eq!(v.to_string(), *$input);
+             assert!(rest.input.is_empty());
+         };
+@@ -415,7 +411,7 @@ trimmed in raw strings.
+    is preserved.
+ '''"#,
+             r#""Jos\u00E9\n""#,
+-            r#""\\\"\b/\f\n\r\t\u00E9\U000A0000""#,
++            r#""\\\"\b\/\f\n\r\t\u00E9\U000A0000""#,
+             r#"{ hello = "world", a = 1}"#,
+             r#"[ { x = 1, a = "2" }, {a = "a",b = "b",     c =    "c"} ]"#,
+         ];
+diff --git a/src/parser/strings.rs b/src/parser/strings.rs
+index f0ff5fb6..b31227f4 100644
+--- a/src/parser/strings.rs
++++ b/src/parser/strings.rs
+@@ -1,6 +1,6 @@
+ use crate::decor::InternalString;
+ use crate::parser::errors::CustomError;
+-use crate::parser::trivia::{is_non_ascii, is_wschar, newline, ws, ws_newlines};
++use crate::parser::trivia::{newline, ws, ws_newlines};
+ use combine::error::{Commit, Info};
+ use combine::parser::char::char;
+ use combine::parser::range::{range, take, take_while};
+@@ -20,30 +20,32 @@ parse!(string() -> InternalString, {
+     ))
+ });
+ 
+-// basic-unescaped = wschar / %x21 / %x23-5B / %x5D-7E / non-ascii
++// basic-unescaped = %x20-21 / %x23-5B / %x5D-10FFFF
+ #[inline]
+ fn is_basic_unescaped(c: char) -> bool {
+-    is_wschar(c)
+-        | matches!(c, '\u{21}' | '\u{23}'..='\u{5B}' | '\u{5D}'..='\u{7E}')
+-        | is_non_ascii(c)
++    matches!(c, '\u{20}'..='\u{21}' | '\u{23}'..='\u{5B}' | '\u{5D}'..='\u{10FFFF}')
+ }
+ 
+-// escape-seq-char =  %x22         ; "    quotation mark  U+0022
+-// escape-seq-char =/ %x5C         ; \    reverse solidus U+005C
+-// escape-seq-char =/ %x62         ; b    backspace       U+0008
+-// escape-seq-char =/ %x66         ; f    form feed       U+000C
+-// escape-seq-char =/ %x6E         ; n    line feed       U+000A
+-// escape-seq-char =/ %x72         ; r    carriage return U+000D
+-// escape-seq-char =/ %x74         ; t    tab             U+0009
+-// escape-seq-char =/ %x75 4HEXDIG ; uXXXX                U+XXXX
+-// escape-seq-char =/ %x55 8HEXDIG ; UXXXXXXXX            U+XXXXXXXX
++// escaped = escape ( %x22 /          ; "    quotation mark  U+0022
++//                    %x5C /          ; \    reverse solidus U+005C
++//                    %x2F /          ; /    solidus         U+002F
++//                    %x62 /          ; b    backspace       U+0008
++//                    %x66 /          ; f    form feed       U+000C
++//                    %x6E /          ; n    line feed       U+000A
++//                    %x72 /          ; r    carriage return U+000D
++//                    %x74 /          ; t    tab             U+0009
++//                    %x75 4HEXDIG /  ; uXXXX                U+XXXX
++//                    %x55 8HEXDIG )  ; UXXXXXXXX            U+XXXXXXXX
+ #[inline]
+-fn is_escape_seq_char(c: char) -> bool {
+-    matches!(c, '"' | '\\' | 'b' | 'f' | 'n' | 'r' | 't' | 'u' | 'U')
++fn is_escape_char(c: char) -> bool {
++    matches!(
++        c,
++        '\\' | '"' | 'b' | '/' | 'f' | 'n' | 'r' | 't' | 'u' | 'U'
++    )
+ }
+ 
+ parse!(escape() -> char, {
+-    satisfy(is_escape_seq_char)
++    satisfy(is_escape_char)
+         .message("While parsing escape sequence")
+         .then(|c| {
+             parser(move |input| {
+@@ -55,7 +57,7 @@ parse!(escape() -> char, {
+                     't'  => Ok(('\t',    Commit::Peek(()))),
+                     'u'  => hexescape(4).parse_stream(input).into_result(),
+                     'U'  => hexescape(8).parse_stream(input).into_result(),
+-                    // ['\\', '"',]
++                    // ['\\', '"', '/']
+                     _    => Ok((c,       Commit::Peek(()))),
+                 }
+             })
+@@ -94,22 +96,18 @@ parse!(basic_string() -> InternalString, {
+ 
+ // ;; Multiline Basic String
+ 
+-// mlb-unescaped = wschar / %x21 / %x23-5B / %x5D-7E / non-ascii
++// ml-basic-unescaped = %x20-5B / %x5D-10FFFF
+ #[inline]
+-fn is_mlb_unescaped(c: char) -> bool {
+-    is_wschar(c)
+-        | matches!(c, '\u{21}' | '\u{23}'..='\u{5B}' | '\u{5D}'..='\u{7E}')
+-        | is_non_ascii(c)
+-        // Unlike the official grammar, we can handle quotes just fine
+-        | (c == '\u{22}')
++fn is_ml_basic_unescaped(c: char) -> bool {
++    matches!(c, '\u{20}'..='\u{5B}' | '\u{5D}'..='\u{10FFFF}')
+ }
+ 
+ // ml-basic-string-delim = 3quotation-mark
+ const ML_BASIC_STRING_DELIM: &str = "\"\"\"";
+ 
+-// mlb-char = mlb-unescaped / escaped
+-parse!(mlb_char() -> char, {
+-    satisfy(|c| is_mlb_unescaped(c) || c == ESCAPE)
++// ml-basic-char = ml-basic-unescaped / escaped
++parse!(ml_basic_char() -> char, {
++    satisfy(|c| is_ml_basic_unescaped(c) || c == ESCAPE)
+         .then(|c| parser(move |input| {
+             match c {
+                 ESCAPE => escape().parse_stream(input).into_result(),
+@@ -143,7 +141,7 @@ parse!(ml_basic_body() -> InternalString, {
+                             // `TOML parsers should feel free to normalize newline
+                             //  to whatever makes sense for their platform.`
+                             newline(),
+-                            mlb_char(),
++                            ml_basic_char(),
+                         ))
+                     )
+                     .skip(try_eat_escaped_newline())
+@@ -164,10 +162,10 @@ parse!(ml_basic_string() -> InternalString, {
+ // apostrophe = %x27 ; ' apostrophe
+ const APOSTROPHE: char = '\'';
+ 
+-// literal-char = %x09 / %x20-26 / %x28-7E / non-ascii
++// literal-char = %x09 / %x20-26 / %x28-10FFFF
+ #[inline]
+ fn is_literal_char(c: char) -> bool {
+-    matches!(c, '\u{09}' | '\u{20}'..='\u{26}' | '\u{28}'..='\u{7E}') | is_non_ascii(c)
++    matches!(c, '\u{09}' | '\u{20}'..='\u{26}' | '\u{28}'..='\u{10FFFF}')
+ }
+ 
+ // literal-string = apostrophe *literal-char apostrophe
+@@ -182,12 +180,10 @@ parse!(literal_string() -> &'a str, {
+ // ml-literal-string-delim = 3apostrophe
+ const ML_LITERAL_STRING_DELIM: &str = "'''";
+ 
+-// mll-char = %x09 / %x20-26 / %x28-7E / non-ascii
++// ml-literal-char = %x09 / %x20-10FFFF
+ #[inline]
+-fn is_mll_char(c: char) -> bool {
+-    matches!(c, '\u{09}' | '\u{20}'..='\u{26}' | '\u{28}'..='\u{7E}') | is_non_ascii(c)
+-        // Unlike the official grammar, we can handle quotes just fine
+-        | (c == '\u{27}')
++fn is_ml_literal_char(c: char) -> bool {
++    matches!(c, '\u{09}' | '\u{20}'..='\u{10FFFF}')
+ }
+ 
+ // ml-literal-body = *( ml-literal-char / newline )
+@@ -202,7 +198,7 @@ parse!(ml_literal_body() -> InternalString, {
+                             // `TOML parsers should feel free to normalize newline
+                             //  to whatever makes sense for their platform.`
+                             newline(),
+-                            satisfy(is_mll_char),
++                            satisfy(is_ml_literal_char),
+                         ))
+                     )
+             )
+diff --git a/src/parser/trivia.rs b/src/parser/trivia.rs
+index d78df4ca..fc9f3da9 100644
+--- a/src/parser/trivia.rs
++++ b/src/parser/trivia.rs
+@@ -6,7 +6,7 @@ use combine::*;
+ // wschar = ( %x20 /              ; Space
+ //            %x09 )              ; Horizontal tab
+ #[inline]
+-pub fn is_wschar(c: char) -> bool {
++fn is_wschar(c: char) -> bool {
+     matches!(c, ' ' | '\t')
+ }
+ 
+@@ -15,16 +15,10 @@ parse!(ws() -> &'a str, {
+     take_while(is_wschar)
+ });
+ 
+-// non-ascii = %x80-D7FF / %xE000-10FFFF
+-#[inline]
+-pub fn is_non_ascii(c: char) -> bool {
+-    matches!(c, '\u{80}'..='\u{D7FF}' | '\u{E000}'..='\u{10FFFF}')
+-}
+-
+-// non-eol = %x09 / %x20-7E / non-ascii
++// non-eol = %x09 / %x20-10FFFF
+ #[inline]
+ fn is_non_eol(c: char) -> bool {
+-    matches!(c, '\u{09}' | '\u{20}'..='\u{7E}') | is_non_ascii(c)
++    matches!(c, '\u{09}' | '\u{20}'..='\u{10FFFF}')
+ }
+ 
+ // comment-start-symbol = %x23 ; #
+diff --git a/tests/decoder_compliance.rs b/tests/decoder_compliance.rs
+index 3b3e4662..2df98ce0 100644
+--- a/tests/decoder_compliance.rs
++++ b/tests/decoder_compliance.rs
+@@ -3,6 +3,12 @@ fn main() {
+     let mut harness = toml_test_harness::DecoderHarness::new(decoder);
+     harness
+         .ignore([
++            "invalid/control/comment-del.toml",
++            "invalid/control/multi-del.toml",
++            "invalid/control/rawmulti-del.toml",
++            "invalid/control/rawstring-del.toml",
++            "invalid/control/string-del.toml",
++            "invalid/string/bad-slash-escape.toml",
+             "valid/array/array.toml",
+             "valid/array/mixed-int-array.toml",
+             "valid/array/mixed-int-float.toml",
+diff --git a/tests/test_parse.rs b/tests/test_parse.rs
+index 4044686e..49ec5a50 100644
+--- a/tests/test_parse.rs
++++ b/tests/test_parse.rs
+@@ -44,8 +44,8 @@ fn test_key_from_str() {
+     test_key!("a", "a");
+     test_key!(r#"'hello key'"#, "hello key");
+     test_key!(
+-        r#""Jos\u00E9\U000A0000\n\t\r\f\b\"""#,
+-        "Jos\u{00E9}\u{A0000}\n\t\r\u{c}\u{8}\""
++        r#""Jos\u00E9\U000A0000\n\t\r\f\b\\\/\"""#,
++        "Jos\u{00E9}\u{A0000}\n\t\r\u{c}\u{8}\\/\""
+     );
+     test_key!("", "");
+     test_key!("'hello key'bla", "'hello key'bla");
+@@ -85,6 +85,6 @@ string'''"#
+     let wp = "C:\\Users\\appveyor\\AppData\\Local\\Temp\\1\\cargo-edit-test.YizxPxxElXn9";
+     let lwp = "'C:\\Users\\appveyor\\AppData\\Local\\Temp\\1\\cargo-edit-test.YizxPxxElXn9'";
+     assert_eq!(Value::from(wp).as_str(), parse_value!(lwp).as_str());
+-    let basic = r#""\\\"\b\f\n\r\t\u00E9\U000A0000""#;
++    let basic = r#""\\\"\b\/\f\n\r\t\u00E9\U000A0000""#;
+     assert_eq!(Value::from(basic).as_str(), parse_value!(basic).as_str());
+ }

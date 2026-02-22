@@ -1,0 +1,246 @@
+diff --git a/rustls/src/client/tls12.rs b/rustls/src/client/tls12.rs
+index d9f9f90f..b7751293 100644
+--- a/rustls/src/client/tls12.rs
++++ b/rustls/src/client/tls12.rs
+@@ -5,14 +5,15 @@ use crate::enums::ProtocolVersion;
+ use crate::enums::{AlertDescription, ContentType, HandshakeType};
+ use crate::error::{Error, InvalidMessage, PeerMisbehaved};
+ use crate::hash_hs::HandshakeHash;
++use crate::kx;
+ #[cfg(feature = "logging")]
+ use crate::log::{debug, trace, warn};
+ use crate::msgs::base::{Payload, PayloadU8};
+ use crate::msgs::ccs::ChangeCipherSpecPayload;
+ use crate::msgs::codec::Codec;
+ use crate::msgs::handshake::{
+-    CertificatePayload, DecomposedSignatureScheme, DigitallySignedStruct, HandshakeMessagePayload,
+-    HandshakePayload, NewSessionTicketPayload, SCTList, ServerECDHParams, SessionID,
++    CertificatePayload, DecomposedSignatureScheme, HandshakeMessagePayload, HandshakePayload,
++    NewSessionTicketPayload, SCTList, ServerECDHParams, SessionID,
+ };
+ use crate::msgs::message::{Message, MessagePayload};
+ use crate::msgs::persist;
+@@ -22,7 +23,7 @@ use crate::suites::PartiallyExtractedSecrets;
+ use crate::suites::SupportedCipherSuite;
+ use crate::ticketer::TimeBase;
+ use crate::tls12::{self, ConnectionSecrets, Tls12CipherSuite};
+-use crate::{kx, verify};
++use crate::verify::{self, DigitallySignedStruct};
+ 
+ use super::client_conn::ClientConnectionData;
+ use super::hs::ClientContext;
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 09a77dc5..421dbe7b 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -18,7 +18,6 @@ use crate::msgs::ccs::ChangeCipherSpecPayload;
+ use crate::msgs::enums::ExtensionType;
+ use crate::msgs::enums::KeyUpdateRequest;
+ use crate::msgs::handshake::ClientExtension;
+-use crate::msgs::handshake::DigitallySignedStruct;
+ use crate::msgs::handshake::EncryptedExtensions;
+ use crate::msgs::handshake::NewSessionTicketPayloadTLS13;
+ use crate::msgs::handshake::{CertificateEntry, CertificatePayloadTLS13};
+@@ -33,7 +32,7 @@ use crate::tls13::key_schedule::{
+     KeyScheduleEarly, KeyScheduleHandshake, KeySchedulePreHandshake, KeyScheduleTraffic,
+ };
+ use crate::tls13::Tls13CipherSuite;
+-use crate::verify;
++use crate::verify::{self, DigitallySignedStruct};
+ use crate::{sign, KeyLog};
+ 
+ use super::client_conn::ClientConnectionData;
+diff --git a/rustls/src/lib.rs b/rustls/src/lib.rs
+index fcb5b08d..7e40d5e5 100644
+--- a/rustls/src/lib.rs
++++ b/rustls/src/lib.rs
+@@ -379,7 +379,7 @@ pub use crate::key_log::{KeyLog, NoKeyLog};
+ pub use crate::key_log_file::KeyLogFile;
+ pub use crate::kx::{SupportedKxGroup, ALL_KX_GROUPS};
+ pub use crate::msgs::enums::{NamedGroup, SignatureAlgorithm};
+-pub use crate::msgs::handshake::{DigitallySignedStruct, DistinguishedNames};
++pub use crate::msgs::handshake::DistinguishedNames;
+ pub use crate::stream::{Stream, StreamOwned};
+ pub use crate::suites::{
+     BulkAlgorithm, SupportedCipherSuite, ALL_CIPHER_SUITES, DEFAULT_CIPHER_SUITES,
+@@ -390,6 +390,7 @@ pub use crate::ticketer::Ticketer;
+ #[cfg(feature = "tls12")]
+ pub use crate::tls12::Tls12CipherSuite;
+ pub use crate::tls13::Tls13CipherSuite;
++pub use crate::verify::DigitallySignedStruct;
+ pub use crate::versions::{SupportedProtocolVersion, ALL_VERSIONS, DEFAULT_VERSIONS};
+ 
+ /// Items for use in a client.
+diff --git a/rustls/src/msgs/handshake.rs b/rustls/src/msgs/handshake.rs
+index c7069689..2ae53bc6 100644
+--- a/rustls/src/msgs/handshake.rs
++++ b/rustls/src/msgs/handshake.rs
+@@ -2,6 +2,8 @@
+ use crate::enums::{CipherSuite, HandshakeType, ProtocolVersion, SignatureScheme};
+ use crate::error::InvalidMessage;
+ use crate::key;
++#[cfg(feature = "logging")]
++use crate::log::warn;
+ use crate::msgs::base::{Payload, PayloadU16, PayloadU24, PayloadU8};
+ use crate::msgs::codec;
+ use crate::msgs::codec::{Codec, Reader};
+@@ -11,9 +13,7 @@ use crate::msgs::enums::{
+     SignatureAlgorithm,
+ };
+ use crate::rand;
+-
+-#[cfg(feature = "logging")]
+-use crate::log::warn;
++use crate::verify::DigitallySignedStruct;
+ 
+ use std::collections;
+ use std::fmt;
+@@ -1583,43 +1583,6 @@ impl Codec for ECParameters {
+     }
+ }
+ 
+-/// This type combines a [`SignatureScheme`] and a signature payload produced with that scheme.
+-#[derive(Debug, Clone)]
+-pub struct DigitallySignedStruct {
+-    pub scheme: SignatureScheme,
+-    #[deprecated(since = "0.20.7", note = "Use signature() accessor")]
+-    pub sig: PayloadU16,
+-}
+-
+-impl DigitallySignedStruct {
+-    #![allow(deprecated)]
+-    pub fn new(scheme: SignatureScheme, sig: Vec<u8>) -> Self {
+-        Self {
+-            scheme,
+-            sig: PayloadU16::new(sig),
+-        }
+-    }
+-
+-    pub fn signature(&self) -> &[u8] {
+-        &self.sig.0
+-    }
+-}
+-
+-impl Codec for DigitallySignedStruct {
+-    #![allow(deprecated)]
+-    fn encode(&self, bytes: &mut Vec<u8>) {
+-        self.scheme.encode(bytes);
+-        self.sig.encode(bytes);
+-    }
+-
+-    fn read(r: &mut Reader) -> Result<Self, InvalidMessage> {
+-        let scheme = SignatureScheme::read(r)?;
+-        let sig = PayloadU16::read(r)?;
+-
+-        Ok(Self { scheme, sig })
+-    }
+-}
+-
+ #[derive(Debug)]
+ pub struct ClientECDHParams {
+     pub public: PayloadU8,
+diff --git a/rustls/src/server/tls12.rs b/rustls/src/server/tls12.rs
+index a26efece..f3da032c 100644
+--- a/rustls/src/server/tls12.rs
++++ b/rustls/src/server/tls12.rs
+@@ -35,14 +35,13 @@ mod client_hello {
+     use crate::msgs::enums::ECPointFormat;
+     use crate::msgs::enums::{ClientCertificateType, Compression};
+     use crate::msgs::handshake::{CertificateRequestPayload, ClientSessionTicket, Random};
+-    use crate::msgs::handshake::{
+-        CertificateStatus, DigitallySignedStruct, ECDHEServerKeyExchange,
+-    };
++    use crate::msgs::handshake::{CertificateStatus, ECDHEServerKeyExchange};
+     use crate::msgs::handshake::{ClientExtension, SessionID};
+     use crate::msgs::handshake::{ClientHelloPayload, ServerHelloPayload};
+     use crate::msgs::handshake::{ECPointFormatList, ServerECDHParams, SupportedPointFormats};
+     use crate::msgs::handshake::{ServerExtension, ServerKeyExchangePayload};
+     use crate::sign;
++    use crate::verify::DigitallySignedStruct;
+ 
+     use super::*;
+ 
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index 1a936747..638af4fb 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -53,7 +53,6 @@ mod client_hello {
+     use crate::msgs::handshake::CertificateRequestPayloadTLS13;
+     use crate::msgs::handshake::CertificateStatus;
+     use crate::msgs::handshake::ClientHelloPayload;
+-    use crate::msgs::handshake::DigitallySignedStruct;
+     use crate::msgs::handshake::HelloRetryExtension;
+     use crate::msgs::handshake::HelloRetryRequest;
+     use crate::msgs::handshake::KeyShareEntry;
+@@ -66,6 +65,7 @@ mod client_hello {
+     use crate::tls13::key_schedule::{
+         KeyScheduleEarly, KeyScheduleHandshake, KeySchedulePreHandshake,
+     };
++    use crate::verify::DigitallySignedStruct;
+ 
+     use super::*;
+ 
+diff --git a/rustls/src/verify.rs b/rustls/src/verify.rs
+index 79699415..25200bd2 100644
+--- a/rustls/src/verify.rs
++++ b/rustls/src/verify.rs
+@@ -3,11 +3,13 @@ use std::fmt;
+ use crate::anchors::{OwnedTrustAnchor, RootCertStore};
+ use crate::client::ServerName;
+ use crate::enums::SignatureScheme;
+-use crate::error::{CertificateError, Error, PeerMisbehaved};
++use crate::error::{CertificateError, Error, InvalidMessage, PeerMisbehaved};
+ use crate::key::Certificate;
+ #[cfg(feature = "logging")]
+ use crate::log::{debug, trace, warn};
+-use crate::msgs::handshake::{DigitallySignedStruct, DistinguishedNames};
++use crate::msgs::base::PayloadU16;
++use crate::msgs::codec::{Codec, Reader};
++use crate::msgs::handshake::DistinguishedNames;
+ 
+ use ring::digest::Digest;
+ 
+@@ -688,6 +690,43 @@ impl ClientCertVerifier for NoClientAuth {
+     }
+ }
+ 
++/// This type combines a [`SignatureScheme`] and a signature payload produced with that scheme.
++#[derive(Debug, Clone)]
++pub struct DigitallySignedStruct {
++    /// The [`SignatureScheme`] used to produce the signature.
++    pub scheme: SignatureScheme,
++    sig: PayloadU16,
++}
++
++impl DigitallySignedStruct {
++    pub(crate) fn new(scheme: SignatureScheme, sig: Vec<u8>) -> Self {
++        Self {
++            scheme,
++            sig: PayloadU16::new(sig),
++        }
++    }
++
++    /// Get the signature.
++    pub fn signature(&self) -> &[u8] {
++        &self.sig.0
++    }
++}
++
++impl Codec for DigitallySignedStruct {
++    #![allow(deprecated)]
++    fn encode(&self, bytes: &mut Vec<u8>) {
++        self.scheme.encode(bytes);
++        self.sig.encode(bytes);
++    }
++
++    fn read(r: &mut Reader) -> Result<Self, InvalidMessage> {
++        let scheme = SignatureScheme::read(r)?;
++        let sig = PayloadU16::read(r)?;
++
++        Ok(Self { scheme, sig })
++    }
++}
++
+ static ECDSA_SHA256: SignatureAlgorithms =
+     &[&webpki::ECDSA_P256_SHA256, &webpki::ECDSA_P384_SHA256];
+ 

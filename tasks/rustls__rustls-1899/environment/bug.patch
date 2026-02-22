@@ -1,0 +1,529 @@
+diff --git a/rustls/examples/internal/bogo_shim_impl.rs b/rustls/examples/internal/bogo_shim_impl.rs
+index ca4bc1b9..9edf1c53 100644
+--- a/rustls/examples/internal/bogo_shim_impl.rs
++++ b/rustls/examples/internal/bogo_shim_impl.rs
+@@ -24,9 +24,9 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+ use rustls::server::{ClientHello, ServerConfig, ServerConnection, WebPkiClientVerifier};
+ use rustls::{
+     client, server, sign, version, AlertDescription, CertificateError, Connection,
+-    DigitallySignedStruct, DistinguishedName, Error, HandshakeKind, InvalidMessage, NamedGroup,
+-    PeerIncompatible, PeerMisbehaved, ProtocolVersion, RootCertStore, Side, SignatureAlgorithm,
+-    SignatureScheme, SupportedProtocolVersion,
++    DigitallySignedStruct, DistinguishedName, Error, InvalidMessage, NamedGroup, PeerIncompatible,
++    PeerMisbehaved, ProtocolVersion, RootCertStore, Side, SignatureAlgorithm, SignatureScheme,
++    SupportedProtocolVersion,
+ };
+ 
+ static BOGO_NACK: i32 = 89;
+@@ -84,8 +84,6 @@ struct Options {
+     resumption_delay: u32,
+     queue_early_data_after_received_messages: Vec<usize>,
+     require_ems: bool,
+-    expect_handshake_kind: Option<Vec<HandshakeKind>>,
+-    expect_handshake_kind_resumed: Option<Vec<HandshakeKind>>,
+ }
+ 
+ impl Options {
+@@ -136,8 +134,6 @@ impl Options {
+             resumption_delay: 0,
+             queue_early_data_after_received_messages: vec![],
+             require_ems: false,
+-            expect_handshake_kind: None,
+-            expect_handshake_kind_resumed: Some(vec![HandshakeKind::Resumed]),
+         }
+     }
+ 
+@@ -971,18 +967,6 @@ fn exec(opts: &Options, mut sess: Connection, count: usize) {
+             }
+         }
+ 
+-        if opts.expect_handshake_kind.is_some() && !sess.is_handshaking() {
+-            let expected_options = opts
+-                .expect_handshake_kind
+-                .as_ref()
+-                .unwrap();
+-            let actual = sess.handshake_kind().unwrap();
+-            assert!(
+-                expected_options.contains(&actual),
+-                "wanted to see {expected_options:?} but got {actual:?}"
+-            );
+-        }
+-
+         let mut buf = [0u8; 1024];
+         let len = match sess
+             .reader()
+@@ -1147,6 +1131,8 @@ pub fn main() {
+             "-expect-secure-renegotiation" |
+             "-expect-no-session-id" |
+             "-enable-ed25519" |
++            "-expect-hrr" |
++            "-expect-no-hrr" |
+             "-on-resume-expect-no-offer-early-data" |
+             "-key-update" | //< we could implement an API for this
+             "-expect-tls13-downgrade" |
+@@ -1155,18 +1141,6 @@ pub fn main() {
+                 println!("not checking {}; NYI", arg);
+             }
+ 
+-            "-expect-hrr" => {
+-                opts.expect_handshake_kind = Some(vec![HandshakeKind::FullWithHelloRetryRequest]);
+-            }
+-            "-expect-no-hrr" => {
+-                opts.expect_handshake_kind = Some(vec![HandshakeKind::Full]);
+-            }
+-            "-expect-session-miss" => {
+-                opts.expect_handshake_kind_resumed = Some(vec![
+-                    HandshakeKind::Full,
+-                    HandshakeKind::FullWithHelloRetryRequest
+-                ]);
+-            }
+             "-export-keying-material" => {
+                 opts.export_keying_material = args.remove(0).parse::<usize>().unwrap();
+             }
+@@ -1302,6 +1276,7 @@ pub fn main() {
+             "-ipv6" |
+             "-decline-alpn" |
+             "-expect-no-session" |
++            "-expect-session-miss" |
+             "-expect-ticket-renewal" |
+             "-enable-ocsp-stapling" |
+             // internal openssl details:
+@@ -1413,8 +1388,5 @@ pub fn main() {
+             opts.tickets = false;
+             server_cfg = Some(make_server_cfg(&opts));
+         }
+-        opts.expect_handshake_kind = opts
+-            .expect_handshake_kind_resumed
+-            .clone();
+     }
+ }
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index a71b05bf..b1accd5d 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -16,7 +16,7 @@ use crate::check::inappropriate_handshake_message;
+ use crate::client::client_conn::ClientConnectionData;
+ use crate::client::common::ClientHelloDetails;
+ use crate::client::{tls13, ClientConfig};
+-use crate::common_state::{CommonState, HandshakeKind, State};
++use crate::common_state::{CommonState, State};
+ use crate::conn::ConnectionRandoms;
+ use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
+ use crate::enums::{AlertDescription, CipherSuite, ContentType, HandshakeType, ProtocolVersion};
+@@ -843,7 +843,6 @@ impl ExpectServerHelloOrHelloRetryRequest {
+ 
+         // HRR selects the ciphersuite.
+         cx.common.suite = Some(cs);
+-        cx.common.handshake_kind = Some(HandshakeKind::FullWithHelloRetryRequest);
+ 
+         // This is the draft19 change where the transcript became a tree
+         let transcript = self
+diff --git a/rustls/src/client/tls12.rs b/rustls/src/client/tls12.rs
+index bd1364f8..46e9e50f 100644
+--- a/rustls/src/client/tls12.rs
++++ b/rustls/src/client/tls12.rs
+@@ -13,7 +13,7 @@ use super::hs::ClientContext;
+ use crate::check::{inappropriate_handshake_message, inappropriate_message};
+ use crate::client::common::{ClientAuthDetails, ServerCertDetails};
+ use crate::client::{hs, ClientConfig};
+-use crate::common_state::{CommonState, HandshakeKind, Side, State};
++use crate::common_state::{CommonState, Side, State};
+ use crate::conn::ConnectionRandoms;
+ use crate::crypto::KeyExchangeAlgorithm;
+ use crate::enums::{AlertDescription, ContentType, HandshakeType, ProtocolVersion};
+@@ -138,7 +138,6 @@ mod server_hello {
+                             .clone()
+                             .into_owned(),
+                     );
+-                    cx.common.handshake_kind = Some(HandshakeKind::Resumed);
+                     let cert_verified = verify::ServerCertVerified::assertion();
+                     let sig_verified = verify::HandshakeSignatureValid::assertion();
+ 
+@@ -173,7 +172,6 @@ mod server_hello {
+                 }
+             }
+ 
+-            cx.common.handshake_kind = Some(HandshakeKind::Full);
+             Ok(Box::new(ExpectCertificate {
+                 config: self.config,
+                 resuming_session: None,
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index ffe84170..a3c746e7 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -11,7 +11,7 @@ use super::hs::ClientContext;
+ use crate::check::inappropriate_handshake_message;
+ use crate::client::common::{ClientAuthDetails, ClientHelloDetails, ServerCertDetails};
+ use crate::client::{hs, ClientConfig, ClientSessionStore};
+-use crate::common_state::{CommonState, HandshakeKind, Protocol, Side, State};
++use crate::common_state::{CommonState, Protocol, Side, State};
+ use crate::conn::ConnectionRandoms;
+ use crate::crypto::ActiveKeyExchange;
+ use crate::enums::{
+@@ -425,7 +425,6 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
+                     .server_cert_chain()
+                     .clone(),
+             );
+-            cx.common.handshake_kind = Some(HandshakeKind::Resumed);
+ 
+             // We *don't* reverify the certificate chain here: resumption is a
+             // continuation of the previous session in terms of security policy.
+@@ -446,9 +445,6 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
+             if exts.early_data_extension_offered() {
+                 return Err(PeerMisbehaved::EarlyDataExtensionWithoutResumption.into());
+             }
+-            cx.common
+-                .handshake_kind
+-                .get_or_insert(HandshakeKind::Full);
+             Ok(Box::new(ExpectCertificateOrCertReq {
+                 config: self.config,
+                 server_name: self.server_name,
+diff --git a/rustls/src/common_state.rs b/rustls/src/common_state.rs
+index 558990d6..5ef47763 100644
+--- a/rustls/src/common_state.rs
++++ b/rustls/src/common_state.rs
+@@ -26,7 +26,6 @@ use crate::{quic, record_layer};
+ /// Connection state common to both client and server connections.
+ pub struct CommonState {
+     pub(crate) negotiated_version: Option<ProtocolVersion>,
+-    pub(crate) handshake_kind: Option<HandshakeKind>,
+     pub(crate) side: Side,
+     pub(crate) record_layer: record_layer::RecordLayer,
+     pub(crate) suite: Option<SupportedCipherSuite>,
+@@ -57,7 +56,6 @@ impl CommonState {
+     pub(crate) fn new(side: Side) -> Self {
+         Self {
+             negotiated_version: None,
+-            handshake_kind: None,
+             side,
+             record_layer: record_layer::RecordLayer::new(),
+             suite: None,
+@@ -142,17 +140,6 @@ impl CommonState {
+         self.negotiated_version
+     }
+ 
+-    /// Which kind of handshake was performed.
+-    ///
+-    /// This tells you whether the handshake was a resumption or not.
+-    ///
+-    /// This will return `Err(Error::HandshakeNotComplete)` before it is
+-    /// known which sort of handshake occurred.
+-    pub fn handshake_kind(&self) -> Result<HandshakeKind, Error> {
+-        self.handshake_kind
+-            .ok_or(Error::HandshakeNotComplete)
+-    }
+-
+     pub(crate) fn is_tls13(&self) -> bool {
+         matches!(self.negotiated_version, Some(ProtocolVersion::TLSv1_3))
+     }
+@@ -695,30 +682,6 @@ impl CommonState {
+     }
+ }
+ 
+-/// Describes which sort of handshake happened.
+-#[derive(Debug, PartialEq, Clone, Copy)]
+-pub enum HandshakeKind {
+-    /// A full handshake.
+-    ///
+-    /// This is the typical TLS connection initiation process when resumption is
+-    /// not yet unavailable, and the initial `ClientHello` was accepted by the server.
+-    Full,
+-
+-    /// A full TLS1.3 handshake, with an extra round-trip for a `HelloRetryRequest`.
+-    ///
+-    /// The server can respond with a `HelloRetryRequest` if the initial `ClientHello`
+-    /// is unacceptable for several reasons, the most likely if no supported key
+-    /// shares were offered by the client.
+-    FullWithHelloRetryRequest,
+-
+-    /// A resumed handshake.
+-    ///
+-    /// Resumed handshakes involve fewer round trips and less cryptography than
+-    /// full ones, but can only happen when the peers have previously done a full
+-    /// handshake together, and then remember data about it.
+-    Resumed,
+-}
+-
+ /// Values of this structure are returned from [`Connection::process_new_packets`]
+ /// and tell the caller the current I/O state of the TLS connection.
+ ///
+diff --git a/rustls/src/lib.rs b/rustls/src/lib.rs
+index 87814625..d5708f2d 100644
+--- a/rustls/src/lib.rs
++++ b/rustls/src/lib.rs
+@@ -499,7 +499,7 @@ pub mod unbuffered {
+ 
+ // The public interface is:
+ pub use crate::builder::{ConfigBuilder, ConfigSide, WantsVerifier, WantsVersions};
+-pub use crate::common_state::{CommonState, HandshakeKind, IoState, Side};
++pub use crate::common_state::{CommonState, IoState, Side};
+ #[cfg(feature = "std")]
+ pub use crate::conn::{Connection, Reader, Writer};
+ pub use crate::conn::{ConnectionCommon, SideData};
+diff --git a/rustls/src/server/tls12.rs b/rustls/src/server/tls12.rs
+index 4fb9f30d..1b337f17 100644
+--- a/rustls/src/server/tls12.rs
++++ b/rustls/src/server/tls12.rs
+@@ -13,7 +13,7 @@ use super::common::ActiveCertifiedKey;
+ use super::hs::{self, ServerContext};
+ use super::server_conn::{ProducesTickets, ServerConfig, ServerConnectionData};
+ use crate::check::inappropriate_message;
+-use crate::common_state::{CommonState, HandshakeKind, Side, State};
++use crate::common_state::{CommonState, Side, State};
+ use crate::conn::ConnectionRandoms;
+ use crate::crypto::ActiveKeyExchange;
+ use crate::enums::{AlertDescription, ContentType, HandshakeType, ProtocolVersion};
+@@ -192,8 +192,6 @@ mod client_hello {
+                 self.session_id = SessionId::random(self.config.provider.secure_random)?;
+             }
+ 
+-            cx.common.handshake_kind = Some(HandshakeKind::Full);
+-
+             self.send_ticket = emit_server_hello(
+                 &self.config,
+                 &mut self.transcript,
+@@ -292,7 +290,6 @@ mod client_hello {
+             cx.common
+                 .start_encryption_tls12(&secrets, Side::Server);
+             cx.common.peer_certificates = resumedata.client_cert_chain;
+-            cx.common.handshake_kind = Some(HandshakeKind::Resumed);
+ 
+             if self.send_ticket {
+                 let now = self.config.current_time()?;
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index feb8227c..de8f41ce 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
+ use super::hs::{self, HandshakeHashOrBuffer, ServerContext};
+ use super::server_conn::ServerConnectionData;
+ use crate::check::{inappropriate_handshake_message, inappropriate_message};
+-use crate::common_state::{CommonState, HandshakeKind, Protocol, Side, State};
++use crate::common_state::{CommonState, Protocol, Side, State};
+ use crate::conn::ConnectionRandoms;
+ use crate::enums::{AlertDescription, ContentType, HandshakeType, ProtocolVersion};
+ use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
+@@ -329,14 +329,6 @@ mod client_hello {
+                 emit_fake_ccs(cx.common);
+             }
+ 
+-            if full_handshake {
+-                cx.common
+-                    .handshake_kind
+-                    .get_or_insert(HandshakeKind::Full);
+-            } else {
+-                cx.common.handshake_kind = Some(HandshakeKind::Resumed);
+-            }
+-
+             let mut ocsp_response = server_key.get_ocsp();
+             let doing_early_data = emit_encrypted_extensions(
+                 &mut self.transcript,
+@@ -563,7 +555,6 @@ mod client_hello {
+         transcript.rollup_for_hrr();
+         transcript.add_message(&m);
+         common.send_msg(m, false);
+-        common.handshake_kind = Some(HandshakeKind::FullWithHelloRetryRequest);
+     }
+ 
+     fn decide_if_early_data_allowed(
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index 112f1815..d22a04f3 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -34,8 +34,8 @@ use rustls::internal::msgs::message::{Message, MessagePayload};
+ use rustls::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
+ use rustls::SupportedCipherSuite;
+ use rustls::{
+-    sign, AlertDescription, CertificateError, ConnectionCommon, ContentType, Error, HandshakeKind,
+-    InvalidMessage, KeyLog, PeerIncompatible, PeerMisbehaved, SideData,
++    sign, AlertDescription, CertificateError, ConnectionCommon, ContentType, Error, InvalidMessage,
++    KeyLog, PeerIncompatible, PeerMisbehaved, SideData,
+ };
+ use rustls::{CipherSuite, ProtocolVersion, SignatureScheme};
+ use rustls::{ClientConfig, ClientConnection};
+@@ -506,29 +506,6 @@ fn server_can_get_client_cert_after_resumption() {
+     }
+ }
+ 
+-#[test]
+-fn resumption_combinations() {
+-    for kt in ALL_KEY_TYPES {
+-        let server_config = make_server_config(*kt);
+-        for version in rustls::ALL_VERSIONS {
+-            let client_config = make_client_config_with_versions(*kt, &[version]);
+-            let (mut client, mut server) =
+-                make_pair_for_configs(client_config.clone(), server_config.clone());
+-            do_handshake(&mut client, &mut server);
+-
+-            assert_eq!(client.handshake_kind(), Ok(HandshakeKind::Full));
+-            assert_eq!(server.handshake_kind(), Ok(HandshakeKind::Full));
+-
+-            let (mut client, mut server) =
+-                make_pair_for_configs(client_config.clone(), server_config.clone());
+-            do_handshake(&mut client, &mut server);
+-
+-            assert_eq!(client.handshake_kind(), Ok(HandshakeKind::Resumed));
+-            assert_eq!(server.handshake_kind(), Ok(HandshakeKind::Resumed));
+-        }
+-    }
+-}
+-
+ #[test]
+ fn test_config_builders_debug() {
+     if !provider_is_ring() {
+@@ -3400,10 +3377,8 @@ fn vectored_write_for_client_appdata() {
+ fn vectored_write_for_server_handshake_with_half_rtt_data() {
+     let mut server_config = make_server_config(KeyType::Rsa2048);
+     server_config.send_half_rtt_data = true;
+-    let (mut client, mut server) = make_pair_for_configs(
+-        make_client_config_with_auth(KeyType::Rsa2048),
+-        server_config,
+-    );
++    let (mut client, mut server) =
++        make_pair_for_configs(make_client_config_with_auth(KeyType::Rsa2048), server_config);
+ 
+     server
+         .writer()
+@@ -3442,10 +3417,8 @@ fn vectored_write_for_server_handshake_with_half_rtt_data() {
+ }
+ 
+ fn check_half_rtt_does_not_work(server_config: ServerConfig) {
+-    let (mut client, mut server) = make_pair_for_configs(
+-        make_client_config_with_auth(KeyType::Rsa2048),
+-        server_config,
+-    );
++    let (mut client, mut server) =
++        make_pair_for_configs(make_client_config_with_auth(KeyType::Rsa2048), server_config);
+ 
+     server
+         .writer()
+@@ -3782,8 +3755,6 @@ fn tls13_stateful_resumption() {
+             .map(|certs| certs.len()),
+         Some(3)
+     );
+-    assert_eq!(client.handshake_kind(), Ok(HandshakeKind::Full));
+-    assert_eq!(server.handshake_kind(), Ok(HandshakeKind::Full));
+ 
+     // resumed
+     let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+@@ -3799,8 +3770,6 @@ fn tls13_stateful_resumption() {
+             .map(|certs| certs.len()),
+         Some(3)
+     );
+-    assert_eq!(client.handshake_kind(), Ok(HandshakeKind::Resumed));
+-    assert_eq!(server.handshake_kind(), Ok(HandshakeKind::Resumed));
+ 
+     // resumed again
+     let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+@@ -3816,8 +3785,6 @@ fn tls13_stateful_resumption() {
+             .map(|certs| certs.len()),
+         Some(3)
+     );
+-    assert_eq!(client.handshake_kind(), Ok(HandshakeKind::Resumed));
+-    assert_eq!(server.handshake_kind(), Ok(HandshakeKind::Resumed));
+ }
+ 
+ #[test]
+@@ -3844,8 +3811,6 @@ fn tls13_stateless_resumption() {
+             .map(|certs| certs.len()),
+         Some(3)
+     );
+-    assert_eq!(client.handshake_kind(), Ok(HandshakeKind::Full));
+-    assert_eq!(server.handshake_kind(), Ok(HandshakeKind::Full));
+ 
+     // resumed
+     let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+@@ -3861,8 +3826,6 @@ fn tls13_stateless_resumption() {
+             .map(|certs| certs.len()),
+         Some(3)
+     );
+-    assert_eq!(client.handshake_kind(), Ok(HandshakeKind::Resumed));
+-    assert_eq!(server.handshake_kind(), Ok(HandshakeKind::Resumed));
+ 
+     // resumed again
+     let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+@@ -3878,8 +3841,6 @@ fn tls13_stateless_resumption() {
+             .map(|certs| certs.len()),
+         Some(3)
+     );
+-    assert_eq!(client.handshake_kind(), Ok(HandshakeKind::Resumed));
+-    assert_eq!(server.handshake_kind(), Ok(HandshakeKind::Resumed));
+ }
+ 
+ #[test]
+@@ -4775,9 +4736,6 @@ fn test_client_sends_helloretryrequest() {
+ 
+     let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+ 
+-    assert_eq!(client.handshake_kind(), Err(Error::HandshakeNotComplete));
+-    assert_eq!(server.handshake_kind(), Err(Error::HandshakeNotComplete));
+-
+     // client sends hello
+     {
+         let mut pipe = OtherSession::new(&mut server);
+@@ -4787,12 +4745,6 @@ fn test_client_sends_helloretryrequest() {
+         assert!(pipe.writevs[0].len() == 1);
+     }
+ 
+-    assert_eq!(client.handshake_kind(), Err(Error::HandshakeNotComplete));
+-    assert_eq!(
+-        server.handshake_kind(),
+-        Ok(HandshakeKind::FullWithHelloRetryRequest)
+-    );
+-
+     // server sends HRR
+     {
+         let mut pipe = OtherSession::new(&mut client);
+@@ -4802,15 +4754,6 @@ fn test_client_sends_helloretryrequest() {
+         assert!(pipe.writevs[0].len() == 2); // hello retry request and CCS
+     }
+ 
+-    assert_eq!(
+-        client.handshake_kind(),
+-        Ok(HandshakeKind::FullWithHelloRetryRequest)
+-    );
+-    assert_eq!(
+-        server.handshake_kind(),
+-        Ok(HandshakeKind::FullWithHelloRetryRequest)
+-    );
+-
+     // client sends fixed hello
+     {
+         let mut pipe = OtherSession::new(&mut server);
+@@ -4829,15 +4772,6 @@ fn test_client_sends_helloretryrequest() {
+         assert!(pipe.writevs[0].len() == 5); // server hello / encrypted exts / cert / cert-verify / finished
+     }
+ 
+-    assert_eq!(
+-        client.handshake_kind(),
+-        Ok(HandshakeKind::FullWithHelloRetryRequest)
+-    );
+-    assert_eq!(
+-        server.handshake_kind(),
+-        Ok(HandshakeKind::FullWithHelloRetryRequest)
+-    );
+-
+     do_handshake_until_error(&mut client, &mut server).unwrap();
+ 
+     // client only did following storage queries:
+@@ -6268,18 +6202,12 @@ fn test_client_removes_tls12_session_if_server_sends_undecryptable_first_message
+ 
+ #[test]
+ fn test_client_fips_service_indicator() {
+-    assert_eq!(
+-        make_client_config(KeyType::Rsa2048).fips(),
+-        provider_is_fips()
+-    );
++    assert_eq!(make_client_config(KeyType::Rsa2048).fips(), provider_is_fips());
+ }
+ 
+ #[test]
+ fn test_server_fips_service_indicator() {
+-    assert_eq!(
+-        make_server_config(KeyType::Rsa2048).fips(),
+-        provider_is_fips()
+-    );
++    assert_eq!(make_server_config(KeyType::Rsa2048).fips(), provider_is_fips());
+ }
+ 
+ #[test]

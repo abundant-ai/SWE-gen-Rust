@@ -1,0 +1,126 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 03d18048d..5aea3c775 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -49,9 +49,6 @@
+ * Fixed duplicate symbols caused by enabling v0 mangling.
+   [#4822](https://github.com/wasm-bindgen/wasm-bindgen/pull/4822)
+ 
+-* Fixed a multithreaded wasm32+atomics race where `Atomics.waitAsync` promise callbacks could call `run` without waking first, causing sporadic panics.
+-  [#TODO](https://github.com/wasm-bindgen/wasm-bindgen/pull/xxxx)
+-
+ ### Removed
+ 
+ ## [0.2.105](https://github.com/wasm-bindgen/wasm-bindgen/compare/0.2.104...0.2.105)
+diff --git a/crates/futures/src/task/multithread.rs b/crates/futures/src/task/multithread.rs
+index 295f4e655..520e92b22 100644
+--- a/crates/futures/src/task/multithread.rs
++++ b/crates/futures/src/task/multithread.rs
+@@ -99,12 +99,7 @@ impl Task {
+ 
+         let closure = {
+             let this = Rc::clone(&this);
+-            Closure::new(move |_| {
+-                // The promise resolution acts like a wake, so ensure the state
+-                // transitions to AWAKE before entering `run`.
+-                this.atomic.wake_by_ref();
+-                this.run();
+-            })
++            Closure::new(move |_| this.run())
+         };
+         *this.inner.borrow_mut() = Some(Inner {
+             future: Box::pin(future),
+diff --git a/crates/futures/tests/tests.rs b/crates/futures/tests/tests.rs
+index 47ee7b663..ba5e44d51 100644
+--- a/crates/futures/tests/tests.rs
++++ b/crates/futures/tests/tests.rs
+@@ -4,13 +4,7 @@ wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+ 
+ use futures_channel::oneshot;
+ use js_sys::Promise;
+-#[cfg(target_feature = "atomics")]
+-use std::future::Future;
+ use std::ops::FnMut;
+-#[cfg(target_feature = "atomics")]
+-use std::pin::Pin;
+-#[cfg(target_feature = "atomics")]
+-use std::task::{Context, Poll};
+ use wasm_bindgen::prelude::*;
+ use wasm_bindgen_futures::{future_to_promise, spawn_local, JsFuture};
+ use wasm_bindgen_test::*;
+@@ -55,16 +49,6 @@ extern "C" {
+     fn setTimeout(c: &Closure<dyn FnMut()>);
+ }
+ 
+-#[cfg(target_feature = "atomics")]
+-#[wasm_bindgen(module = "/tests/wait_async_mock.js")]
+-extern "C" {
+-    #[wasm_bindgen(js_name = installNotifyOnlyWaitAsyncMock)]
+-    fn install_wait_async_mock() -> JsValue;
+-
+-    #[wasm_bindgen(js_name = restoreWaitAsyncMock)]
+-    fn restore_wait_async_mock(original: &JsValue);
+-}
+-
+ #[wasm_bindgen_test]
+ async fn oneshot_works() {
+     let (tx, rx) = oneshot::channel::<u32>();
+@@ -150,58 +134,6 @@ async fn can_create_multiple_futures_from_same_promise() {
+     b.await.unwrap();
+ }
+ 
+-#[cfg(target_feature = "atomics")]
+-struct WaitAsyncMockGuard {
+-    original: JsValue,
+-}
+-
+-#[cfg(target_feature = "atomics")]
+-impl Drop for WaitAsyncMockGuard {
+-    fn drop(&mut self) {
+-        restore_wait_async_mock(&self.original);
+-    }
+-}
+-
+-#[cfg(target_feature = "atomics")]
+-#[derive(Default)]
+-struct PendingThenReady {
+-    polled: bool,
+-}
+-
+-#[cfg(target_feature = "atomics")]
+-impl Future for PendingThenReady {
+-    type Output = ();
+-
+-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+-        if self.polled {
+-            Poll::Ready(())
+-        } else {
+-            self.polled = true;
+-            Poll::Pending
+-        }
+-    }
+-}
+-
+-// Reproduces a race condition where the waitAsync
+-// promise resolves without first transitioning the task state back to AWAKE.
+-// Without the fix this panics inside `Task::run` because it observes the
+-// `SLEEPING` state on entry.
+-#[cfg(target_feature = "atomics")]
+-#[wasm_bindgen_test(async)]
+-async fn wait_async_promise_callback_runs_without_wake() {
+-    let _guard = WaitAsyncMockGuard {
+-        original: install_wait_async_mock(),
+-    };
+-
+-    let (done_tx, done_rx) = oneshot::channel::<()>();
+-    spawn_local(async move {
+-        PendingThenReady::default().await;
+-        done_tx.send(()).ok();
+-    });
+-
+-    done_rx.await.expect("task finished");
+-}
+-
+ #[cfg(feature = "futures-core-03-stream")]
+ #[wasm_bindgen_test]
+ async fn can_use_an_async_iterable_as_stream() {

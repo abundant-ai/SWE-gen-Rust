@@ -1,0 +1,418 @@
+diff --git a/src/inline_table.rs b/src/inline_table.rs
+index 4615ba6d..4af8a708 100644
+--- a/src/inline_table.rs
++++ b/src/inline_table.rs
+@@ -1,4 +1,5 @@
+ use std::iter::FromIterator;
++use std::mem;
+ 
+ use crate::key::Key;
+ use crate::repr::{Decor, InternalString};
+@@ -17,34 +18,10 @@ pub struct InlineTable {
+     pub(crate) decor: Decor,
+ }
+ 
+-impl InlineTable {
+-    /// Creates an empty table.
+-    pub fn new() -> Self {
+-        Default::default()
+-    }
+-}
++/// An iterator type over key/value pairs of an inline table.
++pub type InlineTableIter<'a> = Box<dyn Iterator<Item = (&'a str, &'a Value)> + 'a>;
+ 
+ impl InlineTable {
+-    /// Returns an iterator over key/value pairs.
+-    pub fn iter(&self) -> InlineTableIter<'_> {
+-        Box::new(
+-            self.items
+-                .iter()
+-                .filter(|&(_, kv)| kv.value.is_value())
+-                .map(|(k, kv)| (&k[..], kv.value.as_value().unwrap())),
+-        )
+-    }
+-
+-    /// Returns an iterator over key/value pairs.
+-    pub fn iter_mut(&mut self) -> InlineTableIterMut<'_> {
+-        Box::new(
+-            self.items
+-                .iter_mut()
+-                .filter(|(_, kv)| kv.value.is_value())
+-                .map(|(k, kv)| (&k[..], kv.value.as_value_mut().unwrap())),
+-        )
+-    }
+-
+     /// Returns the number of key/value pairs.
+     pub fn len(&self) -> usize {
+         self.iter().count()
+@@ -55,21 +32,19 @@ impl InlineTable {
+         self.len() == 0
+     }
+ 
+-    /// Clears the table, removing all key-value pairs. Keeps the allocated memory for reuse.
+-    pub fn clear(&mut self) {
+-        self.items.clear()
+-    }
+-
+-    /// Return an optional reference to the value at the given the key.
+-    pub fn get(&self, key: &str) -> Option<&Value> {
+-        self.items.get(key).and_then(|kv| kv.value.as_value())
++    /// Returns an iterator over key/value pairs.
++    pub fn iter(&self) -> InlineTableIter<'_> {
++        Box::new(
++            self.items
++                .iter()
++                .filter(|&(_, kv)| kv.value.is_value())
++                .map(|(k, kv)| (&k[..], kv.value.as_value().unwrap())),
++        )
+     }
+ 
+-    /// Return an optional mutable reference to the value at the given the key.
+-    pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+-        self.items
+-            .get_mut(key)
+-            .and_then(|kv| kv.value.as_value_mut())
++    /// Sorts the key/value pairs by key.
++    pub fn sort(&mut self) {
++        sort_key_value_pairs(&mut self.items);
+     }
+ 
+     /// Returns true iff the table contains given key.
+@@ -81,6 +56,15 @@ impl InlineTable {
+         }
+     }
+ 
++    /// Merges the key/value pairs into the `other` table leaving
++    /// `self` empty.
++    pub fn merge_into(&mut self, other: &mut InlineTable) {
++        let items = mem::replace(&mut self.items, KeyValuePairs::new());
++        for (k, kv) in items {
++            other.items.insert(k, kv);
++        }
++    }
++
+     /// Inserts a key/value pair if the table does not contain the key.
+     /// Returns a mutable reference to the corresponding value.
+     pub fn get_or_insert<V: Into<Value>>(&mut self, key: &str, value: V) -> &mut Value {
+@@ -96,80 +80,28 @@ impl InlineTable {
+             .expect("non-value type in inline table")
+     }
+ 
+-    /// Inserts a key-value pair into the map.
+-    pub fn insert_formatted(&mut self, key: &Key, value: Value) -> Option<Value> {
+-        let kv = TableKeyValue::new(key.repr().to_owned(), Item::Value(value));
+-        self.items
+-            .insert(key.get().to_owned(), kv)
+-            .filter(|kv| kv.value.is_value())
+-            .map(|kv| kv.value.into_value().unwrap())
+-    }
+-
+-    /// Removes an item given the key.
+-    pub fn remove(&mut self, key: &str) -> Option<Item> {
+-        self.items.remove(key).map(|kv| kv.value)
+-    }
+-}
+-
+-impl InlineTable {
+-    /// Sorts the key/value pairs by key.
+-    pub fn sort(&mut self) {
+-        sort_key_value_pairs(&mut self.items);
+-    }
+-
+     /// Auto formats the table.
+     pub fn fmt(&mut self) {
+         decorate_inline_table(self);
+     }
+ 
+-    /// Returns the decor associated with a given key of the table.
+-    pub fn decor(&self, key: &str) -> Option<&Decor> {
+-        self.items.get(key).map(|kv| &kv.key_decor)
+-    }
+-}
+-
+-impl<K: Into<Key>, V: Into<Value>> Extend<(K, V)> for InlineTable {
+-    fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {
+-        for (key, value) in iter {
+-            let key = key.into();
+-            let value = Item::Value(value.into());
+-            let value = TableKeyValue::new(key.repr().to_owned(), value);
+-            self.items.insert(key.into(), value);
+-        }
+-    }
+-}
+-
+-impl<K: Into<Key>, V: Into<Value>> FromIterator<(K, V)> for InlineTable {
+-    fn from_iter<I>(iter: I) -> Self
+-    where
+-        I: IntoIterator<Item = (K, V)>,
+-    {
+-        let mut table = InlineTable::new();
+-        table.extend(iter);
+-        table
++    /// Removes a key/value pair given the key.
++    pub fn remove(&mut self, key: &str) -> Option<Value> {
++        self.items
++            .remove(key)
++            .and_then(|kv| kv.value.as_value().cloned())
+     }
+-}
+-
+-impl IntoIterator for InlineTable {
+-    type Item = (String, Value);
+-    type IntoIter = InlineTableIntoIter;
+ 
+-    fn into_iter(self) -> Self::IntoIter {
+-        Box::new(
+-            self.items
+-                .into_iter()
+-                .filter(|(_, kv)| kv.value.is_value())
+-                .map(|(k, kv)| (k, kv.value.into_value().unwrap())),
+-        )
++    /// Return an optional reference to the value at the given the key.
++    pub fn get(&self, key: &str) -> Option<&Value> {
++        self.items.get(key).and_then(|kv| kv.value.as_value())
+     }
+-}
+-
+-impl<'s> IntoIterator for &'s InlineTable {
+-    type Item = (&'s str, &'s Value);
+-    type IntoIter = InlineTableIter<'s>;
+ 
+-    fn into_iter(self) -> Self::IntoIter {
+-        self.iter()
++    /// Return an optional mutable reference to the value at the given the key.
++    pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
++        self.items
++            .get_mut(key)
++            .and_then(|kv| kv.value.as_value_mut())
+     }
+ }
+ 
+@@ -195,13 +127,6 @@ fn decorate_inline_table(table: &mut InlineTable) {
+     }
+ }
+ 
+-/// An owned iterator type over key/value pairs of an inline table.
+-pub type InlineTableIntoIter = Box<dyn Iterator<Item = (String, Value)>>;
+-/// An iterator type over key/value pairs of an inline table.
+-pub type InlineTableIter<'a> = Box<dyn Iterator<Item = (&'a str, &'a Value)> + 'a>;
+-/// A mutable iterator type over key/value pairs of an inline table.
+-pub type InlineTableIterMut<'a> = Box<dyn Iterator<Item = (&'a str, &'a mut Value)> + 'a>;
+-
+ impl TableLike for InlineTable {
+     fn iter(&self) -> Iter<'_> {
+         Box::new(self.items.iter().map(|(key, kv)| (&key[..], &kv.value)))
+@@ -214,5 +139,35 @@ impl TableLike for InlineTable {
+     }
+ }
+ 
++impl<'k, K: Into<&'k Key>, V: Into<Value>> FromIterator<(K, V)> for InlineTable {
++    fn from_iter<I>(iter: I) -> Self
++    where
++        I: IntoIterator<Item = (K, V)>,
++    {
++        let mut table = InlineTable {
++            items: to_key_value_pairs(iter),
++            ..Default::default()
++        };
++        table.fmt();
++        table
++    }
++}
++
++fn to_key_value_pairs<'k, K, V, I>(iter: I) -> KeyValuePairs
++where
++    K: Into<&'k Key>,
++    V: Into<Value>,
++    I: IntoIterator<Item = (K, V)>,
++{
++    let v = iter.into_iter().map(|(a, b)| {
++        let s: &Key = a.into();
++        (
++            s.get().into(),
++            TableKeyValue::new(s.repr().to_owned(), Item::Value(b.into())),
++        )
++    });
++    v.collect()
++}
++
+ // `{ key1 = value1, ... }`
+ pub(crate) const DEFAULT_INLINE_KEY_DECOR: (&str, &str) = (" ", " ");
+diff --git a/src/item.rs b/src/item.rs
+index d9c9c30f..edfa0723 100644
+--- a/src/item.rs
++++ b/src/item.rs
+@@ -71,27 +71,6 @@ impl Item {
+             _ => None,
+         }
+     }
+-    /// Casts `self` to value.
+-    pub fn into_value(self) -> Result<Value, Self> {
+-        match self {
+-            Item::Value(v) => Ok(v),
+-            _ => Err(self),
+-        }
+-    }
+-    /// Casts `self` to table.
+-    pub fn into_table(self) -> Result<Table, Self> {
+-        match self {
+-            Item::Table(t) => Ok(t),
+-            _ => Err(self),
+-        }
+-    }
+-    /// Casts `self` to array of tables.
+-    pub fn into_array_of_tables(self) -> Result<ArrayOfTables, Self> {
+-        match self {
+-            Item::ArrayOfTables(a) => Ok(a),
+-            _ => Err(self),
+-        }
+-    }
+     /// Returns true iff `self` is a value.
+     pub fn is_value(&self) -> bool {
+         self.as_value().is_some()
+diff --git a/src/key.rs b/src/key.rs
+index 60a2e951..98f5c230 100644
+--- a/src/key.rs
++++ b/src/key.rs
+@@ -38,8 +38,8 @@ impl Key {
+         Self { repr, key }
+     }
+ 
+-    pub(crate) fn with_key(key: impl AsRef<str>) -> Self {
+-        key_string_repr(key.as_ref())
++    pub(crate) fn with_key(key: &str) -> Self {
++        key_string_repr(key)
+     }
+ 
+     /// Returns the parsed key value.
+@@ -91,12 +91,6 @@ impl<'b> From<&'b str> for Key {
+     }
+ }
+ 
+-impl From<String> for Key {
+-    fn from(s: String) -> Self {
+-        Key::with_key(s)
+-    }
+-}
+-
+ #[doc(hidden)]
+ impl From<Key> for InternalString {
+     fn from(key: Key) -> InternalString {
+diff --git a/src/lib.rs b/src/lib.rs
+index 64bc9a3a..cc1b6f1f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -85,12 +85,10 @@ pub use crate::array::{Array, ArrayIter};
+ pub use crate::array_of_tables::ArrayOfTables;
+ pub use crate::datetime::*;
+ pub use crate::document::Document;
+-pub use crate::inline_table::{
+-    InlineTable, InlineTableIntoIter, InlineTableIter, InlineTableIterMut,
+-};
++pub use crate::inline_table::InlineTable;
+ pub use crate::item::{array, table, value, Item};
+ pub use crate::key::Key;
+ pub use crate::parser::TomlError;
+ pub use crate::repr::{Decor, Repr};
+-pub use crate::table::{IntoIter, Iter, IterMut, Table, TableLike};
++pub use crate::table::{Iter, IterMut, Table, TableLike};
+ pub use crate::value::Value;
+diff --git a/src/table.rs b/src/table.rs
+index ad0dbdb0..942e956f 100644
+--- a/src/table.rs
++++ b/src/table.rs
+@@ -246,24 +246,6 @@ impl<K: Into<Key>, V: Into<Value>> FromIterator<(K, V)> for Table {
+     }
+ }
+ 
+-impl IntoIterator for Table {
+-    type Item = (String, Item);
+-    type IntoIter = IntoIter;
+-
+-    fn into_iter(self) -> Self::IntoIter {
+-        Box::new(self.items.into_iter().map(|(k, kv)| (k, kv.value)))
+-    }
+-}
+-
+-impl<'s> IntoIterator for &'s Table {
+-    type Item = (&'s str, &'s Item);
+-    type IntoIter = Iter<'s>;
+-
+-    fn into_iter(self) -> Self::IntoIter {
+-        self.iter()
+-    }
+-}
+-
+ pub(crate) type KeyValuePairs = LinkedHashMap<InternalString, TableKeyValue>;
+ 
+ pub(crate) fn sort_key_value_pairs(items: &mut LinkedHashMap<InternalString, TableKeyValue>) {
+@@ -314,8 +296,6 @@ impl TableKeyValue {
+     }
+ }
+ 
+-/// An owned iterator type over `Table`'s key/value pairs.
+-pub type IntoIter = Box<dyn Iterator<Item = (String, Item)>>;
+ /// An iterator type over `Table`'s key/value pairs.
+ pub type Iter<'a> = Box<dyn Iterator<Item = (&'a str, &'a Item)> + 'a>;
+ /// A mutable iterator type over `Table`'s key/value pairs.
+diff --git a/src/value.rs b/src/value.rs
+index 74af9b9e..9128efe2 100644
+--- a/src/value.rs
++++ b/src/value.rs
+@@ -265,12 +265,6 @@ impl FromStr for Value {
+     }
+ }
+ 
+-impl<'b> From<&'b Value> for Value {
+-    fn from(s: &'b Value) -> Self {
+-        s.clone()
+-    }
+-}
+-
+ impl<'b> From<&'b str> for Value {
+     fn from(s: &'b str) -> Self {
+         let (value, raw) = parse_string_guess_delimiters(s);
+@@ -280,7 +274,7 @@ impl<'b> From<&'b str> for Value {
+ 
+ impl From<InternalString> for Value {
+     fn from(s: InternalString) -> Self {
+-        Value::from(s.as_str())
++        Value::from(s.as_ref())
+     }
+ }
+ 
+@@ -390,7 +384,7 @@ impl<V: Into<Value>> FromIterator<V> for Value {
+     }
+ }
+ 
+-impl<K: Into<Key>, V: Into<Value>> FromIterator<(K, V)> for Value {
++impl<'k, K: Into<&'k Key>, V: Into<Value>> FromIterator<(K, V)> for Value {
+     fn from_iter<I>(iter: I) -> Self
+     where
+         I: IntoIterator<Item = (K, V)>,
+diff --git a/tests/test_edit.rs b/tests/test_edit.rs
+index b3cbd07b..57ccff70 100644
+--- a/tests/test_edit.rs
++++ b/tests/test_edit.rs
+@@ -2,7 +2,7 @@ macro_rules! parse_key {
+     ($s:expr) => {{
+         let key = $s.parse::<Key>();
+         assert!(key.is_ok());
+-        key.unwrap()
++        &key.unwrap()
+     }};
+ }
+ 
+@@ -704,10 +704,10 @@ fn test_inline_table_append() {
+     ]);
+     let b = b.as_inline_table_mut().unwrap();
+ 
+-    a.extend(b.iter());
++    b.merge_into(a);
+     assert_eq!(a.len(), 5);
+     assert!(a.contains_key("e"));
+-    assert_eq!(b.len(), 3);
++    assert!(b.is_empty());
+ }
+ 
+ } // mod tests

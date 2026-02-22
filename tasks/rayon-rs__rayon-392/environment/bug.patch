@@ -1,0 +1,186 @@
+diff --git a/src/iter/mod.rs b/src/iter/mod.rs
+index cde8ace..b59bd63 100644
+--- a/src/iter/mod.rs
++++ b/src/iter/mod.rs
+@@ -59,11 +59,8 @@ mod map_with;
+ pub use self::map_with::MapWith;
+ mod zip;
+ pub use self::zip::Zip;
+-mod zip_eq;
+-pub use self::zip_eq::ZipEq;
+ mod interleave;
+ pub use self::interleave::Interleave;
+-
+ mod noop;
+ mod rev;
+ pub use self::rev::Rev;
+@@ -814,34 +811,6 @@ pub trait IndexedParallelIterator: ParallelIterator {
+         zip::new(self, zip_op.into_par_iter())
+     }
+ 
+-    /// The same as `Zip`, but requires that both iterators have the same length.
+-    ///
+-    /// # Panics
+-    /// Will panic if `self` and `zip_op` are not the same length.
+-    ///
+-    /// ```should_panic
+-    /// use rayon::prelude::*;
+-    ///
+-    /// let one = [1u8];
+-    /// let two = [2u8, 2];
+-    /// let one_iter = one.par_iter();
+-    /// let two_iter = two.par_iter();
+-    ///
+-    /// // this will panic
+-    /// let zipped: Vec<(&u8, &u8)> = one_iter.zip_eq(two_iter).collect();
+-    ///
+-    /// // we should never get here
+-    /// assert_eq!(1, zipped.len());
+-    /// ```
+-    fn zip_eq<Z>(mut self, zip_op: Z) -> ZipEq<Self, Z::Iter>
+-        where Z: IntoParallelIterator,
+-              Z::Iter: IndexedParallelIterator
+-    {
+-        let mut zip_op_iter = zip_op.into_par_iter();
+-        assert_eq!(self.len(), zip_op_iter.len());
+-        zip_eq::new(self, zip_op_iter)
+-    }
+-
+     /// Interleave elements of this iterator and the other given
+     /// iterator. Alternately yields elements from this iterator and
+     /// the given iterator, until both are exhausted. If one iterator
+diff --git a/src/iter/test.rs b/src/iter/test.rs
+index 69d5251..46f6f8f 100644
+--- a/src/iter/test.rs
++++ b/src/iter/test.rs
+@@ -760,47 +760,6 @@ pub fn check_zip_range() {
+     assert!(a.iter().all(|&x| x == a.len() - 1));
+ }
+ 
+-#[test]
+-pub fn check_zip_eq() {
+-    let mut a: Vec<usize> = (0..1024).rev().collect();
+-    let b: Vec<usize> = (0..1024).collect();
+-
+-    a.par_iter_mut().zip_eq(&b[..]).for_each(|(a, &b)| *a += b);
+-
+-    assert!(a.iter().all(|&x| x == a.len() - 1));
+-}
+-
+-#[test]
+-pub fn check_zip_eq_into_par_iter() {
+-    let mut a: Vec<usize> = (0..1024).rev().collect();
+-    let b: Vec<usize> = (0..1024).collect();
+-
+-    a.par_iter_mut()
+-     .zip_eq(&b) // here we rely on &b iterating over &usize
+-     .for_each(|(a, &b)| *a += b);
+-
+-    assert!(a.iter().all(|&x| x == a.len() - 1));
+-}
+-
+-#[test]
+-pub fn check_zip_eq_into_mut_par_iter() {
+-    let a: Vec<usize> = (0..1024).rev().collect();
+-    let mut b: Vec<usize> = (0..1024).collect();
+-
+-    a.par_iter().zip_eq(&mut b).for_each(|(&a, b)| *b += a);
+-
+-    assert!(b.iter().all(|&x| x == b.len() - 1));
+-}
+-
+-#[test]
+-pub fn check_zip_eq_range() {
+-    let mut a: Vec<usize> = (0..1024).rev().collect();
+-
+-    a.par_iter_mut().zip_eq(0usize..1024).for_each(|(a, b)| *a += b);
+-
+-    assert!(a.iter().all(|&x| x == a.len() - 1));
+-}
+-
+ #[test]
+ pub fn check_sum_filtered_ints() {
+     let a: Vec<i32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+diff --git a/src/iter/zip_eq.rs b/src/iter/zip_eq.rs
+deleted file mode 100644
+index dd4622b..0000000
+--- a/src/iter/zip_eq.rs
++++ /dev/null
+@@ -1,67 +0,0 @@
+-
+-use super::internal::*;
+-use super::*;
+-use std::cmp;
+-use std::iter;
+-
+-/// An [`IndexedParallelIterator`] that iterates over two parallel iterators of equal
+-/// length simultaneously.
+-///
+-/// This struct is created by the [`zip_eq`] method on [`IndexedParallelIterator`],
+-/// see its documentation for more information.
+-///
+-/// [`zip_eq`]: trait.IndexedParallelIterator.html#method.zip_eq
+-/// [`IndexedParallelIterator`]: trait.IndexedParallelIterator.html
+-#[must_use = "iterator adaptors are lazy and do nothing unless consumed"]
+-pub struct ZipEq<A: IndexedParallelIterator, B: IndexedParallelIterator> {
+-    zip: Zip<A, B>
+-}
+-
+-/// Create a new `ZipEq` iterator.
+-///
+-/// NB: a free fn because it is NOT part of the end-user API.
+-#[inline]
+-pub fn new<A, B>(a: A, b: B) -> ZipEq<A, B>
+-    where A: IndexedParallelIterator,
+-          B: IndexedParallelIterator
+-{
+-    ZipEq { zip: super::zip::new(a, b) }
+-}
+-
+-impl<A, B> ParallelIterator for ZipEq<A, B>
+-    where A: IndexedParallelIterator,
+-          B: IndexedParallelIterator
+-{
+-    type Item = (A::Item, B::Item);
+-
+-    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+-        where C: UnindexedConsumer<Self::Item>
+-    {
+-        bridge(self.zip, consumer)
+-    }
+-
+-    fn opt_len(&mut self) -> Option<usize> {
+-        Some(self.zip.len())
+-    }
+-}
+-
+-impl<A, B> IndexedParallelIterator for ZipEq<A, B>
+-    where A: IndexedParallelIterator,
+-          B: IndexedParallelIterator
+-{
+-    fn drive<C>(self, consumer: C) -> C::Result
+-        where C: Consumer<Self::Item>
+-    {
+-        bridge(self.zip, consumer)
+-    }
+-
+-    fn len(&mut self) -> usize {
+-        self.zip.len()
+-    }
+-
+-    fn with_producer<CB>(self, callback: CB) -> CB::Output
+-        where CB: ProducerCallback<Self::Item>
+-    {
+-        self.zip.with_producer(callback)
+-    }
+-}
+diff --git a/tests/compile-fail/must_use.rs b/tests/compile-fail/must_use.rs
+index b94e784..39ac2e5 100644
+--- a/tests/compile-fail/must_use.rs
++++ b/tests/compile-fail/must_use.rs
+@@ -28,5 +28,4 @@ fn main() {
+     v.par_iter().with_max_len(1);           //~ ERROR must be used
+     v.par_iter().with_min_len(1);           //~ ERROR must be used
+     v.par_iter().zip(&v);                   //~ ERROR must be used
+-    v.par_iter().zip_eq(&v);                //~ ERROR must be used
+ }

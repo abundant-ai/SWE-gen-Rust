@@ -1,0 +1,146 @@
+diff --git a/rustls/src/conn.rs b/rustls/src/conn.rs
+index 2a046895..a019dce2 100644
+--- a/rustls/src/conn.rs
++++ b/rustls/src/conn.rs
+@@ -10,7 +10,9 @@ use crate::enums::{AlertDescription, ContentType};
+ use crate::error::{Error, PeerMisbehaved};
+ #[cfg(feature = "logging")]
+ use crate::log::trace;
+-use crate::msgs::deframer::{Deframed, DeframerSliceBuffer, DeframerVecBuffer, MessageDeframer};
++use crate::msgs::deframer::{
++    Deframed, DeframerSliceBuffer, DeframerVecBuffer, FilledDeframerBuffer, MessageDeframer,
++};
+ use crate::msgs::handshake::Random;
+ use crate::msgs::message::{InboundPlainMessage, Message, MessagePayload};
+ use crate::suites::{ExtractedSecrets, PartiallyExtractedSecrets};
+@@ -157,10 +159,28 @@ mod connection {
+     /// A structure that implements [`std::io::Read`] for reading plaintext.
+     pub struct Reader<'a> {
+         pub(super) received_plaintext: &'a mut ChunkVecBuffer,
+-        pub(super) peer_cleanly_closed: bool,
++        pub(super) has_received_close_notify: bool,
+         pub(super) has_seen_eof: bool,
+     }
+ 
++    impl<'a> Reader<'a> {
++        /// Check the connection's state if no bytes are available for reading.
++        fn check_no_bytes_state(&self) -> io::Result<()> {
++            match (self.has_received_close_notify, self.has_seen_eof) {
++                // cleanly closed; don't care about TCP EOF: express this as Ok(0)
++                (true, _) => Ok(()),
++                // unclean closure
++                (false, true) => Err(io::Error::new(
++                    io::ErrorKind::UnexpectedEof,
++                    UNEXPECTED_EOF_MESSAGE,
++                )),
++                // connection still going, but needs more data: signal `WouldBlock` so that
++                // the caller knows this
++                (false, false) => Err(io::ErrorKind::WouldBlock.into()),
++            }
++        }
++    }
++
+     impl<'a> io::Read for Reader<'a> {
+         /// Obtain plaintext data received from the peer over this TLS connection.
+         ///
+@@ -184,26 +204,12 @@ mod connection {
+         /// the return of [`Connection::process_new_packets`].
+         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+             let len = self.received_plaintext.read(buf)?;
+-
+-            if len == 0 && !buf.is_empty() {
+-                // No bytes available:
+-                match (self.peer_cleanly_closed, self.has_seen_eof) {
+-                    // cleanly closed; don't care about TCP EOF: express this as Ok(0)
+-                    (true, _) => {}
+-                    // unclean closure
+-                    (false, true) => {
+-                        return Err(io::Error::new(
+-                            io::ErrorKind::UnexpectedEof,
+-                            UNEXPECTED_EOF_MESSAGE,
+-                        ))
+-                    }
+-                    // connection still going, but needs more data: signal `WouldBlock` so that
+-                    // the caller knows this
+-                    (false, false) => return Err(io::ErrorKind::WouldBlock.into()),
+-                }
++            if len > 0 || buf.is_empty() {
++                return Ok(len);
+             }
+ 
+-            Ok(len)
++            self.check_no_bytes_state()
++                .map(|()| len)
+         }
+ 
+         /// Obtain plaintext data received from the peer over this TLS connection.
+@@ -233,26 +239,11 @@ mod connection {
+             self.received_plaintext
+                 .read_buf(cursor.reborrow())?;
+             let len = cursor.written() - before;
+-
+-            if len == 0 && cursor.capacity() > 0 {
+-                // No bytes available:
+-                match (self.peer_cleanly_closed, self.has_seen_eof) {
+-                    // cleanly closed; don't care about TCP EOF: express this as Ok(0)
+-                    (true, _) => {}
+-                    // unclean closure
+-                    (false, true) => {
+-                        return Err(io::Error::new(
+-                            io::ErrorKind::UnexpectedEof,
+-                            UNEXPECTED_EOF_MESSAGE,
+-                        ));
+-                    }
+-                    // connection still going, but need more data: signal `WouldBlock` so that
+-                    // the caller knows this
+-                    (false, false) => return Err(io::ErrorKind::WouldBlock.into()),
+-                }
++            if len > 0 || cursor.capacity() == 0 {
++                return Ok(());
+             }
+ 
+-            Ok(())
++            self.check_no_bytes_state()
+         }
+     }
+ 
+@@ -501,8 +492,7 @@ impl<Data> ConnectionCommon<Data> {
+             received_plaintext: &mut common.received_plaintext,
+             // Are we done? i.e., have we processed all received messages, and received a
+             // close_notify to indicate that no new messages will arrive?
+-            peer_cleanly_closed: common.has_received_close_notify
+-                && !self.deframer_buffer.has_pending(),
++            has_received_close_notify: common.has_received_close_notify,
+             has_seen_eof: common.has_seen_eof,
+         }
+     }
+@@ -796,6 +786,16 @@ impl<Data> ConnectionCore<Data> {
+                     return Err(e);
+                 }
+             }
++
++            if self
++                .common_state
++                .has_received_close_notify
++            {
++                // "Any data received after a closure alert has been received MUST be ignored."
++                // -- <https://datatracker.ietf.org/doc/html/rfc8446#section-6.1>
++                discard = borrowed_buffer.filled().len();
++                break;
++            }
+         }
+ 
+         deframer_buffer.discard(discard);
+diff --git a/rustls/src/msgs/deframer.rs b/rustls/src/msgs/deframer.rs
+index 4734c376..8c6ec710 100644
+--- a/rustls/src/msgs/deframer.rs
++++ b/rustls/src/msgs/deframer.rs
+@@ -614,7 +614,7 @@ trait DeframerBuffer<'a, P: AppendPayload<'a>>: FilledDeframerBuffer {
+     fn copy(&mut self, payload: &P, at: usize);
+ }
+ 
+-trait FilledDeframerBuffer {
++pub(crate) trait FilledDeframerBuffer {
+     fn filled_get_mut<I: SliceIndex<[u8]>>(&mut self, index: I) -> &mut I::Output {
+         self.filled_mut()
+             .get_mut(index)

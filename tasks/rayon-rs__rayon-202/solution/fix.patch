@@ -1,0 +1,105 @@
+diff --git a/src/configuration.rs b/src/configuration.rs
+index 3b521a0..eb80295 100644
+--- a/src/configuration.rs
++++ b/src/configuration.rs
+@@ -43,16 +43,19 @@ impl Error for InitError {
+ }
+ 
+ /// Contains the rayon thread pool configuration.
+-#[derive(Clone, Debug)]
+ pub struct Configuration {
+     /// The number of threads in the rayon thread pool. Must not be zero.
+     num_threads: Option<usize>,
++    get_base_thread_name: Option<Box<FnMut(usize) -> String>>,
+ }
+ 
+ impl Configuration {
+     /// Creates and return a valid rayon thread pool configuration, but does not initialize it.
+     pub fn new() -> Configuration {
+-        Configuration { num_threads: None }
++        Configuration {
++            num_threads: None,
++            get_base_thread_name: None,
++        }
+     }
+ 
+     /// Get the number of threads that will be used for the thread
+@@ -61,6 +64,19 @@ impl Configuration {
+         self.num_threads
+     }
+ 
++    /// Get the base thread name for the given index.
++    pub fn base_thread_name(&mut self, index: usize) -> Option<String> {
++        self.get_base_thread_name.as_mut().map(|c| c(index))
++    }
++
++    /// Set a closure which takes the thread index and return
++    /// the threads name.
++    pub fn set_base_thread_name<F>(mut self, closure: F) -> Self
++    where F: FnMut(usize) -> String + 'static {
++        self.get_base_thread_name = Some(Box::new(closure));
++        self
++    }
++
+     /// Set the number of threads to be used in the rayon threadpool.
+     /// The argument `num_threads` must not be zero. If you do not
+     /// call this function, rayon will select a suitable default
+diff --git a/src/registry.rs b/src/registry.rs
+index 877c102..55f962d 100644
+--- a/src/registry.rs
++++ b/src/registry.rs
+@@ -73,18 +73,20 @@ pub fn get_registry_with_config(config: Configuration) -> &'static Registry {
+ /// function. Declared `unsafe` because it writes to `THE_REGISTRY` in
+ /// an unsynchronized fashion.
+ unsafe fn init_registry(config: Configuration) {
+-    let registry = leak(Arc::new(Registry::new(config.num_threads())));
++    let registry = leak(Arc::new(Registry::new(config)));
+     THE_REGISTRY = Some(registry);
+ }
+ 
+ impl Registry {
+-    pub fn new(num_threads: Option<usize>) -> Arc<Registry> {
+-        let limit_value = match num_threads {
++    pub fn new(mut configuration: Configuration) -> Arc<Registry> {
++        let limit_value = match configuration.num_threads() {
+             Some(value) => value,
+-            None => match env::var("RAYON_RS_NUM_CPUS") {
+-                Ok(s) => usize::from_str(&s).expect("invalid value for RAYON_RS_NUM_CPUS"),
+-                Err(_) => num_cpus::get(),
+-            },
++            None => {
++                match env::var("RAYON_RS_NUM_CPUS") {
++                    Ok(s) => usize::from_str(&s).expect("invalid value for RAYON_RS_NUM_CPUS"),
++                    Err(_) => num_cpus::get(),
++                }
++            }
+         };
+ 
+         let (inj_worker, inj_stealer) = deque::new();
+@@ -102,7 +104,12 @@ impl Registry {
+ 
+         for (index, worker) in workers.into_iter().enumerate() {
+             let registry = registry.clone();
+-            thread::spawn(move || unsafe { main_loop(worker, registry, index) });
++            let mut b = thread::Builder::new();
++            if let Some(name) = configuration.base_thread_name(index) {
++                b = b.name(name);
++            }
++            // FIXME(#205) recover from this error
++            b.spawn(move || unsafe { main_loop(worker, registry, index) }).unwrap();
+         }
+ 
+         registry
+diff --git a/src/thread_pool/mod.rs b/src/thread_pool/mod.rs
+index 599050b..e2a0eb1 100644
+--- a/src/thread_pool/mod.rs
++++ b/src/thread_pool/mod.rs
+@@ -18,7 +18,7 @@ impl ThreadPool {
+     /// result.  See `InitError` for more details.
+     pub fn new(configuration: Configuration) -> Result<ThreadPool, InitError> {
+         try!(configuration.validate());
+-        Ok(ThreadPool { registry: Registry::new(configuration.num_threads()) })
++        Ok(ThreadPool { registry: Registry::new(configuration) })
+     }
+ 
+     /// Executes `op` within the threadpool. Any attempts to use

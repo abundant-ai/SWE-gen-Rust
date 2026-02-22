@@ -1,0 +1,669 @@
+diff --git a/rustls/examples/internal/bogo_shim.rs b/rustls/examples/internal/bogo_shim.rs
+index 15d2ead2..c9cb70d7 100644
+--- a/rustls/examples/internal/bogo_shim.rs
++++ b/rustls/examples/internal/bogo_shim.rs
+@@ -200,7 +200,7 @@ impl server::danger::ClientCertVerifier for DummyClientAuth {
+         self.mandatory
+     }
+ 
+-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
++    fn client_auth_root_subjects(&self) -> &[DistinguishedName] {
+         &[]
+     }
+ 
+@@ -315,7 +315,7 @@ struct FixedSignatureSchemeClientCertResolver {
+ impl client::ResolvesClientCert for FixedSignatureSchemeClientCertResolver {
+     fn resolve(
+         &self,
+-        root_hint_subjects: &[&[u8]],
++        acceptable_issuers: &[&[u8]],
+         sigschemes: &[SignatureScheme],
+     ) -> Option<Arc<sign::CertifiedKey>> {
+         if !sigschemes.contains(&self.scheme) {
+@@ -323,7 +323,7 @@ impl client::ResolvesClientCert for FixedSignatureSchemeClientCertResolver {
+         }
+         let mut certkey = self
+             .resolver
+-            .resolve(root_hint_subjects, sigschemes)?;
++            .resolve(acceptable_issuers, sigschemes)?;
+         Arc::make_mut(&mut certkey).key = Arc::new(FixedSignatureSchemeSigningKey {
+             key: certkey.key.clone(),
+             scheme: self.scheme,
+diff --git a/rustls/src/client/client_conn.rs b/rustls/src/client/client_conn.rs
+index d2c111f8..deab619f 100644
+--- a/rustls/src/client/client_conn.rs
++++ b/rustls/src/client/client_conn.rs
+@@ -86,28 +86,20 @@ pub trait ClientSessionStore: Send + Sync {
+ /// A trait for the ability to choose a certificate chain and
+ /// private key for the purposes of client authentication.
+ pub trait ResolvesClientCert: Send + Sync {
+-    /// Resolve a client certificate chain/private key to use as the client's
+-    /// identity.
++    /// With the server-supplied acceptable issuers in `acceptable_issuers`,
++    /// the server's supported signature schemes in `sigschemes`,
++    /// return a certificate chain and signing key to authenticate.
+     ///
+-    /// `root_hint_subjects` is an optional list of certificate authority
+-    /// subject distinguished names that the client can use to help
+-    /// decide on a client certificate the server is likely to accept. If
+-    /// the list is empty, the client should send whatever certificate it
+-    /// has. The hints are expected to be DER-encoded X.500 distinguished names,
+-    /// per [RFC 5280 A.1]. See [`crate::DistinguishedName`] for more information
+-    /// on decoding with external crates like `x509-parser`.
++    /// `acceptable_issuers` is undecoded and unverified by the rustls
++    /// library, but it should be expected to contain a DER encodings
++    /// of X501 NAMEs.
+     ///
+-    /// `sigschemes` is the list of the [`SignatureScheme`]s the server
+-    /// supports.
+-    ///
+-    /// Return `None` to continue the handshake without any client
++    /// Return None to continue the handshake without any client
+     /// authentication.  The server may reject the handshake later
+     /// if it requires authentication.
+-    ///
+-    /// [RFC 5280 A.1]: https://www.rfc-editor.org/rfc/rfc5280#appendix-A.1
+     fn resolve(
+         &self,
+-        root_hint_subjects: &[&[u8]],
++        acceptable_issuers: &[&[u8]],
+         sigschemes: &[SignatureScheme],
+     ) -> Option<Arc<sign::CertifiedKey>>;
+ 
+diff --git a/rustls/src/client/handy.rs b/rustls/src/client/handy.rs
+index 943abd4f..35c25040 100644
+--- a/rustls/src/client/handy.rs
++++ b/rustls/src/client/handy.rs
+@@ -168,7 +168,7 @@ pub(super) struct FailResolveClientCert {}
+ impl client::ResolvesClientCert for FailResolveClientCert {
+     fn resolve(
+         &self,
+-        _root_hint_subjects: &[&[u8]],
++        _acceptable_issuers: &[&[u8]],
+         _sigschemes: &[SignatureScheme],
+     ) -> Option<Arc<sign::CertifiedKey>> {
+         None
+@@ -196,7 +196,7 @@ impl AlwaysResolvesClientCert {
+ impl client::ResolvesClientCert for AlwaysResolvesClientCert {
+     fn resolve(
+         &self,
+-        _root_hint_subjects: &[&[u8]],
++        _acceptable_issuers: &[&[u8]],
+         _sigschemes: &[SignatureScheme],
+     ) -> Option<Arc<sign::CertifiedKey>> {
+         Some(Arc::clone(&self.0))
+diff --git a/rustls/src/server/tls12.rs b/rustls/src/server/tls12.rs
+index 1a45fd5b..fabfa900 100644
+--- a/rustls/src/server/tls12.rs
++++ b/rustls/src/server/tls12.rs
+@@ -461,7 +461,7 @@ mod client_hello {
+ 
+         let names = config
+             .verifier
+-            .root_hint_subjects()
++            .client_auth_root_subjects()
+             .to_vec();
+ 
+         let cr = CertificateRequestPayload {
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index 102ad410..e34499f0 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -715,13 +715,15 @@ mod client_hello {
+         cr.extensions
+             .push(CertReqExtension::SignatureAlgorithms(schemes.to_vec()));
+ 
+-        cr.extensions
+-            .push(CertReqExtension::AuthorityNames(
+-                config
+-                    .verifier
+-                    .root_hint_subjects()
+-                    .to_vec(),
+-            ));
++        let names = config
++            .verifier
++            .client_auth_root_subjects()
++            .to_vec();
++
++        if !names.is_empty() {
++            cr.extensions
++                .push(CertReqExtension::AuthorityNames(names));
++        }
+ 
+         let m = Message {
+             version: ProtocolVersion::TLSv1_3,
+diff --git a/rustls/src/verify.rs b/rustls/src/verify.rs
+index da87cbd2..9e0dc27f 100644
+--- a/rustls/src/verify.rs
++++ b/rustls/src/verify.rs
+@@ -161,36 +161,19 @@ pub trait ClientCertVerifier: Send + Sync {
+         self.offer_client_auth()
+     }
+ 
+-    /// Returns the [`DistinguishedName`] [subjects] that the server will hint to clients to
+-    /// identify acceptable authentication trust anchors.
++    /// Returns the [Subjects] of the client authentication trust anchors to
++    /// share with the client when requesting client authentication.
+     ///
+-    /// These hint values help the client pick a client certificate it believes the server will
+-    /// accept. The hints must be DER-encoded X.500 distinguished names, per [RFC 5280 A.1]. They
+-    /// are sent in the [`certificate_authorities`] extension of a [`CertificateRequest`] message
+-    /// when [ClientCertVerifier::offer_client_auth] is true. When an empty list is sent the client
+-    /// should always provide a client certificate if it has one.
++    /// These must be DER-encoded X.500 distinguished names, per RFC 5280.
++    /// They are sent in the [`certificate_authorities`] extension of a
++    /// [`CertificateRequest`] message.
+     ///
+-    /// Generally this list should contain the [`DistinguishedName`] of each root trust
+-    /// anchor in the root cert store that the server is configured to use for authenticating
+-    /// presented client certificates.
+-    ///
+-    /// In some circumstances this list may be customized to include [`DistinguishedName`] entries
+-    /// that do not correspond to a trust anchor in the server's root cert store. For example,
+-    /// the server may be configured to trust a root CA that cross-signed an issuer certificate
+-    /// that the client considers a trust anchor. From the server's perspective the cross-signed
+-    /// certificate is an intermediate, and not present in the server's root cert store. The client
+-    /// may have the cross-signed certificate configured as a trust anchor, and be unaware of the
+-    /// root CA that cross-signed it. If the server's hints list only contained the subjects of the
+-    /// server's root store the client would consider a client certificate issued by the cross-signed
+-    /// issuer unacceptable, since its subject was not hinted. To avoid this circumstance the server
+-    /// should customize the hints list to include the subject of the cross-signed issuer in addition
+-    /// to the subjects from the root cert store.
+-    ///
+-    /// [subjects]: https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.2.6
+-    /// [RFC 5280 A.1]: https://www.rfc-editor.org/rfc/rfc5280#appendix-A.1
++    /// [Subjects]: https://datatracker.ietf.org/doc/html/rfc5280#section-4.1.2.6
+     /// [`CertificateRequest`]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.3.2
+     /// [`certificate_authorities`]: https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.4
+-    fn root_hint_subjects(&self) -> &[DistinguishedName];
++    ///
++    /// If the return value is empty, no CertificateRequest message will be sent.
++    fn client_auth_root_subjects(&self) -> &[DistinguishedName];
+ 
+     /// Verify the end-entity certificate `end_entity` is valid, acceptable,
+     /// and chains to at least one of the trust anchors trusted by
+@@ -275,7 +258,7 @@ impl ClientCertVerifier for NoClientAuth {
+         false
+     }
+ 
+-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
++    fn client_auth_root_subjects(&self) -> &[DistinguishedName] {
+         unimplemented!();
+     }
+ 
+diff --git a/rustls/src/webpki/anchors.rs b/rustls/src/webpki/anchors.rs
+index 2ba209dd..886b0756 100644
+--- a/rustls/src/webpki/anchors.rs
++++ b/rustls/src/webpki/anchors.rs
+@@ -6,7 +6,7 @@ use webpki::extract_trust_anchor;
+ use super::pki_error;
+ #[cfg(feature = "logging")]
+ use crate::log::{debug, trace};
+-use crate::{DistinguishedName, Error};
++use crate::Error;
+ 
+ /// A container for root certificates able to provide a root-of-trust
+ /// for connection authentication.
+@@ -22,6 +22,34 @@ impl RootCertStore {
+         Self { roots: Vec::new() }
+     }
+ 
++    /// Return true if there are no certificates.
++    pub fn is_empty(&self) -> bool {
++        self.len() == 0
++    }
++
++    /// Say how many certificates are in the container.
++    pub fn len(&self) -> usize {
++        self.roots.len()
++    }
++
++    /// Add a single DER-encoded certificate to the store.
++    ///
++    /// This is suitable for a small set of root certificates that are expected to parse
++    /// successfully. For large collections of roots (for example from a system store) it
++    /// is expected that some of them might not be valid according to the rules rustls
++    /// implements. As long as a relatively limited number of certificates are affected,
++    /// this should not be a cause for concern. Use [`RootCertStore::add_parsable_certificates`]
++    /// in order to add as many valid roots as possible and to understand how many certificates
++    /// have been diagnosed as malformed.
++    pub fn add(&mut self, der: CertificateDer<'_>) -> Result<(), Error> {
++        self.roots.push(
++            extract_trust_anchor(&der)
++                .map_err(pki_error)?
++                .to_owned(),
++        );
++        Ok(())
++    }
++
+     /// Parse the given DER-encoded certificates and add all that can be parsed
+     /// in a best-effort fashion.
+     ///
+@@ -58,48 +86,6 @@ impl RootCertStore {
+ 
+         (valid_count, invalid_count)
+     }
+-
+-    /// Add a single DER-encoded certificate to the store.
+-    ///
+-    /// This is suitable for a small set of root certificates that are expected to parse
+-    /// successfully. For large collections of roots (for example from a system store) it
+-    /// is expected that some of them might not be valid according to the rules rustls
+-    /// implements. As long as a relatively limited number of certificates are affected,
+-    /// this should not be a cause for concern. Use [`RootCertStore::add_parsable_certificates`]
+-    /// in order to add as many valid roots as possible and to understand how many certificates
+-    /// have been diagnosed as malformed.
+-    pub fn add(&mut self, der: CertificateDer<'_>) -> Result<(), Error> {
+-        self.roots.push(
+-            extract_trust_anchor(&der)
+-                .map_err(pki_error)?
+-                .to_owned(),
+-        );
+-        Ok(())
+-    }
+-
+-    /// Return the DER encoded [`DistinguishedName`] of each trust anchor subject in the root
+-    /// cert store.
+-    ///
+-    /// Each [`DistinguishedName`] will be a DER-encoded X.500 distinguished name, per
+-    /// [RFC 5280 A.1], including the outer `SEQUENCE`.
+-    ///
+-    /// [RFC 5280 A.1]: https://www.rfc-editor.org/rfc/rfc5280#appendix-A.1
+-    pub fn subjects(&self) -> Vec<DistinguishedName> {
+-        self.roots
+-            .iter()
+-            .map(|ta| DistinguishedName::in_sequence(ta.subject.as_ref()))
+-            .collect()
+-    }
+-
+-    /// Return true if there are no certificates.
+-    pub fn is_empty(&self) -> bool {
+-        self.len() == 0
+-    }
+-
+-    /// Say how many certificates are in the container.
+-    pub fn len(&self) -> usize {
+-        self.roots.len()
+-    }
+ }
+ 
+ impl Extend<TrustAnchor<'static>> for RootCertStore {
+diff --git a/rustls/src/webpki/client_verifier.rs b/rustls/src/webpki/client_verifier.rs
+index 086a6b7c..1ffa40fd 100644
+--- a/rustls/src/webpki/client_verifier.rs
++++ b/rustls/src/webpki/client_verifier.rs
+@@ -23,7 +23,6 @@ use crate::{
+ #[derive(Debug, Clone)]
+ pub struct ClientCertVerifierBuilder {
+     roots: Arc<RootCertStore>,
+-    root_hint_subjects: Vec<DistinguishedName>,
+     crls: Vec<CertificateRevocationListDer<'static>>,
+     revocation_check_depth: RevocationCheckDepth,
+     unknown_revocation_policy: UnknownStatusPolicy,
+@@ -34,7 +33,6 @@ pub struct ClientCertVerifierBuilder {
+ impl ClientCertVerifierBuilder {
+     pub(crate) fn new(roots: Arc<RootCertStore>) -> Self {
+         Self {
+-            root_hint_subjects: roots.subjects(),
+             roots,
+             crls: Vec::new(),
+             anon_policy: AnonymousClientPolicy::Deny,
+@@ -44,37 +42,6 @@ impl ClientCertVerifierBuilder {
+         }
+     }
+ 
+-    /// Clear the list of trust anchor hint subjects.
+-    ///
+-    /// By default, the client cert verifier will use the subjects provided by the root cert
+-    /// store configured for client authentication. Calling this function will remove these
+-    /// hint subjects, indicating the client should make a free choice of which certificate
+-    /// to send.
+-    ///
+-    /// See [`ClientCertVerifier::root_hint_subjects`] for more information on
+-    /// circumstances where you may want to clear the default hint subjects.
+-    pub fn clear_root_hint_subjects(mut self) -> Self {
+-        self.root_hint_subjects = Vec::default();
+-        self
+-    }
+-
+-    /// Add additional [`DistinguishedName`]s to the list of trust anchor hint subjects.
+-    ///
+-    /// By default, the client cert verifier will use the subjects provided by the root cert
+-    /// store configured for client authentication. Calling this function will add to these
+-    /// existing hint subjects. Calling this function with empty `subjects` will have no
+-    /// effect.
+-    ///
+-    /// See [`ClientCertVerifier::root_hint_subjects`] for more information on
+-    /// circumstances where you may want to override the default hint subjects.
+-    pub fn add_root_hint_subjects(
+-        mut self,
+-        subjects: impl IntoIterator<Item = DistinguishedName>,
+-    ) -> Self {
+-        self.root_hint_subjects.extend(subjects);
+-        self
+-    }
+-
+     /// Verify the revocation state of presented client certificates against the provided
+     /// certificate revocation lists (CRLs). Calling `with_crls` multiple times appends the
+     /// given CRLs to the existing collection.
+@@ -177,7 +144,6 @@ impl ClientCertVerifierBuilder {
+ 
+         Ok(Arc::new(WebPkiClientVerifier::new(
+             self.roots,
+-            self.root_hint_subjects,
+             self.crls
+                 .into_iter()
+                 .map(|der_crl| {
+@@ -248,7 +214,7 @@ impl ClientCertVerifierBuilder {
+ /// [^1]: <https://github.com/rustls/webpki>
+ pub struct WebPkiClientVerifier {
+     roots: Arc<RootCertStore>,
+-    root_hint_subjects: Vec<DistinguishedName>,
++    subjects: Vec<DistinguishedName>,
+     crls: Vec<OwnedCertRevocationList>,
+     revocation_check_depth: RevocationCheckDepth,
+     unknown_revocation_policy: UnknownStatusPolicy,
+@@ -279,8 +245,6 @@ impl WebPkiClientVerifier {
+     /// Construct a new `WebpkiClientVerifier`.
+     ///
+     /// * `roots` is a list of trust anchors to use for certificate validation.
+-    /// * `root_hint_subjects` is a list of distinguished names to use for hinting acceptable
+-    ///   certificate authority subjects to a client.
+     /// * `crls` is a `Vec` of owned certificate revocation lists (CRLs) to use for
+     ///   client certificate validation.
+     /// * `revocation_check_depth` controls which certificates have their revocation status checked
+@@ -292,7 +256,6 @@ impl WebPkiClientVerifier {
+     /// * `supported_algs` specifies which signature verification algorithms should be used.
+     pub(crate) fn new(
+         roots: Arc<RootCertStore>,
+-        root_hint_subjects: Vec<DistinguishedName>,
+         crls: Vec<OwnedCertRevocationList>,
+         revocation_check_depth: RevocationCheckDepth,
+         unknown_revocation_policy: UnknownStatusPolicy,
+@@ -300,11 +263,15 @@ impl WebPkiClientVerifier {
+         supported_algs: WebPkiSupportedAlgorithms,
+     ) -> Self {
+         Self {
+-            roots,
+-            root_hint_subjects,
++            subjects: roots
++                .roots
++                .iter()
++                .map(|ta| DistinguishedName::in_sequence(ta.subject.as_ref()))
++                .collect(),
+             crls,
+             revocation_check_depth,
+             unknown_revocation_policy,
++            roots,
+             anonymous_policy,
+             supported_algs,
+         }
+@@ -323,8 +290,8 @@ impl ClientCertVerifier for WebPkiClientVerifier {
+         }
+     }
+ 
+-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+-        &self.root_hint_subjects
++    fn client_auth_root_subjects(&self) -> &[DistinguishedName] {
++        &self.subjects
+     }
+ 
+     fn verify_client_cert(
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index 725b2482..fed611aa 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -21,6 +21,7 @@ use rustls::internal::msgs::enums::AlertLevel;
+ use rustls::internal::msgs::handshake::{ClientExtension, HandshakePayload};
+ use rustls::internal::msgs::message::{Message, MessagePayload, PlainMessage};
+ use rustls::server::{ClientHello, ParsedCertificate, ResolvesServerCert, WebPkiClientVerifier};
++use rustls::ConnectionTrafficSecrets;
+ use rustls::SupportedCipherSuite;
+ use rustls::{
+     sign, AlertDescription, CertificateError, ConnectionCommon, ContentType, Error, KeyLog,
+@@ -28,7 +29,6 @@ use rustls::{
+ };
+ use rustls::{CipherSuite, ProtocolVersion, SignatureScheme};
+ use rustls::{ClientConfig, ClientConnection};
+-use rustls::{ConnectionTrafficSecrets, DistinguishedName};
+ use rustls::{ServerConfig, ServerConnection};
+ use rustls::{Stream, StreamOwned};
+ 
+@@ -1224,20 +1224,20 @@ fn client_check_server_certificate_helper_api() {
+ struct ClientCheckCertResolve {
+     query_count: AtomicUsize,
+     expect_queries: usize,
+-    expect_root_hint_subjects: Vec<Vec<u8>>,
++    expect_issuers: Vec<Vec<u8>>,
+     expect_sigschemes: Vec<SignatureScheme>,
+ }
+ 
+ impl ClientCheckCertResolve {
+     fn new(
+         expect_queries: usize,
+-        expect_root_hint_subjects: Vec<Vec<u8>>,
++        expect_issuers: Vec<Vec<u8>>,
+         expect_sigschemes: Vec<SignatureScheme>,
+     ) -> Self {
+         Self {
+             query_count: AtomicUsize::new(0),
+             expect_queries,
+-            expect_root_hint_subjects,
++            expect_issuers,
+             expect_sigschemes,
+         }
+     }
+@@ -1255,18 +1255,22 @@ impl Drop for ClientCheckCertResolve {
+ impl ResolvesClientCert for ClientCheckCertResolve {
+     fn resolve(
+         &self,
+-        root_hint_subjects: &[&[u8]],
++        acceptable_issuers: &[&[u8]],
+         sigschemes: &[SignatureScheme],
+     ) -> Option<Arc<sign::CertifiedKey>> {
+         self.query_count
+             .fetch_add(1, Ordering::SeqCst);
+ 
++        if acceptable_issuers.is_empty() {
++            panic!("no issuers offered by server");
++        }
++
+         if sigschemes.is_empty() {
+             panic!("no signature schemes shared by server");
+         }
+ 
++        assert_eq!(acceptable_issuers, self.expect_issuers);
+         assert_eq!(sigschemes, self.expect_sigschemes);
+-        assert_eq!(root_hint_subjects, self.expect_root_hint_subjects);
+ 
+         None
+     }
+@@ -1276,111 +1280,64 @@ impl ResolvesClientCert for ClientCheckCertResolve {
+     }
+ }
+ 
+-fn test_client_cert_resolve(
+-    key_type: KeyType,
+-    server_config: Arc<ServerConfig>,
+-    expected_root_hint_subjects: Vec<Vec<u8>>,
+-) {
+-    for version in rustls::ALL_VERSIONS {
+-        let expected_sigschemes = match version.version {
+-            ProtocolVersion::TLSv1_2 => vec![
+-                SignatureScheme::ECDSA_NISTP384_SHA384,
+-                SignatureScheme::ECDSA_NISTP256_SHA256,
+-                SignatureScheme::ED25519,
+-                SignatureScheme::RSA_PSS_SHA512,
+-                SignatureScheme::RSA_PSS_SHA384,
+-                SignatureScheme::RSA_PSS_SHA256,
+-                SignatureScheme::RSA_PKCS1_SHA512,
+-                SignatureScheme::RSA_PKCS1_SHA384,
+-                SignatureScheme::RSA_PKCS1_SHA256,
+-            ],
+-            ProtocolVersion::TLSv1_3 => vec![
+-                SignatureScheme::ECDSA_NISTP384_SHA384,
+-                SignatureScheme::ECDSA_NISTP256_SHA256,
+-                SignatureScheme::ED25519,
+-                SignatureScheme::RSA_PSS_SHA512,
+-                SignatureScheme::RSA_PSS_SHA384,
+-                SignatureScheme::RSA_PSS_SHA256,
+-            ],
+-            _ => unreachable!(),
+-        };
++#[test]
++fn client_cert_resolve() {
++    for kt in ALL_KEY_TYPES.iter() {
++        let server_config = Arc::new(make_server_config_with_mandatory_client_auth(*kt));
+ 
+-        println!("{:?} {:?}:", version.version, key_type);
++        let expected_issuers = match *kt {
++            KeyType::Rsa => {
++                vec![b"0\x1a1\x180\x16\x06\x03U\x04\x03\x0c\x0fponytown RSA CA".to_vec()]
++            }
++            KeyType::Ecdsa => {
++                vec![b"0\x1c1\x1a0\x18\x06\x03U\x04\x03\x0c\x11ponytown ECDSA CA".to_vec()]
++            }
++            KeyType::Ed25519 => {
++                vec![b"0\x1c1\x1a0\x18\x06\x03U\x04\x03\x0c\x11ponytown EdDSA CA".to_vec()]
++            }
++        };
+ 
+-        let mut client_config = make_client_config_with_versions(key_type, &[version]);
+-        client_config.client_auth_cert_resolver = Arc::new(ClientCheckCertResolve::new(
+-            1,
+-            expected_root_hint_subjects.clone(),
+-            expected_sigschemes,
+-        ));
++        for version in rustls::ALL_VERSIONS {
++            let expected_sigschemes = match version.version {
++                ProtocolVersion::TLSv1_2 => vec![
++                    SignatureScheme::ECDSA_NISTP384_SHA384,
++                    SignatureScheme::ECDSA_NISTP256_SHA256,
++                    SignatureScheme::ED25519,
++                    SignatureScheme::RSA_PSS_SHA512,
++                    SignatureScheme::RSA_PSS_SHA384,
++                    SignatureScheme::RSA_PSS_SHA256,
++                    SignatureScheme::RSA_PKCS1_SHA512,
++                    SignatureScheme::RSA_PKCS1_SHA384,
++                    SignatureScheme::RSA_PKCS1_SHA256,
++                ],
++                ProtocolVersion::TLSv1_3 => vec![
++                    SignatureScheme::ECDSA_NISTP384_SHA384,
++                    SignatureScheme::ECDSA_NISTP256_SHA256,
++                    SignatureScheme::ED25519,
++                    SignatureScheme::RSA_PSS_SHA512,
++                    SignatureScheme::RSA_PSS_SHA384,
++                    SignatureScheme::RSA_PSS_SHA256,
++                ],
++                _ => unreachable!(),
++            };
+ 
+-        let (mut client, mut server) =
+-            make_pair_for_arc_configs(&Arc::new(client_config), &server_config);
++            println!("{:?} {:?}:", version.version, *kt);
+ 
+-        assert_eq!(
+-            do_handshake_until_error(&mut client, &mut server),
+-            Err(ErrorFromPeer::Server(Error::NoCertificatesPresented))
+-        );
+-    }
+-}
++            let mut client_config = make_client_config_with_versions(*kt, &[version]);
++            client_config.client_auth_cert_resolver = Arc::new(ClientCheckCertResolve::new(
++                1,
++                expected_issuers.clone(),
++                expected_sigschemes,
++            ));
+ 
+-#[test]
+-fn client_cert_resolve_default() {
+-    // Test that in the default configuration that a client cert resolver gets the expected
+-    // CA subject hints, and supported signature algorithms.
+-    for key_type in ALL_KEY_TYPES.into_iter() {
+-        let server_config = Arc::new(make_server_config_with_mandatory_client_auth(key_type));
++            let (mut client, mut server) =
++                make_pair_for_arc_configs(&Arc::new(client_config), &server_config);
+ 
+-        // In a default configuration we expect that the verifier's trust anchors are used
+-        // for the hint subjects.
+-        let expected_root_hint_subjects = vec![match key_type {
+-            KeyType::Rsa => &b"0\x1a1\x180\x16\x06\x03U\x04\x03\x0c\x0fponytown RSA CA"[..],
+-            KeyType::Ecdsa => &b"0\x1c1\x1a0\x18\x06\x03U\x04\x03\x0c\x11ponytown ECDSA CA"[..],
+-            KeyType::Ed25519 => &b"0\x1c1\x1a0\x18\x06\x03U\x04\x03\x0c\x11ponytown EdDSA CA"[..],
++            assert_eq!(
++                do_handshake_until_error(&mut client, &mut server),
++                Err(ErrorFromPeer::Server(Error::NoCertificatesPresented))
++            );
+         }
+-        .to_vec()];
+-
+-        test_client_cert_resolve(key_type, server_config, expected_root_hint_subjects);
+-    }
+-}
+-
+-#[test]
+-fn client_cert_resolve_server_no_hints() {
+-    // Test that a server can provide no hints and the client cert resolver gets the expected
+-    // arguments.
+-    for key_type in ALL_KEY_TYPES.into_iter() {
+-        // Build a verifier with no hint subjects.
+-        let verifier = WebPkiClientVerifier::builder(get_client_root_store(key_type))
+-            .clear_root_hint_subjects();
+-        let server_config = make_server_config_with_client_verifier(key_type, verifier);
+-        let expected_root_hint_subjects = Vec::default(); // no hints expected.
+-        test_client_cert_resolve(key_type, server_config.into(), expected_root_hint_subjects);
+-    }
+-}
+-
+-#[test]
+-fn client_cert_resolve_server_added_hint() {
+-    // Test that a server can add an extra subject above/beyond those found in its trust store
+-    // and the client cert resolver gets the expected arguments.
+-    let extra_name = b"0\x1a1\x180\x16\x06\x03U\x04\x03\x0c\x0fponyland IDK CA".to_vec();
+-    for key_type in ALL_KEY_TYPES.into_iter() {
+-        let expected_hint_subjects = vec![
+-            match key_type {
+-                KeyType::Rsa => &b"0\x1a1\x180\x16\x06\x03U\x04\x03\x0c\x0fponytown RSA CA"[..],
+-                KeyType::Ecdsa => &b"0\x1c1\x1a0\x18\x06\x03U\x04\x03\x0c\x11ponytown ECDSA CA"[..],
+-                KeyType::Ed25519 => {
+-                    &b"0\x1c1\x1a0\x18\x06\x03U\x04\x03\x0c\x11ponytown EdDSA CA"[..]
+-                }
+-            }
+-            .to_vec(),
+-            extra_name.clone(),
+-        ];
+-        // Create a verifier that adds the extra_name as a hint subject in addition to the ones
+-        // from the root cert store.
+-        let verifier = WebPkiClientVerifier::builder(get_client_root_store(key_type))
+-            .add_root_hint_subjects([DistinguishedName::from(extra_name.clone())].into_iter());
+-        let server_config = make_server_config_with_client_verifier(key_type, verifier);
+-        test_client_cert_resolve(key_type, server_config.into(), expected_hint_subjects);
+     }
+ }
+ 
+diff --git a/rustls/tests/client_cert_verifier.rs b/rustls/tests/client_cert_verifier.rs
+index 437e3831..21f56fe6 100644
+--- a/rustls/tests/client_cert_verifier.rs
++++ b/rustls/tests/client_cert_verifier.rs
+@@ -150,7 +150,11 @@ impl MockClientVerifier {
+     pub fn new(verified: fn() -> Result<ClientCertVerified, Error>, kt: KeyType) -> Self {
+         Self {
+             verified,
+-            subjects: get_client_root_store(kt).subjects(),
++            subjects: get_client_root_store(kt)
++                .roots
++                .iter()
++                .map(|ta| DistinguishedName::in_sequence(ta.subject.as_ref()))
++                .collect(),
+             mandatory: true,
+             offered_schemes: None,
+         }
+@@ -162,7 +166,7 @@ impl ClientCertVerifier for MockClientVerifier {
+         self.mandatory
+     }
+ 
+-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
++    fn client_auth_root_subjects(&self) -> &[DistinguishedName] {
+         &self.subjects
+     }
+ 

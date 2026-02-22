@@ -1,0 +1,109 @@
+diff --git a/rustls/Cargo.toml b/rustls/Cargo.toml
+index eb300dfc..0c93c037 100644
+--- a/rustls/Cargo.toml
++++ b/rustls/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "rustls"
+-version = "0.21.9"
++version = "0.21.10"
+ edition = "2021"
+ rust-version = "1.61"
+ license = "Apache-2.0 OR ISC OR MIT"
+diff --git a/rustls/src/client/tls12.rs b/rustls/src/client/tls12.rs
+index 150f051b..57b62131 100644
+--- a/rustls/src/client/tls12.rs
++++ b/rustls/src/client/tls12.rs
+@@ -1072,6 +1072,18 @@ impl State<ClientConnectionData> for ExpectFinished {
+             _fin_verified,
+         }))
+     }
++
++    // we could not decrypt the encrypted handshake message with session resumption
++    // this might mean that the ticket was invalid for some reason, so we remove it
++    // from the store to restart a session from scratch
++    fn handle_decrypt_error(&self) {
++        if self.resuming {
++            self.config
++                .resumption
++                .store
++                .remove_tls12_session(&self.server_name);
++        }
++    }
+ }
+ 
+ // -- Traffic transit state --
+diff --git a/rustls/src/common_state.rs b/rustls/src/common_state.rs
+index 27ba9b68..a886a8a4 100644
+--- a/rustls/src/common_state.rs
++++ b/rustls/src/common_state.rs
+@@ -642,6 +642,8 @@ pub(crate) trait State<Data>: Send + Sync {
+     fn extract_secrets(&self) -> Result<PartiallyExtractedSecrets, Error> {
+         Err(Error::HandshakeNotComplete)
+     }
++
++    fn handle_decrypt_error(&self) {}
+ }
+ 
+ pub(crate) struct Context<'a, Data> {
+diff --git a/rustls/src/conn.rs b/rustls/src/conn.rs
+index 5762091a..68e5ea48 100644
+--- a/rustls/src/conn.rs
++++ b/rustls/src/conn.rs
+@@ -441,7 +441,7 @@ impl<Data> ConnectionCommon<Data> {
+     pub(crate) fn first_handshake_message(&mut self) -> Result<Option<Message>, Error> {
+         match self
+             .core
+-            .deframe()?
++            .deframe(None)?
+             .map(Message::try_from)
+         {
+             Some(Ok(msg)) => Ok(Some(msg)),
+@@ -622,7 +622,7 @@ impl<Data> ConnectionCore<Data> {
+             }
+         };
+ 
+-        while let Some(msg) = self.deframe()? {
++        while let Some(msg) = self.deframe(Some(&*state))? {
+             match self.process_msg(msg, state) {
+                 Ok(new) => state = new,
+                 Err(e) => {
+@@ -637,7 +637,7 @@ impl<Data> ConnectionCore<Data> {
+     }
+ 
+     /// Pull a message out of the deframer and send any messages that need to be sent as a result.
+-    fn deframe(&mut self) -> Result<Option<PlainMessage>, Error> {
++    fn deframe(&mut self, state: Option<&dyn State<Data>>) -> Result<Option<PlainMessage>, Error> {
+         match self
+             .message_deframer
+             .pop(&mut self.common_state.record_layer)
+@@ -678,9 +678,14 @@ impl<Data> ConnectionCore<Data> {
+             Err(err @ Error::PeerSentOversizedRecord) => Err(self
+                 .common_state
+                 .send_fatal_alert(AlertDescription::RecordOverflow, err)),
+-            Err(err @ Error::DecryptError) => Err(self
+-                .common_state
+-                .send_fatal_alert(AlertDescription::BadRecordMac, err)),
++            Err(err @ Error::DecryptError) => {
++                if let Some(state) = state {
++                    state.handle_decrypt_error();
++                }
++                Err(self
++                    .common_state
++                    .send_fatal_alert(AlertDescription::BadRecordMac, err))
++            }
+             Err(e) => Err(e),
+         }
+     }
+diff --git a/rustls/src/versions.rs b/rustls/src/versions.rs
+index 68f6e2a7..7ff3d8a8 100644
+--- a/rustls/src/versions.rs
++++ b/rustls/src/versions.rs
+@@ -8,6 +8,7 @@ use crate::enums::ProtocolVersion;
+ /// the [`ALL_VERSIONS`] array, as well as individually as [`TLS12`]
+ /// and [`TLS13`].
+ #[derive(Eq, PartialEq)]
++#[allow(clippy::manual_non_exhaustive)] // Fixed in main
+ pub struct SupportedProtocolVersion {
+     /// The TLS enumeration naming this version.
+     pub version: ProtocolVersion,

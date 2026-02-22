@@ -1,0 +1,498 @@
+diff --git a/src/compile_fail/must_use.rs b/src/compile_fail/must_use.rs
+index 69c5127..c740315 100644
+--- a/src/compile_fail/must_use.rs
++++ b/src/compile_fail/must_use.rs
+@@ -4,20 +4,6 @@
+ 
+ macro_rules! must_use {
+     ($( $name:ident #[$expr:meta] )*) => {$(
+-        /// First sanity check that the expression is OK.
+-        ///
+-        /// ```
+-        /// #![deny(unused_must_use)]
+-        ///
+-        /// use rayon::prelude::*;
+-        ///
+-        /// let v: Vec<_> = (0..100).map(Some).collect();
+-        /// let _ =
+-        #[$expr]
+-        /// ```
+-        ///
+-        /// Now trigger the `must_use`.
+-        ///
+         /// ```compile_fail
+         /// #![deny(unused_must_use)]
+         ///
+@@ -49,7 +35,6 @@ must_use! {
+     intersperse         /** v.par_iter().intersperse(&None); */
+     map                 /** v.par_iter().map(|x| x); */
+     map_with            /** v.par_iter().map_with(0, |_, x| x); */
+-    map_init            /** v.par_iter().map_init(|| 0, |_, x| x); */
+     rev                 /** v.par_iter().rev(); */
+     skip                /** v.par_iter().skip(1); */
+     take                /** v.par_iter().take(1); */
+diff --git a/src/iter/map_with.rs b/src/iter/map_with.rs
+index eea04b2..2c8e688 100644
+--- a/src/iter/map_with.rs
++++ b/src/iter/map_with.rs
+@@ -180,6 +180,7 @@ struct MapWithIter<'f, I, U, F: 'f> {
+ 
+ impl<'f, I, U, F, R> Iterator for MapWithIter<'f, I, U, F>
+     where I: Iterator,
++          U: Send + Clone,
+           F: Fn(&mut U, I::Item) -> R + Sync,
+           R: Send
+ {
+@@ -196,6 +197,7 @@ impl<'f, I, U, F, R> Iterator for MapWithIter<'f, I, U, F>
+ 
+ impl<'f, I, U, F, R> DoubleEndedIterator for MapWithIter<'f, I, U, F>
+     where I: DoubleEndedIterator,
++          U: Send + Clone,
+           F: Fn(&mut U, I::Item) -> R + Sync,
+           R: Send
+ {
+@@ -206,6 +208,7 @@ impl<'f, I, U, F, R> DoubleEndedIterator for MapWithIter<'f, I, U, F>
+ 
+ impl<'f, I, U, F, R> ExactSizeIterator for MapWithIter<'f, I, U, F>
+     where I: ExactSizeIterator,
++          U: Send + Clone,
+           F: Fn(&mut U, I::Item) -> R + Sync,
+           R: Send
+ {
+@@ -284,6 +287,7 @@ struct MapWithFolder<'f, C, U, F: 'f> {
+ 
+ impl<'f, T, U, R, C, F> Folder<T> for MapWithFolder<'f, C, U, F>
+     where C: Folder<R>,
++          U: Clone,
+           F: Fn(&mut U, T) -> R
+ {
+     type Result = C::Result;
+@@ -314,237 +318,3 @@ impl<'f, T, U, R, C, F> Folder<T> for MapWithFolder<'f, C, U, F>
+         self.base.full()
+     }
+ }
+-
+-// ------------------------------------------------------------------------------------------------
+-
+-/// `MapInit` is an iterator that transforms the elements of an underlying iterator.
+-///
+-/// This struct is created by the [`map_init()`] method on [`ParallelIterator`]
+-///
+-/// [`map_init()`]: trait.ParallelIterator.html#method.map_init
+-/// [`ParallelIterator`]: trait.ParallelIterator.html
+-#[must_use = "iterator adaptors are lazy and do nothing unless consumed"]
+-#[derive(Clone)]
+-pub struct MapInit<I: ParallelIterator, INIT, F> {
+-    base: I,
+-    init: INIT,
+-    map_op: F,
+-}
+-
+-impl<I: ParallelIterator + Debug, INIT, F> Debug for MapInit<I, INIT, F> {
+-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+-        f.debug_struct("MapInit")
+-            .field("base", &self.base)
+-            .finish()
+-    }
+-}
+-
+-/// Create a new `MapInit` iterator.
+-///
+-/// NB: a free fn because it is NOT part of the end-user API.
+-pub fn new_init<I, INIT, F>(base: I, init: INIT, map_op: F) -> MapInit<I, INIT, F>
+-    where I: ParallelIterator
+-{
+-    MapInit {
+-        base: base,
+-        init: init,
+-        map_op: map_op,
+-    }
+-}
+-
+-impl<I, INIT, T, F, R> ParallelIterator for MapInit<I, INIT, F>
+-    where I: ParallelIterator,
+-          INIT: Fn() -> T + Sync + Send,
+-          F: Fn(&mut T, I::Item) -> R + Sync + Send,
+-          R: Send
+-{
+-    type Item = R;
+-
+-    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+-        where C: UnindexedConsumer<Self::Item>
+-    {
+-        let consumer1 = MapInitConsumer::new(consumer, &self.init, &self.map_op);
+-        self.base.drive_unindexed(consumer1)
+-    }
+-
+-    fn opt_len(&self) -> Option<usize> {
+-        self.base.opt_len()
+-    }
+-}
+-
+-impl<I, INIT, T, F, R> IndexedParallelIterator for MapInit<I, INIT, F>
+-    where I: IndexedParallelIterator,
+-          INIT: Fn() -> T + Sync + Send,
+-          F: Fn(&mut T, I::Item) -> R + Sync + Send,
+-          R: Send
+-{
+-    fn drive<C>(self, consumer: C) -> C::Result
+-        where C: Consumer<Self::Item>
+-    {
+-        let consumer1 = MapInitConsumer::new(consumer, &self.init, &self.map_op);
+-        self.base.drive(consumer1)
+-    }
+-
+-    fn len(&self) -> usize {
+-        self.base.len()
+-    }
+-
+-    fn with_producer<CB>(self, callback: CB) -> CB::Output
+-        where CB: ProducerCallback<Self::Item>
+-    {
+-        return self.base.with_producer(Callback {
+-                                           callback: callback,
+-                                           init: self.init,
+-                                           map_op: self.map_op,
+-                                       });
+-
+-        struct Callback<CB, INIT, F> {
+-            callback: CB,
+-            init: INIT,
+-            map_op: F,
+-        }
+-
+-        impl<T, INIT, U, F, R, CB> ProducerCallback<T> for Callback<CB, INIT, F>
+-            where CB: ProducerCallback<R>,
+-                  INIT: Fn() -> U + Sync,
+-                  F: Fn(&mut U, T) -> R + Sync,
+-                  R: Send
+-        {
+-            type Output = CB::Output;
+-
+-            fn callback<P>(self, base: P) -> CB::Output
+-                where P: Producer<Item = T>
+-            {
+-                let producer = MapInitProducer {
+-                    base: base,
+-                    init: &self.init,
+-                    map_op: &self.map_op,
+-                };
+-                self.callback.callback(producer)
+-            }
+-        }
+-    }
+-}
+-
+-/// ////////////////////////////////////////////////////////////////////////
+-
+-struct MapInitProducer<'f, P, INIT: 'f, F: 'f> {
+-    base: P,
+-    init: &'f INIT,
+-    map_op: &'f F,
+-}
+-
+-impl<'f, P, INIT, U, F, R> Producer for MapInitProducer<'f, P, INIT, F>
+-    where P: Producer,
+-          INIT: Fn() -> U + Sync,
+-          F: Fn(&mut U, P::Item) -> R + Sync,
+-          R: Send
+-{
+-    type Item = R;
+-    type IntoIter = MapWithIter<'f, P::IntoIter, U, F>;
+-
+-    fn into_iter(self) -> Self::IntoIter {
+-        MapWithIter {
+-            base: self.base.into_iter(),
+-            item: (self.init)(),
+-            map_op: self.map_op,
+-        }
+-    }
+-
+-    fn min_len(&self) -> usize {
+-        self.base.min_len()
+-    }
+-    fn max_len(&self) -> usize {
+-        self.base.max_len()
+-    }
+-
+-    fn split_at(self, index: usize) -> (Self, Self) {
+-        let (left, right) = self.base.split_at(index);
+-        (MapInitProducer {
+-             base: left,
+-             init: self.init,
+-             map_op: self.map_op,
+-         },
+-         MapInitProducer {
+-             base: right,
+-             init: self.init,
+-             map_op: self.map_op,
+-         })
+-    }
+-
+-    fn fold_with<G>(self, folder: G) -> G
+-        where G: Folder<Self::Item>
+-    {
+-        let folder1 = MapWithFolder {
+-            base: folder,
+-            item: (self.init)(),
+-            map_op: self.map_op,
+-        };
+-        self.base.fold_with(folder1).base
+-    }
+-}
+-
+-
+-/// ////////////////////////////////////////////////////////////////////////
+-/// Consumer implementation
+-
+-struct MapInitConsumer<'f, C, INIT: 'f, F: 'f> {
+-    base: C,
+-    init: &'f INIT,
+-    map_op: &'f F,
+-}
+-
+-impl<'f, C, INIT, F> MapInitConsumer<'f, C, INIT, F> {
+-    fn new(base: C, init: &'f INIT, map_op: &'f F) -> Self {
+-        MapInitConsumer {
+-            base: base,
+-            init: init,
+-            map_op: map_op,
+-        }
+-    }
+-}
+-
+-impl<'f, T, INIT, U, R, C, F> Consumer<T> for MapInitConsumer<'f, C, INIT, F>
+-    where C: Consumer<R>,
+-          INIT: Fn() -> U + Sync,
+-          F: Fn(&mut U, T) -> R + Sync,
+-          R: Send
+-{
+-    type Folder = MapWithFolder<'f, C::Folder, U, F>;
+-    type Reducer = C::Reducer;
+-    type Result = C::Result;
+-
+-    fn split_at(self, index: usize) -> (Self, Self, Self::Reducer) {
+-        let (left, right, reducer) = self.base.split_at(index);
+-        (MapInitConsumer::new(left, self.init, self.map_op),
+-         MapInitConsumer::new(right, self.init, self.map_op),
+-         reducer)
+-    }
+-
+-    fn into_folder(self) -> Self::Folder {
+-        MapWithFolder {
+-            base: self.base.into_folder(),
+-            item: (self.init)(),
+-            map_op: self.map_op,
+-        }
+-    }
+-
+-    fn full(&self) -> bool {
+-        self.base.full()
+-    }
+-}
+-
+-impl<'f, T, INIT, U, R, C, F> UnindexedConsumer<T> for MapInitConsumer<'f, C, INIT, F>
+-    where C: UnindexedConsumer<R>,
+-          INIT: Fn() -> U + Sync,
+-          F: Fn(&mut U, T) -> R + Sync,
+-          R: Send
+-{
+-    fn split_off_left(&self) -> Self {
+-        MapInitConsumer::new(self.base.split_off_left(), self.init, self.map_op)
+-    }
+-
+-    fn to_reducer(&self) -> Self::Reducer {
+-        self.base.to_reducer()
+-    }
+-}
+diff --git a/src/iter/mod.rs b/src/iter/mod.rs
+index a32fde3..36294cf 100644
+--- a/src/iter/mod.rs
++++ b/src/iter/mod.rs
+@@ -130,7 +130,7 @@ pub use self::take::Take;
+ mod map;
+ pub use self::map::Map;
+ mod map_with;
+-pub use self::map_with::{MapWith, MapInit};
++pub use self::map_with::MapWith;
+ mod zip;
+ pub use self::zip::Zip;
+ mod zip_eq;
+@@ -375,42 +375,6 @@ pub trait ParallelIterator: Sized + Send {
+         self.map_with(init, op).for_each(|()| ())
+     }
+ 
+-    /// Executes `OP` on a value returned by `init` with each item produced by
+-    /// the iterator, in parallel.
+-    ///
+-    /// The `init` function will be called only as needed for a value to be
+-    /// paired with the group of items in each rayon job.  There is no
+-    /// constraint on that returned type at all!
+-    ///
+-    /// # Examples
+-    ///
+-    /// ```
+-    /// extern crate rand;
+-    /// extern crate rayon;
+-    ///
+-    /// use rand::Rng;
+-    /// use rayon::prelude::*;
+-    ///
+-    /// let mut v = vec![0u8; 1_000_000];
+-    ///
+-    /// v.par_chunks_mut(1000)
+-    ///     .for_each_init(
+-    ///         || rand::thread_rng(),
+-    ///         |rng, chunk| rng.fill(chunk),
+-    ///     );
+-    ///
+-    /// // There's a remote chance that this will fail...
+-    /// for i in 0u8..=255 {
+-    ///     assert!(v.contains(&i));
+-    /// }
+-    /// ```
+-    fn for_each_init<OP, INIT, T>(self, init: INIT, op: OP)
+-        where OP: Fn(&mut T, Self::Item) + Sync + Send,
+-              INIT: Fn() -> T + Sync + Send,
+-    {
+-        self.map_init(init, op).for_each(|()| ())
+-    }
+-
+     /// Executes a fallible `OP` on each item produced by the iterator, in parallel.
+     ///
+     /// If the `OP` returns `Result::Err` or `Option::None`, we will attempt to
+@@ -474,47 +438,6 @@ pub trait ParallelIterator: Sized + Send {
+             .try_reduce(|| (), |(), ()| R::from_ok(()))
+     }
+ 
+-    /// Executes a fallible `OP` on a value returned by `init` with each item
+-    /// produced by the iterator, in parallel.
+-    ///
+-    /// This combines the `init` semantics of [`for_each_init()`] and the
+-    /// failure semantics of [`try_for_each()`].
+-    ///
+-    /// [`for_each_init()`]: #method.for_each_init
+-    /// [`try_for_each()`]: #method.try_for_each
+-    ///
+-    /// # Examples
+-    ///
+-    /// ```
+-    /// extern crate rand;
+-    /// extern crate rayon;
+-    ///
+-    /// use rand::Rng;
+-    /// use rayon::prelude::*;
+-    ///
+-    /// let mut v = vec![0u8; 1_000_000];
+-    ///
+-    /// v.par_chunks_mut(1000)
+-    ///     .try_for_each_init(
+-    ///         || rand::thread_rng(),
+-    ///         |rng, chunk| rng.try_fill(chunk),
+-    ///     )
+-    ///     .expect("expected no rand errors");
+-    ///
+-    /// // There's a remote chance that this will fail...
+-    /// for i in 0u8..=255 {
+-    ///     assert!(v.contains(&i));
+-    /// }
+-    /// ```
+-    fn try_for_each_init<OP, INIT, T, R>(self, init: INIT, op: OP) -> R
+-        where OP: Fn(&mut T, Self::Item) -> R + Sync + Send,
+-              INIT: Fn() -> T + Sync + Send,
+-              R: Try<Ok = ()> + Send
+-    {
+-        self.map_init(init, op)
+-            .try_reduce(|| (), |(), ()| R::from_ok(()))
+-    }
+-
+     /// Counts the number of items in this parallel iterator.
+     ///
+     /// # Examples
+@@ -588,45 +511,6 @@ pub trait ParallelIterator: Sized + Send {
+         map_with::new(self, init, map_op)
+     }
+ 
+-    /// Applies `map_op` to a value returned by `init` with each item of this
+-    /// iterator, producing a new iterator with the results.
+-    ///
+-    /// The `init` function will be called only as needed for a value to be
+-    /// paired with the group of items in each rayon job.  There is no
+-    /// constraint on that returned type at all!
+-    ///
+-    /// # Examples
+-    ///
+-    /// ```
+-    /// extern crate rand;
+-    /// extern crate rayon;
+-    ///
+-    /// use rand::Rng;
+-    /// use rayon::prelude::*;
+-    ///
+-    /// let a: Vec<_> = (1i32..1_000_000)
+-    ///     .into_par_iter()
+-    ///     .map_init(
+-    ///         || rand::thread_rng(),  // get the thread-local RNG
+-    ///         |rng, x| if rng.gen() { // randomly negate items
+-    ///             -x
+-    ///         } else {
+-    ///             x
+-    ///         },
+-    ///     ).collect();
+-    ///
+-    /// // There's a remote chance that this will fail...
+-    /// assert!(a.iter().any(|&x| x < 0));
+-    /// assert!(a.iter().any(|&x| x > 0));
+-    /// ```
+-    fn map_init<F, INIT, T, R>(self, init: INIT, map_op: F) -> MapInit<Self, INIT, F>
+-        where F: Fn(&mut T, Self::Item) -> R + Sync + Send,
+-              INIT: Fn() -> T + Sync + Send,
+-              R: Send
+-    {
+-        map_with::new_init(self, init, map_op)
+-    }
+-
+     /// Creates an iterator which clones all of its elements.  This may be
+     /// useful when you have an iterator over `&T`, but you need `T`.
+     ///
+diff --git a/tests/clones.rs b/tests/clones.rs
+index 23efd98..f7054d0 100644
+--- a/tests/clones.rs
++++ b/tests/clones.rs
+@@ -124,7 +124,6 @@ fn clone_adaptors() {
+     check(v.par_iter().chunks(3));
+     check(v.par_iter().map(|x| x));
+     check(v.par_iter().map_with(0, |_, x| x));
+-    check(v.par_iter().map_init(|| 0, |_, x| x));
+     check(v.par_iter().rev());
+     check(v.par_iter().skip(1));
+     check(v.par_iter().take(1));
+diff --git a/tests/debug.rs b/tests/debug.rs
+index e9717c7..cf499fb 100644
+--- a/tests/debug.rs
++++ b/tests/debug.rs
+@@ -135,7 +135,6 @@ fn debug_adaptors() {
+     check(v.par_iter().chunks(3));
+     check(v.par_iter().map(|x| x));
+     check(v.par_iter().map_with(0, |_, x| x));
+-    check(v.par_iter().map_init(|| 0, |_, x| x));
+     check(v.par_iter().rev());
+     check(v.par_iter().skip(1));
+     check(v.par_iter().take(1));
+diff --git a/tests/producer_split_at.rs b/tests/producer_split_at.rs
+index b6fc61d..334c683 100644
+--- a/tests/producer_split_at.rs
++++ b/tests/producer_split_at.rs
+@@ -248,12 +248,6 @@ fn map_with() {
+     check(&v, || v.par_iter().map_with(vec![0], |_, &x| x));
+ }
+ 
+-#[test]
+-fn map_init() {
+-    let v: Vec<_> = (0..10).collect();
+-    check(&v, || v.par_iter().map_init(|| vec![0], |_, &x| x));
+-}
+-
+ #[test]
+ fn rev() {
+     let v: Vec<_> = (0..10).rev().collect();

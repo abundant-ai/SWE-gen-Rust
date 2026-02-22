@@ -1,0 +1,283 @@
+diff --git a/src/parser/document.rs b/src/parser/document.rs
+index f6e14279..4b3b1843 100644
+--- a/src/parser/document.rs
++++ b/src/parser/document.rs
+@@ -159,7 +159,7 @@ impl TomlParser {
+         if mixed_table_types {
+             return Err(CustomError::DuplicateKey {
+                 key: kv.key.get().into(),
+-                table: None,
++                table: "<unknown>".into(), // TODO: get actual table name
+             });
+         }
+ 
+@@ -170,7 +170,7 @@ impl TomlParser {
+         if duplicate_key {
+             return Err(CustomError::DuplicateKey {
+                 key: key.as_str().into(),
+-                table: Some(self.current_table_path.clone()),
++                table: "<unknown>".into(), // TODO: get actual table name
+             });
+         }
+ 
+diff --git a/src/parser/errors.rs b/src/parser/errors.rs
+index 295d3c5b..7ec9786f 100644
+--- a/src/parser/errors.rs
++++ b/src/parser/errors.rs
+@@ -1,8 +1,6 @@
+-use crate::Key;
+ use combine::easy::Errors as ParseError;
+ use combine::stream::easy::Error;
+ use combine::stream::position::SourcePosition;
+-use itertools::Itertools;
+ use std::error::Error as StdError;
+ use std::fmt::{Display, Formatter, Result};
+ 
+@@ -235,14 +233,7 @@ mod test_translate_position {
+ 
+ #[derive(Debug, Clone)]
+ pub(crate) enum CustomError {
+-    DuplicateKey {
+-        key: String,
+-        table: Option<Vec<Key>>,
+-    },
+-    DottedKeyExtendWrongType {
+-        key: Vec<Key>,
+-        actual: &'static str,
+-    },
++    DuplicateKey { key: String, table: String },
+     InvalidHexEscape(u32),
+     UnparsedLine,
+     OutOfRange,
+@@ -256,28 +247,11 @@ impl StdError for CustomError {
+ 
+ impl Display for CustomError {
+     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+-        match self {
+-            CustomError::DuplicateKey { key, table } => {
+-                if let Some(table) = table {
+-                    if table.is_empty() {
+-                        writeln!(f, "Duplicate key `{}` in document root", key)
+-                    } else {
+-                        let path = table.iter().join(".");
+-                        writeln!(f, "Duplicate key `{}` in table `{}`", key, path)
+-                    }
+-                } else {
+-                    writeln!(f, "Duplicate key `{}`", key)
+-                }
++        match *self {
++            CustomError::DuplicateKey { ref key, ref table } => {
++                writeln!(f, "Duplicate key `{}` in `{}` table", key, table)
+             }
+-            CustomError::DottedKeyExtendWrongType { key, actual } => {
+-                let path = key.iter().join(".");
+-                writeln!(
+-                    f,
+-                    "Dotted key `{}` attempted to extend non-table type (`{}`)",
+-                    path, actual
+-                )
+-            }
+-            CustomError::InvalidHexEscape(h) => {
++            CustomError::InvalidHexEscape(ref h) => {
+                 writeln!(f, "Invalid hex escape code: {:x} ", h)
+             }
+             CustomError::UnparsedLine => writeln!(f, "Could not parse the line"),
+diff --git a/src/parser/inline_table.rs b/src/parser/inline_table.rs
+index 7cc9d43a..bc797c12 100644
+--- a/src/parser/inline_table.rs
++++ b/src/parser/inline_table.rs
+@@ -1,7 +1,7 @@
+ use crate::key::Key;
+ use crate::parser::errors::CustomError;
+ use crate::parser::key::key;
+-use crate::parser::table::extend_wrong_type;
++use crate::parser::table::duplicate_key;
+ use crate::parser::trivia::ws;
+ use crate::parser::value::value;
+ use crate::table::TableKeyValue;
+@@ -35,7 +35,7 @@ fn table_from_pairs(
+         if duplicate_key {
+             return Err(CustomError::DuplicateKey {
+                 key: key.as_str().into(),
+-                table: None,
++                table: "inline".into(),
+             });
+         }
+     }
+@@ -57,8 +57,8 @@ fn descend_path<'a>(
+             Value::InlineTable(ref mut sweet_child_of_mine) => {
+                 table = sweet_child_of_mine;
+             }
+-            ref v => {
+-                return Err(extend_wrong_type(path, i, v.type_name()));
++            _ => {
++                return Err(duplicate_key(path, i));
+             }
+         }
+     }
+diff --git a/src/parser/table.rs b/src/parser/table.rs
+index 6c17df75..b05edfb6 100644
+--- a/src/parser/table.rs
++++ b/src/parser/table.rs
+@@ -9,6 +9,7 @@ use combine::parser::byte::byte;
+ use combine::parser::range::range;
+ use combine::stream::RangeStream;
+ use combine::*;
++use itertools::Itertools;
+ use std::cell::RefCell;
+ use std::mem;
+ // https://github.com/rust-lang/rust/issues/41358
+@@ -70,17 +71,13 @@ parser! {
+ 
+ pub(crate) fn duplicate_key(path: &[Key], i: usize) -> CustomError {
+     assert!(i < path.len());
++    let header = path[..i]
++        .iter()
++        .map(|k| k.to_repr().as_ref().as_raw().to_owned())
++        .join(".");
+     CustomError::DuplicateKey {
+         key: path[i].to_repr().as_ref().as_raw().into(),
+-        table: Some(path[..i].to_vec()),
+-    }
+-}
+-
+-pub(crate) fn extend_wrong_type(path: &[Key], i: usize, actual: &'static str) -> CustomError {
+-    assert!(i < path.len());
+-    CustomError::DottedKeyExtendWrongType {
+-        key: path[..=i].to_vec(),
+-        actual,
++        table: format!("[{}]", header),
+     }
+ }
+ 
+@@ -99,8 +96,8 @@ impl TomlParser {
+                 Item::Table(new_table)
+             });
+             match *entry {
+-                Item::Value(ref v) => {
+-                    return Err(extend_wrong_type(path, i, v.type_name()));
++                Item::Value(..) => {
++                    return Err(duplicate_key(path, i));
+                 }
+                 Item::ArrayOfTables(ref mut array) => {
+                     debug_assert!(!array.is_empty());
+diff --git a/tests/fixtures/invalid/duplicate-key-dotted-into-std.stderr b/tests/fixtures/invalid/duplicate-key-dotted-into-std.stderr
+index 16e126ed..a3382be6 100644
+--- a/tests/fixtures/invalid/duplicate-key-dotted-into-std.stderr
++++ b/tests/fixtures/invalid/duplicate-key-dotted-into-std.stderr
+@@ -2,5 +2,5 @@ TOML parse error at line 5, column 1
+   |
+ 5 | apple.color = "red"
+   | ^
+-Duplicate key `color`
++Duplicate key `color` in `<unknown>` table
+ 
+diff --git a/tests/fixtures/invalid/duplicate-key-std-into-dotted.stderr b/tests/fixtures/invalid/duplicate-key-std-into-dotted.stderr
+index 210e442e..87679a75 100644
+--- a/tests/fixtures/invalid/duplicate-key-std-into-dotted.stderr
++++ b/tests/fixtures/invalid/duplicate-key-std-into-dotted.stderr
+@@ -2,5 +2,5 @@ TOML parse error at line 6, column 1
+   |
+ 6 | size = "small"
+   | ^
+-Duplicate key `size`
++Duplicate key `size` in `<unknown>` table
+ 
+diff --git a/tests/fixtures/invalid/duplicate-key-table.stderr b/tests/fixtures/invalid/duplicate-key-table.stderr
+index a1c49025..c0824110 100644
+--- a/tests/fixtures/invalid/duplicate-key-table.stderr
++++ b/tests/fixtures/invalid/duplicate-key-table.stderr
+@@ -2,6 +2,6 @@ TOML parse error at line 4, column 1
+   |
+ 4 | [fruit.type]
+   | ^
+-Duplicate key `type` in table `fruit`
++Duplicate key `type` in `[fruit]` table
+ 
+ While parsing a Table Header
+diff --git a/tests/fixtures/invalid/duplicate-keys-cargo.stderr b/tests/fixtures/invalid/duplicate-keys-cargo.stderr
+deleted file mode 100644
+index be31ca3e..00000000
+--- a/tests/fixtures/invalid/duplicate-keys-cargo.stderr
++++ /dev/null
+@@ -1,6 +0,0 @@
+-TOML parse error at line 7, column 1
+-  |
+-7 | categories = ["algorithms"]
+-  | ^
+-Duplicate key `categories` in table `project`
+-
+diff --git a/tests/fixtures/invalid/duplicate-keys-cargo.toml b/tests/fixtures/invalid/duplicate-keys-cargo.toml
+deleted file mode 100644
+index 26240e02..00000000
+--- a/tests/fixtures/invalid/duplicate-keys-cargo.toml
++++ /dev/null
+@@ -1,11 +0,0 @@
+-[project]
+-
+-name = "dep1"
+-version = "0.5.0"
+-authors = ["carlhuda@example.com"]
+-categories = ["algorithms"]
+-categories = ["algorithms"]
+-
+-[lib]
+-
+-name = "dep1"
+diff --git a/tests/fixtures/invalid/duplicate-keys-dotted.stderr b/tests/fixtures/invalid/duplicate-keys-dotted.stderr
+deleted file mode 100644
+index c6d08ac6..00000000
+--- a/tests/fixtures/invalid/duplicate-keys-dotted.stderr
++++ /dev/null
+@@ -1,6 +0,0 @@
+-TOML parse error at line 3, column 1
+-  |
+-3 | ssl-version.min = 'tlsv1.2'
+-  | ^
+-Dotted key `ssl-version` attempted to extend non-table type (`string`)
+-
+diff --git a/tests/fixtures/invalid/duplicate-keys-dotted.toml b/tests/fixtures/invalid/duplicate-keys-dotted.toml
+deleted file mode 100644
+index 199f36e7..00000000
+--- a/tests/fixtures/invalid/duplicate-keys-dotted.toml
++++ /dev/null
+@@ -1,4 +0,0 @@
+-[http]
+-ssl-version = 'tlsv1.1'
+-ssl-version.min = 'tlsv1.2'
+-ssl-version.max = 'tlsv1.3'
+diff --git a/tests/fixtures/invalid/duplicate-keys.stderr b/tests/fixtures/invalid/duplicate-keys.stderr
+index 586f016a..6ef41bd8 100644
+--- a/tests/fixtures/invalid/duplicate-keys.stderr
++++ b/tests/fixtures/invalid/duplicate-keys.stderr
+@@ -2,5 +2,5 @@ TOML parse error at line 2, column 1
+   |
+ 2 | dupe = true
+   | ^
+-Duplicate key `dupe` in document root
++Duplicate key `dupe` in `<unknown>` table
+ 
+diff --git a/tests/fixtures/invalid/duplicate-tables.stderr b/tests/fixtures/invalid/duplicate-tables.stderr
+index 6ff97fa3..86b8f1ed 100644
+--- a/tests/fixtures/invalid/duplicate-tables.stderr
++++ b/tests/fixtures/invalid/duplicate-tables.stderr
+@@ -2,6 +2,6 @@ TOML parse error at line 2, column 1
+   |
+ 2 | [a]
+   | ^
+-Duplicate key `a` in document root
++Duplicate key `a` in `[]` table
+ 
+ While parsing a Table Header
+diff --git a/tests/fixtures/invalid/table-array-implicit.stderr b/tests/fixtures/invalid/table-array-implicit.stderr
+index d771f5c3..14815c68 100644
+--- a/tests/fixtures/invalid/table-array-implicit.stderr
++++ b/tests/fixtures/invalid/table-array-implicit.stderr
+@@ -2,6 +2,6 @@ TOML parse error at line 13, column 1
+    |
+ 13 | [[albums]]
+    | ^
+-Duplicate key `albums` in document root
++Duplicate key `albums` in `[]` table
+ 
+ While parsing a Table Header

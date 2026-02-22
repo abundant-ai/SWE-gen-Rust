@@ -1,0 +1,279 @@
+diff --git a/bogo/config.json b/bogo/config.json
+index 1b76ede6..5464d846 100644
+--- a/bogo/config.json
++++ b/bogo/config.json
+@@ -380,10 +380,8 @@
+   },
+   "TestLocalErrorMap": {
+     "SendServerHelloAsHelloRetryRequest": "remote error: error decoding message",
+-    "GarbageCertificate-Server-TLS12": "remote error: bad certificate",
+-    "GarbageCertificate-Server-TLS13": "remote error: bad certificate",
+-    "GarbageCertificate-Client-TLS12": "remote error: bad certificate",
+-    "GarbageCertificate-Client-TLS13": "remote error: bad certificate",
++    "GarbageCertificate-Server-TLS12": "remote error: access denied",
++    "GarbageCertificate-Server-TLS13": "remote error: access denied",
+     "Client-VerifyDefault-RSA_PKCS1_SHA1-TLS12": "tls: no common signature algorithms",
+     "Server-VerifyDefault-RSA_PKCS1_SHA1-TLS12": "tls: no common signature algorithms",
+     "Downgrade-TLS10-Client": "tls: no cipher suite supported by both client and server",
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index 05e7adb2..b49707d2 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -3,7 +3,7 @@ use crate::bs_debug;
+ use crate::check::inappropriate_handshake_message;
+ use crate::conn::{CommonState, ConnectionRandoms, State};
+ use crate::enums::{CipherSuite, ProtocolVersion};
+-use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
++use crate::error::{CertificateError, Error, PeerIncompatible, PeerMisbehaved};
+ use crate::hash_hs::HandshakeHashBuffer;
+ use crate::kx;
+ #[cfg(feature = "logging")]
+@@ -811,3 +811,19 @@ impl State<ClientConnectionData> for ExpectServerHelloOrHelloRetryRequest {
+         }
+     }
+ }
++
++pub(super) fn send_cert_error_alert(common: &mut CommonState, err: Error) -> Error {
++    match err {
++        Error::InvalidCertificate(CertificateError::BadEncoding) => {
++            common.send_fatal_alert(AlertDescription::DecodeError);
++        }
++        Error::PeerMisbehaved(_) => {
++            common.send_fatal_alert(AlertDescription::IllegalParameter);
++        }
++        _ => {
++            common.send_fatal_alert(AlertDescription::BadCertificate);
++        }
++    };
++
++    err
++}
+diff --git a/rustls/src/client/tls12.rs b/rustls/src/client/tls12.rs
+index fe7eff5c..6b9f383a 100644
+--- a/rustls/src/client/tls12.rs
++++ b/rustls/src/client/tls12.rs
+@@ -1,5 +1,5 @@
+ use crate::check::{inappropriate_handshake_message, inappropriate_message};
+-use crate::conn::{self, CommonState, ConnectionRandoms, Side, State};
++use crate::conn::{CommonState, ConnectionRandoms, Side, State};
+ use crate::enums::ProtocolVersion;
+ use crate::error::{Error, InvalidMessage, PeerMisbehaved};
+ use crate::hash_hs::HandshakeHash;
+@@ -740,7 +740,7 @@ impl State<ClientConnectionData> for ExpectServerDone {
+                 &st.server_cert.ocsp_response,
+                 now,
+             )
+-            .map_err(|err| conn::send_cert_verify_error_alert(cx.common, err))?;
++            .map_err(|err| hs::send_cert_error_alert(cx.common, err))?;
+ 
+         // 3.
+         // Build up the contents of the signed message.
+@@ -766,7 +766,7 @@ impl State<ClientConnectionData> for ExpectServerDone {
+             st.config
+                 .verifier
+                 .verify_tls12_signature(&message, &st.server_cert.cert_chain[0], sig)
+-                .map_err(|err| conn::send_cert_verify_error_alert(cx.common, err))?
++                .map_err(|err| hs::send_cert_error_alert(cx.common, err))?
+         };
+         cx.common.peer_certificates = Some(st.server_cert.cert_chain);
+ 
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 05078957..86ed1cf1 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -3,7 +3,7 @@ use crate::check::inappropriate_handshake_message;
+ use crate::conn::Protocol;
+ #[cfg(feature = "secret_extraction")]
+ use crate::conn::Side;
+-use crate::conn::{self, CommonState, ConnectionRandoms, State};
++use crate::conn::{CommonState, ConnectionRandoms, State};
+ use crate::enums::{ProtocolVersion, SignatureScheme};
+ use crate::error::{Error, InvalidMessage, PeerIncompatible, PeerMisbehaved};
+ use crate::hash_hs::{HandshakeHash, HandshakeHashBuffer};
+@@ -669,7 +669,7 @@ impl State<ClientConnectionData> for ExpectCertificateVerify {
+                 &self.server_cert.ocsp_response,
+                 now,
+             )
+-            .map_err(|err| conn::send_cert_verify_error_alert(cx.common, err))?;
++            .map_err(|err| hs::send_cert_error_alert(cx.common, err))?;
+ 
+         // 2. Verify their signature on the handshake.
+         let handshake_hash = self.transcript.get_current_hash();
+@@ -681,7 +681,7 @@ impl State<ClientConnectionData> for ExpectCertificateVerify {
+                 &self.server_cert.cert_chain[0],
+                 cert_verify,
+             )
+-            .map_err(|err| conn::send_cert_verify_error_alert(cx.common, err))?;
++            .map_err(|err| hs::send_cert_error_alert(cx.common, err))?;
+ 
+         cx.common.peer_certificates = Some(self.server_cert.cert_chain);
+         self.transcript.add_message(&m);
+diff --git a/rustls/src/conn.rs b/rustls/src/conn.rs
+index 3d2de6f4..99878e22 100644
+--- a/rustls/src/conn.rs
++++ b/rustls/src/conn.rs
+@@ -1432,20 +1432,3 @@ pub trait SideData {}
+ 
+ const DEFAULT_RECEIVED_PLAINTEXT_LIMIT: usize = 16 * 1024;
+ const DEFAULT_BUFFER_LIMIT: usize = 64 * 1024;
+-
+-pub(crate) fn send_cert_verify_error_alert(common: &mut CommonState, err: Error) -> Error {
+-    match err {
+-        Error::InvalidCertificate(ref e) => {
+-            // the clone focus on the `Arc` wrapped error in `CertificateError`
+-            common.send_fatal_alert(e.clone().into());
+-        }
+-        Error::PeerMisbehaved(_) => {
+-            common.send_fatal_alert(AlertDescription::IllegalParameter);
+-        }
+-        _ => {
+-            common.send_fatal_alert(AlertDescription::HandshakeFailure);
+-        }
+-    };
+-
+-    err
+-}
+diff --git a/rustls/src/error.rs b/rustls/src/error.rs
+index 8c9157b7..45d39521 100644
+--- a/rustls/src/error.rs
++++ b/rustls/src/error.rs
+@@ -317,29 +317,6 @@ pub enum CertificateError {
+     Other(Arc<dyn StdError + Send + Sync>),
+ }
+ 
+-// The following mapping are heavily referenced in:
+-// * [OpenSSL Implementation](https://github.com/openssl/openssl/blob/45bb98bfa223efd3258f445ad443f878011450f0/ssl/statem/statem_lib.c#L1434)
+-// * [BoringSSL Implementation](https://github.com/google/boringssl/blob/583c60bd4bf76d61b2634a58bcda99a92de106cb/ssl/ssl_x509.cc#L1323)
+-impl From<CertificateError> for AlertDescription {
+-    fn from(e: CertificateError) -> Self {
+-        use CertificateError::*;
+-        match e {
+-            BadEncoding | UnhandledCriticalExtension | NotValidForName => Self::BadCertificate,
+-            // RFC 5246/RFC 8446
+-            // certificate_expired
+-            //  A certificate has expired or **is not currently valid**.
+-            Expired | NotValidYet => Self::CertificateExpired,
+-            UnknownIssuer => Self::UnknownCA,
+-            BadSignature => Self::DecryptError,
+-            // RFC 5246/RFC 8446
+-            // certificate_unknown
+-            //  Some other (unspecified) issue arose in processing the
+-            //  certificate, rendering it unacceptable.
+-            Other(_) => Self::CertificateUnknown,
+-        }
+-    }
+-}
+-
+ impl From<CertificateError> for Error {
+     #[inline]
+     fn from(e: CertificateError) -> Self {
+diff --git a/rustls/src/server/tls12.rs b/rustls/src/server/tls12.rs
+index 4f7a77f8..8ff54a46 100644
+--- a/rustls/src/server/tls12.rs
++++ b/rustls/src/server/tls12.rs
+@@ -1,5 +1,5 @@
+ use crate::check::inappropriate_message;
+-use crate::conn::{send_cert_verify_error_alert, CommonState, ConnectionRandoms, Side, State};
++use crate::conn::{CommonState, ConnectionRandoms, Side, State};
+ use crate::enums::ProtocolVersion;
+ use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
+ use crate::hash_hs::HandshakeHash;
+@@ -544,7 +544,11 @@ impl State<ServerConnectionData> for ExpectCertificate {
+                 self.config
+                     .verifier
+                     .verify_client_cert(end_entity, intermediates, now)
+-                    .map_err(|err| send_cert_verify_error_alert(cx.common, err))?;
++                    .map_err(|err| {
++                        cx.common
++                            .send_fatal_alert(AlertDescription::BadCertificate);
++                        err
++                    })?;
+ 
+                 Some(cert_chain)
+             }
+@@ -668,13 +672,15 @@ impl State<ServerConnectionData> for ExpectCertificateVerify {
+                     // impossible to reach this state.
+                     cx.common
+                         .send_fatal_alert(AlertDescription::AccessDenied);
+-                    return Err(Error::General("client authentication not set up".into()));
++                    Err(Error::General("client authentication not set up".into()))
+                 }
+             }
+         };
+ 
+         if let Err(e) = rc {
+-            return Err(send_cert_verify_error_alert(cx.common, e));
++            cx.common
++                .send_fatal_alert(AlertDescription::AccessDenied);
++            return Err(e);
+         }
+ 
+         trace!("client CertificateVerify OK");
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index 1e9b3d5f..993c4f1e 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -1,7 +1,7 @@
+ use crate::check::inappropriate_handshake_message;
+ #[cfg(feature = "secret_extraction")]
+ use crate::conn::Side;
+-use crate::conn::{send_cert_verify_error_alert, CommonState, ConnectionRandoms, State};
++use crate::conn::{CommonState, ConnectionRandoms, State};
+ use crate::enums::ProtocolVersion;
+ use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
+ use crate::hash_hs::HandshakeHash;
+@@ -922,7 +922,11 @@ impl State<ServerConnectionData> for ExpectCertificate {
+         self.config
+             .verifier
+             .verify_client_cert(end_entity, intermediates, now)
+-            .map_err(|err| send_cert_verify_error_alert(cx.common, err))?;
++            .map_err(|err| {
++                cx.common
++                    .send_fatal_alert(AlertDescription::BadCertificate);
++                err
++            })?;
+ 
+         Ok(Box::new(ExpectCertificateVerify {
+             config: self.config,
+@@ -963,7 +967,9 @@ impl State<ServerConnectionData> for ExpectCertificateVerify {
+         };
+ 
+         if let Err(e) = rc {
+-            return Err(send_cert_verify_error_alert(cx.common, e));
++            cx.common
++                .send_fatal_alert(AlertDescription::AccessDenied);
++            return Err(e);
+         }
+ 
+         trace!("client CertificateVerify OK");
+diff --git a/rustls/tests/server_cert_verifier.rs b/rustls/tests/server_cert_verifier.rs
+index 5a6534ac..eab7e835 100644
+--- a/rustls/tests/server_cert_verifier.rs
++++ b/rustls/tests/server_cert_verifier.rs
+@@ -58,7 +58,7 @@ fn client_can_override_certificate_verification_and_reject_certificate() {
+                     ErrorFromPeer::Client(Error::InvalidMessage(
+                         InvalidMessage::HandshakePayloadTooLarge,
+                     )),
+-                    ErrorFromPeer::Server(Error::AlertReceived(AlertDescription::HandshakeFailure)),
++                    ErrorFromPeer::Server(Error::AlertReceived(AlertDescription::BadCertificate)),
+                 ]),
+             );
+         }
+@@ -89,7 +89,7 @@ fn client_can_override_certificate_verification_and_reject_tls12_signatures() {
+                 ErrorFromPeer::Client(Error::InvalidMessage(
+                     InvalidMessage::HandshakePayloadTooLarge,
+                 )),
+-                ErrorFromPeer::Server(Error::AlertReceived(AlertDescription::HandshakeFailure)),
++                ErrorFromPeer::Server(Error::AlertReceived(AlertDescription::BadCertificate)),
+             ]),
+         );
+     }
+@@ -118,7 +118,7 @@ fn client_can_override_certificate_verification_and_reject_tls13_signatures() {
+                 ErrorFromPeer::Client(Error::InvalidMessage(
+                     InvalidMessage::HandshakePayloadTooLarge,
+                 )),
+-                ErrorFromPeer::Server(Error::AlertReceived(AlertDescription::HandshakeFailure)),
++                ErrorFromPeer::Server(Error::AlertReceived(AlertDescription::BadCertificate)),
+             ]),
+         );
+     }
