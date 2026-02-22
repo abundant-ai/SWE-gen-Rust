@@ -1,0 +1,177 @@
+diff --git a/regex-syntax/src/ast/mod.rs b/regex-syntax/src/ast/mod.rs
+index 5517eeb..884fcfa 100644
+--- a/regex-syntax/src/ast/mod.rs
++++ b/regex-syntax/src/ast/mod.rs
+@@ -95,10 +95,7 @@ pub enum ErrorKind {
+     ClassRangeLiteral,
+     /// An opening `[` was found with no corresponding closing `]`.
+     ClassUnclosed,
+-    /// Note that this error variant is no longer used. Namely, a decimal
+-    /// number can only appear as a repetition quantifier. When the number
+-    /// in a repetition quantifier is empty, then it gets its own specialized
+-    /// error, `RepetitionCountDecimalEmpty`.
++    /// An empty decimal number was given where one was expected.
+     DecimalEmpty,
+     /// An invalid decimal number was given where one was expected.
+     DecimalInvalid,
+@@ -156,9 +153,6 @@ pub enum ErrorKind {
+     /// The range provided in a counted repetition operator is invalid. The
+     /// range is invalid if the start is greater than the end.
+     RepetitionCountInvalid,
+-    /// An opening `{` was not followed by a valid decimal value.
+-    /// For example, `x{}` or `x{]}` would fail.
+-    RepetitionCountDecimalEmpty,
+     /// An opening `{` was found with no corresponding closing `}`.
+     RepetitionCountUnclosed,
+     /// A repetition operator was applied to a missing sub-expression. This
+@@ -313,9 +307,6 @@ impl fmt::Display for ErrorKind {
+                 write!(f, "invalid repetition count range, \
+                            the start must be <= the end")
+             }
+-            RepetitionCountDecimalEmpty => {
+-                write!(f, "repetition quantifier expects a valid decimal")
+-            }
+             RepetitionCountUnclosed => {
+                 write!(f, "unclosed counted repetition")
+             }
+diff --git a/regex-syntax/src/ast/parse.rs b/regex-syntax/src/ast/parse.rs
+index effdf73..9e9900c 100644
+--- a/regex-syntax/src/ast/parse.rs
++++ b/regex-syntax/src/ast/parse.rs
+@@ -1113,11 +1113,7 @@ impl<'s, P: Borrow<Parser>> ParserI<'s, P> {
+                 ast::ErrorKind::RepetitionCountUnclosed,
+             ));
+         }
+-        let count_start = specialize_err(
+-            self.parse_decimal(),
+-            ast::ErrorKind::DecimalEmpty,
+-            ast::ErrorKind::RepetitionCountDecimalEmpty,
+-        )?;
++        let count_start = self.parse_decimal()?;
+         let mut range = ast::RepetitionRange::Exactly(count_start);
+         if self.is_eof() {
+             return Err(self.error(
+@@ -1133,11 +1129,7 @@ impl<'s, P: Borrow<Parser>> ParserI<'s, P> {
+                 ));
+             }
+             if self.char() != '}' {
+-                let count_end = specialize_err(
+-                    self.parse_decimal(),
+-                    ast::ErrorKind::DecimalEmpty,
+-                    ast::ErrorKind::RepetitionCountDecimalEmpty,
+-                )?;
++                let count_end = self.parse_decimal()?;
+                 range = ast::RepetitionRange::Bounded(count_start, count_end);
+             } else {
+                 range = ast::RepetitionRange::AtLeast(count_start);
+@@ -2268,29 +2260,6 @@ impl<'p, 's, P: Borrow<Parser>> ast::Visitor for NestLimiter<'p, 's, P> {
+     }
+ }
+ 
+-/// When the result is an error, transforms the ast::ErrorKind from the source
+-/// Result into another one. This function is used to return clearer error
+-/// messages when possible.
+-fn specialize_err<T>(
+-    result: Result<T>,
+-    from: ast::ErrorKind,
+-    to: ast::ErrorKind,
+-) -> Result<T> {
+-    if let Err(e) = result {
+-        if e.kind == from {
+-            Err(ast::Error {
+-                kind: to,
+-                pattern: e.pattern,
+-                span: e.span,
+-            })
+-        } else {
+-            Err(e)
+-        }
+-    } else {
+-        result
+-    }
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use std::ops::Range;
+@@ -3174,18 +3143,6 @@ bar
+                 span: span(4..4),
+                 kind: ast::ErrorKind::RepetitionMissing,
+             });
+-        assert_eq!(
+-            parser(r"a{]}").parse().unwrap_err(),
+-            TestError {
+-                span: span(2..2),
+-                kind: ast::ErrorKind::RepetitionCountDecimalEmpty,
+-            });
+-        assert_eq!(
+-            parser(r"a{1,]}").parse().unwrap_err(),
+-            TestError {
+-                span: span(4..4),
+-                kind: ast::ErrorKind::RepetitionCountDecimalEmpty,
+-            });
+         assert_eq!(
+             parser(r"a{").parse().unwrap_err(),
+             TestError {
+@@ -3196,13 +3153,13 @@ bar
+             parser(r"a{}").parse().unwrap_err(),
+             TestError {
+                 span: span(2..2),
+-                kind: ast::ErrorKind::RepetitionCountDecimalEmpty,
++                kind: ast::ErrorKind::DecimalEmpty,
+             });
+         assert_eq!(
+             parser(r"a{a").parse().unwrap_err(),
+             TestError {
+                 span: span(2..2),
+-                kind: ast::ErrorKind::RepetitionCountDecimalEmpty,
++                kind: ast::ErrorKind::DecimalEmpty,
+             });
+         assert_eq!(
+             parser(r"a{9999999999}").parse().unwrap_err(),
+@@ -3220,7 +3177,7 @@ bar
+             parser(r"a{9,a").parse().unwrap_err(),
+             TestError {
+                 span: span(4..4),
+-                kind: ast::ErrorKind::RepetitionCountDecimalEmpty,
++                kind: ast::ErrorKind::DecimalEmpty,
+             });
+         assert_eq!(
+             parser(r"a{9,9999999999}").parse().unwrap_err(),
+diff --git a/tests/error_messages.rs b/tests/error_messages.rs
+deleted file mode 100644
+index 8daa9fa..0000000
+--- a/tests/error_messages.rs
++++ /dev/null
+@@ -1,19 +0,0 @@
+-// See: https://github.com/rust-lang/regex/issues/545
+-#[test]
+-fn repetition_quantifier_expects_a_valid_decimal() {
+-    assert_panic_message(r"\\u{[^}]*}", r#"
+-regex parse error:
+-    \\u{[^}]*}
+-        ^
+-error: repetition quantifier expects a valid decimal
+-"#);
+-}
+-
+-fn assert_panic_message(regex: &str, expected_msg: &str) -> () {
+-    let result = regex_new!(regex);
+-    match result {
+-        Ok(_) => panic!("Regular expression should have panicked"),
+-        Err(regex::Error::Syntax(msg)) => assert_eq!(msg, expected_msg.trim()),
+-        _ => panic!("Unexpected error received")
+-    }
+-}
+diff --git a/tests/test_default.rs b/tests/test_default.rs
+index 68ab8dd..cff213b 100644
+--- a/tests/test_default.rs
++++ b/tests/test_default.rs
+@@ -67,7 +67,6 @@ mod suffix_reverse;
+ mod unicode;
+ mod word_boundary;
+ mod word_boundary_unicode;
+-mod error_messages;
+ 
+ #[test]
+ fn disallow_non_utf8() {

@@ -1,0 +1,275 @@
+diff --git a/clap_derive/src/derives/args.rs b/clap_derive/src/derives/args.rs
+index ab2ce319..e8611b6b 100644
+--- a/clap_derive/src/derives/args.rs
++++ b/clap_derive/src/derives/args.rs
+@@ -14,7 +14,6 @@
+ 
+ use proc_macro2::{Ident, Span, TokenStream};
+ use quote::{format_ident, quote, quote_spanned};
+-use syn::ext::IdentExt;
+ use syn::{
+     punctuated::Punctuated, spanned::Spanned, token::Comma, Data, DataStruct, DeriveInput, Field,
+     Fields, Generics,
+@@ -89,7 +88,7 @@ pub fn gen_for_struct(
+     let group_id = if item.skip_group() {
+         quote!(None)
+     } else {
+-        let group_id = item.ident().unraw().to_string();
++        let group_id = item.group_id();
+         quote!(Some(clap::Id::from(#group_id)))
+     };
+ 
+@@ -368,7 +367,7 @@ pub fn gen_augment(
+     let group_app_methods = if parent_item.skip_group() {
+         quote!()
+     } else {
+-        let group_id = parent_item.ident().unraw().to_string();
++        let group_id = parent_item.group_id();
+         let literal_group_members = fields
+             .iter()
+             .filter_map(|(_field, item)| {
+@@ -401,10 +400,13 @@ pub fn gen_augment(
+             }};
+         }
+ 
++        let group_methods = parent_item.group_methods();
++
+         quote!(
+             .group(
+                 clap::ArgGroup::new(#group_id)
+                     .multiple(true)
++                    #group_methods
+                     .args(#literal_group_members)
+             )
+         )
+diff --git a/clap_derive/src/item.rs b/clap_derive/src/item.rs
+index 3aab7ccc..9b29ff9e 100644
+--- a/clap_derive/src/item.rs
++++ b/clap_derive/src/item.rs
+@@ -32,7 +32,6 @@ pub const DEFAULT_ENV_CASING: CasingStyle = CasingStyle::ScreamingSnake;
+ #[derive(Clone)]
+ pub struct Item {
+     name: Name,
+-    ident: Ident,
+     casing: Sp<CasingStyle>,
+     env_casing: Sp<CasingStyle>,
+     ty: Option<Type>,
+@@ -48,6 +47,8 @@ pub struct Item {
+     is_enum: bool,
+     is_positional: bool,
+     skip_group: bool,
++    group_id: Name,
++    group_methods: Vec<Method>,
+     kind: Sp<Kind>,
+ }
+ 
+@@ -254,9 +255,9 @@ impl Item {
+         env_casing: Sp<CasingStyle>,
+         kind: Sp<Kind>,
+     ) -> Self {
++        let group_id = Name::Derived(ident);
+         Self {
+             name,
+-            ident,
+             ty,
+             casing,
+             env_casing,
+@@ -272,6 +273,8 @@ impl Item {
+             is_enum: false,
+             is_positional: true,
+             skip_group: false,
++            group_id,
++            group_methods: vec![],
+             kind,
+         }
+     }
+@@ -294,10 +297,15 @@ impl Item {
+                             kind.as_str()
+                         ),
+                     });
++                    self.name = Name::Assigned(arg);
++                }
++                AttrKind::Group => {
++                    self.group_id = Name::Assigned(arg);
++                }
++                AttrKind::Arg | AttrKind::Clap | AttrKind::StructOpt => {
++                    self.name = Name::Assigned(arg);
+                 }
+-                AttrKind::Group | AttrKind::Arg | AttrKind::Clap | AttrKind::StructOpt => {}
+             }
+-            self.name = Name::Assigned(arg);
+         } else if name == "name" {
+             match kind {
+                 AttrKind::Arg => {
+@@ -312,14 +320,13 @@ impl Item {
+                             kind.as_str()
+                         ),
+                     });
++                    self.name = Name::Assigned(arg);
++                }
++                AttrKind::Group => self.group_methods.push(Method::new(name, arg)),
++                AttrKind::Command | AttrKind::Value | AttrKind::Clap | AttrKind::StructOpt => {
++                    self.name = Name::Assigned(arg);
+                 }
+-                AttrKind::Group
+-                | AttrKind::Command
+-                | AttrKind::Value
+-                | AttrKind::Clap
+-                | AttrKind::StructOpt => {}
+             }
+-            self.name = Name::Assigned(arg);
+         } else if name == "value_parser" {
+             self.value_parser = Some(ValueParser::Explicit(Method::new(name, arg)));
+         } else if name == "action" {
+@@ -328,7 +335,10 @@ impl Item {
+             if name == "short" || name == "long" {
+                 self.is_positional = false;
+             }
+-            self.methods.push(Method::new(name, arg));
++            match kind {
++                AttrKind::Group => self.group_methods.push(Method::new(name, arg)),
++                _ => self.methods.push(Method::new(name, arg)),
++            };
+         }
+     }
+ 
+@@ -972,6 +982,15 @@ impl Item {
+         quote!( #(#doc_comment)* #(#methods)* )
+     }
+ 
++    pub fn group_id(&self) -> TokenStream {
++        self.group_id.clone().raw()
++    }
++
++    pub fn group_methods(&self) -> TokenStream {
++        let group_methods = &self.group_methods;
++        quote!( #(#group_methods)* )
++    }
++
+     pub fn deprecations(&self) -> proc_macro2::TokenStream {
+         let deprecations = &self.deprecations;
+         quote!( #(#deprecations)* )
+@@ -987,10 +1006,6 @@ impl Item {
+         quote!( #(#next_help_heading)* )
+     }
+ 
+-    pub fn ident(&self) -> &Ident {
+-        &self.ident
+-    }
+-
+     pub fn id(&self) -> TokenStream {
+         self.name.clone().raw()
+     }
+diff --git a/examples/tutorial_derive/04_03_relations.rs b/examples/tutorial_derive/04_03_relations.rs
+index cbe491de..8657ebe8 100644
+--- a/examples/tutorial_derive/04_03_relations.rs
++++ b/examples/tutorial_derive/04_03_relations.rs
+@@ -1,13 +1,26 @@
+-use clap::{ArgGroup, Parser};
++use clap::{Args, Parser};
+ 
+ #[derive(Parser)]
+ #[command(author, version, about, long_about = None)]
+-#[command(group(
+-            ArgGroup::new("vers")
+-                .required(true)
+-                .args(["set_ver", "major", "minor", "patch"]),
+-        ))]
+ struct Cli {
++    #[command(flatten)]
++    vers: Vers,
++
++    /// some regular input
++    #[arg(group = "input")]
++    input_file: Option<String>,
++
++    /// some special input argument
++    #[arg(long, group = "input")]
++    spec_in: Option<String>,
++
++    #[arg(short, requires = "input")]
++    config: Option<String>,
++}
++
++#[derive(Args)]
++#[group(required = true, multiple = false)]
++struct Vers {
+     /// set version manually
+     #[arg(long, value_name = "VER")]
+     set_ver: Option<String>,
+@@ -23,17 +36,6 @@ struct Cli {
+     /// auto inc patch
+     #[arg(long)]
+     patch: bool,
+-
+-    /// some regular input
+-    #[arg(group = "input")]
+-    input_file: Option<String>,
+-
+-    /// some special input argument
+-    #[arg(long, group = "input")]
+-    spec_in: Option<String>,
+-
+-    #[arg(short, requires = "input")]
+-    config: Option<String>,
+ }
+ 
+ fn main() {
+@@ -45,11 +47,12 @@ fn main() {
+     let mut patch = 3;
+ 
+     // See if --set_ver was used to set the version manually
+-    let version = if let Some(ver) = cli.set_ver.as_deref() {
++    let vers = &cli.vers;
++    let version = if let Some(ver) = vers.set_ver.as_deref() {
+         ver.to_string()
+     } else {
+         // Increment the one requested (in a real program, we'd reset the lower numbers)
+-        let (maj, min, pat) = (cli.major, cli.minor, cli.patch);
++        let (maj, min, pat) = (vers.major, vers.minor, vers.patch);
+         match (maj, min, pat) {
+             (true, _, _) => major += 1,
+             (_, true, _) => minor += 1,
+diff --git a/src/_derive/_tutorial.rs b/src/_derive/_tutorial.rs
+index f3f55c33..8d00b03e 100644
+--- a/src/_derive/_tutorial.rs
++++ b/src/_derive/_tutorial.rs
+@@ -202,6 +202,9 @@
+ //! want one of them to be required, but making all of them required isn't feasible because perhaps
+ //! they conflict with each other.
+ //!
++//! [`ArgGroup`][crate::ArgGroup]s are automatically created for a `struct` with its
++//! [`ArgGroup::id`][crate::ArgGroup::id] being the struct's name.
++//!
+ //! ```rust
+ #![doc = include_str!("../../examples/tutorial_derive/04_03_relations.rs")]
+ //! ```
+diff --git a/src/_derive/mod.rs b/src/_derive/mod.rs
+index a92b7c87..6bde6033 100644
+--- a/src/_derive/mod.rs
++++ b/src/_derive/mod.rs
+@@ -194,7 +194,14 @@
+ //! These correspond to the [`ArgGroup`][crate::ArgGroup] which is implicitly created for each
+ //! `Args` derive.
+ //!
+-//! At the moment, only `#[group(skip)]` is supported
++//! **Raw attributes:**  Any [`ArgGroup` method][crate::ArgGroup] can also be used as an attribute, see [Terminology](#terminology) for syntax.
++//! - e.g. `#[group(required = true)]` would translate to `arg_group.required(true)`
++//!
++//! **Magic attributes**:
++//! - `id = <expr>`: [`ArgGroup::id`][crate::ArgGroup::id]
++//!   - When not present: struct's name is used
++//! - `skip [= <expr>]`: Ignore this field, filling in with `<expr>`
++//!   - Without `<expr>`: fills the field with `Default::default()`
+ //!
+ //! ### Arg Attributes
+ //!
+@@ -205,7 +212,7 @@
+ //!
+ //! **Magic attributes**:
+ //! - `id = <expr>`: [`Arg::id`][crate::Arg::id]
+-//!   - When not present: case-converted field name is used
++//!   - When not present: field's name is used
+ //! - `value_parser [= <expr>]`: [`Arg::value_parser`][crate::Arg::value_parser]
+ //!   - When not present: will auto-select an implementation based on the field type using
+ //!     [`value_parser!`][crate::value_parser!]

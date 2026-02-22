@@ -1,0 +1,1405 @@
+diff --git a/crates/toml_edit/src/de/array.rs b/crates/toml_edit/src/de/array.rs
+index bc398148..f9cb8ce8 100644
+--- a/crates/toml_edit/src/de/array.rs
++++ b/crates/toml_edit/src/de/array.rs
+@@ -11,6 +11,8 @@ impl ArrayDeserializer {
+     }
+ }
+ 
++// Note: this is wrapped by `ValueDeserializer` and any trait methods
++// implemented here need to be wrapped there
+ impl<'de> serde::Deserializer<'de> for ArrayDeserializer {
+     type Error = Error;
+ 
+@@ -49,94 +51,20 @@ impl<'de> serde::Deserializer<'de> for ArrayDeserializer {
+ impl<'de> serde::de::IntoDeserializer<'de, crate::de::Error> for ArrayDeserializer {
+     type Deserializer = Self;
+ 
+-    fn into_deserializer(self) -> Self {
++    fn into_deserializer(self) -> Self::Deserializer {
+         self
+     }
+ }
+ 
+-impl<'de> serde::Deserializer<'de> for crate::Array {
+-    type Error = Error;
+-
+-    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        visitor.visit_seq(ArraySeqAccess::with_array(self))
+-    }
+-
+-    fn deserialize_struct<V>(
+-        self,
+-        name: &'static str,
+-        fields: &'static [&'static str],
+-        visitor: V,
+-    ) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        if super::is_spanned(name, fields) {
+-            if let Some(span) = self.span() {
+-                return visitor.visit_map(super::SpannedDeserializer::new(self, span));
+-            }
+-        }
+-
+-        self.deserialize_any(visitor)
+-    }
+-
+-    serde::forward_to_deserialize_any! {
+-        bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string seq
+-        bytes byte_buf map option unit newtype_struct
+-        ignored_any unit_struct tuple_struct tuple enum identifier
+-    }
+-}
+-
+-impl<'de> serde::de::IntoDeserializer<'de, crate::de::Error> for crate::Array {
+-    type Deserializer = Self;
+-
+-    fn into_deserializer(self) -> Self {
+-        self
+-    }
+-}
+-
+-impl<'de> serde::Deserializer<'de> for crate::ArrayOfTables {
+-    type Error = Error;
+-
+-    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        visitor.visit_seq(ArraySeqAccess::with_array_of_tables(self))
+-    }
+-
+-    fn deserialize_struct<V>(
+-        self,
+-        name: &'static str,
+-        fields: &'static [&'static str],
+-        visitor: V,
+-    ) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        if super::is_spanned(name, fields) {
+-            if let Some(span) = self.span() {
+-                return visitor.visit_map(super::SpannedDeserializer::new(self, span));
+-            }
+-        }
+-
+-        self.deserialize_any(visitor)
+-    }
+-
+-    serde::forward_to_deserialize_any! {
+-        bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string seq
+-        bytes byte_buf map option unit newtype_struct
+-        ignored_any unit_struct tuple_struct tuple enum identifier
++impl crate::Array {
++    pub(crate) fn into_deserializer(self) -> ArrayDeserializer {
++        ArrayDeserializer::new(self.values, self.span)
+     }
+ }
+ 
+-impl<'de> serde::de::IntoDeserializer<'de, crate::de::Error> for crate::ArrayOfTables {
+-    type Deserializer = Self;
+-
+-    fn into_deserializer(self) -> Self {
+-        self
++impl crate::ArrayOfTables {
++    pub(crate) fn into_deserializer(self) -> ArrayDeserializer {
++        ArrayDeserializer::new(self.values, self.span)
+     }
+ }
+ 
+@@ -150,14 +78,6 @@ impl ArraySeqAccess {
+             iter: input.into_iter(),
+         }
+     }
+-
+-    pub(crate) fn with_array(input: crate::Array) -> Self {
+-        Self::new(input.values)
+-    }
+-
+-    pub(crate) fn with_array_of_tables(input: crate::ArrayOfTables) -> Self {
+-        Self::new(input.values)
+-    }
+ }
+ 
+ impl<'de> serde::de::SeqAccess<'de> for ArraySeqAccess {
+@@ -169,7 +89,7 @@ impl<'de> serde::de::SeqAccess<'de> for ArraySeqAccess {
+     {
+         match self.iter.next() {
+             Some(v) => seed
+-                .deserialize(crate::de::ItemDeserializer::new(v))
++                .deserialize(crate::de::ValueDeserializer::new(v))
+                 .map(Some),
+             None => Ok(None),
+         }
+diff --git a/crates/toml_edit/src/de/datetime.rs b/crates/toml_edit/src/de/datetime.rs
+new file mode 100644
+index 00000000..edd587d0
+--- /dev/null
++++ b/crates/toml_edit/src/de/datetime.rs
+@@ -0,0 +1,58 @@
++use serde::de::IntoDeserializer;
++
++use crate::de::Error;
++
++pub(crate) struct DatetimeDeserializer {
++    visited: bool,
++    date: crate::Datetime,
++}
++
++impl DatetimeDeserializer {
++    pub(crate) fn new(date: crate::Datetime) -> Self {
++        Self {
++            visited: false,
++            date,
++        }
++    }
++}
++
++impl<'de> serde::de::MapAccess<'de> for DatetimeDeserializer {
++    type Error = Error;
++
++    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Error>
++    where
++        K: serde::de::DeserializeSeed<'de>,
++    {
++        if self.visited {
++            return Ok(None);
++        }
++        self.visited = true;
++        seed.deserialize(DatetimeFieldDeserializer).map(Some)
++    }
++
++    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Error>
++    where
++        V: serde::de::DeserializeSeed<'de>,
++    {
++        seed.deserialize(self.date.to_string().into_deserializer())
++    }
++}
++
++pub(crate) struct DatetimeFieldDeserializer;
++
++impl<'de> serde::de::Deserializer<'de> for DatetimeFieldDeserializer {
++    type Error = Error;
++
++    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Error>
++    where
++        V: serde::de::Visitor<'de>,
++    {
++        visitor.visit_borrowed_str(toml_datetime::__unstable::FIELD)
++    }
++
++    serde::forward_to_deserialize_any! {
++        bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string seq
++        bytes byte_buf map struct option unit newtype_struct
++        ignored_any unit_struct tuple_struct tuple enum identifier
++    }
++}
+diff --git a/crates/toml_edit/src/de/inline_table.rs b/crates/toml_edit/src/de/inline_table.rs
+deleted file mode 100644
+index 2155772d..00000000
+--- a/crates/toml_edit/src/de/inline_table.rs
++++ /dev/null
+@@ -1,184 +0,0 @@
+-use serde::de::IntoDeserializer;
+-
+-use crate::de::Error;
+-
+-impl<'de> serde::Deserializer<'de> for crate::InlineTable {
+-    type Error = Error;
+-
+-    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        visitor.visit_map(crate::de::InlineTableMapAccess::new(self))
+-    }
+-
+-    // `None` is interpreted as a missing field so be sure to implement `Some`
+-    // as a present field.
+-    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        visitor.visit_some(self)
+-    }
+-
+-    fn deserialize_newtype_struct<V>(
+-        self,
+-        _name: &'static str,
+-        visitor: V,
+-    ) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        visitor.visit_newtype_struct(self)
+-    }
+-
+-    fn deserialize_struct<V>(
+-        self,
+-        name: &'static str,
+-        fields: &'static [&'static str],
+-        visitor: V,
+-    ) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        if super::is_spanned(name, fields) {
+-            if let Some(span) = self.span() {
+-                return visitor.visit_map(super::SpannedDeserializer::new(self, span));
+-            }
+-        }
+-
+-        self.deserialize_any(visitor)
+-    }
+-
+-    // Called when the type to deserialize is an enum, as opposed to a field in the type.
+-    fn deserialize_enum<V>(
+-        self,
+-        _name: &'static str,
+-        _variants: &'static [&'static str],
+-        visitor: V,
+-    ) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        if self.is_empty() {
+-            Err(crate::de::Error::custom(
+-                "wanted exactly 1 element, found 0 elements",
+-                self.span(),
+-            ))
+-        } else if self.len() != 1 {
+-            Err(crate::de::Error::custom(
+-                "wanted exactly 1 element, more than 1 element",
+-                self.span(),
+-            ))
+-        } else {
+-            visitor.visit_enum(crate::de::InlineTableMapAccess::new(self))
+-        }
+-    }
+-
+-    serde::forward_to_deserialize_any! {
+-        bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string seq
+-        bytes byte_buf map unit
+-        ignored_any unit_struct tuple_struct tuple identifier
+-    }
+-}
+-
+-impl<'de> serde::de::IntoDeserializer<'de, crate::de::Error> for crate::InlineTable {
+-    type Deserializer = Self;
+-
+-    fn into_deserializer(self) -> Self {
+-        self
+-    }
+-}
+-
+-pub(crate) struct InlineTableMapAccess {
+-    iter: indexmap::map::IntoIter<crate::InternalString, crate::table::TableKeyValue>,
+-    span: Option<std::ops::Range<usize>>,
+-    value: Option<crate::Item>,
+-}
+-
+-impl InlineTableMapAccess {
+-    pub(crate) fn new(input: crate::InlineTable) -> Self {
+-        let span = input.span();
+-        Self {
+-            iter: input.items.into_iter(),
+-            span,
+-            value: None,
+-        }
+-    }
+-}
+-
+-impl<'de> serde::de::MapAccess<'de> for InlineTableMapAccess {
+-    type Error = Error;
+-
+-    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+-    where
+-        K: serde::de::DeserializeSeed<'de>,
+-    {
+-        match self.iter.next() {
+-            Some((k, v)) => {
+-                let ret = seed
+-                    .deserialize(super::KeyDeserializer::new(k, v.key.span()))
+-                    .map(Some)
+-                    .map_err(|mut e: Self::Error| {
+-                        if e.span().is_none() {
+-                            e.set_span(v.key.span());
+-                        }
+-                        e
+-                    });
+-                self.value = Some(v.value);
+-                ret
+-            }
+-            None => Ok(None),
+-        }
+-    }
+-
+-    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+-    where
+-        V: serde::de::DeserializeSeed<'de>,
+-    {
+-        match self.value.take() {
+-            Some(v) => {
+-                let span = v.span();
+-                seed.deserialize(crate::de::ItemDeserializer::new(v))
+-                    .map_err(|mut err| {
+-                        if err.span().is_none() {
+-                            err.set_span(span);
+-                        }
+-                        err
+-                    })
+-            }
+-            None => {
+-                panic!("no more values in next_value_seed, internal error in ValueDeserializer")
+-            }
+-        }
+-    }
+-}
+-
+-impl<'de> serde::de::EnumAccess<'de> for InlineTableMapAccess {
+-    type Error = Error;
+-    type Variant = super::TableEnumDeserializer;
+-
+-    fn variant_seed<V>(mut self, seed: V) -> Result<(V::Value, Self::Variant), Self::Error>
+-    where
+-        V: serde::de::DeserializeSeed<'de>,
+-    {
+-        let (key, value) = match self.iter.next() {
+-            Some(pair) => pair,
+-            None => {
+-                return Err(Error::custom(
+-                    "expected table with exactly 1 entry, found empty table",
+-                    self.span,
+-                ));
+-            }
+-        };
+-
+-        seed.deserialize(key.into_deserializer())
+-            .map_err(|mut e: Self::Error| {
+-                if e.span().is_none() {
+-                    e.set_span(value.key.span());
+-                }
+-                e
+-            })
+-            .map(|val| (val, super::TableEnumDeserializer::new(value.value)))
+-    }
+-}
+diff --git a/crates/toml_edit/src/de/item.rs b/crates/toml_edit/src/de/item.rs
+deleted file mode 100644
+index ab8b60fd..00000000
+--- a/crates/toml_edit/src/de/item.rs
++++ /dev/null
+@@ -1,263 +0,0 @@
+-use crate::de::Error;
+-
+-pub(crate) struct ItemDeserializer {
+-    input: crate::Item,
+-    validate_struct_keys: bool,
+-}
+-
+-impl ItemDeserializer {
+-    pub(crate) fn new(input: crate::Item) -> Self {
+-        Self {
+-            input,
+-            validate_struct_keys: false,
+-        }
+-    }
+-
+-    pub(crate) fn with_struct_key_validation(mut self) -> Self {
+-        self.validate_struct_keys = true;
+-        self
+-    }
+-}
+-
+-impl<'de> serde::Deserializer<'de> for ItemDeserializer {
+-    type Error = Error;
+-
+-    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        self.input.deserialize_any(visitor)
+-    }
+-
+-    // `None` is interpreted as a missing field so be sure to implement `Some`
+-    // as a present field.
+-    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        self.input.deserialize_option(visitor)
+-    }
+-
+-    fn deserialize_newtype_struct<V>(
+-        self,
+-        _name: &'static str,
+-        visitor: V,
+-    ) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        let span = self.input.span();
+-        visitor
+-            .visit_newtype_struct(self)
+-            .map_err(|mut e: Self::Error| {
+-                if e.span().is_none() {
+-                    e.set_span(span);
+-                }
+-                e
+-            })
+-    }
+-
+-    fn deserialize_struct<V>(
+-        self,
+-        name: &'static str,
+-        fields: &'static [&'static str],
+-        visitor: V,
+-    ) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        if super::is_spanned(name, fields) {
+-            if let Some(span) = self.input.span() {
+-                return visitor.visit_map(super::SpannedDeserializer::new(self.input, span));
+-            }
+-        }
+-
+-        if self.validate_struct_keys {
+-            match &self.input {
+-                crate::Item::Table(values) => super::validate_struct_keys(&values.items, fields)?,
+-                crate::Item::Value(crate::Value::InlineTable(values)) => {
+-                    super::validate_struct_keys(&values.items, fields)?
+-                }
+-                _ => {}
+-            }
+-        }
+-
+-        self.input.deserialize_struct(name, fields, visitor)
+-    }
+-
+-    // Called when the type to deserialize is an enum, as opposed to a field in the type.
+-    fn deserialize_enum<V>(
+-        self,
+-        name: &'static str,
+-        variants: &'static [&'static str],
+-        visitor: V,
+-    ) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        self.input.deserialize_enum(name, variants, visitor)
+-    }
+-
+-    serde::forward_to_deserialize_any! {
+-        bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string seq
+-        bytes byte_buf map unit
+-        ignored_any unit_struct tuple_struct tuple identifier
+-    }
+-}
+-
+-impl<'de> serde::de::IntoDeserializer<'de, crate::de::Error> for ItemDeserializer {
+-    type Deserializer = Self;
+-
+-    fn into_deserializer(self) -> Self {
+-        self
+-    }
+-}
+-
+-impl<'de> serde::Deserializer<'de> for crate::Item {
+-    type Error = Error;
+-
+-    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        let span = self.span();
+-        match self {
+-            crate::Item::None => visitor.visit_none().map_err(|mut e: Self::Error| {
+-                if e.span().is_none() {
+-                    e.set_span(span);
+-                }
+-                e
+-            }),
+-            crate::Item::Value(v) => v.deserialize_any(visitor).map_err(|mut e: Self::Error| {
+-                if e.span().is_none() {
+-                    e.set_span(span);
+-                }
+-                e
+-            }),
+-            crate::Item::Table(v) => visitor
+-                .visit_map(crate::de::TableMapAccess::new(v))
+-                .map_err(|mut e: Self::Error| {
+-                    if e.span().is_none() {
+-                        e.set_span(span);
+-                    }
+-                    e
+-                }),
+-            crate::Item::ArrayOfTables(v) => {
+-                visitor.visit_seq(crate::de::ArraySeqAccess::with_array_of_tables(v))
+-            }
+-        }
+-    }
+-
+-    // `None` is interpreted as a missing field so be sure to implement `Some`
+-    // as a present field.
+-    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        let span = self.span();
+-        visitor.visit_some(self).map_err(|mut e: Self::Error| {
+-            if e.span().is_none() {
+-                e.set_span(span);
+-            }
+-            e
+-        })
+-    }
+-
+-    fn deserialize_newtype_struct<V>(
+-        self,
+-        _name: &'static str,
+-        visitor: V,
+-    ) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        let span = self.span();
+-        visitor
+-            .visit_newtype_struct(self)
+-            .map_err(|mut e: Self::Error| {
+-                if e.span().is_none() {
+-                    e.set_span(span);
+-                }
+-                e
+-            })
+-    }
+-
+-    fn deserialize_struct<V>(
+-        self,
+-        name: &'static str,
+-        fields: &'static [&'static str],
+-        visitor: V,
+-    ) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        if super::is_spanned(name, fields) {
+-            if let Some(span) = self.span() {
+-                return visitor.visit_map(super::SpannedDeserializer::new(self, span));
+-            }
+-        }
+-
+-        self.deserialize_any(visitor)
+-    }
+-
+-    // Called when the type to deserialize is an enum, as opposed to a field in the type.
+-    fn deserialize_enum<V>(
+-        self,
+-        name: &'static str,
+-        variants: &'static [&'static str],
+-        visitor: V,
+-    ) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        let span = self.span();
+-        match self {
+-            crate::Item::Value(v) => {
+-                v.deserialize_enum(name, variants, visitor)
+-                    .map_err(|mut e: Self::Error| {
+-                        if e.span().is_none() {
+-                            e.set_span(span);
+-                        }
+-                        e
+-                    })
+-            }
+-            crate::Item::Table(v) => {
+-                if v.is_empty() {
+-                    Err(crate::de::Error::custom(
+-                        "wanted exactly 1 element, found 0 elements",
+-                        v.span(),
+-                    ))
+-                } else if v.len() != 1 {
+-                    Err(crate::de::Error::custom(
+-                        "wanted exactly 1 element, more than 1 element",
+-                        v.span(),
+-                    ))
+-                } else {
+-                    visitor
+-                        .visit_enum(crate::de::TableMapAccess::new(v))
+-                        .map_err(|mut e: Self::Error| {
+-                            if e.span().is_none() {
+-                                e.set_span(span);
+-                            }
+-                            e
+-                        })
+-                }
+-            }
+-            e => Err(crate::de::Error::custom("wanted string or table", e.span())),
+-        }
+-    }
+-
+-    serde::forward_to_deserialize_any! {
+-        bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string seq
+-        bytes byte_buf map unit
+-        ignored_any unit_struct tuple_struct tuple identifier
+-    }
+-}
+-
+-impl<'de> serde::de::IntoDeserializer<'de, crate::de::Error> for crate::Item {
+-    type Deserializer = Self;
+-
+-    fn into_deserializer(self) -> Self {
+-        self
+-    }
+-}
+diff --git a/crates/toml_edit/src/de/mod.rs b/crates/toml_edit/src/de/mod.rs
+index cfa81470..b4b4b2e8 100644
+--- a/crates/toml_edit/src/de/mod.rs
++++ b/crates/toml_edit/src/de/mod.rs
+@@ -6,21 +6,22 @@ use itertools::Itertools;
+ use serde::de::DeserializeOwned;
+ 
+ mod array;
+-mod inline_table;
+-mod item;
++mod datetime;
+ mod key;
+ mod spanned;
+ mod table;
+ mod table_enum;
+ mod value;
+ 
+-use array::*;
+-use inline_table::*;
+-use item::*;
+-use key::*;
+-use spanned::*;
+-use table::*;
+-use table_enum::*;
++use array::ArrayDeserializer;
++use datetime::DatetimeDeserializer;
++use key::KeyDeserializer;
++use spanned::is_spanned;
++use spanned::SpannedDeserializer;
++use table::TableMapAccess;
++use table_enum::TableEnumDeserializer;
++
++pub use value::ValueDeserializer;
+ 
+ /// Errors that can occur when deserializing a type.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -91,8 +92,8 @@ pub fn from_str<T>(s: &'_ str) -> Result<T, Error>
+ where
+     T: DeserializeOwned,
+ {
+-    let d = crate::parser::parse_document(s)?;
+-    from_document(d)
++    let de = s.parse::<Deserializer>()?;
++    T::deserialize(de)
+ }
+ 
+ /// Convert a value into `T`.
+@@ -113,14 +114,6 @@ where
+     T::deserialize(deserializer)
+ }
+ 
+-/// Convert an item into `T`.
+-pub fn from_item<T>(d: crate::Item) -> Result<T, Error>
+-where
+-    T: DeserializeOwned,
+-{
+-    T::deserialize(d)
+-}
+-
+ /// Deserialization implementation for TOML.
+ pub struct Deserializer {
+     input: crate::Document,
+@@ -133,66 +126,27 @@ impl Deserializer {
+     }
+ }
+ 
+-impl<'de> serde::Deserializer<'de> for Deserializer {
+-    type Error = Error;
+-
+-    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        self.input.deserialize_any(visitor)
+-    }
+-
+-    // `None` is interpreted as a missing field so be sure to implement `Some`
+-    // as a present field.
+-    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        self.input.deserialize_option(visitor)
+-    }
++impl std::str::FromStr for Deserializer {
++    type Err = Error;
+ 
+-    fn deserialize_struct<V>(
+-        self,
+-        name: &'static str,
+-        fields: &'static [&'static str],
+-        visitor: V,
+-    ) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        self.input.deserialize_struct(name, fields, visitor)
+-    }
+-
+-    // Called when the type to deserialize is an enum, as opposed to a field in the type.
+-    fn deserialize_enum<V>(
+-        self,
+-        name: &'static str,
+-        variants: &'static [&'static str],
+-        visitor: V,
+-    ) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        self.input.deserialize_enum(name, variants, visitor)
+-    }
+-
+-    serde::forward_to_deserialize_any! {
+-        bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string seq
+-        bytes byte_buf map unit newtype_struct
+-        ignored_any unit_struct tuple_struct tuple identifier
++    /// Parses a document from a &str
++    fn from_str(s: &str) -> Result<Self, Self::Err> {
++        let d = crate::parser::parse_document(s).map_err(Error::from)?;
++        Ok(Self::new(d))
+     }
+ }
+ 
+-impl<'de> serde::Deserializer<'de> for crate::Document {
++impl<'de> serde::Deserializer<'de> for Deserializer {
+     type Error = Error;
+ 
+     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+     where
+         V: serde::de::Visitor<'de>,
+     {
+-        let original = self.original;
+-        self.root
++        let original = self.input.original;
++        self.input
++            .root
++            .into_deserializer()
+             .deserialize_any(visitor)
+             .map_err(|mut e: Self::Error| {
+                 e.inner.set_original(original);
+@@ -206,8 +160,10 @@ impl<'de> serde::Deserializer<'de> for crate::Document {
+     where
+         V: serde::de::Visitor<'de>,
+     {
+-        let original = self.original;
+-        self.root
++        let original = self.input.original;
++        self.input
++            .root
++            .into_deserializer()
+             .deserialize_option(visitor)
+             .map_err(|mut e: Self::Error| {
+                 e.inner.set_original(original);
+@@ -215,6 +171,25 @@ impl<'de> serde::Deserializer<'de> for crate::Document {
+             })
+     }
+ 
++    fn deserialize_newtype_struct<V>(
++        self,
++        name: &'static str,
++        visitor: V,
++    ) -> Result<V::Value, Error>
++    where
++        V: serde::de::Visitor<'de>,
++    {
++        let original = self.input.original;
++        self.input
++            .root
++            .into_deserializer()
++            .deserialize_newtype_struct(name, visitor)
++            .map_err(|mut e: Self::Error| {
++                e.inner.set_original(original);
++                e
++            })
++    }
++
+     fn deserialize_struct<V>(
+         self,
+         name: &'static str,
+@@ -224,13 +199,15 @@ impl<'de> serde::Deserializer<'de> for crate::Document {
+     where
+         V: serde::de::Visitor<'de>,
+     {
+-        if is_spanned(name, fields) {
+-            if let Some(span) = self.span() {
+-                return visitor.visit_map(SpannedDeserializer::new(self, span));
+-            }
+-        }
+-
+-        self.deserialize_any(visitor)
++        let original = self.input.original;
++        self.input
++            .root
++            .into_deserializer()
++            .deserialize_struct(name, fields, visitor)
++            .map_err(|mut e: Self::Error| {
++                e.inner.set_original(original);
++                e
++            })
+     }
+ 
+     // Called when the type to deserialize is an enum, as opposed to a field in the type.
+@@ -243,8 +220,10 @@ impl<'de> serde::Deserializer<'de> for crate::Document {
+     where
+         V: serde::de::Visitor<'de>,
+     {
+-        let original = self.original;
+-        self.root
++        let original = self.input.original;
++        self.input
++            .root
++            .into_deserializer()
+             .deserialize_enum(name, variants, visitor)
+             .map_err(|mut e: Self::Error| {
+                 e.inner.set_original(original);
+@@ -254,19 +233,27 @@ impl<'de> serde::Deserializer<'de> for crate::Document {
+ 
+     serde::forward_to_deserialize_any! {
+         bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string seq
+-        bytes byte_buf map unit newtype_struct
++        bytes byte_buf map unit
+         ignored_any unit_struct tuple_struct tuple identifier
+     }
+ }
+ 
+-impl<'de> serde::de::IntoDeserializer<'de, crate::de::Error> for crate::Document {
+-    type Deserializer = Self;
++impl<'de> serde::de::IntoDeserializer<'de, crate::de::Error> for Deserializer {
++    type Deserializer = Deserializer;
+ 
+-    fn into_deserializer(self) -> Self {
++    fn into_deserializer(self) -> Self::Deserializer {
+         self
+     }
+ }
+ 
++impl<'de> serde::de::IntoDeserializer<'de, crate::de::Error> for crate::Document {
++    type Deserializer = Deserializer;
++
++    fn into_deserializer(self) -> Self::Deserializer {
++        Deserializer::new(self)
++    }
++}
++
+ pub(crate) fn validate_struct_keys(
+     table: &crate::table::KeyValuePairs,
+     fields: &'static [&'static str],
+diff --git a/crates/toml_edit/src/de/table.rs b/crates/toml_edit/src/de/table.rs
+index ba19796e..dd892697 100644
+--- a/crates/toml_edit/src/de/table.rs
++++ b/crates/toml_edit/src/de/table.rs
+@@ -2,7 +2,14 @@ use serde::de::IntoDeserializer;
+ 
+ use crate::de::Error;
+ 
+-impl<'de> serde::Deserializer<'de> for crate::Table {
++pub(crate) struct TableDeserializer {
++    span: Option<std::ops::Range<usize>>,
++    items: crate::table::KeyValuePairs,
++}
++
++// Note: this is wrapped by `Deserializer` and `ValueDeserializer` and any trait methods
++// implemented here need to be wrapped there
++impl<'de> serde::Deserializer<'de> for TableDeserializer {
+     type Error = Error;
+ 
+     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+@@ -42,7 +49,7 @@ impl<'de> serde::Deserializer<'de> for crate::Table {
+         V: serde::de::Visitor<'de>,
+     {
+         if super::is_spanned(name, fields) {
+-            if let Some(span) = self.span() {
++            if let Some(span) = self.span.clone() {
+                 return visitor.visit_map(super::SpannedDeserializer::new(self, span));
+             }
+         }
+@@ -60,15 +67,15 @@ impl<'de> serde::Deserializer<'de> for crate::Table {
+     where
+         V: serde::de::Visitor<'de>,
+     {
+-        if self.is_empty() {
++        if self.items.is_empty() {
+             Err(crate::de::Error::custom(
+                 "wanted exactly 1 element, found 0 elements",
+-                self.span(),
++                self.span,
+             ))
+-        } else if self.len() != 1 {
++        } else if self.items.len() != 1 {
+             Err(crate::de::Error::custom(
+                 "wanted exactly 1 element, more than 1 element",
+-                self.span(),
++                self.span,
+             ))
+         } else {
+             visitor.visit_enum(crate::de::TableMapAccess::new(self))
+@@ -82,14 +89,32 @@ impl<'de> serde::Deserializer<'de> for crate::Table {
+     }
+ }
+ 
+-impl<'de> serde::de::IntoDeserializer<'de, crate::de::Error> for crate::Table {
+-    type Deserializer = Self;
++impl<'de> serde::de::IntoDeserializer<'de, crate::de::Error> for TableDeserializer {
++    type Deserializer = TableDeserializer;
+ 
+-    fn into_deserializer(self) -> Self {
++    fn into_deserializer(self) -> Self::Deserializer {
+         self
+     }
+ }
+ 
++impl crate::Table {
++    pub(crate) fn into_deserializer(self) -> TableDeserializer {
++        TableDeserializer {
++            span: self.span(),
++            items: self.items,
++        }
++    }
++}
++
++impl crate::InlineTable {
++    pub(crate) fn into_deserializer(self) -> TableDeserializer {
++        TableDeserializer {
++            span: self.span(),
++            items: self.items,
++        }
++    }
++}
++
+ pub(crate) struct TableMapAccess {
+     iter: indexmap::map::IntoIter<crate::InternalString, crate::table::TableKeyValue>,
+     span: Option<std::ops::Range<usize>>,
+@@ -97,11 +122,10 @@ pub(crate) struct TableMapAccess {
+ }
+ 
+ impl TableMapAccess {
+-    pub(crate) fn new(input: crate::Table) -> Self {
+-        let span = input.span();
++    pub(crate) fn new(input: TableDeserializer) -> Self {
+         Self {
+             iter: input.items.into_iter(),
+-            span,
++            span: input.span,
+             value: None,
+         }
+     }
+@@ -137,9 +161,18 @@ impl<'de> serde::de::MapAccess<'de> for TableMapAccess {
+         V: serde::de::DeserializeSeed<'de>,
+     {
+         match self.value.take() {
+-            Some(v) => seed.deserialize(crate::de::ItemDeserializer::new(v)),
++            Some(v) => {
++                let span = v.span();
++                seed.deserialize(crate::de::ValueDeserializer::new(v))
++                    .map_err(|mut e: Self::Error| {
++                        if e.span().is_none() {
++                            e.set_span(span);
++                        }
++                        e
++                    })
++            }
+             None => {
+-                panic!("no more values in next_value_seed, internal error in ItemDeserializer")
++                panic!("no more values in next_value_seed, internal error in ValueDeserializer")
+             }
+         }
+     }
+@@ -164,6 +197,12 @@ impl<'de> serde::de::EnumAccess<'de> for TableMapAccess {
+         };
+ 
+         seed.deserialize(key.into_deserializer())
++            .map_err(|mut e: Self::Error| {
++                if e.span().is_none() {
++                    e.set_span(value.key.span());
++                }
++                e
++            })
+             .map(|val| (val, super::TableEnumDeserializer::new(value.value)))
+     }
+ }
+diff --git a/crates/toml_edit/src/de/table_enum.rs b/crates/toml_edit/src/de/table_enum.rs
+index 40cfe62a..197ad6ea 100644
+--- a/crates/toml_edit/src/de/table_enum.rs
++++ b/crates/toml_edit/src/de/table_enum.rs
+@@ -41,7 +41,7 @@ impl<'de> serde::de::VariantAccess<'de> for TableEnumDeserializer {
+     where
+         T: serde::de::DeserializeSeed<'de>,
+     {
+-        seed.deserialize(super::ItemDeserializer::new(self.value))
++        seed.deserialize(super::ValueDeserializer::new(self.value))
+     }
+ 
+     fn tuple_variant<V>(self, len: usize, visitor: V) -> Result<V::Value, Self::Error>
+@@ -151,7 +151,7 @@ impl<'de> serde::de::VariantAccess<'de> for TableEnumDeserializer {
+         V: serde::de::Visitor<'de>,
+     {
+         serde::de::Deserializer::deserialize_struct(
+-            super::ItemDeserializer::new(self.value).with_struct_key_validation(),
++            super::ValueDeserializer::new(self.value).with_struct_key_validation(),
+             "", // TODO: this should be the variant name
+             fields,
+             visitor,
+diff --git a/crates/toml_edit/src/de/value.rs b/crates/toml_edit/src/de/value.rs
+index 1ffa2a0f..5f553b97 100644
+--- a/crates/toml_edit/src/de/value.rs
++++ b/crates/toml_edit/src/de/value.rs
+@@ -1,28 +1,94 @@
+-use serde::de::IntoDeserializer;
++use serde::de::IntoDeserializer as _;
+ 
++use crate::de::DatetimeDeserializer;
+ use crate::de::Error;
+ 
+-impl<'de> serde::Deserializer<'de> for crate::Value {
++/// Deserialization implementation for TOML.
++pub struct ValueDeserializer {
++    input: crate::Item,
++    validate_struct_keys: bool,
++}
++
++impl ValueDeserializer {
++    pub(crate) fn new(input: crate::Item) -> Self {
++        Self {
++            input,
++            validate_struct_keys: false,
++        }
++    }
++
++    pub(crate) fn with_struct_key_validation(mut self) -> Self {
++        self.validate_struct_keys = true;
++        self
++    }
++}
++
++impl<'de> serde::Deserializer<'de> for ValueDeserializer {
+     type Error = Error;
+ 
+     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+     where
+         V: serde::de::Visitor<'de>,
+     {
+-        match self {
+-            crate::Value::String(v) => visitor.visit_string(v.into_value()),
+-            crate::Value::Integer(v) => visitor.visit_i64(v.into_value()),
+-            crate::Value::Float(v) => visitor.visit_f64(v.into_value()),
+-            crate::Value::Boolean(v) => visitor.visit_bool(v.into_value()),
+-            crate::Value::Datetime(v) => visitor.visit_map(DatetimeDeserializer {
+-                date: v.into_value(),
+-                visited: false,
+-            }),
+-            crate::Value::Array(v) => visitor.visit_seq(crate::de::ArraySeqAccess::with_array(v)),
+-            crate::Value::InlineTable(v) => {
+-                visitor.visit_map(crate::de::InlineTableMapAccess::new(v))
++        let span = self.input.span();
++        match self.input {
++            crate::Item::None => visitor.visit_none(),
++            crate::Item::Value(crate::Value::String(v)) => visitor.visit_string(v.into_value()),
++            crate::Item::Value(crate::Value::Integer(v)) => visitor.visit_i64(v.into_value()),
++            crate::Item::Value(crate::Value::Float(v)) => visitor.visit_f64(v.into_value()),
++            crate::Item::Value(crate::Value::Boolean(v)) => visitor.visit_bool(v.into_value()),
++            crate::Item::Value(crate::Value::Datetime(v)) => {
++                visitor.visit_map(DatetimeDeserializer::new(v.into_value()))
+             }
++            crate::Item::Value(crate::Value::Array(v)) => {
++                v.into_deserializer().deserialize_any(visitor)
++            }
++            crate::Item::Value(crate::Value::InlineTable(v)) => {
++                v.into_deserializer().deserialize_any(visitor)
++            }
++            crate::Item::Table(v) => v.into_deserializer().deserialize_any(visitor),
++            crate::Item::ArrayOfTables(v) => v.into_deserializer().deserialize_any(visitor),
+         }
++        .map_err(|mut e: Self::Error| {
++            if e.span().is_none() {
++                e.set_span(span);
++            }
++            e
++        })
++    }
++
++    // `None` is interpreted as a missing field so be sure to implement `Some`
++    // as a present field.
++    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Error>
++    where
++        V: serde::de::Visitor<'de>,
++    {
++        let span = self.input.span();
++        visitor.visit_some(self).map_err(|mut e: Self::Error| {
++            if e.span().is_none() {
++                e.set_span(span);
++            }
++            e
++        })
++    }
++
++    fn deserialize_newtype_struct<V>(
++        self,
++        _name: &'static str,
++        visitor: V,
++    ) -> Result<V::Value, Error>
++    where
++        V: serde::de::Visitor<'de>,
++    {
++        let span = self.input.span();
++        visitor
++            .visit_newtype_struct(self)
++            .map_err(|mut e: Self::Error| {
++                if e.span().is_none() {
++                    e.set_span(span);
++                }
++                e
++            })
+     }
+ 
+     fn deserialize_struct<V>(
+@@ -34,46 +100,62 @@ impl<'de> serde::Deserializer<'de> for crate::Value {
+     where
+         V: serde::de::Visitor<'de>,
+     {
++        if super::is_spanned(name, fields) {
++            if let Some(span) = self.input.span() {
++                return visitor.visit_map(super::SpannedDeserializer::new(self, span));
++            }
++        }
++
+         if name == toml_datetime::__unstable::NAME && fields == [toml_datetime::__unstable::FIELD] {
+-            if let crate::Value::Datetime(d) = self {
+-                return visitor.visit_map(DatetimeDeserializer {
+-                    date: d.into_value(),
+-                    visited: false,
+-                });
++            let span = self.input.span();
++            if let crate::Item::Value(crate::Value::Datetime(d)) = self.input {
++                return visitor
++                    .visit_map(DatetimeDeserializer::new(d.into_value()))
++                    .map_err(|mut e: Self::Error| {
++                        if e.span().is_none() {
++                            e.set_span(span);
++                        }
++                        e
++                    });
+             }
+         }
+ 
+-        if super::is_spanned(name, fields) {
+-            if let Some(span) = self.span() {
+-                return visitor.visit_map(super::SpannedDeserializer::new(self, span));
++        if self.validate_struct_keys {
++            let span = self.input.span();
++            match &self.input {
++                crate::Item::Table(values) => super::validate_struct_keys(&values.items, fields),
++                crate::Item::Value(crate::Value::InlineTable(values)) => {
++                    super::validate_struct_keys(&values.items, fields)
++                }
++                _ => Ok(()),
+             }
++            .map_err(|mut e: Self::Error| {
++                if e.span().is_none() {
++                    e.set_span(span);
++                }
++                e
++            })?
+         }
+ 
+         self.deserialize_any(visitor)
+     }
+ 
+-    // `None` is interpreted as a missing field so be sure to implement `Some`
+-    // as a present field.
+-    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        visitor.visit_some(self)
+-    }
+-
+     // Called when the type to deserialize is an enum, as opposed to a field in the type.
+     fn deserialize_enum<V>(
+         self,
+-        _name: &'static str,
+-        _variants: &'static [&'static str],
++        name: &'static str,
++        variants: &'static [&'static str],
+         visitor: V,
+     ) -> Result<V::Value, Error>
+     where
+         V: serde::de::Visitor<'de>,
+     {
+-        match self {
+-            crate::Value::String(v) => visitor.visit_enum(v.into_value().into_deserializer()),
+-            crate::Value::InlineTable(v) => {
++        let span = self.input.span();
++        match self.input {
++            crate::Item::Value(crate::Value::String(v)) => {
++                visitor.visit_enum(v.into_value().into_deserializer())
++            }
++            crate::Item::Value(crate::Value::InlineTable(v)) => {
+                 if v.is_empty() {
+                     Err(crate::de::Error::custom(
+                         "wanted exactly 1 element, found 0 elements",
+@@ -85,73 +167,58 @@ impl<'de> serde::Deserializer<'de> for crate::Value {
+                         v.span(),
+                     ))
+                 } else {
+-                    visitor.visit_enum(crate::de::InlineTableMapAccess::new(v))
++                    v.into_deserializer()
++                        .deserialize_enum(name, variants, visitor)
+                 }
+             }
+-            _ => Err(crate::de::Error::custom(
+-                "wanted string or inline table",
+-                self.span(),
+-            )),
++            crate::Item::Table(v) => v
++                .into_deserializer()
++                .deserialize_enum(name, variants, visitor),
++            e => Err(crate::de::Error::custom("wanted string or table", e.span())),
+         }
++        .map_err(|mut e: Self::Error| {
++            if e.span().is_none() {
++                e.set_span(span);
++            }
++            e
++        })
+     }
+ 
+     serde::forward_to_deserialize_any! {
+         bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string seq
+-        bytes byte_buf map unit newtype_struct
++        bytes byte_buf map unit
+         ignored_any unit_struct tuple_struct tuple identifier
+     }
+ }
+ 
+-impl<'de> serde::de::IntoDeserializer<'de, crate::de::Error> for crate::Value {
++impl<'de> serde::de::IntoDeserializer<'de, crate::de::Error> for ValueDeserializer {
+     type Deserializer = Self;
+ 
+-    fn into_deserializer(self) -> Self {
++    fn into_deserializer(self) -> Self::Deserializer {
+         self
+     }
+ }
+ 
+-struct DatetimeDeserializer {
+-    visited: bool,
+-    date: crate::Datetime,
+-}
+-
+-impl<'de> serde::de::MapAccess<'de> for DatetimeDeserializer {
+-    type Error = Error;
++impl<'de> serde::de::IntoDeserializer<'de, crate::de::Error> for crate::Value {
++    type Deserializer = ValueDeserializer;
+ 
+-    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Error>
+-    where
+-        K: serde::de::DeserializeSeed<'de>,
+-    {
+-        if self.visited {
+-            return Ok(None);
+-        }
+-        self.visited = true;
+-        seed.deserialize(DatetimeFieldDeserializer).map(Some)
++    fn into_deserializer(self) -> Self::Deserializer {
++        ValueDeserializer::new(crate::Item::Value(self))
+     }
++}
+ 
+-    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::DeserializeSeed<'de>,
+-    {
+-        seed.deserialize(self.date.to_string().into_deserializer())
++impl crate::Item {
++    pub(crate) fn into_deserializer(self) -> ValueDeserializer {
++        ValueDeserializer::new(self)
+     }
+ }
+ 
+-struct DatetimeFieldDeserializer;
++impl std::str::FromStr for ValueDeserializer {
++    type Err = Error;
+ 
+-impl<'de> serde::de::Deserializer<'de> for DatetimeFieldDeserializer {
+-    type Error = Error;
+-
+-    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Error>
+-    where
+-        V: serde::de::Visitor<'de>,
+-    {
+-        visitor.visit_borrowed_str(toml_datetime::__unstable::FIELD)
+-    }
+-
+-    serde::forward_to_deserialize_any! {
+-        bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string seq
+-        bytes byte_buf map struct option unit newtype_struct
+-        ignored_any unit_struct tuple_struct tuple enum identifier
++    /// Parses a value from a &str
++    fn from_str(s: &str) -> Result<Self, Self::Err> {
++        let v = crate::parser::parse_value(s).map_err(Error::from)?;
++        Ok(v.into_deserializer())
+     }
+ }
+diff --git a/crates/toml_edit/src/easy/value.rs b/crates/toml_edit/src/easy/value.rs
+index 6e9df5ab..7bb5628f 100644
+--- a/crates/toml_edit/src/easy/value.rs
++++ b/crates/toml_edit/src/easy/value.rs
+@@ -6,6 +6,9 @@ use std::mem::discriminant;
+ use std::ops;
+ use std::str::FromStr;
+ 
++use serde::de::IntoDeserializer as _;
++use serde::Deserialize as _;
++
+ pub use crate::easy::datetime::*;
+ use crate::easy::map::Entry;
+ pub use crate::easy::map::Map;
+@@ -49,8 +52,10 @@ impl Value {
+         T: serde::ser::Serialize,
+     {
+         let item = super::ser::to_item(&value)?;
+-        let value = super::de::from_item(item)?;
+-        Ok(value)
++        let value = item.into_value().expect("`to_item` only generates values");
++        let value = value.into_deserializer();
++        let target = Self::deserialize(value)?;
++        Ok(target)
+     }
+ 
+     /// Interpret a `toml::Value` as an instance of type `T`.
+@@ -67,8 +72,10 @@ impl Value {
+         T: serde::de::DeserializeOwned,
+     {
+         let item = super::ser::to_item(&self)?;
+-        let value = super::de::from_item(item)?;
+-        Ok(value)
++        let value = item.into_value().expect("`to_item` only generates values");
++        let value = value.into_deserializer();
++        let target = T::deserialize(value)?;
++        Ok(target)
+     }
+ 
+     /// Index into a TOML array or map. A string index can be used to access a

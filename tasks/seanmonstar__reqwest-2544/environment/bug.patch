@@ -1,0 +1,682 @@
+diff --git a/src/async_impl/h3_client/mod.rs b/src/async_impl/h3_client/mod.rs
+index 6dc46d6..aa1bc44 100644
+--- a/src/async_impl/h3_client/mod.rs
++++ b/src/async_impl/h3_client/mod.rs
+@@ -40,22 +40,9 @@ impl H3Client {
+         trace!("did not find connection {key:?} in pool so connecting...");
+ 
+         let dest = pool::domain_as_uri(key.clone());
+-
+-        let lock = match self.pool.connecting(&key) {
+-            pool::Connecting::InProgress(waiter) => {
+-                trace!("connecting to {key:?} is already in progress, subscribing...");
+-
+-                match waiter.receive().await {
+-                    Some(client) => return Ok(client),
+-                    None => return Err("failed to establish connection for HTTP/3 request".into()),
+-                }
+-            }
+-            pool::Connecting::Acquired(lock) => lock,
+-        };
+-        trace!("connecting to {key:?}...");
++        self.pool.connecting(key.clone())?;
+         let (driver, tx) = self.connector.connect(dest).await?;
+-        trace!("saving new pooled connection to {key:?}");
+-        Ok(self.pool.new_connection(lock, driver, tx))
++        Ok(self.pool.new_connection(key, driver, tx))
+     }
+ 
+     async fn send_request(
+diff --git a/src/async_impl/h3_client/pool.rs b/src/async_impl/h3_client/pool.rs
+index 1075e1c..100a093 100644
+--- a/src/async_impl/h3_client/pool.rs
++++ b/src/async_impl/h3_client/pool.rs
+@@ -1,9 +1,8 @@
+ use bytes::Bytes;
+-use std::collections::HashMap;
++use std::collections::{HashMap, HashSet};
+ use std::sync::mpsc::{Receiver, TryRecvError};
+ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+-use tokio::sync::watch;
+ use tokio::time::Instant;
+ 
+ use crate::async_impl::body::ResponseBody;
+@@ -24,89 +23,23 @@ pub struct Pool {
+     inner: Arc<Mutex<PoolInner>>,
+ }
+ 
+-struct ConnectingLockInner {
+-    key: Key,
+-    pool: Arc<Mutex<PoolInner>>,
+-}
+-
+-/// A lock that ensures only one HTTP/3 connection is established per host at a
+-/// time. The lock is automatically released when dropped.
+-pub struct ConnectingLock(Option<ConnectingLockInner>);
+-
+-/// A waiter that allows subscribers to receive updates when a new connection is
+-/// established or when the connection attempt fails. For example, whe
+-/// connection lock is dropped due to an error.
+-pub struct ConnectingWaiter {
+-    receiver: watch::Receiver<Option<PoolClient>>,
+-}
+-
+-pub enum Connecting {
+-    /// A connection attempt is already in progress.
+-    /// You must subscribe to updates instead of initiating a new connection.
+-    InProgress(ConnectingWaiter),
+-    /// The connection lock has been acquired, allowing you to initiate a
+-    /// new connection.
+-    Acquired(ConnectingLock),
+-}
+-
+-impl ConnectingLock {
+-    fn new(key: Key, pool: Arc<Mutex<PoolInner>>) -> Self {
+-        Self(Some(ConnectingLockInner { key, pool }))
+-    }
+-
+-    /// Forget the lock and return corresponding Key
+-    fn forget(mut self) -> Key {
+-        // Unwrap is safe because the Option can be None only after dropping the
+-        // lock
+-        self.0.take().unwrap().key
+-    }
+-}
+-
+-impl Drop for ConnectingLock {
+-    fn drop(&mut self) {
+-        if let Some(ConnectingLockInner { key, pool }) = self.0.take() {
+-            let mut pool = pool.lock().unwrap();
+-            pool.connecting.remove(&key);
+-            trace!("HTTP/3 connecting lock for {:?} is dropped", key);
+-        }
+-    }
+-}
+-
+-impl ConnectingWaiter {
+-    pub async fn receive(mut self) -> Option<PoolClient> {
+-        match self.receiver.wait_for(Option::is_some).await {
+-            // unwrap because we already checked that option is Some
+-            Ok(ok) => Some(ok.as_ref().unwrap().to_owned()),
+-            Err(_) => None,
+-        }
+-    }
+-}
+-
+ impl Pool {
+     pub fn new(timeout: Option<Duration>) -> Self {
+         Self {
+             inner: Arc::new(Mutex::new(PoolInner {
+-                connecting: HashMap::new(),
++                connecting: HashSet::new(),
+                 idle_conns: HashMap::new(),
+                 timeout,
+             })),
+         }
+     }
+ 
+-    /// Aqcuire a connecting lock. This is to ensure that we have only one HTTP3
+-    /// connection per host.
+-    pub fn connecting(&self, key: &Key) -> Connecting {
++    pub fn connecting(&self, key: Key) -> Result<(), BoxError> {
+         let mut inner = self.inner.lock().unwrap();
+-
+-        if let Some(sender) = inner.connecting.get(key) {
+-            Connecting::InProgress(ConnectingWaiter {
+-                receiver: sender.subscribe(),
+-            })
+-        } else {
+-            let (tx, _) = watch::channel(None);
+-            inner.connecting.insert(key.clone(), tx);
+-            Connecting::Acquired(ConnectingLock::new(key.clone(), Arc::clone(&self.inner)))
++        if !inner.connecting.insert(key.clone()) {
++            return Err(format!("HTTP/3 connecting already in progress for {key:?}").into());
+         }
++        return Ok(());
+     }
+ 
+     pub fn try_pool(&self, key: &Key) -> Option<PoolClient> {
+@@ -137,7 +70,7 @@ impl Pool {
+ 
+     pub fn new_connection(
+         &mut self,
+-        lock: ConnectingLock,
++        key: Key,
+         mut driver: h3::client::Connection<Connection, Bytes>,
+         tx: SendRequest<OpenStreams, Bytes>,
+     ) -> PoolClient {
+@@ -151,33 +84,20 @@ impl Pool {
+ 
+         let mut inner = self.inner.lock().unwrap();
+ 
+-        // We clean up "connecting" here so we don't have to acquire the lock again.
+-        let key = lock.forget();
+-        let Some(notifier) = inner.connecting.remove(&key) else {
+-            unreachable!("there should be one connecting lock at a time");
+-        };
+         let client = PoolClient::new(tx);
++        let conn = PoolConnection::new(client.clone(), close_rx);
++        inner.insert(key.clone(), conn);
+ 
+-        // Send the client to all our awaiters
+-        let pool_client = if let Err(watch::error::SendError(Some(unsent_client))) =
+-            notifier.send(Some(client.clone()))
+-        {
+-            // If there are no awaiters, the client is returned to us. As a
+-            // micro optimisation, let's reuse it and avoid clonning.
+-            unsent_client
+-        } else {
+-            client.clone()
+-        };
+-
+-        let conn = PoolConnection::new(pool_client, close_rx);
+-        inner.insert(key, conn);
++        // We clean up "connecting" here so we don't have to acquire the lock again.
++        let existed = inner.connecting.remove(&key);
++        debug_assert!(existed, "key not in connecting set");
+ 
+         client
+     }
+ }
+ 
+ struct PoolInner {
+-    connecting: HashMap<Key, watch::Sender<Option<PoolClient>>>,
++    connecting: HashSet<Key>,
+     idle_conns: HashMap<Key, PoolConnection>,
+     timeout: Option<Duration>,
+ }
+diff --git a/tests/client.rs b/tests/client.rs
+index fee341b..f994183 100644
+--- a/tests/client.rs
++++ b/tests/client.rs
+@@ -84,6 +84,35 @@ async fn donot_set_content_length_0_if_have_no_body() {
+     assert_eq!(res.status(), reqwest::StatusCode::OK);
+ }
+ 
++#[cfg(feature = "http3")]
++#[tokio::test]
++async fn http3_request_full() {
++    use http_body_util::BodyExt;
++
++    let server = server::http3(move |req| async move {
++        assert_eq!(req.headers()[CONTENT_LENGTH], "5");
++        let reqb = req.collect().await.unwrap().to_bytes();
++        assert_eq!(reqb, "hello");
++        http::Response::default()
++    });
++
++    let url = format!("https://{}/content-length", server.addr());
++    let res = reqwest::Client::builder()
++        .http3_prior_knowledge()
++        .danger_accept_invalid_certs(true)
++        .build()
++        .expect("client builder")
++        .post(url)
++        .version(http::Version::HTTP_3)
++        .body("hello")
++        .send()
++        .await
++        .expect("request");
++
++    assert_eq!(res.version(), http::Version::HTTP_3);
++    assert_eq!(res.status(), reqwest::StatusCode::OK);
++}
++
+ #[tokio::test]
+ async fn user_agent() {
+     let server = server::http(move |req| async move {
+diff --git a/tests/http3.rs b/tests/http3.rs
+deleted file mode 100644
+index 338e108..0000000
+--- a/tests/http3.rs
++++ /dev/null
+@@ -1,213 +0,0 @@
+-#![cfg(feature = "http3")]
+-#![cfg(not(target_arch = "wasm32"))]
+-
+-mod support;
+-
+-use http::header::CONTENT_LENGTH;
+-use std::error::Error;
+-use support::server;
+-
+-#[tokio::test]
+-async fn http3_request_full() {
+-    use http_body_util::BodyExt;
+-
+-    let server = server::Http3::new().build(move |req| async move {
+-        assert_eq!(req.headers()[CONTENT_LENGTH], "5");
+-        let reqb = req.collect().await.unwrap().to_bytes();
+-        assert_eq!(reqb, "hello");
+-        http::Response::default()
+-    });
+-
+-    let url = format!("https://{}/content-length", server.addr());
+-    let res = reqwest::Client::builder()
+-        .http3_prior_knowledge()
+-        .danger_accept_invalid_certs(true)
+-        .build()
+-        .expect("client builder")
+-        .post(url)
+-        .version(http::Version::HTTP_3)
+-        .body("hello")
+-        .send()
+-        .await
+-        .expect("request");
+-
+-    assert_eq!(res.version(), http::Version::HTTP_3);
+-    assert_eq!(res.status(), reqwest::StatusCode::OK);
+-}
+-
+-async fn find_free_tcp_addr() -> std::net::SocketAddr {
+-    let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+-    listener.local_addr().unwrap()
+-}
+-
+-#[cfg(feature = "http3")]
+-#[tokio::test]
+-async fn http3_test_failed_connection() {
+-    let addr = find_free_tcp_addr().await;
+-    let port = addr.port();
+-
+-    let url = format!("https://[::1]:{port}/");
+-    let client = reqwest::Client::builder()
+-        .http3_prior_knowledge()
+-        .danger_accept_invalid_certs(true)
+-        .http3_max_idle_timeout(std::time::Duration::from_millis(20))
+-        .build()
+-        .expect("client builder");
+-
+-    let err = client
+-        .get(&url)
+-        .version(http::Version::HTTP_3)
+-        .send()
+-        .await
+-        .unwrap_err();
+-
+-    let err = err
+-        .source()
+-        .unwrap()
+-        .source()
+-        .unwrap()
+-        .downcast_ref::<quinn::ConnectionError>()
+-        .unwrap();
+-    assert_eq!(*err, quinn::ConnectionError::TimedOut);
+-
+-    let err = client
+-        .get(&url)
+-        .version(http::Version::HTTP_3)
+-        .send()
+-        .await
+-        .unwrap_err();
+-
+-    let err = err
+-        .source()
+-        .unwrap()
+-        .source()
+-        .unwrap()
+-        .downcast_ref::<quinn::ConnectionError>()
+-        .unwrap();
+-    assert_eq!(*err, quinn::ConnectionError::TimedOut);
+-
+-    let server = server::Http3::new()
+-        .with_addr(addr)
+-        .build(|_| async { http::Response::default() });
+-
+-    let res = client
+-        .post(&url)
+-        .version(http::Version::HTTP_3)
+-        .body("hello")
+-        .send()
+-        .await
+-        .expect("request");
+-
+-    assert_eq!(res.version(), http::Version::HTTP_3);
+-    assert_eq!(res.status(), reqwest::StatusCode::OK);
+-    drop(server);
+-}
+-
+-#[cfg(feature = "http3")]
+-#[tokio::test]
+-async fn http3_test_concurrent_request() {
+-    let server = server::Http3::new().build(|req| async move {
+-        let mut res = http::Response::default();
+-        *res.body_mut() = reqwest::Body::from(format!("hello {}", req.uri().path()));
+-        res
+-    });
+-    let addr = server.addr();
+-
+-    let client = reqwest::Client::builder()
+-        .http3_prior_knowledge()
+-        .danger_accept_invalid_certs(true)
+-        .http3_max_idle_timeout(std::time::Duration::from_millis(20))
+-        .build()
+-        .expect("client builder");
+-
+-    let mut tasks = vec![];
+-    for i in 0..10 {
+-        let client = client.clone();
+-        tasks.push(async move {
+-            let url = format!("https://{}/{}", addr, i);
+-
+-            client
+-                .post(&url)
+-                .version(http::Version::HTTP_3)
+-                .send()
+-                .await
+-                .expect("request")
+-        });
+-    }
+-
+-    let handlers = tasks.into_iter().map(tokio::spawn).collect::<Vec<_>>();
+-
+-    for (i, handler) in handlers.into_iter().enumerate() {
+-        let result = handler.await.unwrap();
+-
+-        assert_eq!(result.version(), http::Version::HTTP_3);
+-        assert_eq!(result.status(), reqwest::StatusCode::OK);
+-
+-        let body = result.text().await.unwrap();
+-        assert_eq!(body, format!("hello /{}", i));
+-    }
+-
+-    drop(server);
+-}
+-
+-#[cfg(feature = "http3")]
+-#[tokio::test]
+-async fn http3_test_reconnection() {
+-    use std::error::Error;
+-
+-    let server = server::Http3::new().build(|_| async { http::Response::default() });
+-    let addr = server.addr();
+-
+-    let url = format!("https://{}/", addr);
+-    let client = reqwest::Client::builder()
+-        .http3_prior_knowledge()
+-        .danger_accept_invalid_certs(true)
+-        .http3_max_idle_timeout(std::time::Duration::from_millis(20))
+-        .build()
+-        .expect("client builder");
+-
+-    let res = client
+-        .post(&url)
+-        .version(http::Version::HTTP_3)
+-        .send()
+-        .await
+-        .expect("request");
+-
+-    assert_eq!(res.version(), http::Version::HTTP_3);
+-    assert_eq!(res.status(), reqwest::StatusCode::OK);
+-    drop(server);
+-
+-    let err = client
+-        .get(&url)
+-        .version(http::Version::HTTP_3)
+-        .send()
+-        .await
+-        .unwrap_err();
+-
+-    let err = err
+-        .source()
+-        .unwrap()
+-        .source()
+-        .unwrap()
+-        .downcast_ref::<h3::Error>()
+-        .unwrap();
+-
+-    // Why is it so hard to inspect h3 errors? :/
+-    assert!(err.to_string().contains("timeout"));
+-
+-    let server = server::Http3::new()
+-        .with_addr(addr)
+-        .build(|_| async { http::Response::default() });
+-
+-    let res = client
+-        .post(&url)
+-        .version(http::Version::HTTP_3)
+-        .body("hello")
+-        .send()
+-        .await
+-        .expect("request");
+-
+-    assert_eq!(res.version(), http::Version::HTTP_3);
+-    assert_eq!(res.status(), reqwest::StatusCode::OK);
+-    drop(server);
+-}
+diff --git a/tests/support/server.rs b/tests/support/server.rs
+index b651cb3..79ebd2d 100644
+--- a/tests/support/server.rs
++++ b/tests/support/server.rs
+@@ -133,133 +133,114 @@ where
+ }
+ 
+ #[cfg(feature = "http3")]
+-#[derive(Debug, Default)]
+-pub struct Http3 {
+-    addr: Option<std::net::SocketAddr>,
+-}
+-
+-#[cfg(feature = "http3")]
+-impl Http3 {
+-    pub fn new() -> Self {
+-        Self::default()
+-    }
+-
+-    pub fn with_addr(mut self, addr: std::net::SocketAddr) -> Self {
+-        self.addr = Some(addr);
+-        self
+-    }
+-
+-    pub fn build<F1, Fut>(self, func: F1) -> Server
+-    where
+-        F1: Fn(http::Request<http_body_util::combinators::BoxBody<bytes::Bytes, h3::Error>>) -> Fut
+-            + Clone
+-            + Send
+-            + 'static,
+-        Fut: Future<Output = http::Response<reqwest::Body>> + Send + 'static,
+-    {
+-        use bytes::Buf;
+-        use http_body_util::BodyExt;
+-        use quinn::crypto::rustls::QuicServerConfig;
+-        use std::sync::Arc;
+-
+-        let addr = self.addr.unwrap_or_else(|| "[::1]:0".parse().unwrap());
+-
+-        // Spawn new runtime in thread to prevent reactor execution context conflict
+-        let test_name = thread::current().name().unwrap_or("<unknown>").to_string();
+-        thread::spawn(move || {
+-            let rt = runtime::Builder::new_current_thread()
+-                .enable_all()
+-                .build()
+-                .expect("new rt");
++pub fn http3<F1, Fut>(func: F1) -> Server
++where
++    F1: Fn(http::Request<http_body_util::combinators::BoxBody<bytes::Bytes, h3::Error>>) -> Fut
++        + Clone
++        + Send
++        + 'static,
++    Fut: Future<Output = http::Response<reqwest::Body>> + Send + 'static,
++{
++    use bytes::Buf;
++    use http_body_util::BodyExt;
++    use quinn::crypto::rustls::QuicServerConfig;
++    use std::sync::Arc;
+ 
+-            let cert = std::fs::read("tests/support/server.cert").unwrap().into();
+-            let key = std::fs::read("tests/support/server.key").unwrap().try_into().unwrap();
++    // Spawn new runtime in thread to prevent reactor execution context conflict
++    let test_name = thread::current().name().unwrap_or("<unknown>").to_string();
++    thread::spawn(move || {
++        let rt = runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()
++            .expect("new rt");
+ 
+-            let mut tls_config = rustls::ServerConfig::builder()
+-                .with_no_client_auth()
+-                .with_single_cert(vec![cert], key)
+-                .unwrap();
+-            tls_config.max_early_data_size = u32::MAX;
+-            tls_config.alpn_protocols = vec![b"h3".into()];
++        let cert = std::fs::read("tests/support/server.cert").unwrap().into();
++        let key = std::fs::read("tests/support/server.key").unwrap().try_into().unwrap();
+ 
+-            let server_config = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls_config).unwrap()));
+-            let endpoint = rt.block_on(async move {
+-                quinn::Endpoint::server(server_config, addr).unwrap()
+-            });
+-            let addr = endpoint.local_addr().unwrap();
++        let mut tls_config = rustls::ServerConfig::builder()
++            .with_no_client_auth()
++            .with_single_cert(vec![cert], key)
++            .unwrap();
++        tls_config.max_early_data_size = u32::MAX;
++        tls_config.alpn_protocols = vec![b"h3".into()];
+ 
+-            let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+-            let (panic_tx, panic_rx) = std_mpsc::channel();
+-            let (events_tx, events_rx) = std_mpsc::channel();
+-            let tname = format!(
+-                "test({})-support-server",
+-                test_name,
+-            );
+-            thread::Builder::new()
+-                .name(tname)
+-                .spawn(move || {
+-                    rt.block_on(async move {
++        let server_config = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls_config).unwrap()));
++        let endpoint = rt.block_on(async move {
++            quinn::Endpoint::server(server_config, "[::1]:0".parse().unwrap()).unwrap()
++        });
++        let addr = endpoint.local_addr().unwrap();
+ 
+-                        loop {
+-                            tokio::select! {
+-                                _ = &mut shutdown_rx => {
+-                                    break;
+-                                }
+-                                Some(accepted) = endpoint.accept() => {
+-                                    let conn = accepted.await.expect("accepted");
+-                                    let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn)).await.unwrap();
+-                                    let events_tx = events_tx.clone();
+-                                    let func = func.clone();
+-                                    tokio::spawn(async move {
+-                                        while let Ok(Some((req, stream))) = h3_conn.accept().await {
+-                                            let events_tx = events_tx.clone();
+-                                            let func = func.clone();
+-                                            tokio::spawn(async move {
+-                                                let (mut tx, rx) = stream.split();
+-                                                let body = futures_util::stream::unfold(rx, |mut rx| async move {
+-                                                    match rx.recv_data().await {
+-                                                        Ok(Some(mut buf)) => {
+-                                                            Some((Ok(hyper::body::Frame::data(buf.copy_to_bytes(buf.remaining()))), rx))
+-                                                        },
+-                                                        Ok(None) => None,
+-                                                        Err(err) => {
+-                                                            Some((Err(err), rx))
+-                                                        }
+-                                                    }
+-                                                });
+-                                                let body = BodyExt::boxed(http_body_util::StreamBody::new(body));
+-                                                let resp = func(req.map(move |()| body)).await;
+-                                                let (parts, mut body) = resp.into_parts();
+-                                                let resp = http::Response::from_parts(parts, ());
+-                                                tx.send_response(resp).await.unwrap();
++        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
++        let (panic_tx, panic_rx) = std_mpsc::channel();
++        let (events_tx, events_rx) = std_mpsc::channel();
++        let tname = format!(
++            "test({})-support-server",
++            test_name,
++        );
++        thread::Builder::new()
++            .name(tname)
++            .spawn(move || {
++                rt.block_on(async move {
+ 
+-                                                while let Some(Ok(frame)) = body.frame().await {
+-                                                    if let Ok(data) = frame.into_data() {
+-                                                        tx.send_data(data).await.unwrap();
++                    loop {
++                        tokio::select! {
++                            _ = &mut shutdown_rx => {
++                                break;
++                            }
++                            Some(accepted) = endpoint.accept() => {
++                                let conn = accepted.await.expect("accepted");
++                                let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn)).await.unwrap();
++                                let events_tx = events_tx.clone();
++                                let func = func.clone();
++                                tokio::spawn(async move {
++                                    while let Ok(Some((req, stream))) = h3_conn.accept().await {
++                                        let events_tx = events_tx.clone();
++                                        let func = func.clone();
++                                        tokio::spawn(async move {
++                                            let (mut tx, rx) = stream.split();
++                                            let body = futures_util::stream::unfold(rx, |mut rx| async move {
++                                                match rx.recv_data().await {
++                                                    Ok(Some(mut buf)) => {
++                                                        Some((Ok(hyper::body::Frame::data(buf.copy_to_bytes(buf.remaining()))), rx))
++                                                    },
++                                                    Ok(None) => None,
++                                                    Err(err) => {
++                                                        Some((Err(err), rx))
+                                                     }
+                                                 }
+-                                                tx.finish().await.unwrap();
+-                                                events_tx.send(Event::ConnectionClosed).unwrap();
+                                             });
+-                                        }
+-                                    });
+-                                }
++                                            let body = BodyExt::boxed(http_body_util::StreamBody::new(body));
++                                            let resp = func(req.map(move |()| body)).await;
++                                            let (parts, mut body) = resp.into_parts();
++                                            let resp = http::Response::from_parts(parts, ());
++                                            tx.send_response(resp).await.unwrap();
++
++                                            while let Some(Ok(frame)) = body.frame().await {
++                                                if let Ok(data) = frame.into_data() {
++                                                    tx.send_data(data).await.unwrap();
++                                                }
++                                            }
++                                            tx.finish().await.unwrap();
++                                            events_tx.send(Event::ConnectionClosed).unwrap();
++                                        });
++                                    }
++                                });
+                             }
+                         }
+-                        let _ = panic_tx.send(());
+-                    });
+-                })
+-                .expect("thread spawn");
+-            Server {
+-                addr,
+-                panic_rx,
+-                events_rx,
+-                shutdown_tx: Some(shutdown_tx),
+-            }
+-        })
+-        .join()
+-        .unwrap()
+-    }
++                    }
++                    let _ = panic_tx.send(());
++                });
++            })
++            .expect("thread spawn");
++        Server {
++            addr,
++            panic_rx,
++            events_rx,
++            shutdown_tx: Some(shutdown_tx),
++        }
++    })
++    .join()
++    .unwrap()
+ }
+ 
+ pub fn low_level_with_response<F>(do_response: F) -> Server

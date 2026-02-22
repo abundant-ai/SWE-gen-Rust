@@ -1,0 +1,474 @@
+diff --git a/admin/all-features-except b/admin/all-features-except
+new file mode 100755
+index 00000000..395ee9d1
+--- /dev/null
++++ b/admin/all-features-except
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++
++DESCRIPTION = """
++Usage: admin/all-features-except a,b,c crate
++
++Prints the set of all features declared by the given crate, minus
++a, b and c.
++
++The output is decorated with `--no-default-features --features` meaning
++it can be used directly with cargo, for example:
++
++$ cargo build $(admin/all-features-except std,logging rustls)
++
++It is assumed but not verified that the remaining features do not
++have dependencies on the disabled features (otherwise, cargo will
++re-enable them without notification).
++"""
++
++import subprocess
++import argparse
++import json
++
++
++def crate_features(crate_name):
++    js = json.loads(
++        subprocess.check_output(
++            ["cargo", "metadata", "--no-deps", "--format-version=1"]
++        )
++    )
++    package = [p for p in js["packages"] if p["name"] == crate_name]
++    if len(package) != 1:
++        raise ValueError(f"crate {crate_name} not found in {js}")
++    return set(package[0]["features"].keys())
++
++
++if __name__ == "__main__":
++    ap = argparse.ArgumentParser(description=DESCRIPTION)
++    ap.add_argument(
++        dest="except_features",
++        metavar="FEATURE,FEATURE,..",
++        type=lambda x: set(x.strip().split(",")),
++        help="Which features to remove from the complete set of features",
++    )
++    ap.add_argument("crate", help="Which crate to determine features for")
++    opts = ap.parse_args()
++
++    features = crate_features(opts.crate)
++
++    for f in opts.except_features:
++        try:
++            features.remove(f)
++        except KeyError as e:
++            ap.error(f"feature `{f}' not found (known are {features})")
++
++    # drop default, as it may re-enable other features
++    features.discard("default")
++
++    print("--no-default-features", "--features", ",".join(sorted(features)))
+diff --git a/bogo/runme b/bogo/runme
+index c13fbe67..d2f0ff92 100755
+--- a/bogo/runme
++++ b/bogo/runme
+@@ -7,11 +7,11 @@ set -xe
+ 
+ case ${BOGO_SHIM_PROVIDER:-ring} in
+   ring)
+-      cargo build -p rustls --example bogo_shim --no-default-features --features ring,tls12,logging,std
++      cargo build -p rustls --example bogo_shim $(../admin/all-features-except aws-lc-rs,aws_lc_rs,fips rustls)
+       cpp -P -DRING config.json.in > config.json
+       ;;
+   aws-lc-rs)
+-      cargo build -p rustls --example bogo_shim --no-default-features --features aws_lc_rs,tls12,logging,std
++      cargo build -p rustls --example bogo_shim $(../admin/all-features-except ring,fips rustls)
+       cpp -P -DAWS_LC_RS config.json.in > config.json
+       ;;
+   existing)
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index ffe84170..917b6a7a 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -658,7 +658,12 @@ impl State<ClientConnectionData> for ExpectCertificate {
+             ));
+         }
+         let end_entity_ocsp = cert_chain.end_entity_ocsp();
+-        let server_cert = ServerCertDetails::new(cert_chain.convert(), end_entity_ocsp);
++        let server_cert = ServerCertDetails::new(
++            cert_chain
++                .into_certificate_chain()
++                .into_owned(),
++            end_entity_ocsp,
++        );
+ 
+         Ok(Box::new(ExpectCertificateVerify {
+             config: self.config,
+diff --git a/rustls/src/msgs/base.rs b/rustls/src/msgs/base.rs
+index b05e1068..244e774c 100644
+--- a/rustls/src/msgs/base.rs
++++ b/rustls/src/msgs/base.rs
+@@ -81,31 +81,35 @@ impl fmt::Debug for Payload<'_> {
+ 
+ /// An arbitrary, unknown-content, u24-length-prefixed payload
+ #[derive(Clone, Eq, PartialEq)]
+-pub(crate) struct PayloadU24(pub(crate) Vec<u8>);
++pub(crate) struct PayloadU24<'a>(pub(crate) Payload<'a>);
+ 
+-impl PayloadU24 {
+-    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+-        Self(bytes)
++impl<'a> PayloadU24<'a> {
++    pub(crate) fn new(bytes: Vec<u8>) -> PayloadU24<'static> {
++        PayloadU24(Payload::Owned(bytes))
++    }
++
++    pub(crate) fn into_owned(self) -> PayloadU24<'static> {
++        PayloadU24(self.0.into_owned())
+     }
+ }
+ 
+-impl Codec<'_> for PayloadU24 {
++impl<'a> Codec<'a> for PayloadU24<'a> {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+-        codec::u24(self.0.len() as u32).encode(bytes);
+-        bytes.extend_from_slice(&self.0);
++        let inner = self.0.bytes();
++        codec::u24(inner.len() as u32).encode(bytes);
++        bytes.extend_from_slice(inner);
+     }
+ 
+-    fn read(r: &mut Reader) -> Result<Self, InvalidMessage> {
++    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+         let len = codec::u24::read(r)?.0 as usize;
+         let mut sub = r.sub(len)?;
+-        let body = sub.rest().to_vec();
+-        Ok(Self(body))
++        Ok(Self(Payload::read(&mut sub)))
+     }
+ }
+ 
+-impl fmt::Debug for PayloadU24 {
++impl<'a> fmt::Debug for PayloadU24<'a> {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        hex(f, &self.0)
++        self.0.fmt(f)
+     }
+ }
+ 
+diff --git a/rustls/src/msgs/handshake.rs b/rustls/src/msgs/handshake.rs
+index 729a79a9..d6534a9a 100644
+--- a/rustls/src/msgs/handshake.rs
++++ b/rustls/src/msgs/handshake.rs
+@@ -1287,20 +1287,25 @@ impl<'a> Deref for CertificateChain<'a> {
+ }
+ 
+ impl TlsListElement for CertificateDer<'_> {
+-    const SIZE_LEN: ListLength = ListLength::U24 { max: 0x1_0000 };
++    const SIZE_LEN: ListLength = ListLength::U24 {
++        max: CERTIFICATE_MAX_SIZE_LIMIT,
++    };
+ }
+ 
+-// TLS1.3 changes the Certificate payload encoding.
+-// That's annoying. It means the parsing is not
+-// context-free any more.
++/// TLS has a 16MB size limit on any handshake message,
++/// plus a 16MB limit on any given certificate.
++///
++/// We contract that to 64KB to limit the amount of memory allocation
++/// that is directly controllable by the peer.
++pub(crate) const CERTIFICATE_MAX_SIZE_LIMIT: usize = 0x1_0000;
+ 
+ #[derive(Debug)]
+-pub(crate) enum CertificateExtension {
+-    CertificateStatus(CertificateStatus),
++pub(crate) enum CertificateExtension<'a> {
++    CertificateStatus(CertificateStatus<'a>),
+     Unknown(UnknownExtension),
+ }
+ 
+-impl CertificateExtension {
++impl<'a> CertificateExtension<'a> {
+     pub(crate) fn ext_type(&self) -> ExtensionType {
+         match *self {
+             Self::CertificateStatus(_) => ExtensionType::StatusRequest,
+@@ -1308,15 +1313,22 @@ impl CertificateExtension {
+         }
+     }
+ 
+-    pub(crate) fn cert_status(&self) -> Option<&Vec<u8>> {
++    pub(crate) fn cert_status(&self) -> Option<&[u8]> {
+         match *self {
+-            Self::CertificateStatus(ref cs) => Some(&cs.ocsp_response.0),
++            Self::CertificateStatus(ref cs) => Some(cs.ocsp_response.0.bytes()),
+             _ => None,
+         }
+     }
++
++    pub(crate) fn into_owned(self) -> CertificateExtension<'static> {
++        match self {
++            Self::CertificateStatus(st) => CertificateExtension::CertificateStatus(st.into_owned()),
++            Self::Unknown(unk) => CertificateExtension::Unknown(unk),
++        }
++    }
+ }
+ 
+-impl Codec<'_> for CertificateExtension {
++impl<'a> Codec<'a> for CertificateExtension<'a> {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+         self.ext_type().encode(bytes);
+ 
+@@ -1327,7 +1339,7 @@ impl Codec<'_> for CertificateExtension {
+         }
+     }
+ 
+-    fn read(r: &mut Reader) -> Result<Self, InvalidMessage> {
++    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+         let typ = ExtensionType::read(r)?;
+         let len = u16::read(r)? as usize;
+         let mut sub = r.sub(len)?;
+@@ -1345,38 +1357,49 @@ impl Codec<'_> for CertificateExtension {
+     }
+ }
+ 
+-impl TlsListElement for CertificateExtension {
++impl<'a> TlsListElement for CertificateExtension<'a> {
+     const SIZE_LEN: ListLength = ListLength::U16;
+ }
+ 
+ #[derive(Debug)]
+-pub(crate) struct CertificateEntry {
+-    pub(crate) cert: CertificateDer<'static>,
+-    pub(crate) exts: Vec<CertificateExtension>,
++pub(crate) struct CertificateEntry<'a> {
++    pub(crate) cert: CertificateDer<'a>,
++    pub(crate) exts: Vec<CertificateExtension<'a>>,
+ }
+ 
+-impl Codec<'_> for CertificateEntry {
++impl<'a> Codec<'a> for CertificateEntry<'a> {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+         self.cert.encode(bytes);
+         self.exts.encode(bytes);
+     }
+ 
+-    fn read(r: &mut Reader) -> Result<Self, InvalidMessage> {
++    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+         Ok(Self {
+-            cert: CertificateDer::read(r)?.into_owned(),
++            cert: CertificateDer::read(r)?,
+             exts: Vec::read(r)?,
+         })
+     }
+ }
+ 
+-impl CertificateEntry {
+-    pub(crate) fn new(cert: CertificateDer<'static>) -> Self {
+-        Self {
++impl<'a> CertificateEntry<'a> {
++    pub(crate) fn new(cert: CertificateDer<'static>) -> CertificateEntry<'static> {
++        CertificateEntry {
+             cert,
+             exts: Vec::new(),
+         }
+     }
+ 
++    pub(crate) fn into_owned(self) -> CertificateEntry<'static> {
++        CertificateEntry {
++            cert: self.cert.into_owned(),
++            exts: self
++                .exts
++                .into_iter()
++                .map(CertificateExtension::into_owned)
++                .collect(),
++        }
++    }
++
+     pub(crate) fn has_duplicate_extension(&self) -> bool {
+         has_duplicates::<_, _, u16>(
+             self.exts
+@@ -1391,7 +1414,7 @@ impl CertificateEntry {
+             .any(|ext| ext.ext_type() != ExtensionType::StatusRequest)
+     }
+ 
+-    pub(crate) fn ocsp_response(&self) -> Option<&Vec<u8>> {
++    pub(crate) fn ocsp_response(&self) -> Option<&[u8]> {
+         self.exts
+             .iter()
+             .find(|ext| ext.ext_type() == ExtensionType::StatusRequest)
+@@ -1399,23 +1422,25 @@ impl CertificateEntry {
+     }
+ }
+ 
+-impl TlsListElement for CertificateEntry {
+-    const SIZE_LEN: ListLength = ListLength::U24 { max: 0x1_0000 };
++impl<'a> TlsListElement for CertificateEntry<'a> {
++    const SIZE_LEN: ListLength = ListLength::U24 {
++        max: CERTIFICATE_MAX_SIZE_LIMIT,
++    };
+ }
+ 
+ #[derive(Debug)]
+-pub struct CertificatePayloadTls13 {
++pub struct CertificatePayloadTls13<'a> {
+     pub(crate) context: PayloadU8,
+-    pub(crate) entries: Vec<CertificateEntry>,
++    pub(crate) entries: Vec<CertificateEntry<'a>>,
+ }
+ 
+-impl Codec<'_> for CertificatePayloadTls13 {
++impl<'a> Codec<'a> for CertificatePayloadTls13<'a> {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+         self.context.encode(bytes);
+         self.entries.encode(bytes);
+     }
+ 
+-    fn read(r: &mut Reader) -> Result<Self, InvalidMessage> {
++    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+         Ok(Self {
+             context: PayloadU8::read(r)?,
+             entries: Vec::read(r)?,
+@@ -1423,14 +1448,25 @@ impl Codec<'_> for CertificatePayloadTls13 {
+     }
+ }
+ 
+-impl CertificatePayloadTls13 {
+-    pub(crate) fn new(entries: Vec<CertificateEntry>) -> Self {
++impl<'a> CertificatePayloadTls13<'a> {
++    pub(crate) fn new(entries: Vec<CertificateEntry<'a>>) -> Self {
+         Self {
+             context: PayloadU8::empty(),
+             entries,
+         }
+     }
+ 
++    pub(crate) fn into_owned(self) -> CertificatePayloadTls13<'static> {
++        CertificatePayloadTls13 {
++            context: self.context,
++            entries: self
++                .entries
++                .into_iter()
++                .map(CertificateEntry::into_owned)
++                .collect(),
++        }
++    }
++
+     pub(crate) fn any_entry_has_duplicate_extension(&self) -> bool {
+         for entry in &self.entries {
+             if entry.has_duplicate_extension() {
+@@ -1465,11 +1501,11 @@ impl CertificatePayloadTls13 {
+         self.entries
+             .first()
+             .and_then(CertificateEntry::ocsp_response)
+-            .cloned()
++            .map(|resp| resp.to_vec())
+             .unwrap_or_default()
+     }
+ 
+-    pub(crate) fn convert(self) -> CertificateChain<'static> {
++    pub(crate) fn into_certificate_chain(self) -> CertificateChain<'a> {
+         CertificateChain(
+             self.entries
+                 .into_iter()
+@@ -2175,17 +2211,17 @@ impl Codec<'_> for NewSessionTicketPayloadTls13 {
+ 
+ /// Only supports OCSP
+ #[derive(Debug)]
+-pub struct CertificateStatus {
+-    pub(crate) ocsp_response: PayloadU24,
++pub struct CertificateStatus<'a> {
++    pub(crate) ocsp_response: PayloadU24<'a>,
+ }
+ 
+-impl Codec<'_> for CertificateStatus {
++impl<'a> Codec<'a> for CertificateStatus<'a> {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+         CertificateStatusType::OCSP.encode(bytes);
+         self.ocsp_response.encode(bytes);
+     }
+ 
+-    fn read(r: &mut Reader) -> Result<Self, InvalidMessage> {
++    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+         let typ = CertificateStatusType::read(r)?;
+ 
+         match typ {
+@@ -2197,16 +2233,22 @@ impl Codec<'_> for CertificateStatus {
+     }
+ }
+ 
+-impl CertificateStatus {
+-    pub(crate) fn new(ocsp: Vec<u8>) -> Self {
+-        Self {
++impl<'a> CertificateStatus<'a> {
++    pub(crate) fn new(ocsp: Vec<u8>) -> CertificateStatus<'static> {
++        CertificateStatus {
+             ocsp_response: PayloadU24::new(ocsp),
+         }
+     }
+ 
+     #[cfg(feature = "tls12")]
+     pub(crate) fn into_inner(self) -> Vec<u8> {
+-        self.ocsp_response.0
++        self.ocsp_response.0.into_vec()
++    }
++
++    pub(crate) fn into_owned(self) -> CertificateStatus<'static> {
++        CertificateStatus {
++            ocsp_response: self.ocsp_response.into_owned(),
++        }
+     }
+ }
+ 
+@@ -2217,7 +2259,7 @@ pub enum HandshakePayload<'a> {
+     ServerHello(ServerHelloPayload),
+     HelloRetryRequest(HelloRetryRequest),
+     Certificate(CertificateChain<'a>),
+-    CertificateTls13(CertificatePayloadTls13),
++    CertificateTls13(CertificatePayloadTls13<'a>),
+     ServerKeyExchange(ServerKeyExchangePayload),
+     CertificateRequest(CertificateRequestPayload),
+     CertificateRequestTls13(CertificateRequestPayloadTls13),
+@@ -2230,7 +2272,7 @@ pub enum HandshakePayload<'a> {
+     EncryptedExtensions(Vec<ServerExtension>),
+     KeyUpdate(KeyUpdateRequest),
+     Finished(Payload<'a>),
+-    CertificateStatus(CertificateStatus),
++    CertificateStatus(CertificateStatus<'a>),
+     MessageHash(Payload<'a>),
+     Unknown(Payload<'a>),
+ }
+@@ -2270,7 +2312,7 @@ impl HandshakePayload<'_> {
+             ServerHello(x) => ServerHello(x),
+             HelloRetryRequest(x) => HelloRetryRequest(x),
+             Certificate(x) => Certificate(x.into_owned()),
+-            CertificateTls13(x) => CertificateTls13(x),
++            CertificateTls13(x) => CertificateTls13(x.into_owned()),
+             ServerKeyExchange(x) => ServerKeyExchange(x),
+             CertificateRequest(x) => CertificateRequest(x),
+             CertificateRequestTls13(x) => CertificateRequestTls13(x),
+@@ -2283,7 +2325,7 @@ impl HandshakePayload<'_> {
+             EncryptedExtensions(x) => EncryptedExtensions(x),
+             KeyUpdate(x) => KeyUpdate(x),
+             Finished(x) => Finished(x.into_owned()),
+-            CertificateStatus(x) => CertificateStatus(x),
++            CertificateStatus(x) => CertificateStatus(x.into_owned()),
+             MessageHash(x) => MessageHash(x.into_owned()),
+             Unknown(x) => Unknown(x.into_owned()),
+         }
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index b18f39da..87041af8 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -872,7 +872,7 @@ impl State<ServerConnectionData> for ExpectCertificate {
+             return Err(PeerMisbehaved::UnsolicitedCertExtension.into());
+         }
+ 
+-        let client_cert = certp.convert();
++        let client_cert = certp.into_certificate_chain();
+ 
+         let mandatory = self
+             .config
+@@ -916,7 +916,7 @@ impl State<ServerConnectionData> for ExpectCertificate {
+             suite: self.suite,
+             transcript: self.transcript,
+             key_schedule: self.key_schedule,
+-            client_cert,
++            client_cert: client_cert.into_owned(),
+             send_tickets: self.send_tickets,
+         }))
+     }

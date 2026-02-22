@@ -1,0 +1,767 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 5e1545f..c20978b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -51,7 +51,10 @@ use_std = ["std"]
+ # Enables all performance features.
+ perf = ["perf-cache", "perf-dfa", "perf-inline", "perf-literal"]
+ # Enables fast caching. (If disabled, caching is still used, but is slower.)
+-perf-cache = ["thread_local"]
++# Currently, this feature has no effect. It used to remove the thread_local
++# dependency and use a slower internal cache, but now the default cache has
++# been improved and thread_local is no longer a dependency at all.
++perf-cache = []
+ # Enables use of a lazy DFA when possible.
+ perf-dfa = []
+ # Enables aggressive use of inlining.
+@@ -110,11 +113,6 @@ optional = true
+ version = "2.2.1"
+ optional = true
+ 
+-# For managing regex caches quickly across multiple threads.
+-[dependencies.thread_local]
+-version = "1"
+-optional = true
+-
+ # For parsing regular expressions.
+ [dependencies.regex-syntax]
+ path = "regex-syntax"
+@@ -125,9 +123,9 @@ default-features = false
+ # For examples.
+ lazy_static = "1"
+ # For property based tests.
+-quickcheck = { version = "0.8", default-features = false }
++quickcheck = { version = "1.0.3", default-features = false }
+ # For generating random test data.
+-rand = "0.6.5"
++rand = { version = "0.8.3", default-features = false, features = ["getrandom", "small_rng"] }
+ # To check README's example
+ # TODO: Re-enable this once the MSRV is 1.43 or greater.
+ # See: https://github.com/rust-lang/regex/issues/684
+diff --git a/bench/src/rust_compile.rs b/bench/src/rust_compile.rs
+index 1f96948..f88e9b1 100644
+--- a/bench/src/rust_compile.rs
++++ b/bench/src/rust_compile.rs
+@@ -48,7 +48,7 @@ fn compile_small_full(b: &mut Bencher) {
+ #[bench]
+ fn compile_huge(b: &mut Bencher) {
+     b.iter(|| {
+-        let re = Parser::new().parse(r"\p{L}{100}").unwrap();
++        let re = Parser::new().parse(r"\p{L}{50}").unwrap();
+         Compiler::new().size_limit(1 << 30).compile(&[re]).unwrap()
+     });
+ }
+@@ -56,12 +56,12 @@ fn compile_huge(b: &mut Bencher) {
+ #[bench]
+ fn compile_huge_bytes(b: &mut Bencher) {
+     b.iter(|| {
+-        let re = Parser::new().parse(r"\p{L}{100}").unwrap();
++        let re = Parser::new().parse(r"\p{L}{50}").unwrap();
+         Compiler::new().size_limit(1 << 30).bytes(true).compile(&[re]).unwrap()
+     });
+ }
+ 
+ #[bench]
+ fn compile_huge_full(b: &mut Bencher) {
+-    b.iter(|| regex!(r"\p{L}{100}"));
++    b.iter(|| regex!(r"\p{L}{50}"));
+ }
+diff --git a/src/backtrack.rs b/src/backtrack.rs
+index 2eaeb72..6100c17 100644
+--- a/src/backtrack.rs
++++ b/src/backtrack.rs
+@@ -115,8 +115,8 @@ impl<'a, 'm, 'r, 's, I: Input> Bounded<'a, 'm, 'r, 's, I> {
+         // Then we reset all existing allocated space to 0.
+         // Finally, we request more space if we need it.
+         //
+-        // This is all a little circuitous, but doing this unsafely
+-        // doesn't seem to have a measurable impact on performance.
++        // This is all a little circuitous, but doing this using unchecked
++        // operations doesn't seem to have a measurable impact on performance.
+         // (Probably because backtracking is limited to such small
+         // inputs/regexes in the first place.)
+         let visited_len =
+diff --git a/src/cache.rs b/src/cache.rs
+deleted file mode 100644
+index dbb7e64..0000000
+--- a/src/cache.rs
++++ /dev/null
+@@ -1,100 +0,0 @@
+-// This module defines a common API for caching internal runtime state.
+-// The `thread_local` crate provides an extremely optimized version of this.
+-// However, if the perf-cache feature is disabled, then we drop the
+-// thread_local dependency and instead use a pretty naive caching mechanism
+-// with a mutex.
+-//
+-// Strictly speaking, the CachedGuard isn't necessary for the much more
+-// flexible thread_local API, but implementing thread_local's API doesn't
+-// seem possible in purely safe code.
+-
+-pub use self::imp::{Cached, CachedGuard};
+-
+-#[cfg(feature = "perf-cache")]
+-mod imp {
+-    use thread_local::CachedThreadLocal;
+-
+-    #[derive(Debug)]
+-    pub struct Cached<T: Send>(CachedThreadLocal<T>);
+-
+-    #[derive(Debug)]
+-    pub struct CachedGuard<'a, T: 'a>(&'a T);
+-
+-    impl<T: Send> Cached<T> {
+-        pub fn new() -> Cached<T> {
+-            Cached(CachedThreadLocal::new())
+-        }
+-
+-        pub fn get_or(&self, create: impl FnOnce() -> T) -> CachedGuard<T> {
+-            CachedGuard(self.0.get_or(|| create()))
+-        }
+-    }
+-
+-    impl<'a, T: Send> CachedGuard<'a, T> {
+-        pub fn value(&self) -> &T {
+-            self.0
+-        }
+-    }
+-}
+-
+-#[cfg(not(feature = "perf-cache"))]
+-mod imp {
+-    use std::marker::PhantomData;
+-    use std::panic::UnwindSafe;
+-    use std::sync::Mutex;
+-
+-    #[derive(Debug)]
+-    pub struct Cached<T: Send> {
+-        stack: Mutex<Vec<T>>,
+-        /// When perf-cache is enabled, the thread_local crate is used, and
+-        /// its CachedThreadLocal impls Send, Sync and UnwindSafe, but NOT
+-        /// RefUnwindSafe. However, a Mutex impls RefUnwindSafe. So in order
+-        /// to keep the APIs consistent regardless of whether perf-cache is
+-        /// enabled, we force this type to NOT impl RefUnwindSafe too.
+-        ///
+-        /// Ideally, we should always impl RefUnwindSafe, but it seems a little
+-        /// tricky to do that right now.
+-        ///
+-        /// See also: https://github.com/rust-lang/regex/issues/576
+-        _phantom: PhantomData<Box<dyn Send + Sync + UnwindSafe>>,
+-    }
+-
+-    #[derive(Debug)]
+-    pub struct CachedGuard<'a, T: 'a + Send> {
+-        cache: &'a Cached<T>,
+-        value: Option<T>,
+-    }
+-
+-    impl<T: Send> Cached<T> {
+-        pub fn new() -> Cached<T> {
+-            Cached { stack: Mutex::new(vec![]), _phantom: PhantomData }
+-        }
+-
+-        pub fn get_or(&self, create: impl FnOnce() -> T) -> CachedGuard<T> {
+-            let mut stack = self.stack.lock().unwrap();
+-            match stack.pop() {
+-                None => CachedGuard { cache: self, value: Some(create()) },
+-                Some(value) => CachedGuard { cache: self, value: Some(value) },
+-            }
+-        }
+-
+-        fn put(&self, value: T) {
+-            let mut stack = self.stack.lock().unwrap();
+-            stack.push(value);
+-        }
+-    }
+-
+-    impl<'a, T: Send> CachedGuard<'a, T> {
+-        pub fn value(&self) -> &T {
+-            self.value.as_ref().unwrap()
+-        }
+-    }
+-
+-    impl<'a, T: Send> Drop for CachedGuard<'a, T> {
+-        fn drop(&mut self) {
+-            if let Some(value) = self.value.take() {
+-                self.cache.put(value);
+-            }
+-        }
+-    }
+-}
+diff --git a/src/dfa.rs b/src/dfa.rs
+index 2a365ee..9ac0c2c 100644
+--- a/src/dfa.rs
++++ b/src/dfa.rs
+@@ -848,7 +848,7 @@ impl<'a> Fsm<'a> {
+     /// next_si transitions to the next state, where the transition input
+     /// corresponds to text[i].
+     ///
+-    /// This elides bounds checks, and is therefore unsafe.
++    /// This elides bounds checks, and is therefore not safe.
+     #[cfg_attr(feature = "perf-inline", inline(always))]
+     unsafe fn next_si(&self, si: StatePtr, text: &[u8], i: usize) -> StatePtr {
+         // What is the argument for safety here?
+@@ -1688,7 +1688,7 @@ impl Transitions {
+         self.num_byte_classes * mem::size_of::<StatePtr>()
+     }
+ 
+-    /// Like `next`, but uses unchecked access and is therefore unsafe.
++    /// Like `next`, but uses unchecked access and is therefore not safe.
+     unsafe fn next_unchecked(&self, si: StatePtr, cls: usize) -> StatePtr {
+         debug_assert!((si as usize) < self.table.len());
+         debug_assert!(cls < self.num_byte_classes);
+@@ -1895,12 +1895,22 @@ mod tests {
+         push_inst_ptr, read_vari32, read_varu32, write_vari32, write_varu32,
+         State, StateFlags,
+     };
+-    use quickcheck::{quickcheck, QuickCheck, StdGen};
++    use quickcheck::{quickcheck, Gen, QuickCheck};
+     use std::sync::Arc;
+ 
+     #[test]
+     fn prop_state_encode_decode() {
+-        fn p(ips: Vec<u32>, flags: u8) -> bool {
++        fn p(mut ips: Vec<u32>, flags: u8) -> bool {
++            // It looks like our encoding scheme can't handle instruction
++            // pointers at or above 2**31. We should fix that, but it seems
++            // unlikely to occur in real code due to the amount of memory
++            // required for such a state machine. So for now, we just clamp
++            // our test data.
++            for ip in &mut ips {
++                if *ip >= 1 << 31 {
++                    *ip = (1 << 31) - 1;
++                }
++            }
+             let mut data = vec![flags];
+             let mut prev = 0;
+             for &ip in ips.iter() {
+@@ -1914,7 +1924,7 @@ mod tests {
+             expected == got && state.flags() == StateFlags(flags)
+         }
+         QuickCheck::new()
+-            .gen(StdGen::new(self::rand::thread_rng(), 10_000))
++            .gen(Gen::new(10_000))
+             .quickcheck(p as fn(Vec<u32>, u8) -> bool);
+     }
+ 
+diff --git a/src/exec.rs b/src/exec.rs
+index e1aae87..3fd7cc4 100644
+--- a/src/exec.rs
++++ b/src/exec.rs
+@@ -1,5 +1,6 @@
+ use std::cell::RefCell;
+ use std::collections::HashMap;
++use std::panic::AssertUnwindSafe;
+ use std::sync::Arc;
+ 
+ #[cfg(feature = "perf-literal")]
+@@ -9,7 +10,6 @@ use syntax::hir::Hir;
+ use syntax::ParserBuilder;
+ 
+ use backtrack;
+-use cache::{Cached, CachedGuard};
+ use compile::Compiler;
+ #[cfg(feature = "perf-dfa")]
+ use dfa;
+@@ -17,6 +17,7 @@ use error::Error;
+ use input::{ByteInput, CharInput};
+ use literal::LiteralSearcher;
+ use pikevm;
++use pool::{Pool, PoolGuard};
+ use prog::Program;
+ use re_builder::RegexOptions;
+ use re_bytes;
+@@ -34,8 +35,8 @@ use utf8::next_utf8;
+ pub struct Exec {
+     /// All read only state.
+     ro: Arc<ExecReadOnly>,
+-    /// Caches for the various matching engines.
+-    cache: Cached<ProgramCache>,
++    /// A pool of reusable values for the various matching engines.
++    pool: Pool<ProgramCache>,
+ }
+ 
+ /// `ExecNoSync` is like `Exec`, except it embeds a reference to a cache. This
+@@ -46,7 +47,7 @@ pub struct ExecNoSync<'c> {
+     /// All read only state.
+     ro: &'c Arc<ExecReadOnly>,
+     /// Caches for the various matching engines.
+-    cache: CachedGuard<'c, ProgramCache>,
++    cache: PoolGuard<'c, ProgramCache>,
+ }
+ 
+ /// `ExecNoSyncStr` is like `ExecNoSync`, but matches on &str instead of &[u8].
+@@ -302,7 +303,8 @@ impl ExecBuilder {
+                 ac: None,
+                 match_type: MatchType::Nothing,
+             });
+-            return Ok(Exec { ro: ro, cache: Cached::new() });
++            let pool = ExecReadOnly::new_pool(&ro);
++            return Ok(Exec { ro: ro, pool });
+         }
+         let parsed = self.parse()?;
+         let mut nfa = Compiler::new()
+@@ -342,7 +344,8 @@ impl ExecBuilder {
+         ro.match_type = ro.choose_match_type(self.match_type);
+ 
+         let ro = Arc::new(ro);
+-        Ok(Exec { ro: ro, cache: Cached::new() })
++        let pool = ExecReadOnly::new_pool(&ro);
++        Ok(Exec { ro, pool })
+     }
+ 
+     #[cfg(feature = "perf-literal")]
+@@ -1254,10 +1257,9 @@ impl Exec {
+     /// Get a searcher that isn't Sync.
+     #[cfg_attr(feature = "perf-inline", inline(always))]
+     pub fn searcher(&self) -> ExecNoSync {
+-        let create = || RefCell::new(ProgramCacheInner::new(&self.ro));
+         ExecNoSync {
+             ro: &self.ro, // a clone is too expensive here! (and not needed)
+-            cache: self.cache.get_or(create),
++            cache: self.pool.get(),
+         }
+     }
+ 
+@@ -1309,7 +1311,8 @@ impl Exec {
+ 
+ impl Clone for Exec {
+     fn clone(&self) -> Exec {
+-        Exec { ro: self.ro.clone(), cache: Cached::new() }
++        let pool = ExecReadOnly::new_pool(&self.ro);
++        Exec { ro: self.ro.clone(), pool }
+     }
+ }
+ 
+@@ -1442,6 +1445,13 @@ impl ExecReadOnly {
+         let lcs_len = self.suffixes.lcs().char_len();
+         lcs_len >= 3 && lcs_len > self.dfa.prefixes.lcp().char_len()
+     }
++
++    fn new_pool(ro: &Arc<ExecReadOnly>) -> Pool<ProgramCache> {
++        let ro = ro.clone();
++        Pool::new(Box::new(move || {
++            AssertUnwindSafe(RefCell::new(ProgramCacheInner::new(&ro)))
++        }))
++    }
+ }
+ 
+ #[derive(Clone, Copy, Debug)]
+@@ -1500,7 +1510,11 @@ enum MatchNfaType {
+ 
+ /// `ProgramCache` maintains reusable allocations for each matching engine
+ /// available to a particular program.
+-pub type ProgramCache = RefCell<ProgramCacheInner>;
++///
++/// We declare this as unwind safe since it's a cache that's only used for
++/// performance purposes. If a panic occurs, it is (or should be) always safe
++/// to continue using the same regex object.
++pub type ProgramCache = AssertUnwindSafe<RefCell<ProgramCacheInner>>;
+ 
+ #[derive(Debug)]
+ pub struct ProgramCacheInner {
+diff --git a/src/expand.rs b/src/expand.rs
+index fd2ab03..70dbf91 100644
+--- a/src/expand.rs
++++ b/src/expand.rs
+@@ -144,7 +144,8 @@ fn find_cap_ref(replacement: &[u8]) -> Option<CaptureRef> {
+     }
+     // We just verified that the range 0..cap_end is valid ASCII, so it must
+     // therefore be valid UTF-8. If we really cared, we could avoid this UTF-8
+-    // check with either unsafe or by parsing the number straight from &[u8].
++    // check via an unchecked conversion or by parsing the number straight from
++    // &[u8].
+     let cap =
+         str::from_utf8(&rep[i..cap_end]).expect("valid UTF-8 capture name");
+     Some(CaptureRef {
+diff --git a/src/lib.rs b/src/lib.rs
+index c9fe74f..357ac0d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -523,11 +523,6 @@ All features below are enabled by default.
+   Enables all performance related features. This feature is enabled by default
+   and will always cover all features that improve performance, even if more
+   are added in the future.
+-* **perf-cache** -
+-  Enables the use of very fast thread safe caching for internal match state.
+-  When this is disabled, caching is still used, but with a slower and simpler
+-  implementation. Disabling this drops the `thread_local` and `lazy_static`
+-  dependencies.
+ * **perf-dfa** -
+   Enables the use of a lazy DFA for matching. The lazy DFA is used to compile
+   portions of a regex to a very fast DFA on an as-needed basis. This can
+@@ -542,6 +537,11 @@ All features below are enabled by default.
+   Enables the use of literal optimizations for speeding up matches. In some
+   cases, literal optimizations can result in speedups of _several_ orders of
+   magnitude. Disabling this drops the `aho-corasick` and `memchr` dependencies.
++* **perf-cache** -
++  This feature used to enable a faster internal cache at the cost of using
++  additional dependencies, but this is no longer an option. A fast internal
++  cache is now used unconditionally with no additional dependencies. This may
++  change in the future.
+ 
+ ### Unicode features
+ 
+@@ -631,8 +631,6 @@ extern crate memchr;
+ #[cfg_attr(feature = "perf-literal", macro_use)]
+ extern crate quickcheck;
+ extern crate regex_syntax as syntax;
+-#[cfg(feature = "perf-cache")]
+-extern crate thread_local;
+ 
+ // #[cfg(doctest)]
+ // doc_comment::doctest!("../README.md");
+@@ -749,7 +747,6 @@ pub mod bytes {
+ }
+ 
+ mod backtrack;
+-mod cache;
+ mod compile;
+ #[cfg(feature = "perf-dfa")]
+ mod dfa;
+@@ -764,6 +761,7 @@ mod literal;
+ #[cfg(feature = "pattern")]
+ mod pattern;
+ mod pikevm;
++mod pool;
+ mod prog;
+ mod re_builder;
+ mod re_bytes;
+diff --git a/src/pool.rs b/src/pool.rs
+new file mode 100644
+index 0000000..a506ee9
+--- /dev/null
++++ b/src/pool.rs
+@@ -0,0 +1,333 @@
++// This module provides a relatively simple thread-safe pool of reusable
++// objects. For the most part, it's implemented by a stack represented by a
++// Mutex<Vec<T>>. It has one small trick: because unlocking a mutex is somewhat
++// costly, in the case where a pool is accessed by the first thread that tried
++// to get a value, we bypass the mutex. Here are some benchmarks showing the
++// difference.
++//
++// 1) misc::anchored_literal_long_non_match    21 (18571 MB/s)
++// 2) misc::anchored_literal_long_non_match   107 (3644 MB/s)
++// 3) misc::anchored_literal_long_non_match    45 (8666 MB/s)
++// 4) misc::anchored_literal_long_non_match    19 (20526 MB/s)
++//
++// (1) represents our baseline: the master branch at the time of writing when
++// using the 'thread_local' crate to implement the pool below.
++//
++// (2) represents a naive pool implemented completely via Mutex<Vec<T>>. There
++// is no special trick for bypassing the mutex.
++//
++// (3) is the same as (2), except it uses Mutex<Vec<Box<T>>>. It is twice as
++// fast because a Box<T> is much smaller than the T we use with a Pool in this
++// crate. So pushing and popping a Box<T> from a Vec is quite a bit faster
++// than for T.
++//
++// (4) is the same as (3), but with the trick for bypassing the mutex in the
++// case of the first-to-get thread.
++//
++// Why move off of thread_local? Even though (4) is a hair faster than (1)
++// above, this was not the main goal. The main goal was to move off of
++// thread_local and find a way to *simply* re-capture some of its speed for
++// regex's specific case. So again, why move off of it? The *primary* reason is
++// because of memory leaks. See https://github.com/rust-lang/regex/issues/362
++// for example. (Why do I want it to be simple? Well, I suppose what I mean is,
++// "use as much safe code as possible to minimize risk and be as sure as I can
++// be that it is correct.")
++//
++// My guess is that the thread_local design is probably not appropriate for
++// regex since its memory usage scales to the number of active threads that
++// have used a regex, where as the pool below scales to the number of threads
++// that simultaneously use a regex. While neither case permits contraction,
++// since we own the pool data structure below, we can add contraction if a
++// clear use case pops up in the wild. More pressingly though, it seems that
++// there are at least some use case patterns where one might have many threads
++// sitting around that might have used a regex at one point. While thread_local
++// does try to reuse space previously used by a thread that has since stopped,
++// its maximal memory usage still scales with the total number of active
++// threads. In contrast, the pool below scales with the total number of threads
++// *simultaneously* using the pool. The hope is that this uses less memory
++// overall. And if it doesn't, we can hopefully tune it somehow.
++//
++// It seems that these sort of conditions happen frequently
++// in FFI inside of other more "managed" languages. This was
++// mentioned in the issue linked above, and also mentioned here:
++// https://github.com/BurntSushi/rure-go/issues/3. And in particular, users
++// confirm that disabling the use of thread_local resolves the leak.
++//
++// There were other weaker reasons for moving off of thread_local as well.
++// Namely, at the time, I was looking to reduce dependencies. And for something
++// like regex, maintenance can be simpler when we own the full dependency tree.
++
++use std::panic::{RefUnwindSafe, UnwindSafe};
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::Mutex;
++
++/// An atomic counter used to allocate thread IDs.
++static COUNTER: AtomicUsize = AtomicUsize::new(1);
++
++thread_local!(
++    /// A thread local used to assign an ID to a thread.
++    static THREAD_ID: usize = {
++        let next = COUNTER.fetch_add(1, Ordering::Relaxed);
++        // SAFETY: We cannot permit the reuse of thread IDs since reusing a
++        // thread ID might result in more than one thread "owning" a pool,
++        // and thus, permit accessing a mutable value from multiple threads
++        // simultaneously without synchronization. The intent of this panic is
++        // to be a sanity check. It is not expected that the thread ID space
++        // will actually be exhausted in practice.
++        //
++        // This checks that the counter never wraps around, since atomic
++        // addition wraps around on overflow.
++        if next == 0 {
++            panic!("regex: thread ID allocation space exhausted");
++        }
++        next
++    };
++);
++
++/// The type of the function used to create values in a pool when the pool is
++/// empty and the caller requests one.
++type CreateFn<T> =
++    Box<dyn Fn() -> T + Send + Sync + UnwindSafe + RefUnwindSafe + 'static>;
++
++/// A simple thread safe pool for reusing values.
++///
++/// Getting a value out comes with a guard. When that guard is dropped, the
++/// value is automatically put back in the pool.
++///
++/// A Pool<T> impls Sync when T is Send (even if it's not Sync). This means
++/// that T can use interior mutability. This is possible because a pool is
++/// guaranteed to provide a value to exactly one thread at any time.
++///
++/// Currently, a pool never contracts in size. Its size is proportional to the
++/// number of simultaneous uses.
++pub struct Pool<T> {
++    /// A stack of T values to hand out. These are used when a Pool is
++    /// accessed by a thread that didn't create it.
++    stack: Mutex<Vec<Box<T>>>,
++    /// A function to create more T values when stack is empty and a caller
++    /// has requested a T.
++    create: CreateFn<T>,
++    /// The ID of the thread that owns this pool. The owner is the thread
++    /// that makes the first call to 'get'. When the owner calls 'get', it
++    /// gets 'owner_val' directly instead of returning a T from 'stack'.
++    /// See comments elsewhere for details, but this is intended to be an
++    /// optimization for the common case that makes getting a T faster.
++    ///
++    /// It is initialized to a value of zero (an impossible thread ID) as a
++    /// sentinel to indicate that it is unowned.
++    owner: AtomicUsize,
++    /// A value to return when the caller is in the same thread that created
++    /// the Pool.
++    owner_val: T,
++}
++
++// SAFETY: Since we want to use a Pool from multiple threads simultaneously
++// behind an Arc, we need for it to be Sync. In cases where T is sync, Pool<T>
++// would be Sync. However, since we use a Pool to store mutable scratch space,
++// we wind up using a T that has interior mutability and is thus itself not
++// Sync. So what we *really* want is for our Pool<T> to by Sync even when T is
++// not Sync (but is at least Send).
++//
++// The only non-sync aspect of a Pool is its 'owner_val' field, which is used
++// to implement faster access to a pool value in the common case of a pool
++// being accessed in the same thread in which it was created. The 'stack' field
++// is also shared, but a Mutex<T> where T: Send is already Sync. So we only
++// need to worry about 'owner_val'.
++//
++// The key is to guarantee that 'owner_val' can only ever be accessed from one
++// thread. In our implementation below, we guarantee this by only returning the
++// 'owner_val' when the ID of the current thread matches the ID of the thread
++// that created the Pool. Since this can only ever be one thread, it follows
++// that only one thread can access 'owner_val' at any point in time. Thus, it
++// is safe to declare that Pool<T> is Sync when T is Send.
++//
++// NOTE: It would also be possible to make the owning thread be the *first*
++// thread that tries to get a value out of a Pool. However, the current
++// implementation is a little simpler and it's not clear if making the first
++// thread (rather than the creating thread) is meaningfully better.
++//
++// If there is a way to achieve our performance goals using safe code, then
++// I would very much welcome a patch. As it stands, the implementation below
++// tries to balance safety with performance. The case where a Regex is used
++// from multiple threads simultaneously will suffer a bit since getting a cache
++// will require unlocking a mutex.
++unsafe impl<T: Send> Sync for Pool<T> {}
++
++impl<T: ::std::fmt::Debug> ::std::fmt::Debug for Pool<T> {
++    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
++        f.debug_struct("Pool")
++            .field("stack", &self.stack)
++            .field("owner", &self.owner)
++            .field("owner_val", &self.owner_val)
++            .finish()
++    }
++}
++
++/// A guard that is returned when a caller requests a value from the pool.
++///
++/// The purpose of the guard is to use RAII to automatically put the value back
++/// in the pool once it's dropped.
++#[derive(Debug)]
++pub struct PoolGuard<'a, T: 'a + Send> {
++    /// The pool that this guard is attached to.
++    pool: &'a Pool<T>,
++    /// This is None when the guard represents the special "owned" value. In
++    /// which case, the value is retrieved from 'pool.owner_val'.
++    value: Option<Box<T>>,
++}
++
++impl<T: Send> Pool<T> {
++    /// Create a new pool. The given closure is used to create values in the
++    /// pool when necessary.
++    pub fn new(create: CreateFn<T>) -> Pool<T> {
++        let owner = AtomicUsize::new(0);
++        let owner_val = create();
++        Pool { stack: Mutex::new(vec![]), create, owner, owner_val }
++    }
++
++    /// Get a value from the pool. The caller is guaranteed to have exclusive
++    /// access to the given value.
++    ///
++    /// Note that there is no guarantee provided about which value in the
++    /// pool is returned. That is, calling get, dropping the guard (causing
++    /// the value to go back into the pool) and then calling get again is NOT
++    /// guaranteed to return the same value received in the first get call.
++    #[cfg_attr(feature = "perf-inline", inline(always))]
++    pub fn get(&self) -> PoolGuard<T> {
++        // Our fast path checks if the caller is the thread that "owns" this
++        // pool. Or stated differently, whether it is the first thread that
++        // tried to extract a value from the pool. If it is, then we can return
++        // a T to the caller without going through a mutex.
++        //
++        // SAFETY: We must guarantee that only one thread gets access to this
++        // value. Since a thread is uniquely identified by the THREAD_ID thread
++        // local, it follows that is the caller's thread ID is equal to the
++        // owner, then only one thread may receive this value.
++        let caller = THREAD_ID.with(|id| *id);
++        let owner = self.owner.load(Ordering::Relaxed);
++        if caller == owner {
++            return self.guard_owned();
++        }
++        self.get_slow(caller, owner)
++    }
++
++    /// This is the "slow" version that goes through a mutex to pop an
++    /// allocated value off a stack to return to the caller. (Or, if the stack
++    /// is empty, a new value is created.)
++    ///
++    /// If the pool has no owner, then this will set the owner.
++    #[cold]
++    fn get_slow(&self, caller: usize, owner: usize) -> PoolGuard<T> {
++        use std::sync::atomic::Ordering::Relaxed;
++
++        if owner == 0 {
++            // The sentinel 0 value means this pool is not yet owned. We
++            // try to atomically set the owner. If we do, then this thread
++            // becomes the owner and we can return a guard that represents
++            // the special T for the owner.
++            let res = self.owner.compare_exchange(0, caller, Relaxed, Relaxed);
++            if res.is_ok() {
++                return self.guard_owned();
++            }
++        }
++        let mut stack = self.stack.lock().unwrap();
++        let value = match stack.pop() {
++            None => Box::new((self.create)()),
++            Some(value) => value,
++        };
++        self.guard_stack(value)
++    }
++
++    /// Puts a value back into the pool. Callers don't need to call this. Once
++    /// the guard that's returned by 'get' is dropped, it is put back into the
++    /// pool automatically.
++    fn put(&self, value: Box<T>) {
++        let mut stack = self.stack.lock().unwrap();
++        stack.push(value);
++    }
++
++    /// Create a guard that represents the special owned T.
++    fn guard_owned(&self) -> PoolGuard<'_, T> {
++        PoolGuard { pool: self, value: None }
++    }
++
++    /// Create a guard that contains a value from the pool's stack.
++    fn guard_stack(&self, value: Box<T>) -> PoolGuard<'_, T> {
++        PoolGuard { pool: self, value: Some(value) }
++    }
++}
++
++impl<'a, T: Send> PoolGuard<'a, T> {
++    /// Return the underlying value.
++    pub fn value(&self) -> &T {
++        match self.value {
++            None => &self.pool.owner_val,
++            Some(ref v) => &**v,
++        }
++    }
++}
++
++impl<'a, T: Send> Drop for PoolGuard<'a, T> {
++    #[cfg_attr(feature = "perf-inline", inline(always))]
++    fn drop(&mut self) {
++        if let Some(value) = self.value.take() {
++            self.pool.put(value);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use std::panic::{RefUnwindSafe, UnwindSafe};
++
++    use super::*;
++
++    #[test]
++    fn oibits() {
++        use exec::ProgramCache;
++
++        fn has_oibits<T: Send + Sync + UnwindSafe + RefUnwindSafe>() {}
++        has_oibits::<Pool<ProgramCache>>();
++    }
++
++    // Tests that Pool implements the "single owner" optimization. That is, the
++    // thread that first accesses the pool gets its own copy, while all other
++    // threads get distinct copies.
++    #[test]
++    fn thread_owner_optimization() {
++        use std::cell::RefCell;
++        use std::sync::Arc;
++
++        let pool: Arc<Pool<RefCell<Vec<char>>>> =
++            Arc::new(Pool::new(Box::new(|| RefCell::new(vec!['a']))));
++        pool.get().value().borrow_mut().push('x');
++
++        let pool1 = pool.clone();
++        let t1 = std::thread::spawn(move || {
++            let guard = pool1.get();
++            let v = guard.value();
++            v.borrow_mut().push('y');
++        });
++
++        let pool2 = pool.clone();
++        let t2 = std::thread::spawn(move || {
++            let guard = pool2.get();
++            let v = guard.value();
++            v.borrow_mut().push('z');
++        });
++
++        t1.join().unwrap();
++        t2.join().unwrap();
++
++        // If we didn't implement the single owner optimization, then one of
++        // the threads above is likely to have mutated the [a, x] vec that
++        // we stuffed in the pool before spawning the threads. But since
++        // neither thread was first to access the pool, and because of the
++        // optimization, we should be guaranteed that neither thread mutates
++        // the special owned pool value.
++        //
++        // (Technically this is an implementation detail and not a contract of
++        // Pool's API.)
++        assert_eq!(vec!['a', 'x'], *pool.get().value().borrow());
++    }
++}

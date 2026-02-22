@@ -1,0 +1,553 @@
+diff --git a/crates/toml_edit/src/encode.rs b/crates/toml_edit/src/encode.rs
+index 30b153ac..1339d1c4 100644
+--- a/crates/toml_edit/src/encode.rs
++++ b/crates/toml_edit/src/encode.rs
+@@ -13,7 +13,15 @@ use crate::value::{
+ };
+ use crate::{Array, InlineTable, Item, Table, Value};
+ 
+-pub(crate) fn encode_key(this: &Key, buf: &mut dyn Write, input: Option<&str>) -> Result {
++pub(crate) fn encode_key(
++    this: &Key,
++    buf: &mut dyn Write,
++    input: Option<&str>,
++    default_decor: (&str, &str),
++) -> Result {
++    let decor = this.decor();
++    decor.prefix_encode(buf, input, default_decor.0)?;
++
+     if let Some(input) = input {
+         let repr = this
+             .as_repr()
+@@ -25,6 +33,7 @@ pub(crate) fn encode_key(this: &Key, buf: &mut dyn Write, input: Option<&str>) -
+         write!(buf, "{}", repr)?;
+     };
+ 
++    decor.suffix_encode(buf, input, default_decor.1)?;
+     Ok(())
+ }
+ 
+@@ -34,27 +43,25 @@ fn encode_key_path(
+     input: Option<&str>,
+     default_decor: (&str, &str),
+ ) -> Result {
+-    let leaf_decor = this.last().expect("always at least one key").leaf_decor();
+     for (i, key) in this.iter().enumerate() {
+-        let dotted_decor = key.dotted_decor();
+-
+         let first = i == 0;
+         let last = i + 1 == this.len();
+ 
+-        if first {
+-            leaf_decor.prefix_encode(buf, input, default_decor.0)?;
++        let prefix = if first {
++            default_decor.0
+         } else {
+-            write!(buf, ".")?;
+-            dotted_decor.prefix_encode(buf, input, DEFAULT_KEY_PATH_DECOR.0)?;
+-        }
+-
+-        encode_key(key, buf, input)?;
+-
+-        if last {
+-            leaf_decor.suffix_encode(buf, input, default_decor.1)?;
++            DEFAULT_KEY_PATH_DECOR.0
++        };
++        let suffix = if last {
++            default_decor.1
+         } else {
+-            dotted_decor.suffix_encode(buf, input, DEFAULT_KEY_PATH_DECOR.1)?;
++            DEFAULT_KEY_PATH_DECOR.1
++        };
++
++        if !first {
++            write!(buf, ".")?;
+         }
++        encode_key(key, buf, input, (prefix, suffix))?;
+     }
+     Ok(())
+ }
+@@ -65,27 +72,25 @@ pub(crate) fn encode_key_path_ref(
+     input: Option<&str>,
+     default_decor: (&str, &str),
+ ) -> Result {
+-    let leaf_decor = this.last().expect("always at least one key").leaf_decor();
+     for (i, key) in this.iter().enumerate() {
+-        let dotted_decor = key.dotted_decor();
+-
+         let first = i == 0;
+         let last = i + 1 == this.len();
+ 
+-        if first {
+-            leaf_decor.prefix_encode(buf, input, default_decor.0)?;
++        let prefix = if first {
++            default_decor.0
+         } else {
+-            write!(buf, ".")?;
+-            dotted_decor.prefix_encode(buf, input, DEFAULT_KEY_PATH_DECOR.0)?;
+-        }
+-
+-        encode_key(key, buf, input)?;
+-
+-        if last {
+-            leaf_decor.suffix_encode(buf, input, default_decor.1)?;
++            DEFAULT_KEY_PATH_DECOR.0
++        };
++        let suffix = if last {
++            default_decor.1
+         } else {
+-            dotted_decor.suffix_encode(buf, input, DEFAULT_KEY_PATH_DECOR.1)?;
++            DEFAULT_KEY_PATH_DECOR.1
++        };
++
++        if !first {
++            write!(buf, ".")?;
+         }
++        encode_key(key, buf, input, (prefix, suffix))?;
+     }
+     Ok(())
+ }
+@@ -242,7 +247,11 @@ where
+     for kv in table.items.values() {
+         match kv.value {
+             Item::Table(ref t) => {
+-                let key = kv.key.clone();
++                let mut key = kv.key.clone();
++                if t.is_dotted() {
++                    // May have newlines and generally isn't written for standard tables
++                    key.decor_mut().clear();
++                }
+                 path.push(key);
+                 visit_nested_tables(t, path, false, callback)?;
+                 path.pop();
+diff --git a/crates/toml_edit/src/inline_table.rs b/crates/toml_edit/src/inline_table.rs
+index f1b28b09..ba1161c4 100644
+--- a/crates/toml_edit/src/inline_table.rs
++++ b/crates/toml_edit/src/inline_table.rs
+@@ -185,23 +185,14 @@ impl InlineTable {
+         &self.decor
+     }
+ 
+-    /// Returns an accessor to a key's formatting
+-    pub fn key_mut(&mut self, key: &str) -> Option<KeyMut<'_>> {
+-        self.items.get_mut(key).map(|kv| kv.key.as_mut())
+-    }
+-
+     /// Returns the decor associated with a given key of the table.
+-    #[deprecated(since = "0.21.1", note = "Replaced with `key_mut`")]
+     pub fn key_decor_mut(&mut self, key: &str) -> Option<&mut Decor> {
+-        #![allow(deprecated)]
+-        self.items.get_mut(key).map(|kv| kv.key.leaf_decor_mut())
++        self.items.get_mut(key).map(|kv| &mut kv.key.decor)
+     }
+ 
+     /// Returns the decor associated with a given key of the table.
+-    #[deprecated(since = "0.21.1", note = "Replaced with `key_mut`")]
+     pub fn key_decor(&self, key: &str) -> Option<&Decor> {
+-        #![allow(deprecated)]
+-        self.items.get(key).map(|kv| kv.key.leaf_decor())
++        self.items.get(key).map(|kv| &kv.key.decor)
+     }
+ 
+     /// Set whitespace after before element
+@@ -478,14 +469,13 @@ impl<'s> IntoIterator for &'s InlineTable {
+ }
+ 
+ fn decorate_inline_table(table: &mut InlineTable) {
+-    for (mut key, value) in table
++    for (key_decor, value) in table
+         .items
+         .iter_mut()
+         .filter(|(_, kv)| kv.value.is_value())
+-        .map(|(_, kv)| (kv.key.as_mut(), kv.value.as_value_mut().unwrap()))
++        .map(|(_, kv)| (&mut kv.key.decor, kv.value.as_value_mut().unwrap()))
+     {
+-        key.leaf_decor_mut().clear();
+-        key.dotted_decor_mut().clear();
++        key_decor.clear();
+         value.decor_mut().clear();
+     }
+ }
+@@ -573,15 +563,10 @@ impl TableLike for InlineTable {
+         self.is_dotted()
+     }
+ 
+-    fn key_mut(&mut self, key: &str) -> Option<KeyMut<'_>> {
+-        self.key_mut(key)
+-    }
+     fn key_decor_mut(&mut self, key: &str) -> Option<&mut Decor> {
+-        #![allow(deprecated)]
+         self.key_decor_mut(key)
+     }
+     fn key_decor(&self, key: &str) -> Option<&Decor> {
+-        #![allow(deprecated)]
+         self.key_decor(key)
+     }
+ }
+diff --git a/crates/toml_edit/src/key.rs b/crates/toml_edit/src/key.rs
+index 2f4c30ae..27132edc 100644
+--- a/crates/toml_edit/src/key.rs
++++ b/crates/toml_edit/src/key.rs
+@@ -30,8 +30,7 @@ use crate::InternalString;
+ pub struct Key {
+     key: InternalString,
+     pub(crate) repr: Option<Repr>,
+-    pub(crate) leaf_decor: Decor,
+-    pub(crate) dotted_decor: Decor,
++    pub(crate) decor: Decor,
+ }
+ 
+ impl Key {
+@@ -40,8 +39,7 @@ impl Key {
+         Self {
+             key: key.into(),
+             repr: None,
+-            leaf_decor: Default::default(),
+-            dotted_decor: Default::default(),
++            decor: Default::default(),
+         }
+     }
+ 
+@@ -59,20 +57,8 @@ impl Key {
+     }
+ 
+     /// While creating the `Key`, add `Decor` to it
+-    #[deprecated(since = "0.21.1", note = "Replaced with `with_leaf_decor`")]
+-    pub fn with_decor(self, decor: Decor) -> Self {
+-        self.with_leaf_decor(decor)
+-    }
+-
+-    /// While creating the `Key`, add `Decor` to it for the line entry
+-    pub fn with_leaf_decor(mut self, decor: Decor) -> Self {
+-        self.leaf_decor = decor;
+-        self
+-    }
+-
+-    /// While creating the `Key`, add `Decor` to it for between dots
+-    pub fn with_dotted_decor(mut self, decor: Decor) -> Self {
+-        self.dotted_decor = decor;
++    pub fn with_decor(mut self, decor: Decor) -> Self {
++        self.decor = decor;
+         self
+     }
+ 
+@@ -113,35 +99,13 @@ impl Key {
+     }
+ 
+     /// Returns the surrounding whitespace
+-    #[deprecated(since = "0.21.1", note = "Replaced with `decor_mut`")]
+     pub fn decor_mut(&mut self) -> &mut Decor {
+-        self.leaf_decor_mut()
+-    }
+-
+-    /// Returns the surrounding whitespace for the line entry
+-    pub fn leaf_decor_mut(&mut self) -> &mut Decor {
+-        &mut self.leaf_decor
+-    }
+-
+-    /// Returns the surrounding whitespace for between dots
+-    pub fn dotted_decor_mut(&mut self) -> &mut Decor {
+-        &mut self.dotted_decor
++        &mut self.decor
+     }
+ 
+     /// Returns the surrounding whitespace
+-    #[deprecated(since = "0.21.1", note = "Replaced with `decor`")]
+     pub fn decor(&self) -> &Decor {
+-        self.leaf_decor()
+-    }
+-
+-    /// Returns the surrounding whitespace for the line entry
+-    pub fn leaf_decor(&self) -> &Decor {
+-        &self.leaf_decor
+-    }
+-
+-    /// Returns the surrounding whitespace for between dots
+-    pub fn dotted_decor(&self) -> &Decor {
+-        &self.dotted_decor
++        &self.decor
+     }
+ 
+     /// Returns the location within the original document
+@@ -151,8 +115,7 @@ impl Key {
+     }
+ 
+     pub(crate) fn despan(&mut self, input: &str) {
+-        self.leaf_decor.despan(input);
+-        self.dotted_decor.despan(input);
++        self.decor.despan(input);
+         if let Some(repr) = &mut self.repr {
+             repr.despan(input)
+         }
+@@ -161,8 +124,7 @@ impl Key {
+     /// Auto formats the key.
+     pub fn fmt(&mut self) {
+         self.repr = None;
+-        self.leaf_decor.clear();
+-        self.dotted_decor.clear();
++        self.decor.clear();
+     }
+ 
+     #[cfg(feature = "parse")]
+@@ -188,8 +150,7 @@ impl Clone for Key {
+         Self {
+             key: self.key.clone(),
+             repr: self.repr.clone(),
+-            leaf_decor: self.leaf_decor.clone(),
+-            dotted_decor: self.dotted_decor.clone(),
++            decor: self.decor.clone(),
+         }
+     }
+ }
+@@ -253,7 +214,7 @@ impl PartialEq<String> for Key {
+ #[cfg(feature = "display")]
+ impl std::fmt::Display for Key {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        crate::encode::encode_key(self, f, None)
++        crate::encode::encode_key(self, f, None, ("", ""))
+     }
+ }
+ 
+@@ -330,7 +291,7 @@ impl From<Key> for InternalString {
+     }
+ }
+ 
+-/// A mutable reference to a `Key`'s formatting
++/// A mutable reference to a `Key`
+ #[derive(Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
+ pub struct KeyMut<'k> {
+     key: &'k mut Key,
+@@ -360,39 +321,15 @@ impl<'k> KeyMut<'k> {
+     }
+ 
+     /// Returns the surrounding whitespace
+-    #[deprecated(since = "0.21.1", note = "Replaced with `decor_mut`")]
+     pub fn decor_mut(&mut self) -> &mut Decor {
+-        #![allow(deprecated)]
+         self.key.decor_mut()
+     }
+ 
+-    /// Returns the surrounding whitespace for the line entry
+-    pub fn leaf_decor_mut(&mut self) -> &mut Decor {
+-        self.key.leaf_decor_mut()
+-    }
+-
+-    /// Returns the surrounding whitespace for between dots
+-    pub fn dotted_decor_mut(&mut self) -> &mut Decor {
+-        self.key.dotted_decor_mut()
+-    }
+-
+     /// Returns the surrounding whitespace
+-    #[deprecated(since = "0.21.1", note = "Replaced with `decor`")]
+     pub fn decor(&self) -> &Decor {
+-        #![allow(deprecated)]
+         self.key.decor()
+     }
+ 
+-    /// Returns the surrounding whitespace for the line entry
+-    pub fn leaf_decor(&self) -> &Decor {
+-        self.key.leaf_decor()
+-    }
+-
+-    /// Returns the surrounding whitespace for between dots
+-    pub fn dotted_decor(&self) -> &Decor {
+-        self.key.dotted_decor()
+-    }
+-
+     /// Auto formats the key.
+     pub fn fmt(&mut self) {
+         self.key.fmt()
+diff --git a/crates/toml_edit/src/parser/key.rs b/crates/toml_edit/src/parser/key.rs
+index e72b1957..71b75630 100644
+--- a/crates/toml_edit/src/parser/key.rs
++++ b/crates/toml_edit/src/parser/key.rs
+@@ -18,13 +18,13 @@ use crate::RawString;
+ // key = simple-key / dotted-key
+ // dotted-key = simple-key 1*( dot-sep simple-key )
+ pub(crate) fn key(input: &mut Input<'_>) -> PResult<Vec<Key>> {
+-    let mut key_path = trace(
++    trace(
+         "dotted-key",
+         separated1(
+             (ws.span(), simple_key, ws.span()).map(|(pre, (raw, key), suffix)| {
+                 Key::new(key)
+                     .with_repr_unchecked(Repr::new_unchecked(raw))
+-                    .with_dotted_decor(Decor::new(
++                    .with_decor(Decor::new(
+                         RawString::with_span(pre),
+                         RawString::with_span(suffix),
+                     ))
+@@ -38,31 +38,7 @@ pub(crate) fn key(input: &mut Input<'_>) -> PResult<Vec<Key>> {
+             Ok::<_, CustomError>(k)
+         }),
+     )
+-    .parse_next(input)?;
+-
+-    let mut leaf_decor = Decor::new("", "");
+-    {
+-        let first_dotted_decor = key_path
+-            .first_mut()
+-            .expect("always at least one key")
+-            .dotted_decor_mut();
+-        if let Some(prefix) = first_dotted_decor.prefix().cloned() {
+-            leaf_decor.set_prefix(prefix);
+-            first_dotted_decor.set_prefix("");
+-        }
+-    }
+-    let last_key = &mut key_path.last_mut().expect("always at least one key");
+-    {
+-        let last_dotted_decor = last_key.dotted_decor_mut();
+-        if let Some(suffix) = last_dotted_decor.suffix().cloned() {
+-            leaf_decor.set_suffix(suffix);
+-            last_dotted_decor.set_suffix("");
+-        }
+-    }
+-
+-    *last_key.leaf_decor_mut() = leaf_decor;
+-
+-    Ok(key_path)
++    .parse_next(input)
+ }
+ 
+ // simple-key = quoted-key / unquoted-key
+diff --git a/crates/toml_edit/src/parser/state.rs b/crates/toml_edit/src/parser/state.rs
+index 187dd5f5..8388c884 100644
+--- a/crates/toml_edit/src/parser/state.rs
++++ b/crates/toml_edit/src/parser/state.rs
+@@ -39,21 +39,26 @@ impl ParseState {
+ 
+     pub(crate) fn on_keyval(
+         &mut self,
+-        path: Vec<Key>,
++        mut path: Vec<Key>,
+         mut kv: TableKeyValue,
+     ) -> Result<(), CustomError> {
+         {
+             let mut prefix = self.trailing.take();
++            let first_key = if path.is_empty() {
++                &mut kv.key
++            } else {
++                &mut path[0]
++            };
+             let prefix = match (
+                 prefix.take(),
+-                kv.key.leaf_decor.prefix().and_then(|d| d.span()),
++                first_key.decor.prefix().and_then(|d| d.span()),
+             ) {
+                 (Some(p), Some(k)) => Some(p.start..k.end),
+                 (Some(p), None) | (None, Some(p)) => Some(p),
+                 (None, None) => None,
+             };
+-            kv.key
+-                .leaf_decor
++            first_key
++                .decor
+                 .set_prefix(prefix.map(RawString::with_span).unwrap_or_default());
+         }
+ 
+diff --git a/crates/toml_edit/src/table.rs b/crates/toml_edit/src/table.rs
+index e2792f51..3a0d48c1 100644
+--- a/crates/toml_edit/src/table.rs
++++ b/crates/toml_edit/src/table.rs
+@@ -218,23 +218,14 @@ impl Table {
+         &self.decor
+     }
+ 
+-    /// Returns an accessor to a key's formatting
+-    pub fn key_mut(&mut self, key: &str) -> Option<KeyMut<'_>> {
+-        self.items.get_mut(key).map(|kv| kv.key.as_mut())
+-    }
+-
+     /// Returns the decor associated with a given key of the table.
+-    #[deprecated(since = "0.21.1", note = "Replaced with `key_mut`")]
+     pub fn key_decor_mut(&mut self, key: &str) -> Option<&mut Decor> {
+-        #![allow(deprecated)]
+-        self.items.get_mut(key).map(|kv| kv.key.leaf_decor_mut())
++        self.items.get_mut(key).map(|kv| &mut kv.key.decor)
+     }
+ 
+     /// Returns the decor associated with a given key of the table.
+-    #[deprecated(since = "0.21.1", note = "Replaced with `key_mut`")]
+     pub fn key_decor(&self, key: &str) -> Option<&Decor> {
+-        #![allow(deprecated)]
+-        self.items.get(key).map(|kv| kv.key.leaf_decor())
++        self.items.get(key).map(|kv| &kv.key.decor)
+     }
+ 
+     /// Returns the location within the original document
+@@ -484,14 +475,13 @@ impl<'s> IntoIterator for &'s Table {
+ pub(crate) type KeyValuePairs = IndexMap<InternalString, TableKeyValue>;
+ 
+ fn decorate_table(table: &mut Table) {
+-    for (mut key, value) in table
++    for (key_decor, value) in table
+         .items
+         .iter_mut()
+         .filter(|(_, kv)| kv.value.is_value())
+-        .map(|(_, kv)| (kv.key.as_mut(), kv.value.as_value_mut().unwrap()))
++        .map(|(_, kv)| (&mut kv.key.decor, kv.value.as_value_mut().unwrap()))
+     {
+-        key.leaf_decor_mut().clear();
+-        key.dotted_decor_mut().clear();
++        key_decor.clear();
+         value.decor_mut().clear();
+     }
+ }
+@@ -571,13 +561,9 @@ pub trait TableLike: crate::private::Sealed {
+     /// Check if this is a wrapper for dotted keys, rather than a standard table
+     fn is_dotted(&self) -> bool;
+ 
+-    /// Returns an accessor to a key's formatting
+-    fn key_mut(&mut self, key: &str) -> Option<KeyMut<'_>>;
+     /// Returns the decor associated with a given key of the table.
+-    #[deprecated(since = "0.21.1", note = "Replaced with `key_mut`")]
+     fn key_decor_mut(&mut self, key: &str) -> Option<&mut Decor>;
+     /// Returns the decor associated with a given key of the table.
+-    #[deprecated(since = "0.21.1", note = "Replaced with `key_mut`")]
+     fn key_decor(&self, key: &str) -> Option<&Decor>;
+ }
+ 
+@@ -635,15 +621,10 @@ impl TableLike for Table {
+         self.set_dotted(yes)
+     }
+ 
+-    fn key_mut(&mut self, key: &str) -> Option<KeyMut<'_>> {
+-        self.key_mut(key)
+-    }
+     fn key_decor_mut(&mut self, key: &str) -> Option<&mut Decor> {
+-        #![allow(deprecated)]
+         self.key_decor_mut(key)
+     }
+     fn key_decor(&self, key: &str) -> Option<&Decor> {
+-        #![allow(deprecated)]
+         self.key_decor(key)
+     }
+ }
+diff --git a/crates/toml_edit/tests/testsuite/parse.rs b/crates/toml_edit/tests/testsuite/parse.rs
+index f22b61d8..c0f84c40 100644
+--- a/crates/toml_edit/tests/testsuite/parse.rs
++++ b/crates/toml_edit/tests/testsuite/parse.rs
+@@ -1488,23 +1488,3 @@ fn despan_keys() {
+ 
+     assert_eq!(doc.to_string(), "aaaaaa = 1\nbbb = 2\n");
+ }
+-
+-#[test]
+-fn dotted_key_comment_roundtrip() {
+-    let input = r###"
+-rust.unsafe_op_in_unsafe_fn = "deny"
+-
+-rust.explicit_outlives_requirements = "warn"
+-# rust.unused_crate_dependencies = "warn"
+-
+-clippy.cast_lossless = "warn"
+-clippy.doc_markdown = "warn"
+-clippy.exhaustive_enums = "warn"
+-"###;
+-    let expected = input;
+-
+-    let manifest: toml_edit::Document = input.parse().unwrap();
+-    let actual = manifest.to_string();
+-
+-    assert_eq(expected, actual);
+-}

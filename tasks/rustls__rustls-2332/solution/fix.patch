@@ -1,0 +1,109 @@
+diff --git a/rustls/src/common_state.rs b/rustls/src/common_state.rs
+index 3ff4609d..12aca203 100644
+--- a/rustls/src/common_state.rs
++++ b/rustls/src/common_state.rs
+@@ -40,6 +40,8 @@ pub struct CommonState {
+     pub(crate) may_receive_application_data: bool,
+     pub(crate) early_traffic: bool,
+     sent_fatal_alert: bool,
++    /// If we signaled end of stream.
++    pub(crate) has_sent_close_notify: bool,
+     /// If the peer has signaled end of stream.
+     pub(crate) has_received_close_notify: bool,
+     #[cfg(feature = "std")]
+@@ -74,6 +76,7 @@ impl CommonState {
+             may_receive_application_data: false,
+             early_traffic: false,
+             sent_fatal_alert: false,
++            has_sent_close_notify: false,
+             has_received_close_notify: false,
+             #[cfg(feature = "std")]
+             has_seen_eof: false,
+@@ -573,6 +576,7 @@ impl CommonState {
+         }
+         debug!("Sending warning alert {:?}", AlertDescription::CloseNotify);
+         self.sent_fatal_alert = true;
++        self.has_sent_close_notify = true;
+         self.send_warning_alert_no_log(AlertDescription::CloseNotify);
+     }
+ 
+diff --git a/rustls/src/conn.rs b/rustls/src/conn.rs
+index 43706241..426d3770 100644
+--- a/rustls/src/conn.rs
++++ b/rustls/src/conn.rs
+@@ -811,6 +811,7 @@ impl<Data> From<ConnectionCore<Data>> for ConnectionCommon<Data> {
+ pub struct UnbufferedConnectionCommon<Data> {
+     pub(crate) core: ConnectionCore<Data>,
+     wants_write: bool,
++    emitted_peer_closed_state: bool,
+ }
+ 
+ impl<Data> From<ConnectionCore<Data>> for UnbufferedConnectionCommon<Data> {
+@@ -818,6 +819,7 @@ impl<Data> From<ConnectionCore<Data>> for UnbufferedConnectionCommon<Data> {
+         Self {
+             core,
+             wants_write: false,
++            emitted_peer_closed_state: false,
+         }
+     }
+ }
+diff --git a/rustls/src/conn/unbuffered.rs b/rustls/src/conn/unbuffered.rs
+index ef8146e0..ffe14c75 100644
+--- a/rustls/src/conn/unbuffered.rs
++++ b/rustls/src/conn/unbuffered.rs
+@@ -131,6 +131,18 @@ impl<Data> UnbufferedConnectionCommon<Data> {
+                 .core
+                 .common_state
+                 .has_received_close_notify
++                && !self.emitted_peer_closed_state
++            {
++                self.emitted_peer_closed_state = true;
++                break (buffer.pending_discard(), ConnectionState::PeerClosed);
++            } else if self
++                .core
++                .common_state
++                .has_received_close_notify
++                && self
++                    .core
++                    .common_state
++                    .has_sent_close_notify
+             {
+                 break (buffer.pending_discard(), ConnectionState::Closed);
+             } else if self
+@@ -185,7 +197,26 @@ pub enum ConnectionState<'c, 'i, Data> {
+     /// the received data.
+     ReadTraffic(ReadTraffic<'c, 'i, Data>),
+ 
+-    /// Connection has been cleanly closed by the peer
++    /// Connection has been cleanly closed by the peer.
++    ///
++    /// This state is encountered at most once by each connection -- it is
++    /// "edge" triggered, rather than "level" triggered.
++    ///
++    /// It delimits the data received from the peer, meaning you can be sure you
++    /// have received all the data the peer sent.
++    ///
++    /// No further application data will be received from the peer, so no further
++    /// `ReadTraffic` states will be produced.
++    ///
++    /// However, it is possible to _send_ further application data via `WriteTraffic`
++    /// states, or close the connection cleanly by calling
++    /// [`WriteTraffic::queue_close_notify()`].
++    PeerClosed,
++
++    /// Connection has been cleanly closed by both us and the peer.
++    ///
++    /// This is a terminal state.  No other states will be produced for this
++    /// connection.
+     Closed,
+ 
+     /// One, or more, early (RTT-0) data records are available
+@@ -262,6 +293,8 @@ impl<Data> fmt::Debug for ConnectionState<'_, '_, Data> {
+         match self {
+             Self::ReadTraffic(..) => f.debug_tuple("ReadTraffic").finish(),
+ 
++            Self::PeerClosed => write!(f, "PeerClosed"),
++
+             Self::Closed => write!(f, "Closed"),
+ 
+             Self::ReadEarlyData(..) => f.debug_tuple("ReadEarlyData").finish(),

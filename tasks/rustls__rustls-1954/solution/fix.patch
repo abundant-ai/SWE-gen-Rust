@@ -1,0 +1,235 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index b338ddf1..1e7c1adb 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2228,7 +2228,7 @@ dependencies = [
+  "ring",
+  "rustls-pemfile 2.1.2",
+  "rustls-pki-types",
+- "rustls-webpki 0.102.4",
++ "rustls-webpki 0.102.5",
+  "rustversion",
+  "serde",
+  "serde_json",
+@@ -2355,7 +2355,7 @@ dependencies = [
+  "rsa",
+  "rustls 0.23.10",
+  "rustls-pki-types",
+- "rustls-webpki 0.102.4",
++ "rustls-webpki 0.102.5",
+  "sha2",
+  "signature",
+  "webpki-roots 0.26.3",
+@@ -2385,9 +2385,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "rustls-webpki"
+-version = "0.102.4"
++version = "0.102.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ff448f7e92e913c4b7d4c6d8e4540a1724b319b4152b8aef6d4cf8339712b33e"
++checksum = "f9a6fccd794a42c2c105b513a2f62bc3fd8f3ba57a4593677ceb0bd035164d78"
+ dependencies = [
+  "aws-lc-rs",
+  "ring",
+diff --git a/fuzz/Cargo.lock b/fuzz/Cargo.lock
+index 09bed286..79a977e1 100644
+--- a/fuzz/Cargo.lock
++++ b/fuzz/Cargo.lock
+@@ -401,9 +401,9 @@ checksum = "976295e77ce332211c0d24d92c0e83e50f5c5f046d11082cea19f3df13a3562d"
+ 
+ [[package]]
+ name = "rustls-webpki"
+-version = "0.102.4"
++version = "0.102.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ff448f7e92e913c4b7d4c6d8e4540a1724b319b4152b8aef6d4cf8339712b33e"
++checksum = "f9a6fccd794a42c2c105b513a2f62bc3fd8f3ba57a4593677ceb0bd035164d78"
+ dependencies = [
+  "aws-lc-rs",
+  "ring",
+diff --git a/rustls/Cargo.toml b/rustls/Cargo.toml
+index 1def27c7..e83b0e82 100644
+--- a/rustls/Cargo.toml
++++ b/rustls/Cargo.toml
+@@ -26,7 +26,7 @@ log = { version = "0.4.4", optional = true }
+ once_cell = { version = "1.16", default-features = false, features = ["alloc", "race"] }
+ ring = { version = "0.17", optional = true }
+ subtle = { version = "2.5.0", default-features = false }
+-webpki = { package = "rustls-webpki", version = "0.102.4", features = ["alloc"], default-features = false }
++webpki = { package = "rustls-webpki", version = "0.102.5", features = ["alloc"], default-features = false }
+ pki-types = { package = "rustls-pki-types", version = "1.7", features = ["alloc"] }
+ zeroize = "1.7"
+ zlib-rs = { version = "0.2", optional = true }
+diff --git a/rustls/src/crypto/signer.rs b/rustls/src/crypto/signer.rs
+index b6f65747..12ff97a0 100644
+--- a/rustls/src/crypto/signer.rs
++++ b/rustls/src/crypto/signer.rs
+@@ -3,10 +3,11 @@ use alloc::sync::Arc;
+ use alloc::vec::Vec;
+ use core::fmt::Debug;
+ 
+-use pki_types::CertificateDer;
++use pki_types::{CertificateDer, SubjectPublicKeyInfoDer};
+ 
+ use crate::enums::{SignatureAlgorithm, SignatureScheme};
+-use crate::error::Error;
++use crate::error::{Error, InconsistentKeys};
++use crate::server::ParsedCertificate;
+ 
+ /// An abstract signing key.
+ ///
+@@ -59,6 +60,12 @@ pub trait SigningKey: Debug + Send + Sync {
+     /// using the chosen scheme.
+     fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>>;
+ 
++    /// Get the RFC 5280-compliant SubjectPublicKeyInfo (SPKI) of this [`SigningKey`] if available.
++    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
++        // Opt-out by default
++        None
++    }
++
+     /// What kind of key we have.
+     fn algorithm(&self) -> SignatureAlgorithm;
+ }
+@@ -105,6 +112,21 @@ impl CertifiedKey {
+         }
+     }
+ 
++    /// Verify the consistency of this [`CertifiedKey`]'s public and private keys.
++    /// This is done by performing a comparison of SubjectPublicKeyInfo bytes.
++    pub fn keys_match(&self) -> Result<(), Error> {
++        let key_spki = match self.key.public_key() {
++            Some(key) => key,
++            None => return Err(InconsistentKeys::Unknown.into()),
++        };
++
++        let cert = ParsedCertificate::try_from(self.end_entity_cert()?)?;
++        match key_spki == cert.subject_public_key_info() {
++            true => Ok(()),
++            false => Err(InconsistentKeys::KeyMismatch.into()),
++        }
++    }
++
+     /// The end-entity certificate.
+     pub fn end_entity_cert(&self) -> Result<&CertificateDer<'_>, Error> {
+         self.cert
+diff --git a/rustls/src/error.rs b/rustls/src/error.rs
+index 1e66d1e6..f7988e3a 100644
+--- a/rustls/src/error.rs
++++ b/rustls/src/error.rs
+@@ -97,6 +97,11 @@ pub enum Error {
+     /// or too large.
+     BadMaxFragmentSize,
+ 
++    /// Specific failure cases from [`keys_match`].
++    ///
++    /// [`keys_match`]: crate::crypto::signer::CertifiedKey::keys_match
++    InconsistentKeys(InconsistentKeys),
++
+     /// Any other error.
+     ///
+     /// This variant should only be used when the error is not better described by a more
+@@ -107,6 +112,30 @@ pub enum Error {
+     Other(OtherError),
+ }
+ 
++/// Specific failure cases from [`keys_match`].
++///
++/// [`keys_match`]: crate::crypto::signer::CertifiedKey::keys_match
++#[non_exhaustive]
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum InconsistentKeys {
++    /// The public key returned by the [`SigningKey`] does not match the public key information in the certificate.
++    ///
++    /// [`SigningKey`]: crate::crypto::signer::SigningKey
++    KeyMismatch,
++
++    /// The [`SigningKey`] cannot produce its corresponding public key.
++    ///
++    /// [`SigningKey`]: crate::crypto::signer::SigningKey
++    Unknown,
++}
++
++impl From<InconsistentKeys> for Error {
++    #[inline]
++    fn from(e: InconsistentKeys) -> Self {
++        Self::InconsistentKeys(e)
++    }
++}
++
+ /// A corrupt TLS message payload that resulted in an error.
+ #[non_exhaustive]
+ #[derive(Debug, Clone, Copy, PartialEq)]
+@@ -563,6 +592,9 @@ impl fmt::Display for Error {
+             Self::BadMaxFragmentSize => {
+                 write!(f, "the supplied max_fragment_size was too small or large")
+             }
++            Self::InconsistentKeys(ref why) => {
++                write!(f, "keys may not be consistent: {:?}", why)
++            }
+             Self::General(ref err) => write!(f, "unexpected error: {}", err),
+             Self::Other(ref err) => write!(f, "other error: {}", err),
+         }
+@@ -644,7 +676,7 @@ mod tests {
+     use std::prelude::v1::*;
+     use std::{println, vec};
+ 
+-    use super::{Error, InvalidMessage};
++    use super::{Error, InconsistentKeys, InvalidMessage};
+     use crate::error::{CertRevocationListError, OtherError};
+ 
+     #[test]
+@@ -731,6 +763,8 @@ mod tests {
+             Error::PeerSentOversizedRecord,
+             Error::NoApplicationProtocol,
+             Error::BadMaxFragmentSize,
++            Error::InconsistentKeys(InconsistentKeys::KeyMismatch),
++            Error::InconsistentKeys(InconsistentKeys::Unknown),
+             Error::InvalidCertRevocationList(CertRevocationListError::BadSignature),
+             Error::Other(OtherError(
+                 #[cfg(feature = "std")]
+diff --git a/rustls/src/lib.rs b/rustls/src/lib.rs
+index efb2e013..43691e7f 100644
+--- a/rustls/src/lib.rs
++++ b/rustls/src/lib.rs
+@@ -516,8 +516,8 @@ pub use crate::enums::{
+     ProtocolVersion, SignatureAlgorithm, SignatureScheme,
+ };
+ pub use crate::error::{
+-    CertRevocationListError, CertificateError, EncryptedClientHelloError, Error, InvalidMessage,
+-    OtherError, PeerIncompatible, PeerMisbehaved,
++    CertRevocationListError, CertificateError, EncryptedClientHelloError, Error, InconsistentKeys,
++    InvalidMessage, OtherError, PeerIncompatible, PeerMisbehaved,
+ };
+ pub use crate::key_log::{KeyLog, NoKeyLog};
+ #[cfg(feature = "std")]
+diff --git a/rustls/src/webpki/verify.rs b/rustls/src/webpki/verify.rs
+index 1d2725d2..8dc4e18c 100644
+--- a/rustls/src/webpki/verify.rs
++++ b/rustls/src/webpki/verify.rs
+@@ -1,7 +1,9 @@
+ use alloc::vec::Vec;
+ use core::fmt;
+ 
+-use pki_types::{CertificateDer, ServerName, SignatureVerificationAlgorithm, UnixTime};
++use pki_types::{
++    CertificateDer, ServerName, SignatureVerificationAlgorithm, SubjectPublicKeyInfoDer, UnixTime,
++};
+ 
+ use super::anchors::RootCertStore;
+ use super::pki_error;
+@@ -125,6 +127,13 @@ impl fmt::Debug for WebPkiSupportedAlgorithms {
+ /// This is used in order to avoid parsing twice when specifying custom verification
+ pub struct ParsedCertificate<'a>(pub(crate) webpki::EndEntityCert<'a>);
+ 
++impl<'a> ParsedCertificate<'a> {
++    /// Get the parsed certificate's SubjectPublicKeyInfo (SPKI)
++    pub fn subject_public_key_info(&self) -> SubjectPublicKeyInfoDer<'static> {
++        self.0.subject_public_key_info()
++    }
++}
++
+ impl<'a> TryFrom<&'a CertificateDer<'a>> for ParsedCertificate<'a> {
+     type Error = Error;
+     fn try_from(value: &'a CertificateDer<'a>) -> Result<Self, Self::Error> {

@@ -1,0 +1,255 @@
+diff --git a/rustls-post-quantum/examples/client.rs b/rustls-post-quantum/examples/client.rs
+index 574252fa..b37c8970 100644
+--- a/rustls-post-quantum/examples/client.rs
++++ b/rustls-post-quantum/examples/client.rs
+@@ -52,6 +52,15 @@ fn main() {
+         ciphersuite.suite()
+     )
+     .unwrap();
++    let kx_group = tls
++        .conn
++        .negotiated_key_exchange_group()
++        .unwrap();
++    writeln!(
++        &mut std::io::stderr(),
++        "Current key exchange group: {kx_group:?}",
++    )
++    .unwrap();
+     let mut plaintext = Vec::new();
+     tls.read_to_end(&mut plaintext).unwrap();
+     stdout().write_all(&plaintext).unwrap();
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index ec13af6c..49ce6c79 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -17,7 +17,7 @@ use crate::client::client_conn::ClientConnectionData;
+ use crate::client::common::ClientHelloDetails;
+ use crate::client::ech::EchState;
+ use crate::client::{tls13, ClientConfig, EchMode, EchStatus};
+-use crate::common_state::{CommonState, HandshakeKind, State};
++use crate::common_state::{CommonState, HandshakeKind, KxState, State};
+ use crate::conn::ConnectionRandoms;
+ use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
+ use crate::enums::{AlertDescription, CipherSuite, ContentType, HandshakeType, ProtocolVersion};
+@@ -109,7 +109,11 @@ pub(super) fn start_handshake(
+     let mut resuming = find_session(&server_name, &config, cx);
+ 
+     let key_share = if config.supports_version(ProtocolVersion::TLSv1_3) {
+-        Some(tls13::initial_key_share(&config, &server_name)?)
++        Some(tls13::initial_key_share(
++            &config,
++            &server_name,
++            &mut cx.common.kx_state,
++        )?)
+     } else {
+         None
+     };
+@@ -1035,6 +1039,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
+                     }
+                 };
+ 
++                cx.common.kx_state = KxState::Start(skxg);
+                 skxg.start()?
+             }
+             _ => offered_key_share,
+diff --git a/rustls/src/client/tls12.rs b/rustls/src/client/tls12.rs
+index 8e6fe57f..fe6fecaf 100644
+--- a/rustls/src/client/tls12.rs
++++ b/rustls/src/client/tls12.rs
+@@ -13,7 +13,7 @@ use super::hs::ClientContext;
+ use crate::check::{inappropriate_handshake_message, inappropriate_message};
+ use crate::client::common::{ClientAuthDetails, ServerCertDetails};
+ use crate::client::{hs, ClientConfig};
+-use crate::common_state::{CommonState, HandshakeKind, Side, State};
++use crate::common_state::{CommonState, HandshakeKind, KxState, Side, State};
+ use crate::conn::ConnectionRandoms;
+ use crate::crypto::KeyExchangeAlgorithm;
+ use crate::enums::{AlertDescription, ContentType, HandshakeType, ProtocolVersion};
+@@ -929,6 +929,7 @@ impl State<ClientConnectionData> for ExpectServerDone<'_> {
+                 return Err(PeerMisbehaved::SelectedUnofferedKxGroup.into());
+             }
+         };
++        cx.common.kx_state = KxState::Start(skxg);
+         let kx = skxg.start()?;
+ 
+         // 5b.
+@@ -955,6 +956,7 @@ impl State<ClientConnectionData> for ExpectServerDone<'_> {
+             st.randoms,
+             suite,
+         )?;
++        cx.common.kx_state.complete();
+ 
+         st.config.key_log.log(
+             "CLIENT_RANDOM",
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index f7d918ba..93d5c6b0 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -12,7 +12,7 @@ use crate::check::inappropriate_handshake_message;
+ use crate::client::common::{ClientAuthDetails, ClientHelloDetails, ServerCertDetails};
+ use crate::client::ech::{self, EchState, EchStatus};
+ use crate::client::{hs, ClientConfig, ClientSessionStore};
+-use crate::common_state::{CommonState, HandshakeKind, Protocol, Side, State};
++use crate::common_state::{CommonState, HandshakeKind, KxState, Protocol, Side, State};
+ use crate::conn::ConnectionRandoms;
+ use crate::crypto::ActiveKeyExchange;
+ use crate::enums::{
+@@ -147,6 +147,7 @@ pub(super) fn handle_server_hello(
+         KeySchedulePreHandshake::new(suite)
+     };
+ 
++    cx.common.kx_state.complete();
+     let shared_secret = our_key_share.complete(&their_key_share.payload.0)?;
+ 
+     let mut key_schedule = key_schedule_pre_handshake.into_handshake(shared_secret);
+@@ -228,6 +229,7 @@ fn validate_server_hello(
+ pub(super) fn initial_key_share(
+     config: &ClientConfig,
+     server_name: &ServerName<'_>,
++    kx_state: &mut KxState,
+ ) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+     let group = config
+         .resumption
+@@ -244,6 +246,7 @@ pub(super) fn initial_key_share(
+                 .expect("No kx groups configured")
+         });
+ 
++    *kx_state = KxState::Start(group);
+     group.start()
+ }
+ 
+diff --git a/rustls/src/common_state.rs b/rustls/src/common_state.rs
+index 3afd9eec..8d8daa73 100644
+--- a/rustls/src/common_state.rs
++++ b/rustls/src/common_state.rs
+@@ -3,6 +3,7 @@ use alloc::vec::Vec;
+ 
+ use pki_types::CertificateDer;
+ 
++use crate::crypto::SupportedKxGroup;
+ use crate::enums::{AlertDescription, ContentType, HandshakeType, ProtocolVersion};
+ use crate::error::{Error, InvalidMessage, PeerMisbehaved};
+ #[cfg(feature = "logging")]
+@@ -31,6 +32,7 @@ pub struct CommonState {
+     pub(crate) side: Side,
+     pub(crate) record_layer: record_layer::RecordLayer,
+     pub(crate) suite: Option<SupportedCipherSuite>,
++    pub(crate) kx_state: KxState,
+     pub(crate) alpn_protocol: Option<Vec<u8>>,
+     pub(crate) aligned_handshake: bool,
+     pub(crate) may_send_application_data: bool,
+@@ -63,6 +65,7 @@ impl CommonState {
+             side,
+             record_layer: record_layer::RecordLayer::new(),
+             suite: None,
++            kx_state: KxState::default(),
+             alpn_protocol: None,
+             aligned_handshake: true,
+             may_send_application_data: false,
+@@ -138,6 +141,22 @@ impl CommonState {
+         self.suite
+     }
+ 
++    /// Retrieves the key exchange group agreed with the peer.
++    ///
++    /// This function may return `None` depending on the state of the connection,
++    /// the type of handshake, and the protocol version.
++    ///
++    /// If [`CommonState::is_handshaking()`] is true this function will return `None`.
++    /// Similarly, if the [`CommonState::handshake_kind()`] is [`HandshakeKind::Resumed`]
++    /// and the [`CommonState::protocol_version()`] is TLS 1.2, then no key exchange will have
++    /// occurred and this function will return `None`.
++    pub fn negotiated_key_exchange_group(&self) -> Option<&'static dyn SupportedKxGroup> {
++        match self.kx_state {
++            KxState::Complete(group) => Some(group),
++            _ => None,
++        }
++    }
++
+     /// Retrieves the protocol version agreed with the peer.
+     ///
+     /// This returns `None` until the version is agreed.
+@@ -939,5 +958,22 @@ impl Default for TemperCounters {
+     }
+ }
+ 
++#[derive(Debug, Default)]
++pub(crate) enum KxState {
++    #[default]
++    None,
++    Start(&'static dyn SupportedKxGroup),
++    Complete(&'static dyn SupportedKxGroup),
++}
++
++impl KxState {
++    pub(crate) fn complete(&mut self) {
++        debug_assert!(matches!(self, Self::Start(_)));
++        if let Self::Start(group) = self {
++            *self = Self::Complete(*group);
++        }
++    }
++}
++
+ const DEFAULT_RECEIVED_PLAINTEXT_LIMIT: usize = 16 * 1024;
+ pub(crate) const DEFAULT_BUFFER_LIMIT: usize = 64 * 1024;
+diff --git a/rustls/src/server/hs.rs b/rustls/src/server/hs.rs
+index a750e31d..9b86a161 100644
+--- a/rustls/src/server/hs.rs
++++ b/rustls/src/server/hs.rs
+@@ -8,7 +8,7 @@ use pki_types::DnsName;
+ use super::server_conn::ServerConnectionData;
+ #[cfg(feature = "tls12")]
+ use super::tls12;
+-use crate::common_state::{Protocol, State};
++use crate::common_state::{KxState, Protocol, State};
+ use crate::conn::ConnectionRandoms;
+ use crate::crypto::SupportedKxGroup;
+ use crate::enums::{
+@@ -352,6 +352,7 @@ impl ExpectClientHello {
+ 
+         debug!("decided upon suite {:?}", suite);
+         cx.common.suite = Some(suite);
++        cx.common.kx_state = KxState::Start(skxg);
+ 
+         // Start handshake hash.
+         let starting_hash = suite.hash_provider();
+diff --git a/rustls/src/server/tls12.rs b/rustls/src/server/tls12.rs
+index b3bdc307..89383f78 100644
+--- a/rustls/src/server/tls12.rs
++++ b/rustls/src/server/tls12.rs
+@@ -37,6 +37,7 @@ mod client_hello {
+     use pki_types::CertificateDer;
+ 
+     use super::*;
++    use crate::common_state::KxState;
+     use crate::crypto::SupportedKxGroup;
+     use crate::enums::SignatureScheme;
+     use crate::msgs::enums::{ClientCertificateType, Compression, ECPointFormat};
+@@ -191,6 +192,7 @@ mod client_hello {
+                 self.session_id = SessionId::random(self.config.provider.secure_random)?;
+             }
+ 
++            cx.common.kx_state = KxState::Start(selected_kxg);
+             cx.common.handshake_kind = Some(HandshakeKind::Full);
+ 
+             self.send_ticket = emit_server_hello(
+@@ -613,6 +615,7 @@ impl State<ServerConnectionData> for ExpectClientKx<'_> {
+             self.randoms,
+             self.suite,
+         )?;
++        cx.common.kx_state.complete();
+ 
+         self.config.key_log.log(
+             "CLIENT_RANDOM",
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index 58214ac7..27c65a0a 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -351,6 +351,7 @@ mod client_hello {
+                 cx.common
+                     .handshake_kind
+                     .get_or_insert(HandshakeKind::Full);
++                cx.common.kx_state.complete();
+             } else {
+                 cx.common.handshake_kind = Some(HandshakeKind::Resumed);
+             }

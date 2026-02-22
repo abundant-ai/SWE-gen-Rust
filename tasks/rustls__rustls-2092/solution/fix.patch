@@ -1,0 +1,383 @@
+diff --git a/openssl-tests/src/ffdhe.rs b/openssl-tests/src/ffdhe.rs
+index c45f5199..941005b4 100644
+--- a/openssl-tests/src/ffdhe.rs
++++ b/openssl-tests/src/ffdhe.rs
+@@ -11,7 +11,7 @@ pub static TLS_DHE_RSA_WITH_AES_128_GCM_SHA256: SupportedCipherSuite =
+     SupportedCipherSuite::Tls12(&TLS12_DHE_RSA_WITH_AES_128_GCM_SHA256);
+ 
+ #[derive(Debug)]
+-pub struct FfdheKxGroup(pub NamedGroup);
++pub struct FfdheKxGroup(pub NamedGroup, pub FfdheGroup<'static>);
+ 
+ impl SupportedKxGroup for FfdheKxGroup {
+     fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, rustls::Error> {
+@@ -21,7 +21,7 @@ impl SupportedKxGroup for FfdheKxGroup {
+             .fill(&mut x)?;
+         let x = BigUint::from_bytes_be(&x);
+ 
+-        let group = FfdheGroup::from_named_group(self.0).unwrap();
++        let group = self.1;
+         let p = BigUint::from_bytes_be(group.p);
+         let g = BigUint::from_bytes_be(group.g);
+ 
+@@ -37,6 +37,10 @@ impl SupportedKxGroup for FfdheKxGroup {
+         }))
+     }
+ 
++    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
++        Some(self.1)
++    }
++
+     fn name(&self) -> NamedGroup {
+         self.0
+     }
+@@ -76,6 +80,10 @@ impl ActiveKeyExchange for ActiveFfdheKx {
+         &self.x_pub
+     }
+ 
++    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
++        Some(self.group)
++    }
++
+     fn group(&self) -> NamedGroup {
+         self.named_group
+     }
+diff --git a/openssl-tests/src/ffdhe_kx_with_openssl.rs b/openssl-tests/src/ffdhe_kx_with_openssl.rs
+index fe3fe532..89b814ee 100644
+--- a/openssl-tests/src/ffdhe_kx_with_openssl.rs
++++ b/openssl-tests/src/ffdhe_kx_with_openssl.rs
+@@ -211,7 +211,10 @@ fn ffdhe_provider() -> CryptoProvider {
+             ffdhe::TLS_DHE_RSA_WITH_AES_128_GCM_SHA256,
+             provider::cipher_suite::TLS13_AES_128_GCM_SHA256,
+         ],
+-        kx_groups: vec![&FfdheKxGroup(rustls::NamedGroup::FFDHE2048)],
++        kx_groups: vec![&FfdheKxGroup(
++            rustls::NamedGroup::FFDHE2048,
++            rustls::ffdhe_groups::FFDHE2048,
++        )],
+         ..provider::default_provider()
+     }
+ }
+diff --git a/openssl-tests/src/validate_ffdhe_params.rs b/openssl-tests/src/validate_ffdhe_params.rs
+index 9b4f292b..ae10871d 100644
+--- a/openssl-tests/src/validate_ffdhe_params.rs
++++ b/openssl-tests/src/validate_ffdhe_params.rs
+@@ -1,6 +1,6 @@
+ use base64::prelude::*;
+ use rustls::ffdhe_groups::FfdheGroup;
+-use rustls::NamedGroup;
++use rustls::{ffdhe_groups, NamedGroup};
+ 
+ use crate::utils::verify_openssl3_available;
+ 
+@@ -10,20 +10,29 @@ fn ffdhe_params_correct() {
+ 
+     verify_openssl3_available();
+ 
+-    let groups = [FFDHE2048, FFDHE3072, FFDHE4096, FFDHE6144, FFDHE8192];
+-    for group in groups {
+-        println!("testing {group:?}");
+-        test_ffdhe_params_correct(group);
++    for (name, group) in [
++        (FFDHE2048, ffdhe_groups::FFDHE2048),
++        (FFDHE3072, ffdhe_groups::FFDHE3072),
++        (FFDHE4096, ffdhe_groups::FFDHE4096),
++        (FFDHE6144, ffdhe_groups::FFDHE6144),
++        (FFDHE8192, ffdhe_groups::FFDHE8192),
++    ] {
++        println!("testing {name:?}");
++        test_ffdhe_params_correct(name, group);
+     }
+ }
+ 
+-fn test_ffdhe_params_correct(group: NamedGroup) {
+-    let (p, g) = get_ffdhe_params_from_openssl(group);
++fn test_ffdhe_params_correct(name: NamedGroup, group: FfdheGroup<'static>) {
++    let (p, g) = get_ffdhe_params_from_openssl(name);
+     let openssl_params = FfdheGroup::from_params_trimming_leading_zeros(&p, &g);
+-    let rustls_params = FfdheGroup::from_named_group(group).unwrap();
+-    assert_eq!(rustls_params.named_group(), Some(group));
++    #[allow(deprecated)]
++    let rustls_params_from_name = FfdheGroup::from_named_group(name).unwrap();
++    #[allow(deprecated)]
++    let round_trip_name = rustls_params_from_name.named_group();
++    assert_eq!(round_trip_name, Some(name));
+ 
+-    assert_eq!(rustls_params, openssl_params);
++    assert_eq!(rustls_params_from_name, openssl_params);
++    assert_eq!(group, openssl_params);
+ }
+ 
+ /// Get FFDHE parameters `(p, g)` for the given `ffdhe_group` from OpenSSL
+diff --git a/provider-example/src/kx.rs b/provider-example/src/kx.rs
+index 93e1540d..80fb235b 100644
+--- a/provider-example/src/kx.rs
++++ b/provider-example/src/kx.rs
+@@ -2,6 +2,7 @@ use alloc::boxed::Box;
+ 
+ use crypto::SupportedKxGroup;
+ use rustls::crypto;
++use rustls::ffdhe_groups::FfdheGroup;
+ 
+ pub struct KeyExchange {
+     priv_key: x25519_dalek::EphemeralSecret,
+@@ -25,6 +26,10 @@ impl crypto::ActiveKeyExchange for KeyExchange {
+         self.pub_key.as_bytes()
+     }
+ 
++    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
++        None
++    }
++
+     fn group(&self) -> rustls::NamedGroup {
+         X25519.name()
+     }
+@@ -44,6 +49,10 @@ impl crypto::SupportedKxGroup for X25519 {
+         }))
+     }
+ 
++    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
++        None
++    }
++
+     fn name(&self) -> rustls::NamedGroup {
+         rustls::NamedGroup::X25519
+     }
+diff --git a/rustls-post-quantum/src/lib.rs b/rustls-post-quantum/src/lib.rs
+index 9816bc1a..d1a1717c 100644
+--- a/rustls-post-quantum/src/lib.rs
++++ b/rustls-post-quantum/src/lib.rs
+@@ -55,6 +55,7 @@ use rustls::crypto::aws_lc_rs::{default_provider, kx_group};
+ use rustls::crypto::{
+     ActiveKeyExchange, CompletedKeyExchange, CryptoProvider, SharedSecret, SupportedKxGroup,
+ };
++use rustls::ffdhe_groups::FfdheGroup;
+ use rustls::{Error, NamedGroup, PeerMisbehaved};
+ 
+ /// A `CryptoProvider` which includes `X25519Kyber768Draft00` key exchange.
+@@ -119,6 +120,10 @@ impl SupportedKxGroup for X25519Kyber768Draft00 {
+         })
+     }
+ 
++    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
++        None
++    }
++
+     fn name(&self) -> NamedGroup {
+         NAMED_GROUP
+     }
+@@ -153,6 +158,10 @@ impl ActiveKeyExchange for Active {
+         &self.combined_pub_key
+     }
+ 
++    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
++        None
++    }
++
+     fn group(&self) -> NamedGroup {
+         NAMED_GROUP
+     }
+diff --git a/rustls/src/client/tls12.rs b/rustls/src/client/tls12.rs
+index 85ba9ed6..9dd0ec81 100644
+--- a/rustls/src/client/tls12.rs
++++ b/rustls/src/client/tls12.rs
+@@ -919,10 +919,22 @@ impl State<ClientConnectionData> for ExpectServerDone<'_> {
+             cx.common,
+             &st.server_kx.kx_params,
+         )?;
+-        let named_group = kx_params
+-            .named_group()
+-            .ok_or(PeerMisbehaved::SelectedUnofferedKxGroup)?;
+-        let skxg = match st.config.find_kx_group(named_group) {
++        let maybe_skxg = match &kx_params {
++            ServerKeyExchangeParams::Ecdh(ecdh) => st
++                .config
++                .find_kx_group(ecdh.curve_params.named_group),
++            ServerKeyExchangeParams::Dh(dh) => {
++                let ffdhe_group = dh.as_ffdhe_group();
++
++                st.config
++                    .provider
++                    .kx_groups
++                    .iter()
++                    .find(|kxg| kxg.ffdhe_group() == Some(ffdhe_group))
++                    .copied()
++            }
++        };
++        let skxg = match maybe_skxg {
+             Some(skxg) => skxg,
+             None => {
+                 return Err(PeerMisbehaved::SelectedUnofferedKxGroup.into());
+diff --git a/rustls/src/crypto/mod.rs b/rustls/src/crypto/mod.rs
+index caf708b8..bb3e501b 100644
+--- a/rustls/src/crypto/mod.rs
++++ b/rustls/src/crypto/mod.rs
+@@ -10,6 +10,7 @@ use once_cell::sync::OnceCell;
+ use pki_types::PrivateKeyDer;
+ use zeroize::Zeroize;
+ 
++use crate::msgs::ffdhe_groups::FfdheGroup;
+ use crate::sign::SigningKey;
+ pub use crate::webpki::{
+     verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms,
+@@ -411,6 +412,21 @@ pub trait SupportedKxGroup: Send + Sync + Debug {
+         })
+     }
+ 
++    /// FFDHE group the `SupportedKxGroup` operates in.
++    ///
++    /// Return `None` if this group is not a FFDHE one.
++    ///
++    /// The default implementation calls `FfdheGroup::from_named_group`: this function
++    /// is extremely linker-unfriendly so it is recommended all key exchange implementers
++    /// provide this function.
++    ///
++    /// `rustls::ffdhe_groups` contains suitable values to return from this,
++    /// for example [`rustls::ffdhe_groups::FFDHE2048`][crate::ffdhe_groups::FFDHE2048].
++    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
++        #[allow(deprecated)]
++        FfdheGroup::from_named_group(self.name())
++    }
++
+     /// Named group the SupportedKxGroup operates in.
+     ///
+     /// If the `NamedGroup` enum does not have a name for the algorithm you are implementing,
+@@ -491,6 +507,21 @@ pub trait ActiveKeyExchange: Send + Sync {
+     /// [RFC8446 section 4.2.8.1](https://www.rfc-editor.org/rfc/rfc8446#section-4.2.8.1).
+     fn pub_key(&self) -> &[u8];
+ 
++    /// FFDHE group the `ActiveKeyExchange` is operating in.
++    ///
++    /// Return `None` if this group is not a FFDHE one.
++    ///
++    /// The default implementation calls `FfdheGroup::from_named_group`: this function
++    /// is extremely linker-unfriendly so it is recommended all key exchange implementers
++    /// provide this function.
++    ///
++    /// `rustls::ffdhe_groups` contains suitable values to return from this,
++    /// for example [`rustls::ffdhe_groups::FFDHE2048`][crate::ffdhe_groups::FFDHE2048].
++    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
++        #[allow(deprecated)]
++        FfdheGroup::from_named_group(self.group())
++    }
++
+     /// Return the group being used.
+     fn group(&self) -> NamedGroup;
+ }
+diff --git a/rustls/src/crypto/ring/kx.rs b/rustls/src/crypto/ring/kx.rs
+index 55dcd2c0..8c267e9e 100644
+--- a/rustls/src/crypto/ring/kx.rs
++++ b/rustls/src/crypto/ring/kx.rs
+@@ -5,7 +5,7 @@ use core::fmt;
+ 
+ use super::ring_like::agreement;
+ use super::ring_like::rand::SystemRandom;
+-use crate::crypto::{ActiveKeyExchange, SharedSecret, SupportedKxGroup};
++use crate::crypto::{ActiveKeyExchange, FfdheGroup, SharedSecret, SupportedKxGroup};
+ use crate::error::{Error, PeerMisbehaved};
+ use crate::msgs::enums::NamedGroup;
+ use crate::rand::GetRandomFailed;
+@@ -46,6 +46,10 @@ impl SupportedKxGroup for KxGroup {
+         }))
+     }
+ 
++    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
++        None
++    }
++
+     fn name(&self) -> NamedGroup {
+         self.name
+     }
+@@ -108,6 +112,10 @@ impl ActiveKeyExchange for KeyExchange {
+             .map_err(|_| PeerMisbehaved::InvalidKeyShare.into())
+     }
+ 
++    fn ffdhe_group(&self) -> Option<FfdheGroup<'static>> {
++        None
++    }
++
+     /// Return the group being used.
+     fn group(&self) -> NamedGroup {
+         self.name
+diff --git a/rustls/src/msgs/ffdhe_groups.rs b/rustls/src/msgs/ffdhe_groups.rs
+index 7194fdff..ac105b59 100644
+--- a/rustls/src/msgs/ffdhe_groups.rs
++++ b/rustls/src/msgs/ffdhe_groups.rs
+@@ -13,6 +13,10 @@ pub struct FfdheGroup<'a> {
+ impl FfdheGroup<'static> {
+     /// Return the `FfdheGroup` corresponding to the provided `NamedGroup`
+     /// if it is indeed an FFDHE group
++    #[deprecated(
++        since = "0.23.13",
++        note = "This function is linker-unfriendly.  Use `SupportedKxGroup::ffdhe_group()` instead"
++    )]
+     pub fn from_named_group(named_group: NamedGroup) -> Option<Self> {
+         match named_group {
+             NamedGroup::FFDHE2048 => Some(FFDHE2048),
+@@ -27,6 +31,10 @@ impl FfdheGroup<'static> {
+ 
+ impl<'a> FfdheGroup<'a> {
+     /// Return the `NamedGroup` for the `FfdheGroup` if it represents one.
++    #[deprecated(
++        since = "0.23.13",
++        note = "This function is linker-unfriendly.  Use `SupportedKxGroup::name()` instead"
++    )]
+     pub fn named_group(&self) -> Option<NamedGroup> {
+         match *self {
+             FFDHE2048 => Some(NamedGroup::FFDHE2048),
+@@ -306,11 +314,10 @@ fn named_group_ffdhe_group_roundtrip() {
+     use NamedGroup::*;
+     let ffdhe_groups = [FFDHE2048, FFDHE3072, FFDHE4096, FFDHE6144, FFDHE8192];
+     for g in ffdhe_groups {
+-        assert_eq!(
+-            FfdheGroup::from_named_group(g)
+-                .unwrap()
+-                .named_group(),
+-            Some(g)
+-        );
++        #[allow(deprecated)]
++        let roundtrip = FfdheGroup::from_named_group(g)
++            .unwrap()
++            .named_group();
++        assert_eq!(roundtrip, Some(g));
+     }
+ }
+diff --git a/rustls/src/msgs/handshake.rs b/rustls/src/msgs/handshake.rs
+index c9badca0..e17ef314 100644
+--- a/rustls/src/msgs/handshake.rs
++++ b/rustls/src/msgs/handshake.rs
+@@ -1866,7 +1866,7 @@ pub(crate) struct ServerDhParams {
+ impl ServerDhParams {
+     #[cfg(feature = "tls12")]
+     pub(crate) fn new(kx: &dyn ActiveKeyExchange) -> Self {
+-        let params = match FfdheGroup::from_named_group(kx.group()) {
++        let params = match kx.ffdhe_group() {
+             Some(params) => params,
+             None => panic!("invalid NamedGroup for DHE key exchange: {:?}", kx.group()),
+         };
+@@ -1879,8 +1879,8 @@ impl ServerDhParams {
+     }
+ 
+     #[cfg(feature = "tls12")]
+-    fn named_group(&self) -> Option<NamedGroup> {
+-        FfdheGroup::from_params_trimming_leading_zeros(&self.dh_p.0, &self.dh_g.0).named_group()
++    pub(crate) fn as_ffdhe_group(&self) -> FfdheGroup<'_> {
++        FfdheGroup::from_params_trimming_leading_zeros(&self.dh_p.0, &self.dh_g.0)
+     }
+ }
+ 
+@@ -1930,14 +1930,6 @@ impl ServerKeyExchangeParams {
+             Self::Dh(dh) => dh.encode(buf),
+         }
+     }
+-
+-    #[cfg(feature = "tls12")]
+-    pub(crate) fn named_group(&self) -> Option<NamedGroup> {
+-        match self {
+-            Self::Ecdh(ecdh) => Some(ecdh.curve_params.named_group),
+-            Self::Dh(dh) => dh.named_group(),
+-        }
+-    }
+ }
+ 
+ #[cfg(feature = "tls12")]

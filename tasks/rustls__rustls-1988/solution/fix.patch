@@ -1,0 +1,237 @@
+diff --git a/bogo/config.json.in b/bogo/config.json.in
+index 6a39eeb7..4b13c557 100644
+--- a/bogo/config.json.in
++++ b/bogo/config.json.in
+@@ -19,8 +19,6 @@
+     "DummyPQPadding-*": "not supported",
+     "MTU*": "dtls only",
+     "DisableEverything": "not useful",
+-    "SendEmptyRecords": "non-standard openssl/boringssl behaviour",
+-    "SendEmptyRecords-Async": "",
+     "CheckLeafCurve": "",
+     "SendWarningAlerts": "",
+     "SendWarningAlerts-*": "",
+@@ -100,8 +98,6 @@
+     "Resume-Server-OmitPSKsOnSecondClientHello": "not required by RFC",
+     "FallbackSCSV*": "fallback countermeasure not yet implemented",
+     "RequireAnyClientCertificate-TLS12": "we don't send an alert in this case",
+-    "TooManyKeyUpdates": "no limit implemented",
+-    "SendUserCanceledAlerts-TooMany-TLS13": "",
+     "ServerBogusVersion": "we ignore legacy_version if there's an extension",
+     "Renegotiate-Client-*": "no reneg",
+     "Shutdown-Shim-Renegotiate-*": "",
+diff --git a/rustls/examples/internal/bogo_shim_impl.rs b/rustls/examples/internal/bogo_shim_impl.rs
+index 33b67651..48fecfdc 100644
+--- a/rustls/examples/internal/bogo_shim_impl.rs
++++ b/rustls/examples/internal/bogo_shim_impl.rs
+@@ -824,6 +824,15 @@ fn handle_err(err: Error) -> ! {
+         Error::PeerMisbehaved(PeerMisbehaved::SelectedUnofferedCipherSuite) => {
+             quit(":WRONG_CIPHER_RETURNED:")
+         }
++        Error::PeerMisbehaved(PeerMisbehaved::TooManyWarningAlertsReceived) => {
++            quit(":TOO_MANY_WARNING_ALERTS:")
++        }
++        Error::PeerMisbehaved(PeerMisbehaved::TooManyKeyUpdateRequests) => {
++            quit(":TOO_MANY_KEY_UPDATES:")
++        }
++        Error::PeerMisbehaved(PeerMisbehaved::TooManyEmptyFragments) => {
++            quit(":TOO_MANY_EMPTY_FRAGMENTS:")
++        }
+         Error::PeerMisbehaved(_) => quit(":PEER_MISBEHAVIOUR:"),
+         Error::NoCertificatesPresented => quit(":NO_CERTS:"),
+         Error::AlertReceived(AlertDescription::UnexpectedMessage) => quit(":BAD_ALERT:"),
+@@ -1373,6 +1382,7 @@ pub fn main() {
+             "-expect-no-session" |
+             "-expect-ticket-renewal" |
+             "-enable-ocsp-stapling" |
++            "-forbid-renegotiation-after-handshake" |
+             // internal openssl details:
+             "-async" |
+             "-implicit-handshake" |
+diff --git a/rustls/src/common_state.rs b/rustls/src/common_state.rs
+index 29825ea7..9edb8dd5 100644
+--- a/rustls/src/common_state.rs
++++ b/rustls/src/common_state.rs
+@@ -51,6 +51,7 @@ pub struct CommonState {
+     pub(crate) protocol: Protocol,
+     pub(crate) quic: quic::Quic,
+     pub(crate) enable_secret_extraction: bool,
++    temper_counters: TemperCounters,
+ }
+ 
+ impl CommonState {
+@@ -79,6 +80,7 @@ impl CommonState {
+             protocol: Protocol::Tcp,
+             quic: quic::Quic::default(),
+             enable_secret_extraction: false,
++            temper_counters: TemperCounters::default(),
+         }
+     }
+ 
+@@ -171,6 +173,8 @@ impl CommonState {
+                 Side::Server => HandshakeType::ClientHello,
+             };
+             if msg.is_handshake_type(reject_ty) {
++                self.temper_counters
++                    .received_renegotiation_request()?;
+                 self.send_warning_alert(AlertDescription::NoRenegotiation);
+                 return Ok(state);
+             }
+@@ -441,6 +445,8 @@ impl CommonState {
+         // (except, for no good reason, user_cancelled).
+         let err = Error::AlertReceived(alert.description);
+         if alert.level == AlertLevel::Warning {
++            self.temper_counters
++                .received_warning_alert()?;
+             if self.is_tls13() && alert.description != AlertDescription::UserCanceled {
+                 return Err(self.send_fatal_alert(AlertDescription::DecodeError, err));
+             } else {
+@@ -621,6 +627,9 @@ impl CommonState {
+         &mut self,
+         key_update_request: &KeyUpdateRequest,
+     ) -> Result<bool, Error> {
++        self.temper_counters
++            .received_key_update_request()?;
++
+         match key_update_request {
+             KeyUpdateRequest::UpdateNotRequested => Ok(false),
+             KeyUpdateRequest::UpdateRequested => Ok(self.queued_key_update_message.is_none()),
+@@ -828,5 +837,63 @@ enum Limit {
+     No,
+ }
+ 
++/// Tracking technically-allowed protocol actions
++/// that we limit to avoid denial-of-service vectors.
++struct TemperCounters {
++    allowed_warning_alerts: u8,
++    allowed_renegotiation_requests: u8,
++    allowed_key_update_requests: u8,
++}
++
++impl TemperCounters {
++    fn received_warning_alert(&mut self) -> Result<(), Error> {
++        match self.allowed_warning_alerts {
++            0 => Err(PeerMisbehaved::TooManyWarningAlertsReceived.into()),
++            _ => {
++                self.allowed_warning_alerts -= 1;
++                Ok(())
++            }
++        }
++    }
++
++    fn received_renegotiation_request(&mut self) -> Result<(), Error> {
++        match self.allowed_renegotiation_requests {
++            0 => Err(PeerMisbehaved::TooManyRenegotiationRequests.into()),
++            _ => {
++                self.allowed_renegotiation_requests -= 1;
++                Ok(())
++            }
++        }
++    }
++
++    fn received_key_update_request(&mut self) -> Result<(), Error> {
++        match self.allowed_key_update_requests {
++            0 => Err(PeerMisbehaved::TooManyKeyUpdateRequests.into()),
++            _ => {
++                self.allowed_key_update_requests -= 1;
++                Ok(())
++            }
++        }
++    }
++}
++
++impl Default for TemperCounters {
++    fn default() -> Self {
++        Self {
++            // cf. BoringSSL `kMaxWarningAlerts`
++            // <https://github.com/google/boringssl/blob/dec5989b793c56ad4dd32173bd2d8595ca78b398/ssl/tls_record.cc#L137-L139>
++            allowed_warning_alerts: 4,
++
++            // we rebuff renegotiation requests with a `NoRenegotiation` warning alerts.
++            // a second request after this is fatal.
++            allowed_renegotiation_requests: 1,
++
++            // cf. BoringSSL `kMaxKeyUpdates`
++            // <https://github.com/google/boringssl/blob/dec5989b793c56ad4dd32173bd2d8595ca78b398/ssl/tls13_both.cc#L35-L38>
++            allowed_key_update_requests: 32,
++        }
++    }
++}
++
+ const DEFAULT_RECEIVED_PLAINTEXT_LIMIT: usize = 16 * 1024;
+ pub(crate) const DEFAULT_BUFFER_LIMIT: usize = 64 * 1024;
+diff --git a/rustls/src/error.rs b/rustls/src/error.rs
+index d334e1b3..9c3afd18 100644
+--- a/rustls/src/error.rs
++++ b/rustls/src/error.rs
+@@ -233,6 +233,10 @@ pub enum PeerMisbehaved {
+     ServerNameMustContainOneHostName,
+     SignedKxWithWrongAlgorithm,
+     SignedHandshakeWithUnadvertisedSigScheme,
++    TooManyEmptyFragments,
++    TooManyKeyUpdateRequests,
++    TooManyRenegotiationRequests,
++    TooManyWarningAlertsReceived,
+     TooMuchEarlyDataReceived,
+     UnexpectedCleartextExtension,
+     UnsolicitedCertExtension,
+diff --git a/rustls/src/msgs/codec.rs b/rustls/src/msgs/codec.rs
+index 2af661f6..cc440ec8 100644
+--- a/rustls/src/msgs/codec.rs
++++ b/rustls/src/msgs/codec.rs
+@@ -203,7 +203,7 @@ impl Codec<'_> for u16 {
+     fn read(r: &mut Reader) -> Result<Self, InvalidMessage> {
+         match r.take(2) {
+             Some(&[b1, b2]) => Ok(Self::from_be_bytes([b1, b2])),
+-            _ => Err(InvalidMessage::MissingData("u8")),
++            _ => Err(InvalidMessage::MissingData("u16")),
+         }
+     }
+ }
+diff --git a/rustls/src/msgs/deframer.rs b/rustls/src/msgs/deframer.rs
+index 013a36fc..c8df5702 100644
+--- a/rustls/src/msgs/deframer.rs
++++ b/rustls/src/msgs/deframer.rs
+@@ -26,6 +26,10 @@ pub struct MessageDeframer {
+ 
+     /// If we're in the middle of joining a handshake payload, this is the metadata.
+     joining_hs: Option<HandshakePayloadMeta>,
++
++    /// We limit consecutive empty fragments to avoid a route for the peer to send
++    /// us significant but fruitless traffic.
++    seen_consecutive_empty_fragments: u8,
+ }
+ 
+ impl MessageDeframer {
+@@ -168,6 +172,20 @@ impl MessageDeframer {
+                 return Err(self.set_err(PeerMisbehaved::MessageInterleavedWithHandshakeMessage));
+             }
+ 
++            match plain_payload_slice.len {
++                0 => {
++                    if self.seen_consecutive_empty_fragments
++                        == ALLOWED_CONSECUTIVE_EMPTY_FRAGMENTS_MAX
++                    {
++                        return Err(self.set_err(PeerMisbehaved::TooManyEmptyFragments));
++                    }
++                    self.seen_consecutive_empty_fragments += 1;
++                }
++                _ => {
++                    self.seen_consecutive_empty_fragments = 0;
++                }
++            }
++
+             // If it's not a handshake message, just return it -- no joining necessary.
+             if typ != ContentType::Handshake {
+                 buffer.queue_discard(end);
+@@ -705,6 +723,10 @@ const MAX_HANDSHAKE_SIZE: u32 = 0xffff;
+ #[cfg(feature = "std")]
+ const READ_SIZE: usize = 4096;
+ 
++/// cf. BoringSSL's `kMaxEmptyRecords`
++/// <https://github.com/google/boringssl/blob/dec5989b793c56ad4dd32173bd2d8595ca78b398/ssl/tls_record.cc#L124-L128>
++const ALLOWED_CONSECUTIVE_EMPTY_FRAGMENTS_MAX: u8 = 32;
++
+ #[cfg(feature = "std")]
+ #[cfg(test)]
+ mod tests {

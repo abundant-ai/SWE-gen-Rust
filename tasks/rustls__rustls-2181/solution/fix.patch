@@ -1,0 +1,369 @@
+diff --git a/rustls/src/builder.rs b/rustls/src/builder.rs
+index 612df1c4..85f95bdf 100644
+--- a/rustls/src/builder.rs
++++ b/rustls/src/builder.rs
+@@ -163,9 +163,18 @@ use crate::{ClientConfig, ServerConfig};
+ #[derive(Clone)]
+ pub struct ConfigBuilder<Side: ConfigSide, State> {
+     pub(crate) state: State,
++    pub(crate) provider: Arc<CryptoProvider>,
++    pub(crate) time_provider: Arc<dyn TimeProvider>,
+     pub(crate) side: PhantomData<Side>,
+ }
+ 
++impl<Side: ConfigSide, State> ConfigBuilder<Side, State> {
++    /// Return the crypto provider used to construct this builder.
++    pub fn crypto_provider(&self) -> &Arc<CryptoProvider> {
++        &self.provider
++    }
++}
++
+ impl<Side: ConfigSide, State: fmt::Debug> fmt::Debug for ConfigBuilder<Side, State> {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         let side_name = core::any::type_name::<Side>();
+@@ -184,10 +193,7 @@ impl<Side: ConfigSide, State: fmt::Debug> fmt::Debug for ConfigBuilder<Side, Sta
+ ///
+ /// For more information, see the [`ConfigBuilder`] documentation.
+ #[derive(Clone, Debug)]
+-pub struct WantsVersions {
+-    pub(crate) provider: Arc<CryptoProvider>,
+-    pub(crate) time_provider: Arc<dyn TimeProvider>,
+-}
++pub struct WantsVersions {}
+ 
+ impl<S: ConfigSide> ConfigBuilder<S, WantsVersions> {
+     /// Accept the default protocol versions: both TLS1.2 and TLS1.3 are enabled.
+@@ -203,7 +209,7 @@ impl<S: ConfigSide> ConfigBuilder<S, WantsVersions> {
+         versions: &[&'static versions::SupportedProtocolVersion],
+     ) -> Result<ConfigBuilder<S, WantsVerifier>, Error> {
+         let mut any_usable_suite = false;
+-        for suite in &self.state.provider.cipher_suites {
++        for suite in &self.provider.cipher_suites {
+             if versions.contains(&suite.version()) {
+                 any_usable_suite = true;
+                 break;
+@@ -214,13 +220,13 @@ impl<S: ConfigSide> ConfigBuilder<S, WantsVersions> {
+             return Err(Error::General("no usable cipher suites configured".into()));
+         }
+ 
+-        if self.state.provider.kx_groups.is_empty() {
++        if self.provider.kx_groups.is_empty() {
+             return Err(Error::General("no kx groups configured".into()));
+         }
+ 
+         // verifying cipher suites have matching kx groups
+         let mut supported_kx_algos = Vec::with_capacity(ALL_KEY_EXCHANGE_ALGORITHMS.len());
+-        for group in self.state.provider.kx_groups.iter() {
++        for group in self.provider.kx_groups.iter() {
+             let kx = group.name().key_exchange_algorithm();
+             if !supported_kx_algos.contains(&kx) {
+                 supported_kx_algos.push(kx);
+@@ -232,7 +238,7 @@ impl<S: ConfigSide> ConfigBuilder<S, WantsVersions> {
+             }
+         }
+ 
+-        for cs in self.state.provider.cipher_suites.iter() {
++        for cs in self.provider.cipher_suites.iter() {
+             let cs_kx = cs.key_exchange_algorithms();
+             if cs_kx
+                 .iter()
+@@ -249,11 +255,11 @@ impl<S: ConfigSide> ConfigBuilder<S, WantsVersions> {
+ 
+         Ok(ConfigBuilder {
+             state: WantsVerifier {
+-                provider: self.state.provider,
+                 versions: versions::EnabledVersions::new(versions),
+-                time_provider: self.state.time_provider,
+                 client_ech_mode: None,
+             },
++            provider: self.provider,
++            time_provider: self.time_provider,
+             side: self.side,
+         })
+     }
+@@ -264,9 +270,7 @@ impl<S: ConfigSide> ConfigBuilder<S, WantsVersions> {
+ /// For more information, see the [`ConfigBuilder`] documentation.
+ #[derive(Clone, Debug)]
+ pub struct WantsVerifier {
+-    pub(crate) provider: Arc<CryptoProvider>,
+     pub(crate) versions: versions::EnabledVersions,
+-    pub(crate) time_provider: Arc<dyn TimeProvider>,
+     pub(crate) client_ech_mode: Option<EchMode>,
+ }
+ 
+diff --git a/rustls/src/client/builder.rs b/rustls/src/client/builder.rs
+index 22ca184c..bb2a7d66 100644
+--- a/rustls/src/client/builder.rs
++++ b/rustls/src/client/builder.rs
+@@ -7,11 +7,9 @@ use pki_types::{CertificateDer, PrivateKeyDer};
+ use super::client_conn::Resumption;
+ use crate::builder::{ConfigBuilder, WantsVerifier};
+ use crate::client::{handy, ClientConfig, EchMode, ResolvesClientCert};
+-use crate::crypto::CryptoProvider;
+ use crate::error::Error;
+ use crate::key_log::NoKeyLog;
+ use crate::msgs::handshake::CertificateChain;
+-use crate::time_provider::TimeProvider;
+ use crate::versions::TLS13;
+ use crate::webpki::{self, WebPkiServerVerifier};
+ use crate::{compress, verify, versions, WantsVersions};
+@@ -55,7 +53,6 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
+         root_store: impl Into<Arc<webpki::RootCertStore>>,
+     ) -> ConfigBuilder<ClientConfig, WantsClientCert> {
+         let algorithms = self
+-            .state
+             .provider
+             .signature_verification_algorithms;
+         self.with_webpki_verifier(
+@@ -73,12 +70,12 @@ impl ConfigBuilder<ClientConfig, WantsVerifier> {
+     ) -> ConfigBuilder<ClientConfig, WantsClientCert> {
+         ConfigBuilder {
+             state: WantsClientCert {
+-                provider: self.state.provider,
+                 versions: self.state.versions,
+                 verifier,
+-                time_provider: self.state.time_provider,
+                 client_ech_mode: self.state.client_ech_mode,
+             },
++            provider: self.provider,
++            time_provider: self.time_provider,
+             side: PhantomData,
+         }
+     }
+@@ -113,12 +110,12 @@ pub(super) mod danger {
+         ) -> ConfigBuilder<ClientConfig, WantsClientCert> {
+             ConfigBuilder {
+                 state: WantsClientCert {
+-                    provider: self.cfg.state.provider,
+                     versions: self.cfg.state.versions,
+                     verifier,
+-                    time_provider: self.cfg.state.time_provider,
+                     client_ech_mode: self.cfg.state.client_ech_mode,
+                 },
++                provider: self.cfg.provider,
++                time_provider: self.cfg.time_provider,
+                 side: PhantomData,
+             }
+         }
+@@ -131,10 +128,8 @@ pub(super) mod danger {
+ /// For more information, see the [`ConfigBuilder`] documentation.
+ #[derive(Clone)]
+ pub struct WantsClientCert {
+-    provider: Arc<CryptoProvider>,
+     versions: versions::EnabledVersions,
+     verifier: Arc<dyn verify::ServerCertVerifier>,
+-    time_provider: Arc<dyn TimeProvider>,
+     client_ech_mode: Option<EchMode>,
+ }
+ 
+@@ -144,8 +139,8 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
+     ///
+     /// `cert_chain` is a vector of DER-encoded certificates.
+     /// `key_der` is a DER-encoded private key as PKCS#1, PKCS#8, or SEC1. The
+-    /// `aws-lc-rs` and `ring` [`CryptoProvider`]s support all three encodings,
+-    /// but other `CryptoProviders` may not.
++    /// `aws-lc-rs` and `ring` [`CryptoProvider`][crate::CryptoProvider]s support
++    /// all three encodings, but other `CryptoProviders` may not.
+     ///
+     /// This function fails if `key_der` is invalid.
+     pub fn with_client_auth_cert(
+@@ -154,7 +149,6 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
+         key_der: PrivateKeyDer<'static>,
+     ) -> Result<ClientConfig, Error> {
+         let private_key = self
+-            .state
+             .provider
+             .key_provider
+             .load_private_key(key_der)?;
+@@ -174,7 +168,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
+         client_auth_cert_resolver: Arc<dyn ResolvesClientCert>,
+     ) -> ClientConfig {
+         ClientConfig {
+-            provider: self.state.provider,
++            provider: self.provider,
+             alpn_protocols: Vec::new(),
+             resumption: Resumption::default(),
+             max_fragment_size: None,
+@@ -187,7 +181,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
+             enable_early_data: false,
+             #[cfg(feature = "tls12")]
+             require_ems: cfg!(feature = "fips"),
+-            time_provider: self.state.time_provider,
++            time_provider: self.time_provider,
+             cert_compressors: compress::default_cert_compressors().to_vec(),
+             cert_compression_cache: Arc::new(compress::CompressionCache::default()),
+             cert_decompressors: compress::default_cert_decompressors().to_vec(),
+diff --git a/rustls/src/client/client_conn.rs b/rustls/src/client/client_conn.rs
+index 82974592..c9a23ea5 100644
+--- a/rustls/src/client/client_conn.rs
++++ b/rustls/src/client/client_conn.rs
+@@ -120,9 +120,9 @@ pub trait ResolvesClientCert: fmt::Debug + Send + Sync {
+         sigschemes: &[SignatureScheme],
+     ) -> Option<Arc<sign::CertifiedKey>>;
+ 
+-    /// Return true if the client only supports raw public keys.  
+-    ///  
+-    /// See [RFC 7250](https://www.rfc-editor.org/rfc/rfc7250).  
++    /// Return true if the client only supports raw public keys.
++    ///
++    /// See [RFC 7250](https://www.rfc-editor.org/rfc/rfc7250).
+     fn only_raw_public_keys(&self) -> bool {
+         false
+     }
+@@ -316,10 +316,9 @@ impl ClientConfig {
+         provider: Arc<CryptoProvider>,
+     ) -> ConfigBuilder<Self, WantsVersions> {
+         ConfigBuilder {
+-            state: WantsVersions {
+-                provider,
+-                time_provider: Arc::new(DefaultTimeProvider),
+-            },
++            state: WantsVersions {},
++            provider,
++            time_provider: Arc::new(DefaultTimeProvider),
+             side: PhantomData,
+         }
+     }
+@@ -342,10 +341,9 @@ impl ClientConfig {
+         time_provider: Arc<dyn TimeProvider>,
+     ) -> ConfigBuilder<Self, WantsVersions> {
+         ConfigBuilder {
+-            state: WantsVersions {
+-                provider,
+-                time_provider,
+-            },
++            state: WantsVersions {},
++            provider,
++            time_provider,
+             side: PhantomData,
+         }
+     }
+diff --git a/rustls/src/server/builder.rs b/rustls/src/server/builder.rs
+index 6a58a612..7f79fd88 100644
+--- a/rustls/src/server/builder.rs
++++ b/rustls/src/server/builder.rs
+@@ -5,11 +5,9 @@ use core::marker::PhantomData;
+ use pki_types::{CertificateDer, PrivateKeyDer};
+ 
+ use crate::builder::{ConfigBuilder, WantsVerifier};
+-use crate::crypto::CryptoProvider;
+ use crate::error::Error;
+ use crate::server::{handy, ResolvesServerCert, ServerConfig};
+ use crate::sign::CertifiedKey;
+-use crate::time_provider::TimeProvider;
+ use crate::verify::{ClientCertVerifier, NoClientAuth};
+ use crate::{compress, versions, InconsistentKeys, NoKeyLog};
+ 
+@@ -21,11 +19,11 @@ impl ConfigBuilder<ServerConfig, WantsVerifier> {
+     ) -> ConfigBuilder<ServerConfig, WantsServerCert> {
+         ConfigBuilder {
+             state: WantsServerCert {
+-                provider: self.state.provider,
+                 versions: self.state.versions,
+                 verifier: client_cert_verifier,
+-                time_provider: self.state.time_provider,
+             },
++            provider: self.provider,
++            time_provider: self.time_provider,
+             side: PhantomData,
+         }
+     }
+@@ -42,10 +40,8 @@ impl ConfigBuilder<ServerConfig, WantsVerifier> {
+ /// For more information, see the [`ConfigBuilder`] documentation.
+ #[derive(Clone, Debug)]
+ pub struct WantsServerCert {
+-    provider: Arc<CryptoProvider>,
+     versions: versions::EnabledVersions,
+     verifier: Arc<dyn ClientCertVerifier>,
+-    time_provider: Arc<dyn TimeProvider>,
+ }
+ 
+ impl ConfigBuilder<ServerConfig, WantsServerCert> {
+@@ -60,8 +56,8 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
+     ///
+     /// `cert_chain` is a vector of DER-encoded certificates.
+     /// `key_der` is a DER-encoded private key as PKCS#1, PKCS#8, or SEC1. The
+-    /// `aws-lc-rs` and `ring` [`CryptoProvider`]s support all three encodings,
+-    /// but other `CryptoProviders` may not.
++    /// `aws-lc-rs` and `ring` [`CryptoProvider`][crate::CryptoProvider]s support
++    /// all three encodings, but other `CryptoProviders` may not.
+     ///
+     /// This function fails if `key_der` is invalid, or if the
+     /// `SubjectPublicKeyInfo` from the private key does not match the public
+@@ -72,7 +68,6 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
+         key_der: PrivateKeyDer<'static>,
+     ) -> Result<ServerConfig, Error> {
+         let private_key = self
+-            .state
+             .provider
+             .key_provider
+             .load_private_key(key_der)?;
+@@ -94,8 +89,8 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
+     ///
+     /// `cert_chain` is a vector of DER-encoded certificates.
+     /// `key_der` is a DER-encoded private key as PKCS#1, PKCS#8, or SEC1. The
+-    /// `aws-lc-rs` and `ring` [`CryptoProvider`]s support all three encodings,
+-    /// but other `CryptoProviders` may not.
++    /// `aws-lc-rs` and `ring` [`CryptoProvider`][crate::CryptoProvider]s support
++    /// all three encodings, but other `CryptoProviders` may not.
+     /// `ocsp` is a DER-encoded OCSP response.  Ignored if zero length.
+     ///
+     /// This function fails if `key_der` is invalid, or if the
+@@ -108,7 +103,6 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
+         ocsp: Vec<u8>,
+     ) -> Result<ServerConfig, Error> {
+         let private_key = self
+-            .state
+             .provider
+             .key_provider
+             .load_private_key(key_der)?;
+@@ -127,7 +121,7 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
+     /// Sets a custom [`ResolvesServerCert`].
+     pub fn with_cert_resolver(self, cert_resolver: Arc<dyn ResolvesServerCert>) -> ServerConfig {
+         ServerConfig {
+-            provider: self.state.provider,
++            provider: self.provider,
+             verifier: self.state.verifier,
+             cert_resolver,
+             ignore_client_order: false,
+@@ -146,7 +140,7 @@ impl ConfigBuilder<ServerConfig, WantsServerCert> {
+             send_tls13_tickets: 4,
+             #[cfg(feature = "tls12")]
+             require_ems: cfg!(feature = "fips"),
+-            time_provider: self.state.time_provider,
++            time_provider: self.time_provider,
+             cert_compressors: compress::default_cert_compressors().to_vec(),
+             cert_compression_cache: Arc::new(compress::CompressionCache::default()),
+             cert_decompressors: compress::default_cert_decompressors().to_vec(),
+diff --git a/rustls/src/server/server_conn.rs b/rustls/src/server/server_conn.rs
+index 9160d231..c03265d2 100644
+--- a/rustls/src/server/server_conn.rs
++++ b/rustls/src/server/server_conn.rs
+@@ -450,10 +450,9 @@ impl ServerConfig {
+         provider: Arc<CryptoProvider>,
+     ) -> ConfigBuilder<Self, WantsVersions> {
+         ConfigBuilder {
+-            state: WantsVersions {
+-                provider,
+-                time_provider: Arc::new(DefaultTimeProvider),
+-            },
++            state: WantsVersions {},
++            provider,
++            time_provider: Arc::new(DefaultTimeProvider),
+             side: PhantomData,
+         }
+     }
+@@ -477,10 +476,9 @@ impl ServerConfig {
+         time_provider: Arc<dyn TimeProvider>,
+     ) -> ConfigBuilder<Self, WantsVersions> {
+         ConfigBuilder {
+-            state: WantsVersions {
+-                provider,
+-                time_provider,
+-            },
++            state: WantsVersions {},
++            provider,
++            time_provider,
+             side: PhantomData,
+         }
+     }

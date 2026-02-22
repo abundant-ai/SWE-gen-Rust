@@ -1,0 +1,418 @@
+diff --git a/crates/toml_edit/Cargo.toml b/crates/toml_edit/Cargo.toml
+index 0dfead33..ae02bef6 100644
+--- a/crates/toml_edit/Cargo.toml
++++ b/crates/toml_edit/Cargo.toml
+@@ -39,6 +39,12 @@ default = []
+ easy = ["serde"]
+ perf = ["dep:kstring"]
+ serde = ["dep:serde", "toml_datetime/serde"]
++# Provide a method disable_recursion_limit to parse arbitrarily deep structures
++# without any consideration for overflowing the stack. Additionally you will
++# need to be careful around other recursive operations on the parsed result
++# which may overflow the stack after deserialization has completed, including,
++# but not limited to, Display and Debug and Drop impls.
++unbounded = []
+ 
+ [dependencies]
+ indexmap = "1.9.1"
+diff --git a/crates/toml_edit/src/parser/array.rs b/crates/toml_edit/src/parser/array.rs
+index 885c5b58..2092b5e9 100644
+--- a/crates/toml_edit/src/parser/array.rs
++++ b/crates/toml_edit/src/parser/array.rs
+@@ -12,15 +12,19 @@ use crate::parser::prelude::*;
+ // ;; Array
+ 
+ // array = array-open array-values array-close
+-pub(crate) fn array(input: Input<'_>) -> IResult<Input<'_>, Array, ParserError<'_>> {
+-    delimited(
+-        ARRAY_OPEN,
+-        cut(array_values),
+-        cut(ARRAY_CLOSE)
+-            .context(Context::Expression("array"))
+-            .context(Context::Expected(ParserValue::CharLiteral(']'))),
+-    )
+-    .parse(input)
++pub(crate) fn array(
++    check: RecursionCheck,
++) -> impl FnMut(Input<'_>) -> IResult<Input<'_>, Array, ParserError<'_>> {
++    move |input| {
++        delimited(
++            ARRAY_OPEN,
++            cut(array_values(check)),
++            cut(ARRAY_CLOSE)
++                .context(Context::Expression("array"))
++                .context(Context::Expected(ParserValue::CharLiteral(']'))),
++        )
++        .parse(input)
++    }
+ }
+ 
+ // note: we're omitting ws and newlines here, because
+@@ -35,36 +39,45 @@ const ARRAY_SEP: u8 = b',';
+ // note: this rule is modified
+ // array-values = [ ( array-value array-sep array-values ) /
+ //                  array-value / ws-comment-newline ]
+-pub(crate) fn array_values(input: Input<'_>) -> IResult<Input<'_>, Array, ParserError<'_>> {
+-    (
+-        opt(
+-            (separated_list1(ARRAY_SEP, array_value), opt(ARRAY_SEP)).map(
+-                |(v, trailing): (Vec<Value>, Option<u8>)| {
++pub(crate) fn array_values(
++    check: RecursionCheck,
++) -> impl FnMut(Input<'_>) -> IResult<Input<'_>, Array, ParserError<'_>> {
++    move |input| {
++        let check = check.recursing(input)?;
++        (
++            opt((
++                separated_list1(ARRAY_SEP, array_value(check)),
++                opt(ARRAY_SEP),
++            )
++                .map(|(v, trailing): (Vec<Value>, Option<u8>)| {
+                     (
+                         Array::with_vec(v.into_iter().map(Item::Value).collect()),
+                         trailing.is_some(),
+                     )
+-                },
+-            ),
+-        ),
+-        ws_comment_newline,
+-    )
+-        .map_res::<_, _, std::str::Utf8Error>(|(array, trailing)| {
+-            let (mut array, comma) = array.unwrap_or_default();
+-            array.set_trailing_comma(comma);
+-            array.set_trailing(std::str::from_utf8(trailing)?);
+-            Ok(array)
+-        })
+-        .parse(input)
++                })),
++            ws_comment_newline,
++        )
++            .map_res::<_, _, std::str::Utf8Error>(|(array, trailing)| {
++                let (mut array, comma) = array.unwrap_or_default();
++                array.set_trailing_comma(comma);
++                array.set_trailing(std::str::from_utf8(trailing)?);
++                Ok(array)
++            })
++            .parse(input)
++    }
+ }
+ 
+-pub(crate) fn array_value(input: Input<'_>) -> IResult<Input<'_>, Value, ParserError<'_>> {
+-    (ws_comment_newline, value, ws_comment_newline)
+-        .map_res::<_, _, std::str::Utf8Error>(|(ws1, v, ws2)| {
+-            let v = v.decorated(std::str::from_utf8(ws1)?, std::str::from_utf8(ws2)?);
+-            Ok(v)
+-        })
+-        .parse(input)
++pub(crate) fn array_value(
++    check: RecursionCheck,
++) -> impl FnMut(Input<'_>) -> IResult<Input<'_>, Value, ParserError<'_>> {
++    move |input| {
++        (ws_comment_newline, value(check), ws_comment_newline)
++            .map_res::<_, _, std::str::Utf8Error>(|(ws1, v, ws2)| {
++                let v = v.decorated(std::str::from_utf8(ws1)?, std::str::from_utf8(ws2)?);
++                Ok(v)
++            })
++            .parse(input)
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -109,13 +122,13 @@ mod test {
+             r#"[ { x = 1, a = "2" }, {a = "a",b = "b",     c =    "c"} ]"#,
+         ];
+         for input in inputs {
+-            let parsed = array.parse(input.as_bytes()).finish();
++            let parsed = array(Default::default()).parse(input.as_bytes()).finish();
+             assert_eq!(parsed.map(|a| a.to_string()), Ok(input.to_owned()));
+         }
+ 
+         let invalid_inputs = [r#"["#, r#"[,]"#, r#"[,2]"#, r#"[1e165,,]"#];
+         for input in invalid_inputs {
+-            let parsed = array.parse(input.as_bytes()).finish();
++            let parsed = array(Default::default()).parse(input.as_bytes()).finish();
+             assert!(parsed.is_err());
+         }
+     }
+diff --git a/crates/toml_edit/src/parser/document.rs b/crates/toml_edit/src/parser/document.rs
+index 77a43d00..cec93050 100644
+--- a/crates/toml_edit/src/parser/document.rs
++++ b/crates/toml_edit/src/parser/document.rs
+@@ -111,7 +111,7 @@ pub(crate) fn parse_keyval(
+                 .context(Context::Expected(ParserValue::CharLiteral('='))),
+             (
+                 ws,
+-                value,
++                value(RecursionCheck::default()),
+                 line_trailing
+                     .context(Context::Expected(ParserValue::CharLiteral('\n')))
+                     .context(Context::Expected(ParserValue::CharLiteral('#'))),
+diff --git a/crates/toml_edit/src/parser/errors.rs b/crates/toml_edit/src/parser/errors.rs
+index ac09094b..43a4e6d4 100644
+--- a/crates/toml_edit/src/parser/errors.rs
++++ b/crates/toml_edit/src/parser/errors.rs
+@@ -344,6 +344,8 @@ pub(crate) enum CustomError {
+         actual: &'static str,
+     },
+     OutOfRange,
++    #[cfg_attr(feature = "unbounded", allow(dead_code))]
++    RecursionLimitExceeded,
+ }
+ 
+ impl CustomError {
+@@ -394,6 +396,7 @@ impl Display for CustomError {
+                 )
+             }
+             CustomError::OutOfRange => writeln!(f, "Value is out of range"),
++            CustomError::RecursionLimitExceeded => writeln!(f, "Recursion limit exceded"),
+         }
+     }
+ }
+diff --git a/crates/toml_edit/src/parser/inline_table.rs b/crates/toml_edit/src/parser/inline_table.rs
+index dae8f1e9..cd9122dc 100644
+--- a/crates/toml_edit/src/parser/inline_table.rs
++++ b/crates/toml_edit/src/parser/inline_table.rs
+@@ -17,15 +17,19 @@ use indexmap::map::Entry;
+ // ;; Inline Table
+ 
+ // inline-table = inline-table-open inline-table-keyvals inline-table-close
+-pub(crate) fn inline_table(input: Input<'_>) -> IResult<Input<'_>, InlineTable, ParserError<'_>> {
+-    delimited(
+-        INLINE_TABLE_OPEN,
+-        cut(inline_table_keyvals.map_res(|(kv, p)| table_from_pairs(kv, p))),
+-        cut(INLINE_TABLE_CLOSE)
+-            .context(Context::Expression("inline table"))
+-            .context(Context::Expected(ParserValue::CharLiteral('}'))),
+-    )
+-    .parse(input)
++pub(crate) fn inline_table(
++    check: RecursionCheck,
++) -> impl FnMut(Input<'_>) -> IResult<Input<'_>, InlineTable, ParserError<'_>> {
++    move |input| {
++        delimited(
++            INLINE_TABLE_OPEN,
++            cut(inline_table_keyvals(check).map_res(|(kv, p)| table_from_pairs(kv, p))),
++            cut(INLINE_TABLE_CLOSE)
++                .context(Context::Expression("inline table"))
++                .context(Context::Expected(ParserValue::CharLiteral('}'))),
++        )
++        .parse(input)
++    }
+ }
+ 
+ fn table_from_pairs(
+@@ -93,36 +97,44 @@ pub(crate) const KEYVAL_SEP: u8 = b'=';
+ // ( key keyval-sep val )
+ 
+ fn inline_table_keyvals(
+-    input: Input<'_>,
+-) -> IResult<Input<'_>, (Vec<(Vec<Key>, TableKeyValue)>, &str), ParserError<'_>> {
+-    (separated_list0(INLINE_TABLE_SEP, keyval), ws).parse(input)
++    check: RecursionCheck,
++) -> impl FnMut(Input<'_>) -> IResult<Input<'_>, (Vec<(Vec<Key>, TableKeyValue)>, &str), ParserError<'_>>
++{
++    move |input| {
++        let check = check.recursing(input)?;
++        (separated_list0(INLINE_TABLE_SEP, keyval(check)), ws).parse(input)
++    }
+ }
+ 
+-fn keyval(input: Input<'_>) -> IResult<Input<'_>, (Vec<Key>, TableKeyValue), ParserError<'_>> {
+-    (
+-        key,
+-        cut((
+-            one_of(KEYVAL_SEP)
+-                .context(Context::Expected(ParserValue::CharLiteral('.')))
+-                .context(Context::Expected(ParserValue::CharLiteral('='))),
+-            (ws, value, ws),
+-        )),
+-    )
+-        .map(|(key, (_, v))| {
+-            let mut path = key;
+-            let key = path.pop().expect("grammar ensures at least 1");
++fn keyval(
++    check: RecursionCheck,
++) -> impl FnMut(Input<'_>) -> IResult<Input<'_>, (Vec<Key>, TableKeyValue), ParserError<'_>> {
++    move |input| {
++        (
++            key,
++            cut((
++                one_of(KEYVAL_SEP)
++                    .context(Context::Expected(ParserValue::CharLiteral('.')))
++                    .context(Context::Expected(ParserValue::CharLiteral('='))),
++                (ws, value(check), ws),
++            )),
++        )
++            .map(|(key, (_, v))| {
++                let mut path = key;
++                let key = path.pop().expect("grammar ensures at least 1");
+ 
+-            let (pre, v, suf) = v;
+-            let v = v.decorated(pre, suf);
+-            (
+-                path,
+-                TableKeyValue {
+-                    key,
+-                    value: Item::Value(v),
+-                },
+-            )
+-        })
+-        .parse(input)
++                let (pre, v, suf) = v;
++                let v = v.decorated(pre, suf);
++                (
++                    path,
++                    TableKeyValue {
++                        key,
++                        value: Item::Value(v),
++                    },
++                )
++            })
++            .parse(input)
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -139,12 +151,16 @@ mod test {
+             r#"{ hello.world = "a" }"#,
+         ];
+         for input in inputs {
+-            let parsed = inline_table.parse(input.as_bytes()).finish();
++            let parsed = inline_table(Default::default())
++                .parse(input.as_bytes())
++                .finish();
+             assert_eq!(parsed.map(|a| a.to_string()), Ok(input.to_owned()));
+         }
+         let invalid_inputs = [r#"{a = 1e165"#, r#"{ hello = "world", a = 2, hello = 1}"#];
+         for input in invalid_inputs {
+-            let parsed = inline_table.parse(input.as_bytes()).finish();
++            let parsed = inline_table(Default::default())
++                .parse(input.as_bytes())
++                .finish();
+             assert!(parsed.is_err());
+         }
+     }
+diff --git a/crates/toml_edit/src/parser/mod.rs b/crates/toml_edit/src/parser/mod.rs
+index 72f058ff..d04a5b90 100644
+--- a/crates/toml_edit/src/parser/mod.rs
++++ b/crates/toml_edit/src/parser/mod.rs
+@@ -18,7 +18,7 @@ pub(crate) mod value;
+ 
+ pub use errors::TomlError;
+ 
+-mod prelude {
++pub(crate) mod prelude {
+     pub(crate) use super::errors::Context;
+     pub(crate) use super::errors::ParserError;
+     pub(crate) use super::errors::ParserValue;
+@@ -61,4 +61,45 @@ mod prelude {
+             }
+         }
+     }
++
++    #[cfg(not(feature = "unbounded"))]
++    #[derive(Copy, Clone, Debug, Default)]
++    pub(crate) struct RecursionCheck {
++        current: usize,
++    }
++
++    #[cfg(not(feature = "unbounded"))]
++    impl RecursionCheck {
++        pub(crate) fn recursing(
++            mut self,
++            input: Input<'_>,
++        ) -> Result<Self, nom8::Err<ParserError<'_>>> {
++            self.current += 1;
++            if self.current < 128 {
++                Ok(self)
++            } else {
++                Err(nom8::Err::Error(
++                    nom8::error::FromExternalError::from_external_error(
++                        input,
++                        nom8::error::ErrorKind::Eof,
++                        super::errors::CustomError::RecursionLimitExceeded,
++                    ),
++                ))
++            }
++        }
++    }
++
++    #[cfg(feature = "unbounded")]
++    #[derive(Copy, Clone, Debug, Default)]
++    pub(crate) struct RecursionCheck {}
++
++    #[cfg(feature = "unbounded")]
++    impl RecursionCheck {
++        pub(crate) fn recursing(
++            self,
++            _input: Input<'_>,
++        ) -> Result<Self, nom8::Err<ParserError<'_>>> {
++            Ok(self)
++        }
++    }
+ }
+diff --git a/crates/toml_edit/src/parser/value.rs b/crates/toml_edit/src/parser/value.rs
+index 662b8311..8bfe17dc 100644
+--- a/crates/toml_edit/src/parser/value.rs
++++ b/crates/toml_edit/src/parser/value.rs
+@@ -15,16 +15,19 @@ use crate::value as v;
+ use crate::Value;
+ 
+ // val = string / boolean / array / inline-table / date-time / float / integer
+-pub(crate) fn value(input: Input<'_>) -> IResult<Input<'_>, v::Value, ParserError<'_>> {
+-    dispatch!{peek(any);
++pub(crate) fn value(
++    check: RecursionCheck,
++) -> impl FnMut(Input<'_>) -> IResult<Input<'_>, v::Value, ParserError<'_>> {
++    move |input| {
++        dispatch!{peek(any);
+             crate::parser::strings::QUOTATION_MARK |
+             crate::parser::strings::APOSTROPHE => string.map(|s| {
+                 v::Value::String(Formatted::new(
+                     s.into_owned()
+                 ))
+             }),
+-            crate::parser::array::ARRAY_OPEN => array.map(v::Value::Array),
+-            crate::parser::inline_table::INLINE_TABLE_OPEN => inline_table.map(v::Value::InlineTable),
++            crate::parser::array::ARRAY_OPEN => array(check).map(v::Value::Array),
++            crate::parser::inline_table::INLINE_TABLE_OPEN => inline_table(check).map(v::Value::InlineTable),
+             // Date/number starts
+             b'+' | b'-' | b'0'..=b'9' => {
+                 // Uncommon enough not to be worth optimizing at this time
+@@ -83,6 +86,7 @@ pub(crate) fn value(input: Input<'_>) -> IResult<Input<'_>, v::Value, ParserErro
+         .with_recognized()
+         .map_res(|(value, raw)| apply_raw(value, raw))
+         .parse(input)
++    }
+ }
+ 
+ fn apply_raw(mut val: Value, raw: &[u8]) -> Result<Value, std::str::Utf8Error> {
+@@ -137,7 +141,7 @@ trimmed in raw strings.
+             r#"[ { x = 1, a = "2" }, {a = "a",b = "b",     c =    "c"} ]"#,
+         ];
+         for input in inputs {
+-            let parsed = value.parse(input.as_bytes()).finish();
++            let parsed = value(Default::default()).parse(input.as_bytes()).finish();
+             assert_eq!(parsed.map(|a| a.to_string()), Ok(input.to_owned()));
+         }
+     }
+diff --git a/crates/toml_edit/src/value.rs b/crates/toml_edit/src/value.rs
+index 12df12d4..994b03b1 100644
+--- a/crates/toml_edit/src/value.rs
++++ b/crates/toml_edit/src/value.rs
+@@ -211,10 +211,13 @@ impl FromStr for Value {
+ 
+     /// Parses a value from a &str
+     fn from_str(s: &str) -> Result<Self, Self::Err> {
+-        use nom8::prelude::*;
++        use crate::parser::prelude::*;
++        use nom8::FinishIResult;
+ 
+         let b = s.as_bytes();
+-        let parsed = parser::value::value.parse(b).finish();
++        let parsed = parser::value::value(RecursionCheck::default())
++            .parse(b)
++            .finish();
+         match parsed {
+             Ok(mut value) => {
+                 // Only take the repr and not decor, as its probably not intended

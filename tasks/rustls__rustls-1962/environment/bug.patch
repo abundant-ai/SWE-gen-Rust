@@ -1,0 +1,665 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 68f29796..a35b7025 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -232,13 +232,13 @@ jobs:
+         uses: dtolnay/rust-toolchain@nightly
+ 
+       - name: Smoke-test benchmark program (ring)
+-        run: cargo run -p rustls --profile=bench --locked --example bench $(admin/all-features-except aws_lc_rs,aws-lc-rs,fips rustls)
++        run: cargo run -p rustls --profile=bench --locked --example bench
+ 
+       - name: Smoke-test benchmark program (aws-lc-rs)
+-        run: cargo run -p rustls --profile=bench --locked --example bench $(admin/all-features-except ring,fips rustls)
++        run: cargo run -p rustls --profile=bench --locked --example bench --no-default-features --features aws_lc_rs,tls12,std
+ 
+       - name: Smoke-test benchmark program (fips)
+-        run: cargo run -p rustls --profile=bench --locked --example bench $(admin/all-features-except aws_lc_rs,aws-lc-rs,ring rustls)
++        run: cargo run -p rustls --profile=bench --locked --example bench --no-default-features --features fips,tls12,std
+ 
+       - name: Run micro-benchmarks
+         run: cargo bench --locked --all-features
+diff --git a/admin/all-features-except b/admin/all-features-except
+deleted file mode 100755
+index 395ee9d1..00000000
+--- a/admin/all-features-except
++++ /dev/null
+@@ -1,58 +0,0 @@
+-#!/usr/bin/env python3
+-
+-DESCRIPTION = """
+-Usage: admin/all-features-except a,b,c crate
+-
+-Prints the set of all features declared by the given crate, minus
+-a, b and c.
+-
+-The output is decorated with `--no-default-features --features` meaning
+-it can be used directly with cargo, for example:
+-
+-$ cargo build $(admin/all-features-except std,logging rustls)
+-
+-It is assumed but not verified that the remaining features do not
+-have dependencies on the disabled features (otherwise, cargo will
+-re-enable them without notification).
+-"""
+-
+-import subprocess
+-import argparse
+-import json
+-
+-
+-def crate_features(crate_name):
+-    js = json.loads(
+-        subprocess.check_output(
+-            ["cargo", "metadata", "--no-deps", "--format-version=1"]
+-        )
+-    )
+-    package = [p for p in js["packages"] if p["name"] == crate_name]
+-    if len(package) != 1:
+-        raise ValueError(f"crate {crate_name} not found in {js}")
+-    return set(package[0]["features"].keys())
+-
+-
+-if __name__ == "__main__":
+-    ap = argparse.ArgumentParser(description=DESCRIPTION)
+-    ap.add_argument(
+-        dest="except_features",
+-        metavar="FEATURE,FEATURE,..",
+-        type=lambda x: set(x.strip().split(",")),
+-        help="Which features to remove from the complete set of features",
+-    )
+-    ap.add_argument("crate", help="Which crate to determine features for")
+-    opts = ap.parse_args()
+-
+-    features = crate_features(opts.crate)
+-
+-    for f in opts.except_features:
+-        try:
+-            features.remove(f)
+-        except KeyError as e:
+-            ap.error(f"feature `{f}' not found (known are {features})")
+-
+-    # drop default, as it may re-enable other features
+-    features.discard("default")
+-
+-    print("--no-default-features", "--features", ",".join(sorted(features)))
+diff --git a/bogo/runme b/bogo/runme
+index d2f0ff92..c13fbe67 100755
+--- a/bogo/runme
++++ b/bogo/runme
+@@ -7,11 +7,11 @@ set -xe
+ 
+ case ${BOGO_SHIM_PROVIDER:-ring} in
+   ring)
+-      cargo build -p rustls --example bogo_shim $(../admin/all-features-except aws-lc-rs,aws_lc_rs,fips rustls)
++      cargo build -p rustls --example bogo_shim --no-default-features --features ring,tls12,logging,std
+       cpp -P -DRING config.json.in > config.json
+       ;;
+   aws-lc-rs)
+-      cargo build -p rustls --example bogo_shim $(../admin/all-features-except ring,fips rustls)
++      cargo build -p rustls --example bogo_shim --no-default-features --features aws_lc_rs,tls12,logging,std
+       cpp -P -DAWS_LC_RS config.json.in > config.json
+       ;;
+   existing)
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 917b6a7a..ffe84170 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -658,12 +658,7 @@ impl State<ClientConnectionData> for ExpectCertificate {
+             ));
+         }
+         let end_entity_ocsp = cert_chain.end_entity_ocsp();
+-        let server_cert = ServerCertDetails::new(
+-            cert_chain
+-                .into_certificate_chain()
+-                .into_owned(),
+-            end_entity_ocsp,
+-        );
++        let server_cert = ServerCertDetails::new(cert_chain.convert(), end_entity_ocsp);
+ 
+         Ok(Box::new(ExpectCertificateVerify {
+             config: self.config,
+diff --git a/rustls/src/msgs/base.rs b/rustls/src/msgs/base.rs
+index 244e774c..b05e1068 100644
+--- a/rustls/src/msgs/base.rs
++++ b/rustls/src/msgs/base.rs
+@@ -81,35 +81,31 @@ impl fmt::Debug for Payload<'_> {
+ 
+ /// An arbitrary, unknown-content, u24-length-prefixed payload
+ #[derive(Clone, Eq, PartialEq)]
+-pub(crate) struct PayloadU24<'a>(pub(crate) Payload<'a>);
++pub(crate) struct PayloadU24(pub(crate) Vec<u8>);
+ 
+-impl<'a> PayloadU24<'a> {
+-    pub(crate) fn new(bytes: Vec<u8>) -> PayloadU24<'static> {
+-        PayloadU24(Payload::Owned(bytes))
+-    }
+-
+-    pub(crate) fn into_owned(self) -> PayloadU24<'static> {
+-        PayloadU24(self.0.into_owned())
++impl PayloadU24 {
++    pub(crate) fn new(bytes: Vec<u8>) -> Self {
++        Self(bytes)
+     }
+ }
+ 
+-impl<'a> Codec<'a> for PayloadU24<'a> {
++impl Codec<'_> for PayloadU24 {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+-        let inner = self.0.bytes();
+-        codec::u24(inner.len() as u32).encode(bytes);
+-        bytes.extend_from_slice(inner);
++        codec::u24(self.0.len() as u32).encode(bytes);
++        bytes.extend_from_slice(&self.0);
+     }
+ 
+-    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
++    fn read(r: &mut Reader) -> Result<Self, InvalidMessage> {
+         let len = codec::u24::read(r)?.0 as usize;
+         let mut sub = r.sub(len)?;
+-        Ok(Self(Payload::read(&mut sub)))
++        let body = sub.rest().to_vec();
++        Ok(Self(body))
+     }
+ }
+ 
+-impl<'a> fmt::Debug for PayloadU24<'a> {
++impl fmt::Debug for PayloadU24 {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        self.0.fmt(f)
++        hex(f, &self.0)
+     }
+ }
+ 
+diff --git a/rustls/src/msgs/handshake.rs b/rustls/src/msgs/handshake.rs
+index d6534a9a..729a79a9 100644
+--- a/rustls/src/msgs/handshake.rs
++++ b/rustls/src/msgs/handshake.rs
+@@ -1287,25 +1287,20 @@ impl<'a> Deref for CertificateChain<'a> {
+ }
+ 
+ impl TlsListElement for CertificateDer<'_> {
+-    const SIZE_LEN: ListLength = ListLength::U24 {
+-        max: CERTIFICATE_MAX_SIZE_LIMIT,
+-    };
++    const SIZE_LEN: ListLength = ListLength::U24 { max: 0x1_0000 };
+ }
+ 
+-/// TLS has a 16MB size limit on any handshake message,
+-/// plus a 16MB limit on any given certificate.
+-///
+-/// We contract that to 64KB to limit the amount of memory allocation
+-/// that is directly controllable by the peer.
+-pub(crate) const CERTIFICATE_MAX_SIZE_LIMIT: usize = 0x1_0000;
++// TLS1.3 changes the Certificate payload encoding.
++// That's annoying. It means the parsing is not
++// context-free any more.
+ 
+ #[derive(Debug)]
+-pub(crate) enum CertificateExtension<'a> {
+-    CertificateStatus(CertificateStatus<'a>),
++pub(crate) enum CertificateExtension {
++    CertificateStatus(CertificateStatus),
+     Unknown(UnknownExtension),
+ }
+ 
+-impl<'a> CertificateExtension<'a> {
++impl CertificateExtension {
+     pub(crate) fn ext_type(&self) -> ExtensionType {
+         match *self {
+             Self::CertificateStatus(_) => ExtensionType::StatusRequest,
+@@ -1313,22 +1308,15 @@ impl<'a> CertificateExtension<'a> {
+         }
+     }
+ 
+-    pub(crate) fn cert_status(&self) -> Option<&[u8]> {
++    pub(crate) fn cert_status(&self) -> Option<&Vec<u8>> {
+         match *self {
+-            Self::CertificateStatus(ref cs) => Some(cs.ocsp_response.0.bytes()),
++            Self::CertificateStatus(ref cs) => Some(&cs.ocsp_response.0),
+             _ => None,
+         }
+     }
+-
+-    pub(crate) fn into_owned(self) -> CertificateExtension<'static> {
+-        match self {
+-            Self::CertificateStatus(st) => CertificateExtension::CertificateStatus(st.into_owned()),
+-            Self::Unknown(unk) => CertificateExtension::Unknown(unk),
+-        }
+-    }
+ }
+ 
+-impl<'a> Codec<'a> for CertificateExtension<'a> {
++impl Codec<'_> for CertificateExtension {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+         self.ext_type().encode(bytes);
+ 
+@@ -1339,7 +1327,7 @@ impl<'a> Codec<'a> for CertificateExtension<'a> {
+         }
+     }
+ 
+-    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
++    fn read(r: &mut Reader) -> Result<Self, InvalidMessage> {
+         let typ = ExtensionType::read(r)?;
+         let len = u16::read(r)? as usize;
+         let mut sub = r.sub(len)?;
+@@ -1357,49 +1345,38 @@ impl<'a> Codec<'a> for CertificateExtension<'a> {
+     }
+ }
+ 
+-impl<'a> TlsListElement for CertificateExtension<'a> {
++impl TlsListElement for CertificateExtension {
+     const SIZE_LEN: ListLength = ListLength::U16;
+ }
+ 
+ #[derive(Debug)]
+-pub(crate) struct CertificateEntry<'a> {
+-    pub(crate) cert: CertificateDer<'a>,
+-    pub(crate) exts: Vec<CertificateExtension<'a>>,
++pub(crate) struct CertificateEntry {
++    pub(crate) cert: CertificateDer<'static>,
++    pub(crate) exts: Vec<CertificateExtension>,
+ }
+ 
+-impl<'a> Codec<'a> for CertificateEntry<'a> {
++impl Codec<'_> for CertificateEntry {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+         self.cert.encode(bytes);
+         self.exts.encode(bytes);
+     }
+ 
+-    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
++    fn read(r: &mut Reader) -> Result<Self, InvalidMessage> {
+         Ok(Self {
+-            cert: CertificateDer::read(r)?,
++            cert: CertificateDer::read(r)?.into_owned(),
+             exts: Vec::read(r)?,
+         })
+     }
+ }
+ 
+-impl<'a> CertificateEntry<'a> {
+-    pub(crate) fn new(cert: CertificateDer<'static>) -> CertificateEntry<'static> {
+-        CertificateEntry {
++impl CertificateEntry {
++    pub(crate) fn new(cert: CertificateDer<'static>) -> Self {
++        Self {
+             cert,
+             exts: Vec::new(),
+         }
+     }
+ 
+-    pub(crate) fn into_owned(self) -> CertificateEntry<'static> {
+-        CertificateEntry {
+-            cert: self.cert.into_owned(),
+-            exts: self
+-                .exts
+-                .into_iter()
+-                .map(CertificateExtension::into_owned)
+-                .collect(),
+-        }
+-    }
+-
+     pub(crate) fn has_duplicate_extension(&self) -> bool {
+         has_duplicates::<_, _, u16>(
+             self.exts
+@@ -1414,7 +1391,7 @@ impl<'a> CertificateEntry<'a> {
+             .any(|ext| ext.ext_type() != ExtensionType::StatusRequest)
+     }
+ 
+-    pub(crate) fn ocsp_response(&self) -> Option<&[u8]> {
++    pub(crate) fn ocsp_response(&self) -> Option<&Vec<u8>> {
+         self.exts
+             .iter()
+             .find(|ext| ext.ext_type() == ExtensionType::StatusRequest)
+@@ -1422,25 +1399,23 @@ impl<'a> CertificateEntry<'a> {
+     }
+ }
+ 
+-impl<'a> TlsListElement for CertificateEntry<'a> {
+-    const SIZE_LEN: ListLength = ListLength::U24 {
+-        max: CERTIFICATE_MAX_SIZE_LIMIT,
+-    };
++impl TlsListElement for CertificateEntry {
++    const SIZE_LEN: ListLength = ListLength::U24 { max: 0x1_0000 };
+ }
+ 
+ #[derive(Debug)]
+-pub struct CertificatePayloadTls13<'a> {
++pub struct CertificatePayloadTls13 {
+     pub(crate) context: PayloadU8,
+-    pub(crate) entries: Vec<CertificateEntry<'a>>,
++    pub(crate) entries: Vec<CertificateEntry>,
+ }
+ 
+-impl<'a> Codec<'a> for CertificatePayloadTls13<'a> {
++impl Codec<'_> for CertificatePayloadTls13 {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+         self.context.encode(bytes);
+         self.entries.encode(bytes);
+     }
+ 
+-    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
++    fn read(r: &mut Reader) -> Result<Self, InvalidMessage> {
+         Ok(Self {
+             context: PayloadU8::read(r)?,
+             entries: Vec::read(r)?,
+@@ -1448,25 +1423,14 @@ impl<'a> Codec<'a> for CertificatePayloadTls13<'a> {
+     }
+ }
+ 
+-impl<'a> CertificatePayloadTls13<'a> {
+-    pub(crate) fn new(entries: Vec<CertificateEntry<'a>>) -> Self {
++impl CertificatePayloadTls13 {
++    pub(crate) fn new(entries: Vec<CertificateEntry>) -> Self {
+         Self {
+             context: PayloadU8::empty(),
+             entries,
+         }
+     }
+ 
+-    pub(crate) fn into_owned(self) -> CertificatePayloadTls13<'static> {
+-        CertificatePayloadTls13 {
+-            context: self.context,
+-            entries: self
+-                .entries
+-                .into_iter()
+-                .map(CertificateEntry::into_owned)
+-                .collect(),
+-        }
+-    }
+-
+     pub(crate) fn any_entry_has_duplicate_extension(&self) -> bool {
+         for entry in &self.entries {
+             if entry.has_duplicate_extension() {
+@@ -1501,11 +1465,11 @@ impl<'a> CertificatePayloadTls13<'a> {
+         self.entries
+             .first()
+             .and_then(CertificateEntry::ocsp_response)
+-            .map(|resp| resp.to_vec())
++            .cloned()
+             .unwrap_or_default()
+     }
+ 
+-    pub(crate) fn into_certificate_chain(self) -> CertificateChain<'a> {
++    pub(crate) fn convert(self) -> CertificateChain<'static> {
+         CertificateChain(
+             self.entries
+                 .into_iter()
+@@ -2211,17 +2175,17 @@ impl Codec<'_> for NewSessionTicketPayloadTls13 {
+ 
+ /// Only supports OCSP
+ #[derive(Debug)]
+-pub struct CertificateStatus<'a> {
+-    pub(crate) ocsp_response: PayloadU24<'a>,
++pub struct CertificateStatus {
++    pub(crate) ocsp_response: PayloadU24,
+ }
+ 
+-impl<'a> Codec<'a> for CertificateStatus<'a> {
++impl Codec<'_> for CertificateStatus {
+     fn encode(&self, bytes: &mut Vec<u8>) {
+         CertificateStatusType::OCSP.encode(bytes);
+         self.ocsp_response.encode(bytes);
+     }
+ 
+-    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
++    fn read(r: &mut Reader) -> Result<Self, InvalidMessage> {
+         let typ = CertificateStatusType::read(r)?;
+ 
+         match typ {
+@@ -2233,22 +2197,16 @@ impl<'a> Codec<'a> for CertificateStatus<'a> {
+     }
+ }
+ 
+-impl<'a> CertificateStatus<'a> {
+-    pub(crate) fn new(ocsp: Vec<u8>) -> CertificateStatus<'static> {
+-        CertificateStatus {
++impl CertificateStatus {
++    pub(crate) fn new(ocsp: Vec<u8>) -> Self {
++        Self {
+             ocsp_response: PayloadU24::new(ocsp),
+         }
+     }
+ 
+     #[cfg(feature = "tls12")]
+     pub(crate) fn into_inner(self) -> Vec<u8> {
+-        self.ocsp_response.0.into_vec()
+-    }
+-
+-    pub(crate) fn into_owned(self) -> CertificateStatus<'static> {
+-        CertificateStatus {
+-            ocsp_response: self.ocsp_response.into_owned(),
+-        }
++        self.ocsp_response.0
+     }
+ }
+ 
+@@ -2259,7 +2217,7 @@ pub enum HandshakePayload<'a> {
+     ServerHello(ServerHelloPayload),
+     HelloRetryRequest(HelloRetryRequest),
+     Certificate(CertificateChain<'a>),
+-    CertificateTls13(CertificatePayloadTls13<'a>),
++    CertificateTls13(CertificatePayloadTls13),
+     ServerKeyExchange(ServerKeyExchangePayload),
+     CertificateRequest(CertificateRequestPayload),
+     CertificateRequestTls13(CertificateRequestPayloadTls13),
+@@ -2272,7 +2230,7 @@ pub enum HandshakePayload<'a> {
+     EncryptedExtensions(Vec<ServerExtension>),
+     KeyUpdate(KeyUpdateRequest),
+     Finished(Payload<'a>),
+-    CertificateStatus(CertificateStatus<'a>),
++    CertificateStatus(CertificateStatus),
+     MessageHash(Payload<'a>),
+     Unknown(Payload<'a>),
+ }
+@@ -2312,7 +2270,7 @@ impl HandshakePayload<'_> {
+             ServerHello(x) => ServerHello(x),
+             HelloRetryRequest(x) => HelloRetryRequest(x),
+             Certificate(x) => Certificate(x.into_owned()),
+-            CertificateTls13(x) => CertificateTls13(x.into_owned()),
++            CertificateTls13(x) => CertificateTls13(x),
+             ServerKeyExchange(x) => ServerKeyExchange(x),
+             CertificateRequest(x) => CertificateRequest(x),
+             CertificateRequestTls13(x) => CertificateRequestTls13(x),
+@@ -2325,7 +2283,7 @@ impl HandshakePayload<'_> {
+             EncryptedExtensions(x) => EncryptedExtensions(x),
+             KeyUpdate(x) => KeyUpdate(x),
+             Finished(x) => Finished(x.into_owned()),
+-            CertificateStatus(x) => CertificateStatus(x.into_owned()),
++            CertificateStatus(x) => CertificateStatus(x),
+             MessageHash(x) => MessageHash(x.into_owned()),
+             Unknown(x) => Unknown(x.into_owned()),
+         }
+diff --git a/rustls/src/msgs/handshake_test.rs b/rustls/src/msgs/handshake_test.rs
+index 9236023d..11efe6be 100644
+--- a/rustls/src/msgs/handshake_test.rs
++++ b/rustls/src/msgs/handshake_test.rs
+@@ -793,14 +793,14 @@ fn get_sample_helloretryrequest() -> HelloRetryRequest {
+     }
+ }
+ 
+-fn get_sample_certificatepayloadtls13() -> CertificatePayloadTls13<'static> {
++fn get_sample_certificatepayloadtls13() -> CertificatePayloadTls13 {
+     CertificatePayloadTls13 {
+         context: PayloadU8(vec![1, 2, 3]),
+         entries: vec![CertificateEntry {
+             cert: CertificateDer::from(vec![3, 4, 5]),
+             exts: vec![
+                 CertificateExtension::CertificateStatus(CertificateStatus {
+-                    ocsp_response: PayloadU24::new(vec![1, 2, 3]),
++                    ocsp_response: PayloadU24(vec![1, 2, 3]),
+                 }),
+                 CertificateExtension::Unknown(UnknownExtension {
+                     typ: ExtensionType::Unknown(12345),
+@@ -885,9 +885,9 @@ fn get_sample_encryptedextensions() -> Vec<ServerExtension> {
+     get_sample_serverhellopayload().extensions
+ }
+ 
+-fn get_sample_certificatestatus() -> CertificateStatus<'static> {
++fn get_sample_certificatestatus() -> CertificateStatus {
+     CertificateStatus {
+-        ocsp_response: PayloadU24::new(vec![1, 2, 3]),
++        ocsp_response: PayloadU24(vec![1, 2, 3]),
+     }
+ }
+ 
+@@ -989,17 +989,6 @@ fn can_roundtrip_all_tls12_handshake_payloads() {
+     }
+ }
+ 
+-#[test]
+-fn can_into_owned_all_tls12_handshake_payloads() {
+-    for hm in get_all_tls12_handshake_payloads().drain(..) {
+-        let enc = hm.get_encoding();
+-        let debug = format!("{hm:?}");
+-        let other = hm.into_owned();
+-        assert_eq!(enc, other.get_encoding());
+-        assert_eq!(debug, format!("{other:?}"));
+-    }
+-}
+-
+ #[test]
+ fn can_detect_truncation_of_all_tls12_handshake_payloads() {
+     for hm in get_all_tls12_handshake_payloads().iter() {
+@@ -1145,17 +1134,6 @@ fn can_roundtrip_all_tls13_handshake_payloads() {
+     }
+ }
+ 
+-#[test]
+-fn can_into_owned_all_tls13_handshake_payloads() {
+-    for hm in get_all_tls13_handshake_payloads().drain(..) {
+-        let enc = hm.get_encoding();
+-        let debug = format!("{hm:?}");
+-        let other = hm.into_owned();
+-        assert_eq!(enc, other.get_encoding());
+-        assert_eq!(debug, format!("{other:?}"));
+-    }
+-}
+-
+ fn put_u24(u: u32, b: &mut [u8]) {
+     b[0] = (u >> 16) as u8;
+     b[1] = (u >> 8) as u8;
+diff --git a/rustls/src/msgs/message_test.rs b/rustls/src/msgs/message_test.rs
+index ba91c1f6..69450a9b 100644
+--- a/rustls/src/msgs/message_test.rs
++++ b/rustls/src/msgs/message_test.rs
+@@ -103,8 +103,5 @@ fn debug_payload() {
+     assert_eq!("01020304", format!("{:?}", Payload::new(vec![1, 2, 3, 4])));
+     assert_eq!("01020304", format!("{:?}", PayloadU8(vec![1, 2, 3, 4])));
+     assert_eq!("01020304", format!("{:?}", PayloadU16(vec![1, 2, 3, 4])));
+-    assert_eq!(
+-        "01020304",
+-        format!("{:?}", PayloadU24::new(vec![1, 2, 3, 4]))
+-    );
++    assert_eq!("01020304", format!("{:?}", PayloadU24(vec![1, 2, 3, 4])));
+ }
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index 87041af8..b18f39da 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -872,7 +872,7 @@ impl State<ServerConnectionData> for ExpectCertificate {
+             return Err(PeerMisbehaved::UnsolicitedCertExtension.into());
+         }
+ 
+-        let client_cert = certp.into_certificate_chain();
++        let client_cert = certp.convert();
+ 
+         let mandatory = self
+             .config
+@@ -916,7 +916,7 @@ impl State<ServerConnectionData> for ExpectCertificate {
+             suite: self.suite,
+             transcript: self.transcript,
+             key_schedule: self.key_schedule,
+-            client_cert: client_cert.into_owned(),
++            client_cert,
+             send_tickets: self.send_tickets,
+         }))
+     }
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index 4f9016d0..bfebb640 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -6495,29 +6495,6 @@ fn test_read_tls_artificial_eof_after_close_notify() {
+     );
+ }
+ 
+-#[test]
+-fn test_pinned_ocsp_response_given_to_custom_server_cert_verifier() {
+-    let ocsp_response = b"hello-ocsp-world!";
+-    let kt = KeyType::EcdsaP256;
+-
+-    for version in rustls::ALL_VERSIONS {
+-        let server_config = server_config_builder()
+-            .with_no_client_auth()
+-            .with_single_cert_with_ocsp(kt.get_chain(), kt.get_key(), ocsp_response.to_vec())
+-            .unwrap();
+-
+-        let client_config = client_config_builder_with_versions(&[version])
+-            .dangerous()
+-            .with_custom_certificate_verifier(Arc::new(MockServerVerifier::expects_ocsp_response(
+-                ocsp_response,
+-            )))
+-            .with_no_client_auth();
+-
+-        let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+-        do_handshake(&mut client, &mut server);
+-    }
+-}
+-
+ struct FakeStream<'a>(&'a [u8]);
+ 
+ impl<'a> io::Read for FakeStream<'a> {
+diff --git a/rustls/tests/common/mod.rs b/rustls/tests/common/mod.rs
+index d24e0465..9e5df0bd 100644
+--- a/rustls/tests/common/mod.rs
++++ b/rustls/tests/common/mod.rs
+@@ -778,7 +778,6 @@ pub struct MockServerVerifier {
+     tls12_signature_error: Option<Error>,
+     tls13_signature_error: Option<Error>,
+     signature_schemes: Vec<SignatureScheme>,
+-    expected_ocsp_response: Option<Vec<u8>>,
+ }
+ 
+ impl ServerCertVerifier for MockServerVerifier {
+@@ -787,16 +786,13 @@ impl ServerCertVerifier for MockServerVerifier {
+         end_entity: &CertificateDer<'_>,
+         intermediates: &[CertificateDer<'_>],
+         server_name: &ServerName<'_>,
+-        ocsp_response: &[u8],
++        oscp_response: &[u8],
+         now: UnixTime,
+     ) -> Result<ServerCertVerified, Error> {
+         println!(
+             "verify_server_cert({:?}, {:?}, {:?}, {:?}, {:?})",
+-            end_entity, intermediates, server_name, ocsp_response, now
++            end_entity, intermediates, server_name, oscp_response, now
+         );
+-        if let Some(expected_ocsp) = &self.expected_ocsp_response {
+-            assert_eq!(expected_ocsp, ocsp_response);
+-        }
+         if let Some(error) = &self.cert_rejection_error {
+             Err(error.clone())
+         } else {
+@@ -851,13 +847,6 @@ impl MockServerVerifier {
+         }
+     }
+ 
+-    pub fn expects_ocsp_response(response: &[u8]) -> Self {
+-        MockServerVerifier {
+-            expected_ocsp_response: Some(response.to_vec()),
+-            ..Default::default()
+-        }
+-    }
+-
+     pub fn rejects_certificate(err: Error) -> Self {
+         MockServerVerifier {
+             cert_rejection_error: Some(err),
+@@ -901,7 +890,6 @@ impl Default for MockServerVerifier {
+                 SignatureScheme::ECDSA_NISTP384_SHA384,
+                 SignatureScheme::ECDSA_NISTP521_SHA512,
+             ],
+-            expected_ocsp_response: None,
+         }
+     }
+ }

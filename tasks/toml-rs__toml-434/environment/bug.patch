@@ -1,0 +1,209 @@
+diff --git a/crates/toml_edit/src/array_of_tables.rs b/crates/toml_edit/src/array_of_tables.rs
+index 25790b69..de64649f 100644
+--- a/crates/toml_edit/src/array_of_tables.rs
++++ b/crates/toml_edit/src/array_of_tables.rs
+@@ -32,11 +32,6 @@ impl ArrayOfTables {
+         a
+     }
+ 
+-    /// Returns the location within the original document
+-    pub(crate) fn span(&self) -> Option<std::ops::Range<usize>> {
+-        self.span.clone()
+-    }
+-
+     pub(crate) fn despan(&mut self, input: &str) {
+         self.span = None;
+         for value in &mut self.values {
+diff --git a/crates/toml_edit/src/item.rs b/crates/toml_edit/src/item.rs
+index 48a1a356..fa2dd813 100644
+--- a/crates/toml_edit/src/item.rs
++++ b/crates/toml_edit/src/item.rs
+@@ -301,8 +301,8 @@ impl Item {
+         match self {
+             Item::None => None,
+             Item::Value(v) => v.span(),
+-            Item::Table(v) => v.span(),
+-            Item::ArrayOfTables(v) => v.span(),
++            Item::Table(_) => None,
++            Item::ArrayOfTables(_) => None,
+         }
+     }
+ 
+diff --git a/crates/toml_edit/src/parser/state.rs b/crates/toml_edit/src/parser/state.rs
+index e83c8577..132951e8 100644
+--- a/crates/toml_edit/src/parser/state.rs
++++ b/crates/toml_edit/src/parser/state.rs
+@@ -98,7 +98,6 @@ impl ParseState {
+         &mut self,
+         path: Vec<Key>,
+         decor: Decor,
+-        span: std::ops::Range<usize>,
+     ) -> Result<(), CustomError> {
+         debug_assert!(!path.is_empty());
+         debug_assert!(self.current_table.is_empty());
+@@ -115,22 +114,26 @@ impl ParseState {
+             .as_array_of_tables()
+             .ok_or_else(|| CustomError::duplicate_key(&path, path.len() - 1))?;
+ 
++        let span = if let (Some(prefix), Some(suffix)) = (
++            decor.prefix().and_then(|r| r.span()),
++            decor.suffix().and_then(|r| r.span()),
++        ) {
++            Some((prefix.end)..(suffix.start))
++        } else {
++            None
++        };
++
+         self.current_table_position += 1;
+         self.current_table.decor = decor;
+         self.current_table.set_position(self.current_table_position);
+-        self.current_table.span = Some(span);
++        self.current_table.span = span;
+         self.current_is_array = true;
+         self.current_table_path = path;
+ 
+         Ok(())
+     }
+ 
+-    pub(crate) fn start_table(
+-        &mut self,
+-        path: Vec<Key>,
+-        decor: Decor,
+-        span: std::ops::Range<usize>,
+-    ) -> Result<(), CustomError> {
++    pub(crate) fn start_table(&mut self, path: Vec<Key>, decor: Decor) -> Result<(), CustomError> {
+         debug_assert!(!path.is_empty());
+         debug_assert!(self.current_table.is_empty());
+         debug_assert!(self.current_table_path.is_empty());
+@@ -150,10 +153,19 @@ impl ParseState {
+             }
+         }
+ 
++        let span = if let (Some(prefix), Some(suffix)) = (
++            decor.prefix().and_then(|r| r.span()),
++            decor.suffix().and_then(|r| r.span()),
++        ) {
++            Some((prefix.end)..(suffix.start))
++        } else {
++            None
++        };
++
+         self.current_table_position += 1;
+         self.current_table.decor = decor;
+         self.current_table.set_position(self.current_table_position);
+-        self.current_table.span = Some(span);
++        self.current_table.span = span;
+         self.current_is_array = false;
+         self.current_table_path = path;
+ 
+@@ -266,7 +278,6 @@ impl ParseState {
+         &mut self,
+         path: Vec<Key>,
+         trailing: std::ops::Range<usize>,
+-        span: std::ops::Range<usize>,
+     ) -> Result<(), CustomError> {
+         debug_assert!(!path.is_empty());
+ 
+@@ -276,11 +287,7 @@ impl ParseState {
+             .take()
+             .map(RawString::with_span)
+             .unwrap_or_default();
+-        self.start_table(
+-            path,
+-            Decor::new(leading, RawString::with_span(trailing)),
+-            span,
+-        )?;
++        self.start_table(path, Decor::new(leading, RawString::with_span(trailing)))?;
+ 
+         Ok(())
+     }
+@@ -289,7 +296,6 @@ impl ParseState {
+         &mut self,
+         path: Vec<Key>,
+         trailing: std::ops::Range<usize>,
+-        span: std::ops::Range<usize>,
+     ) -> Result<(), CustomError> {
+         debug_assert!(!path.is_empty());
+ 
+@@ -299,11 +305,7 @@ impl ParseState {
+             .take()
+             .map(RawString::with_span)
+             .unwrap_or_default();
+-        self.start_aray_table(
+-            path,
+-            Decor::new(leading, RawString::with_span(trailing)),
+-            span,
+-        )?;
++        self.start_aray_table(path, Decor::new(leading, RawString::with_span(trailing)))?;
+ 
+         Ok(())
+     }
+diff --git a/crates/toml_edit/src/parser/table.rs b/crates/toml_edit/src/parser/table.rs
+index 1c76ed19..b11f5c9c 100644
+--- a/crates/toml_edit/src/parser/table.rs
++++ b/crates/toml_edit/src/parser/table.rs
+@@ -36,13 +36,12 @@ pub(crate) fn std_table<'s, 'i>(
+                 cut(STD_TABLE_CLOSE)
+                     .context(Context::Expected(ParserValue::CharLiteral('.')))
+                     .context(Context::Expected(ParserValue::StringLiteral("]"))),
+-            )
+-            .with_span(),
++            ),
+             cut(line_trailing)
+                 .context(Context::Expected(ParserValue::CharLiteral('\n')))
+                 .context(Context::Expected(ParserValue::CharLiteral('#'))),
+         )
+-            .map_res(|((h, span), t)| state.borrow_mut().deref_mut().on_std_header(h, t, span))
++            .map_res(|(h, t)| state.borrow_mut().deref_mut().on_std_header(h, t))
+             .parse(i)
+     }
+ }
+@@ -61,13 +60,12 @@ pub(crate) fn array_table<'s, 'i>(
+                 cut(ARRAY_TABLE_CLOSE)
+                     .context(Context::Expected(ParserValue::CharLiteral('.')))
+                     .context(Context::Expected(ParserValue::StringLiteral("]]"))),
+-            )
+-            .with_span(),
++            ),
+             cut(line_trailing)
+                 .context(Context::Expected(ParserValue::CharLiteral('\n')))
+                 .context(Context::Expected(ParserValue::CharLiteral('#'))),
+         )
+-            .map_res(|((h, span), t)| state.borrow_mut().deref_mut().on_array_header(h, t, span))
++            .map_res(|(h, t)| state.borrow_mut().deref_mut().on_array_header(h, t))
+             .parse(i)
+     }
+ }
+diff --git a/crates/toml_edit/tests/testsuite/serde.rs b/crates/toml_edit/tests/testsuite/serde.rs
+index 316f8cf8..b4d9dfd7 100644
+--- a/crates/toml_edit/tests/testsuite/serde.rs
++++ b/crates/toml_edit/tests/testsuite/serde.rs
+@@ -258,11 +258,7 @@ fn missing_errors() {
+     error! {
+         Foo,
+         Table(map! { }),
+-        r#"TOML parse error at line 1, column 1
+-  |
+-1 | 
+-  | ^
+-missing field `bar`"#,
++        "missing field `bar`",
+         "missing field `bar`"
+     }
+ }
+@@ -548,14 +544,7 @@ debug = 'a'
+ "#,
+     );
+     let err = res.unwrap_err();
+-    snapbox::assert_eq(
+-        err.to_string(),
+-        r#"TOML parse error at line 7, column 1
+-  |
+-7 | [profile.dev]
+-  | ^^^^^^^^^^^^^
+-expected a boolean or an integer"#,
+-    );
++    snapbox::assert_eq(err.to_string(), "expected a boolean or an integer");
+ 
+     let res: Result<Package, _> = toml_edit::de::from_str(
+         r#"

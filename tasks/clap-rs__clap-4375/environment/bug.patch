@@ -1,0 +1,157 @@
+diff --git a/src/parser/arg_matcher.rs b/src/parser/arg_matcher.rs
+index 93bac7e1..65102c2b 100644
+--- a/src/parser/arg_matcher.rs
++++ b/src/parser/arg_matcher.rs
+@@ -152,6 +152,23 @@ impl ArgMatcher {
+         ma.new_val_group();
+     }
+ 
++    pub(crate) fn start_occurrence_of_arg(&mut self, arg: &Arg) {
++        let id = arg.get_id().clone();
++        debug!("ArgMatcher::start_occurrence_of_arg: id={:?}", id);
++        let ma = self.entry(id).or_insert(MatchedArg::new_arg(arg));
++        debug_assert_eq!(ma.type_id(), Some(arg.get_value_parser().type_id()));
++        ma.set_source(ValueSource::CommandLine);
++        ma.new_val_group();
++    }
++
++    pub(crate) fn start_occurrence_of_group(&mut self, id: Id) {
++        debug!("ArgMatcher::start_occurrence_of_group: id={:?}", id);
++        let ma = self.entry(id).or_insert(MatchedArg::new_group());
++        debug_assert_eq!(ma.type_id(), None);
++        ma.set_source(ValueSource::CommandLine);
++        ma.new_val_group();
++    }
++
+     pub(crate) fn start_occurrence_of_external(&mut self, cmd: &crate::Command) {
+         let id = Id::from_static_ref(Id::EXTERNAL);
+         debug!("ArgMatcher::start_occurrence_of_external: id={:?}", id,);
+diff --git a/src/parser/matches/matched_arg.rs b/src/parser/matches/matched_arg.rs
+index 6a80625f..22d5b414 100644
+--- a/src/parser/matches/matched_arg.rs
++++ b/src/parser/matches/matched_arg.rs
+@@ -130,7 +130,7 @@ impl MatchedArg {
+     }
+ 
+     pub(crate) fn check_explicit(&self, predicate: &ArgPredicate) -> bool {
+-        if self.source.map(|s| !s.is_explicit()).unwrap_or(false) {
++        if self.source == Some(ValueSource::DefaultValue) {
+             return false;
+         }
+ 
+diff --git a/src/parser/matches/value_source.rs b/src/parser/matches/value_source.rs
+index db45d9c0..fb762d2a 100644
+--- a/src/parser/matches/value_source.rs
++++ b/src/parser/matches/value_source.rs
+@@ -9,9 +9,3 @@ pub enum ValueSource {
+     /// Value was passed in on the command-line
+     CommandLine,
+ }
+-
+-impl ValueSource {
+-    pub(crate) fn is_explicit(self) -> bool {
+-        self != Self::DefaultValue
+-    }
+-}
+diff --git a/src/parser/parser.rs b/src/parser/parser.rs
+index 9a224cd8..dec42b77 100644
+--- a/src/parser/parser.rs
++++ b/src/parser/parser.rs
+@@ -1078,6 +1078,15 @@ impl<'cmd> Parser<'cmd> {
+             matcher.add_index_to(arg.get_id(), self.cur_idx.get());
+         }
+ 
++        // Increment or create the group "args"
++        for group in self.cmd.groups_for_arg(arg.get_id()) {
++            matcher.add_val_to(
++                &group,
++                AnyValue::new(arg.get_id().clone()),
++                OsString::from(arg.get_id().as_str()),
++            );
++        }
++
+         Ok(())
+     }
+ 
+@@ -1490,15 +1499,20 @@ impl<'cmd> Parser<'cmd> {
+             self.remove_overrides(arg, matcher);
+         }
+         matcher.start_custom_arg(arg, source);
+-        if source.is_explicit() {
+-            for group in self.cmd.groups_for_arg(arg.get_id()) {
+-                matcher.start_custom_group(group.clone(), source);
+-                matcher.add_val_to(
+-                    &group,
+-                    AnyValue::new(arg.get_id().clone()),
+-                    OsString::from(arg.get_id().as_str()),
+-                );
+-            }
++        for group in self.cmd.groups_for_arg(arg.get_id()) {
++            matcher.start_custom_group(group, source);
++        }
++    }
++
++    /// Increase occurrence of specific argument and the grouped arg it's in.
++    fn start_occurrence_of_arg(&self, matcher: &mut ArgMatcher, arg: &Arg) {
++        // With each new occurrence, remove overrides from prior occurrences
++        self.remove_overrides(arg, matcher);
++
++        matcher.start_occurrence_of_arg(arg);
++        // Increment or create the group "args"
++        for group in self.cmd.groups_for_arg(arg.get_id()) {
++            matcher.start_occurrence_of_group(group);
+         }
+     }
+ }
+@@ -1535,7 +1549,7 @@ impl<'cmd> Parser<'cmd> {
+         // Add the arg to the matches to build a proper usage string
+         if let Some((name, _)) = did_you_mean.as_ref() {
+             if let Some(arg) = self.cmd.get_keymap().get(&name.as_ref()) {
+-                self.start_custom_arg(matcher, arg, ValueSource::CommandLine);
++                self.start_occurrence_of_arg(matcher, arg);
+             }
+         }
+ 
+diff --git a/tests/builder/groups.rs b/tests/builder/groups.rs
+index 2150a2b6..17bd9c37 100644
+--- a/tests/builder/groups.rs
++++ b/tests/builder/groups.rs
+@@ -73,10 +73,9 @@ fn group_single_value() {
+ #[test]
+ fn group_empty() {
+     let res = Command::new("group")
+-        .arg(arg!(-f --flag "some flag"))
+         .arg(arg!(-c --color [color] "some option"))
+         .arg(arg!(-n --hostname <name> "another option"))
+-        .group(ArgGroup::new("grp").args(["hostname", "color", "flag"]))
++        .group(ArgGroup::new("grp").args(["hostname", "color"]))
+         .try_get_matches_from(vec![""]);
+     assert!(res.is_ok(), "{}", res.unwrap_err());
+ 
+@@ -88,13 +87,12 @@ fn group_empty() {
+ #[test]
+ fn group_required_flags_empty() {
+     let result = Command::new("group")
+-        .arg(arg!(-f --flag "some flag"))
+         .arg(arg!(-c --color "some option"))
+         .arg(arg!(-n --hostname <name> "another option"))
+         .group(
+             ArgGroup::new("grp")
+                 .required(true)
+-                .args(["hostname", "color", "flag"]),
++                .args(["hostname", "color"]),
+         )
+         .try_get_matches_from(vec![""]);
+     assert!(result.is_err());
+@@ -105,10 +103,9 @@ fn group_required_flags_empty() {
+ #[test]
+ fn group_multi_value_single_arg() {
+     let res = Command::new("group")
+-        .arg(arg!(-f --flag "some flag"))
+         .arg(arg!(-c --color <color> "some option").num_args(1..))
+         .arg(arg!(-n --hostname <name> "another option"))
+-        .group(ArgGroup::new("grp").args(["hostname", "color", "flag"]))
++        .group(ArgGroup::new("grp").args(["hostname", "color"]))
+         .try_get_matches_from(vec!["", "-c", "blue", "red", "green"]);
+     assert!(res.is_ok(), "{:?}", res.unwrap_err().kind());
+ 

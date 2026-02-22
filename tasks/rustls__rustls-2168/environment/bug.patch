@@ -1,0 +1,253 @@
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 678eaf59..9c878022 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -38,7 +38,6 @@ use crate::sign::{CertifiedKey, Signer};
+ use crate::suites::PartiallyExtractedSecrets;
+ use crate::tls13::key_schedule::{
+     KeyScheduleEarly, KeyScheduleHandshake, KeySchedulePreHandshake, KeyScheduleTraffic,
+-    ResumptionSecret,
+ };
+ use crate::tls13::{
+     construct_client_verify_message, construct_server_verify_message, Tls13CipherSuite,
+@@ -1427,8 +1426,9 @@ impl ExpectTraffic {
+         }
+ 
+         let handshake_hash = self.transcript.current_hash();
+-        let secret = ResumptionSecret::new(&self.key_schedule, &handshake_hash)
+-            .derive_ticket_psk(&nst.nonce.0);
++        let secret = self
++            .key_schedule
++            .resumption_master_secret_and_derive_ticket_psk(&handshake_hash, &nst.nonce.0);
+ 
+         let now = self.config.current_time()?;
+ 
+diff --git a/rustls/src/server/tls13.rs b/rustls/src/server/tls13.rs
+index 48d7596b..c202d809 100644
+--- a/rustls/src/server/tls13.rs
++++ b/rustls/src/server/tls13.rs
+@@ -28,9 +28,7 @@ use crate::msgs::message::{Message, MessagePayload};
+ use crate::msgs::persist;
+ use crate::server::ServerConfig;
+ use crate::suites::PartiallyExtractedSecrets;
+-use crate::tls13::key_schedule::{
+-    KeyScheduleTraffic, KeyScheduleTrafficWithClientFinishedPending, ResumptionSecret,
+-};
++use crate::tls13::key_schedule::{KeyScheduleTraffic, KeyScheduleTrafficWithClientFinishedPending};
+ use crate::tls13::{
+     construct_client_verify_message, construct_server_verify_message, Tls13CipherSuite,
+ };
+@@ -1262,8 +1260,9 @@ impl State<ServerConnectionData> for ExpectEarlyData {
+ 
+ // --- Process client's Finished ---
+ fn get_server_session_value(
++    transcript: &HandshakeHash,
+     suite: &'static Tls13CipherSuite,
+-    secret: &ResumptionSecret<'_>,
++    key_schedule: &KeyScheduleTraffic,
+     cx: &ServerContext<'_>,
+     nonce: &[u8],
+     time_now: UnixTime,
+@@ -1271,7 +1270,9 @@ fn get_server_session_value(
+ ) -> persist::ServerSessionValue {
+     let version = ProtocolVersion::TLSv1_3;
+ 
+-    let secret = secret.derive_ticket_psk(nonce);
++    let handshake_hash = transcript.current_hash();
++    let secret =
++        key_schedule.resumption_master_secret_and_derive_ticket_psk(&handshake_hash, nonce);
+ 
+     persist::ServerSessionValue::new(
+         cx.data.sni.as_ref(),
+@@ -1296,10 +1297,10 @@ struct ExpectFinished {
+ 
+ impl ExpectFinished {
+     fn emit_ticket(
+-        flight: &mut HandshakeFlightTls13<'_>,
++        transcript: &HandshakeHash,
+         suite: &'static Tls13CipherSuite,
+-        cx: &ServerContext<'_>,
+-        secret: &ResumptionSecret<'_>,
++        cx: &mut ServerContext<'_>,
++        key_schedule: &KeyScheduleTraffic,
+         config: &ServerConfig,
+     ) -> Result<(), Error> {
+         let secure_random = config.provider.secure_random;
+@@ -1309,7 +1310,8 @@ impl ExpectFinished {
+         let now = config.current_time()?;
+ 
+         let plain =
+-            get_server_session_value(suite, secret, cx, &nonce, now, age_add).get_encoding();
++            get_server_session_value(transcript, suite, key_schedule, cx, &nonce, now, age_add)
++                .get_encoding();
+ 
+         let stateless = config.ticketer.enabled();
+         let (ticket, lifetime) = if stateless {
+@@ -1347,13 +1349,16 @@ impl ExpectFinished {
+             }
+         }
+ 
+-        let t = HandshakeMessagePayload {
+-            typ: HandshakeType::NewSessionTicket,
+-            payload: HandshakePayload::NewSessionTicketTls13(payload),
++        let m = Message {
++            version: ProtocolVersion::TLSv1_3,
++            payload: MessagePayload::handshake(HandshakeMessagePayload {
++                typ: HandshakeType::NewSessionTicket,
++                payload: HandshakePayload::NewSessionTicketTls13(payload),
++            }),
+         };
+-        trace!("sending new ticket {:?} (stateless: {})", t, stateless);
+-        flight.add(t);
+ 
++        trace!("sending new ticket {:?} (stateless: {})", m, stateless);
++        cx.common.send_msg(m, true);
+         Ok(())
+     }
+ }
+@@ -1391,14 +1396,15 @@ impl State<ServerConnectionData> for ExpectFinished {
+ 
+         cx.common.check_aligned_handshake()?;
+ 
+-        let handshake_hash = self.transcript.current_hash();
+-        let resumption = ResumptionSecret::new(&key_schedule_traffic, &handshake_hash);
+-
+-        let mut flight = HandshakeFlightTls13::new(&mut self.transcript);
+         for _ in 0..self.send_tickets {
+-            Self::emit_ticket(&mut flight, self.suite, cx, &resumption, &self.config)?;
++            Self::emit_ticket(
++                &self.transcript,
++                self.suite,
++                cx,
++                &key_schedule_traffic,
++                &self.config,
++            )?;
+         }
+-        flight.finish(cx.common);
+ 
+         // Application data may now flow, even if we have client auth enabled.
+         cx.common
+diff --git a/rustls/src/tls13/key_schedule.rs b/rustls/src/tls13/key_schedule.rs
+index 0c454157..bfb92f68 100644
+--- a/rustls/src/tls13/key_schedule.rs
++++ b/rustls/src/tls13/key_schedule.rs
+@@ -524,6 +524,18 @@ impl KeyScheduleTraffic {
+         secret
+     }
+ 
++    pub(crate) fn resumption_master_secret_and_derive_ticket_psk(
++        &self,
++        hs_hash: &hash::Output,
++        nonce: &[u8],
++    ) -> OkmBlock {
++        let resumption_master_secret = self
++            .ks
++            .derive(SecretKind::ResumptionMasterSecret, hs_hash.as_ref());
++        self.ks
++            .derive_ticket_psk(&resumption_master_secret, nonce)
++    }
++
+     pub(crate) fn export_keying_material(
+         &self,
+         out: &mut [u8],
+@@ -577,28 +589,6 @@ impl KeyScheduleTraffic {
+     }
+ }
+ 
+-pub(crate) struct ResumptionSecret<'a> {
+-    kst: &'a KeyScheduleTraffic,
+-    resumption_master_secret: OkmBlock,
+-}
+-
+-impl<'a> ResumptionSecret<'a> {
+-    pub(crate) fn new(kst: &'a KeyScheduleTraffic, hs_hash: &hash::Output) -> Self {
+-        ResumptionSecret {
+-            kst,
+-            resumption_master_secret: kst
+-                .ks
+-                .derive(SecretKind::ResumptionMasterSecret, hs_hash.as_ref()),
+-        }
+-    }
+-
+-    pub(crate) fn derive_ticket_psk(&self, nonce: &[u8]) -> OkmBlock {
+-        self.kst
+-            .ks
+-            .derive_ticket_psk(&self.resumption_master_secret, nonce)
+-    }
+-}
+-
+ impl KeySchedule {
+     fn new(suite: &'static Tls13CipherSuite, secret: &[u8]) -> Self {
+         Self {
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index a6bd1f8e..5da6a85d 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -4082,9 +4082,9 @@ fn vectored_write_for_server_handshake_with_half_rtt_data() {
+     {
+         let mut pipe = OtherSession::new(&mut client);
+         let wrlen = server.write_tls(&mut pipe).unwrap();
+-        // 4 tickets (in one flight)
+-        assert_eq!(wrlen, 346);
+-        assert_eq!(pipe.writevs, vec![vec![346]]);
++        // 4 tickets
++        assert_eq!(wrlen, 103 * 4);
++        assert_eq!(pipe.writevs, vec![vec![103, 103, 103, 103]]);
+     }
+ 
+     assert!(!server.is_handshaking());
+@@ -4129,8 +4129,8 @@ fn check_half_rtt_does_not_work(server_config: ServerConfig) {
+     {
+         let mut pipe = OtherSession::new(&mut client);
+         let wrlen = server.write_tls(&mut pipe).unwrap();
+-        assert_eq!(wrlen, 420);
+-        assert_eq!(pipe.writevs, vec![vec![346, 42, 32]]);
++        assert_eq!(wrlen, 486);
++        assert_eq!(pipe.writevs, vec![vec![103, 103, 103, 103, 42, 32]]);
+     }
+ 
+     assert!(!server.is_handshaking());
+diff --git a/rustls/tests/unbuffered.rs b/rustls/tests/unbuffered.rs
+index f1e3b903..97a0f189 100644
+--- a/rustls/tests/unbuffered.rs
++++ b/rustls/tests/unbuffered.rs
+@@ -72,6 +72,9 @@ fn tls13_handshake() {
+             "Ok(EncodeTlsData)",
+             "Ok(TransmitTlsData)",
+             "Ok(WriteTraffic)",
++            "Ok(WriteTraffic)",
++            "Ok(WriteTraffic)",
++            "Ok(WriteTraffic)",
+             "Ok(WriteTraffic)"
+         ],
+         "client transcript mismatch"
+@@ -86,6 +89,9 @@ fn tls13_handshake() {
+             "Ok(TransmitTlsData)",
+             "Ok(BlockedHandshake)",
+             "Ok(EncodeTlsData)",
++            "Ok(EncodeTlsData)",
++            "Ok(EncodeTlsData)",
++            "Ok(EncodeTlsData)",
+             "Ok(TransmitTlsData)",
+             "Ok(WriteTraffic)"
+         ],
+@@ -213,6 +219,9 @@ fn early_data() {
+             "Ok(EncodeTlsData)",
+             "Ok(TransmitTlsData)",
+             "Ok(WriteTraffic)",
++            "Ok(WriteTraffic)",
++            "Ok(WriteTraffic)",
++            "Ok(WriteTraffic)",
+             "Ok(WriteTraffic)"
+         ]
+     );
+@@ -227,6 +236,9 @@ fn early_data() {
+             "Ok(TransmitTlsData)",
+             "Ok(BlockedHandshake)",
+             "Ok(EncodeTlsData)",
++            "Ok(EncodeTlsData)",
++            "Ok(EncodeTlsData)",
++            "Ok(EncodeTlsData)",
+             "Ok(TransmitTlsData)",
+             "Ok(WriteTraffic)"
+         ]

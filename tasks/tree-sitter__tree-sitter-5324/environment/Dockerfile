@@ -41,6 +41,15 @@ RUN patch -p1 < /tmp/bug.patch && rm /tmp/bug.patch
 # Rebuild after applying bug.patch (required for Rust)
 RUN cargo build --release
 
+# Clone test grammars needed for highlight tests
+RUN mkdir -p test/fixtures/grammars && \
+    cd test/fixtures/grammars && \
+    git clone --depth 1 https://github.com/tree-sitter/tree-sitter-javascript.git javascript && \
+    git clone --depth 1 https://github.com/tree-sitter/tree-sitter-jsdoc.git jsdoc && \
+    git clone --depth 1 https://github.com/tree-sitter/tree-sitter-html.git html && \
+    git clone --depth 1 https://github.com/tree-sitter/tree-sitter-embedded-template.git embedded-template && \
+    git clone --depth 1 https://github.com/tree-sitter/tree-sitter-rust.git rust
+
 RUN rm -rf /app/src/.git
 
 WORKDIR /app/src

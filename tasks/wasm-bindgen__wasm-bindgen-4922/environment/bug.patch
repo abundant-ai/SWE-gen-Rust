@@ -1,0 +1,1182 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4c64a8f15..2ddba2de1 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,8 +5,6 @@
+ 
+ ### Added
+ 
+-* Add Node.js `worker_threads` support for atomics builds. When targeting Node.js with atomics enabled, wasm-bindgen now generates `initSync({ module, memory, thread_stack_size })` and `__wbg_get_imports(memory)` functions that allow worker threads to initialize with a shared WebAssembly.Memory and pre-compiled module. Auto-initialization occurs only on the main thread for backwards compatibility.
+-
+ * Added the `web` and `node` targets to the `--experimental-reset-state-function` flag.
+   [#4909](https://github.com/wasm-bindgen/wasm-bindgen/pull/4909)
+ 
+diff --git a/Cargo.toml b/Cargo.toml
+index 8f75f4e72..ebc5e6026 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -101,7 +101,6 @@ members = [
+   "examples/closures",
+   "examples/console_log",
+   "examples/nodejs_and_deno",
+-  "examples/nodejs-threads",
+   "examples/dom",
+   "examples/duck-typed-interfaces",
+   "examples/explicit-resource-management",
+diff --git a/crates/cli-support/src/js/mod.rs b/crates/cli-support/src/js/mod.rs
+index a73781582..1e3c4894a 100644
+--- a/crates/cli-support/src/js/mod.rs
++++ b/crates/cli-support/src/js/mod.rs
+@@ -483,15 +483,6 @@ impl<'a> Context<'a> {
+             ts.push_str(&init_ts);
+         }
+ 
+-        // Generate TypeScript definitions for Node.js with threads enabled
+-        if self.config.typescript
+-            && matches!(self.config.mode, OutputMode::Node { .. })
+-            && self.threads_enabled
+-        {
+-            let node_atomics_ts = self.ts_for_node_atomics()?;
+-            ts.push_str(&node_atomics_ts);
+-        }
+-
+         Ok((self.globals.to_owned(), ts, start))
+     }
+ 
+@@ -719,55 +710,6 @@ impl<'a> Context<'a> {
+         ))
+     }
+ 
+-    /// Generate TypeScript definitions for Node.js targets with threads/atomics enabled.
+-    fn ts_for_node_atomics(&self) -> Result<String, Error> {
+-        let output = crate::wasm2es6js::interface(self.module)?;
+-
+-        Ok(format!(
+-            r#"
+-export type SyncInitInput = BufferSource | WebAssembly.Module;
+-
+-export interface InitOutput {{
+-{output}}}
+-
+-export interface InitSyncOptions {{
+-    module?: SyncInitInput;
+-    memory?: WebAssembly.Memory;
+-    thread_stack_size?: number;
+-}}
+-
+-/**
+- * Initialize the WebAssembly module synchronously.
+- *
+- * For the main thread, this is called automatically on import.
+- * Worker threads should call this explicitly with shared module and memory:
+- *
+- * ```js
+- * initSync({{ module: __wbg_wasm_module, memory: __wbg_memory }});
+- * ```
+- *
+- * @param opts - Initialization options
+- * @returns The exports object
+- */
+-export function initSync(opts?: InitSyncOptions): InitOutput;
+-
+-/**
+- * Get the imports object for WebAssembly instantiation.
+- *
+- * @param memory - Optional shared memory to use instead of creating new
+- * @returns The imports object for WebAssembly.Instance
+- */
+-export function __wbg_get_imports(memory?: WebAssembly.Memory): WebAssembly.Imports;
+-
+-/** The compiled WebAssembly module. Can be shared with workers. */
+-export const __wbg_wasm_module: WebAssembly.Module;
+-
+-/** The shared WebAssembly memory. */
+-export const __wbg_memory: WebAssembly.Memory;
+-"#
+-        ))
+-    }
+-
+     fn generate_module_wasm_loading(&self, module_name: &str, needs_manual_start: bool) -> String {
+         format!(
+             r#"import source wasmModule from "./{module_name}_bg.wasm";
+@@ -969,8 +911,8 @@ export const __wbg_memory: WebAssembly.Memory;
+             init_stack_size_check = if self.threads_enabled {
+                 format!(
+                     "if (typeof thread_stack_size !== 'undefined' && (typeof thread_stack_size !== 'number' || thread_stack_size === 0 || thread_stack_size % {} !== 0)) {{
+-                        throw new Error('invalid stack size');
+-                    }}\n\n",
++                        throw 'invalid stack size';
++                    }}\n",
+                     threads_xform::PAGE_SIZE,
+                 )
+             } else {
+@@ -1010,80 +952,19 @@ export const __wbg_memory: WebAssembly.Memory;
+         module_name: &str,
+         needs_manual_start: bool,
+     ) -> String {
+-        if self.threads_enabled {
+-            // For threads: generate initSync that accepts custom memory
+-            let start_call = if needs_manual_start {
+-                format!(
+-                    r#"
+-    if (typeof thread_stack_size !== 'undefined' && (typeof thread_stack_size !== 'number' || thread_stack_size === 0 || thread_stack_size % {page_size} !== 0)) {{
+-        throw new Error('invalid stack size');
+-    }}
+-
+-    wasm.__wbindgen_start(thread_stack_size);"#,
+-                    page_size = crate::transforms::threads::PAGE_SIZE,
+-                )
+-            } else {
+-                String::new()
+-            };
+-
+-            format!(
+-                r#"import {{ readFileSync }} from 'node:fs';
+-import {{ isMainThread }} from 'node:worker_threads';
+-
+-let wasm;
+-let wasmModule;
+-let memory;
+-let __initialized = false;
+-
+-export function initSync(opts = {{}}) {{
+-    if (__initialized) return wasm;
+-
+-    let {{ module, memory: mem, thread_stack_size }} = opts;
+-
+-    if (module === undefined) {{
+-        const wasmUrl = new URL('{module_name}_bg.wasm', import.meta.url);
+-        module = readFileSync(wasmUrl);
+-    }}
+-
+-    if (!(module instanceof WebAssembly.Module)) {{
+-        wasmModule = new WebAssembly.Module(module);
+-    }} else {{
+-        wasmModule = module;
+-    }}
+-
+-    const wasmImports = __wbg_get_imports(mem);
+-    const instance = new WebAssembly.Instance(wasmModule, wasmImports);
+-    wasm = instance.exports;
+-    memory = wasmImports['./{module_name}_bg.js'].memory;
+-{start_call}
+-    __initialized = true;
+-    return wasm;
+-}}
+-
+-// Auto-initialize for backwards compatibility (only on main thread)
+-// Worker threads should call initSync({{ module, memory }}) explicitly
+-if (isMainThread) {{
+-    initSync();
+-}}
+-
+-export {{ wasm as __wasm, wasmModule as __wbg_wasm_module, memory as __wbg_memory, __wbg_get_imports }};
+-"#
+-            )
+-        } else {
+-            format!(
+-                r#"import {{ readFileSync }} from 'node:fs';
++        format!(
++            r#"import {{ readFileSync }} from 'node:fs';
+             const wasmUrl = new URL('{module_name}_bg.wasm', import.meta.url);
+             const wasmBytes = readFileSync(wasmUrl);
+             const wasmModule = new WebAssembly.Module(wasmBytes);
+             let wasm = new WebAssembly.Instance(wasmModule, __wbg_get_imports()).exports;
+             {start}"#,
+-                start = if needs_manual_start {
+-                    "wasm.__wbindgen_start();\n"
+-                } else {
+-                    ""
+-                },
+-            )
+-        }
++            start = if needs_manual_start {
++                "wasm.__wbindgen_start();\n"
++            } else {
++                ""
++            },
++        )
+     }
+ 
+     fn generate_node_cjs_wasm_loading(
+@@ -1091,83 +972,18 @@ export {{ wasm as __wasm, wasmModule as __wbg_wasm_module, memory as __wbg_memor
+         module_name: &str,
+         needs_manual_start: bool,
+     ) -> String {
+-        if self.threads_enabled {
+-            // For threads: generate initSync that accepts custom memory
+-            let start_call = if needs_manual_start {
+-                format!(
+-                    r#"
+-    if (typeof thread_stack_size !== 'undefined' && (typeof thread_stack_size !== 'number' || thread_stack_size === 0 || thread_stack_size % {page_size} !== 0)) {{
+-        throw new Error('invalid stack size');
+-    }}
+-
+-    wasm.__wbindgen_start(thread_stack_size);"#,
+-                    page_size = crate::transforms::threads::PAGE_SIZE,
+-                )
+-            } else {
+-                String::new()
+-            };
+-
+-            format!(
+-                r#"let wasm;
+-let wasmModule;
+-let memory;
+-let __initialized = false;
+-
+-// Export __wbg_get_imports for workers to use
+-exports.__wbg_get_imports = __wbg_get_imports;
+-
+-exports.initSync = function(opts) {{
+-    if (opts === undefined) opts = {{}};
+-    if (__initialized) return wasm;
+-
+-    let module = opts.module;
+-    let mem = opts.memory;
+-    let thread_stack_size = opts.thread_stack_size;
+-
+-    if (module === undefined) {{
+-        const wasmPath = `${{__dirname}}/{module_name}_bg.wasm`;
+-        module = require('fs').readFileSync(wasmPath);
+-    }}
+-
+-    if (!(module instanceof WebAssembly.Module)) {{
+-        wasmModule = new WebAssembly.Module(module);
+-    }} else {{
+-        wasmModule = module;
+-    }}
+-
+-    const wasmImports = __wbg_get_imports(mem);
+-    const instance = new WebAssembly.Instance(wasmModule, wasmImports);
+-    wasm = instance.exports;
+-    memory = wasmImports['./{module_name}_bg.js'].memory;
+-    exports.__wasm = wasm;
+-    exports.__wbg_wasm_module = wasmModule;
+-    exports.__wbg_memory = memory;
+-{start_call}
+-    __initialized = true;
+-    return wasm;
+-}};
+-
+-// Auto-initialize for backwards compatibility (only on main thread)
+-// Worker threads should call initSync({{ module, memory }}) explicitly
+-if (require('worker_threads').isMainThread) {{
+-    exports.initSync();
+-}}
+-"#
+-            )
+-        } else {
+-            format!(
+-                r#"const wasmPath = `${{__dirname}}/{module_name}_bg.wasm`;
++        format!(
++            r#"const wasmPath = `${{__dirname}}/{module_name}_bg.wasm`;
+             const wasmBytes = require('fs').readFileSync(wasmPath);
+             const wasmModule = new WebAssembly.Module(wasmBytes);
+             let wasm = new WebAssembly.Instance(wasmModule, __wbg_get_imports()).exports;
+             {start}"#,
+-                start = if needs_manual_start {
+-                    "wasm.__wbindgen_start();\n"
+-                } else {
+-                    ""
+-                },
+-            )
+-        }
++            start = if needs_manual_start {
++                "wasm.__wbindgen_start();\n"
++            } else {
++                ""
++            },
++        )
+     }
+ 
+     fn generate_wasm_loading(
+diff --git a/crates/cli/tests/reference/targets-target-experimental-nodejs-module-atomics.d.ts b/crates/cli/tests/reference/targets-target-experimental-nodejs-module-atomics.d.ts
+index 36b1790cd..fe30d7fca 100644
+--- a/crates/cli/tests/reference/targets-target-experimental-nodejs-module-atomics.d.ts
++++ b/crates/cli/tests/reference/targets-target-experimental-nodejs-module-atomics.d.ts
+@@ -2,48 +2,3 @@
+ /* eslint-disable */
+ 
+ export function add_that_might_fail(a: number, b: number): number;
+-
+-export type SyncInitInput = BufferSource | WebAssembly.Module;
+-
+-export interface InitOutput {
+-    readonly add_that_might_fail: (a: number, b: number) => number;
+-    readonly memory: WebAssembly.Memory;
+-    readonly __wbindgen_externrefs: WebAssembly.Table;
+-    readonly __wbindgen_thread_destroy: (a?: number, b?: number, c?: number) => void;
+-    readonly __wbindgen_start: (a: number) => void;
+-}
+-
+-export interface InitSyncOptions {
+-    module?: SyncInitInput;
+-    memory?: WebAssembly.Memory;
+-    thread_stack_size?: number;
+-}
+-
+-/**
+- * Initialize the WebAssembly module synchronously.
+- *
+- * For the main thread, this is called automatically on import.
+- * Worker threads should call this explicitly with shared module and memory:
+- *
+- * ```js
+- * initSync({ module: __wbg_wasm_module, memory: __wbg_memory });
+- * ```
+- *
+- * @param opts - Initialization options
+- * @returns The exports object
+- */
+-export function initSync(opts?: InitSyncOptions): InitOutput;
+-
+-/**
+- * Get the imports object for WebAssembly instantiation.
+- *
+- * @param memory - Optional shared memory to use instead of creating new
+- * @returns The imports object for WebAssembly.Instance
+- */
+-export function __wbg_get_imports(memory?: WebAssembly.Memory): WebAssembly.Imports;
+-
+-/** The compiled WebAssembly module. Can be shared with workers. */
+-export const __wbg_wasm_module: WebAssembly.Module;
+-
+-/** The shared WebAssembly memory. */
+-export const __wbg_memory: WebAssembly.Memory;
+diff --git a/crates/cli/tests/reference/targets-target-experimental-nodejs-module-atomics.js b/crates/cli/tests/reference/targets-target-experimental-nodejs-module-atomics.js
+index c4608bc64..9eeae6cfc 100644
+--- a/crates/cli/tests/reference/targets-target-experimental-nodejs-module-atomics.js
++++ b/crates/cli/tests/reference/targets-target-experimental-nodejs-module-atomics.js
+@@ -58,47 +58,8 @@ function decodeText(ptr, len) {
+ }
+ 
+ import { readFileSync } from 'node:fs';
+-import { isMainThread } from 'node:worker_threads';
+-
+-let wasm;
+-let wasmModule;
+-let memory;
+-let __initialized = false;
+-
+-export function initSync(opts = {}) {
+-    if (__initialized) return wasm;
+-
+-    let { module, memory: mem, thread_stack_size } = opts;
+-
+-    if (module === undefined) {
+-        const wasmUrl = new URL('reference_test_bg.wasm', import.meta.url);
+-        module = readFileSync(wasmUrl);
+-    }
+-
+-    if (!(module instanceof WebAssembly.Module)) {
+-        wasmModule = new WebAssembly.Module(module);
+-    } else {
+-        wasmModule = module;
+-    }
+-
+-    const wasmImports = __wbg_get_imports(mem);
+-    const instance = new WebAssembly.Instance(wasmModule, wasmImports);
+-    wasm = instance.exports;
+-    memory = wasmImports['./reference_test_bg.js'].memory;
+-
+-    if (typeof thread_stack_size !== 'undefined' && (typeof thread_stack_size !== 'number' || thread_stack_size === 0 || thread_stack_size % 65536 !== 0)) {
+-        throw new Error('invalid stack size');
+-    }
+-
+-    wasm.__wbindgen_start(thread_stack_size);
+-    __initialized = true;
+-    return wasm;
+-}
+-
+-// Auto-initialize for backwards compatibility (only on main thread)
+-// Worker threads should call initSync({ module, memory }) explicitly
+-if (isMainThread) {
+-    initSync();
+-}
+-
+-export { wasm as __wasm, wasmModule as __wbg_wasm_module, memory as __wbg_memory, __wbg_get_imports };
++const wasmUrl = new URL('reference_test_bg.wasm', import.meta.url);
++const wasmBytes = readFileSync(wasmUrl);
++const wasmModule = new WebAssembly.Module(wasmBytes);
++let wasm = new WebAssembly.Instance(wasmModule, __wbg_get_imports()).exports;
++wasm.__wbindgen_start();
+diff --git a/crates/cli/tests/reference/targets-target-no-modules-atomics.js b/crates/cli/tests/reference/targets-target-no-modules-atomics.js
+index d5a9ddd3c..3ab765fc3 100644
+--- a/crates/cli/tests/reference/targets-target-no-modules-atomics.js
++++ b/crates/cli/tests/reference/targets-target-no-modules-atomics.js
+@@ -68,9 +68,8 @@ let wasm_bindgen = (function(exports) {
+         wasmModule = module;
+         cachedUint8ArrayMemory0 = null;
+         if (typeof thread_stack_size !== 'undefined' && (typeof thread_stack_size !== 'number' || thread_stack_size === 0 || thread_stack_size % 65536 !== 0)) {
+-            throw new Error('invalid stack size');
++            throw 'invalid stack size';
+         }
+-
+         wasm.__wbindgen_start(thread_stack_size);
+         return wasm;
+     }
+diff --git a/crates/cli/tests/reference/targets-target-nodejs-atomics.d.ts b/crates/cli/tests/reference/targets-target-nodejs-atomics.d.ts
+index 36b1790cd..fe30d7fca 100644
+--- a/crates/cli/tests/reference/targets-target-nodejs-atomics.d.ts
++++ b/crates/cli/tests/reference/targets-target-nodejs-atomics.d.ts
+@@ -2,48 +2,3 @@
+ /* eslint-disable */
+ 
+ export function add_that_might_fail(a: number, b: number): number;
+-
+-export type SyncInitInput = BufferSource | WebAssembly.Module;
+-
+-export interface InitOutput {
+-    readonly add_that_might_fail: (a: number, b: number) => number;
+-    readonly memory: WebAssembly.Memory;
+-    readonly __wbindgen_externrefs: WebAssembly.Table;
+-    readonly __wbindgen_thread_destroy: (a?: number, b?: number, c?: number) => void;
+-    readonly __wbindgen_start: (a: number) => void;
+-}
+-
+-export interface InitSyncOptions {
+-    module?: SyncInitInput;
+-    memory?: WebAssembly.Memory;
+-    thread_stack_size?: number;
+-}
+-
+-/**
+- * Initialize the WebAssembly module synchronously.
+- *
+- * For the main thread, this is called automatically on import.
+- * Worker threads should call this explicitly with shared module and memory:
+- *
+- * ```js
+- * initSync({ module: __wbg_wasm_module, memory: __wbg_memory });
+- * ```
+- *
+- * @param opts - Initialization options
+- * @returns The exports object
+- */
+-export function initSync(opts?: InitSyncOptions): InitOutput;
+-
+-/**
+- * Get the imports object for WebAssembly instantiation.
+- *
+- * @param memory - Optional shared memory to use instead of creating new
+- * @returns The imports object for WebAssembly.Instance
+- */
+-export function __wbg_get_imports(memory?: WebAssembly.Memory): WebAssembly.Imports;
+-
+-/** The compiled WebAssembly module. Can be shared with workers. */
+-export const __wbg_wasm_module: WebAssembly.Module;
+-
+-/** The shared WebAssembly memory. */
+-export const __wbg_memory: WebAssembly.Memory;
+diff --git a/crates/cli/tests/reference/targets-target-nodejs-atomics.js b/crates/cli/tests/reference/targets-target-nodejs-atomics.js
+index d805c3f72..82bdb7f41 100644
+--- a/crates/cli/tests/reference/targets-target-nodejs-atomics.js
++++ b/crates/cli/tests/reference/targets-target-nodejs-atomics.js
+@@ -58,52 +58,8 @@ function decodeText(ptr, len) {
+     return cachedTextDecoder.decode(getUint8ArrayMemory0().slice(ptr, ptr + len));
+ }
+ 
+-let wasm;
+-let wasmModule;
+-let memory;
+-let __initialized = false;
+-
+-// Export __wbg_get_imports for workers to use
+-exports.__wbg_get_imports = __wbg_get_imports;
+-
+-exports.initSync = function(opts) {
+-    if (opts === undefined) opts = {};
+-    if (__initialized) return wasm;
+-
+-    let module = opts.module;
+-    let mem = opts.memory;
+-    let thread_stack_size = opts.thread_stack_size;
+-
+-    if (module === undefined) {
+-        const wasmPath = `${__dirname}/reference_test_bg.wasm`;
+-        module = require('fs').readFileSync(wasmPath);
+-    }
+-
+-    if (!(module instanceof WebAssembly.Module)) {
+-        wasmModule = new WebAssembly.Module(module);
+-    } else {
+-        wasmModule = module;
+-    }
+-
+-    const wasmImports = __wbg_get_imports(mem);
+-    const instance = new WebAssembly.Instance(wasmModule, wasmImports);
+-    wasm = instance.exports;
+-    memory = wasmImports['./reference_test_bg.js'].memory;
+-    exports.__wasm = wasm;
+-    exports.__wbg_wasm_module = wasmModule;
+-    exports.__wbg_memory = memory;
+-
+-    if (typeof thread_stack_size !== 'undefined' && (typeof thread_stack_size !== 'number' || thread_stack_size === 0 || thread_stack_size % 65536 !== 0)) {
+-        throw new Error('invalid stack size');
+-    }
+-
+-    wasm.__wbindgen_start(thread_stack_size);
+-    __initialized = true;
+-    return wasm;
+-};
+-
+-// Auto-initialize for backwards compatibility (only on main thread)
+-// Worker threads should call initSync({ module, memory }) explicitly
+-if (require('worker_threads').isMainThread) {
+-    exports.initSync();
+-}
++const wasmPath = `${__dirname}/reference_test_bg.wasm`;
++const wasmBytes = require('fs').readFileSync(wasmPath);
++const wasmModule = new WebAssembly.Module(wasmBytes);
++let wasm = new WebAssembly.Instance(wasmModule, __wbg_get_imports()).exports;
++wasm.__wbindgen_start();
+diff --git a/crates/cli/tests/reference/targets-target-nodejs-experimental-reset-state-function-atomics.d.ts b/crates/cli/tests/reference/targets-target-nodejs-experimental-reset-state-function-atomics.d.ts
+index 292be0319..5874704f1 100644
+--- a/crates/cli/tests/reference/targets-target-nodejs-experimental-reset-state-function-atomics.d.ts
++++ b/crates/cli/tests/reference/targets-target-nodejs-experimental-reset-state-function-atomics.d.ts
+@@ -4,48 +4,3 @@
+ export function __wbg_reset_state(): void;
+ 
+ export function add_that_might_fail(a: number, b: number): number;
+-
+-export type SyncInitInput = BufferSource | WebAssembly.Module;
+-
+-export interface InitOutput {
+-    readonly add_that_might_fail: (a: number, b: number) => number;
+-    readonly memory: WebAssembly.Memory;
+-    readonly __wbindgen_externrefs: WebAssembly.Table;
+-    readonly __wbindgen_thread_destroy: (a?: number, b?: number, c?: number) => void;
+-    readonly __wbindgen_start: (a: number) => void;
+-}
+-
+-export interface InitSyncOptions {
+-    module?: SyncInitInput;
+-    memory?: WebAssembly.Memory;
+-    thread_stack_size?: number;
+-}
+-
+-/**
+- * Initialize the WebAssembly module synchronously.
+- *
+- * For the main thread, this is called automatically on import.
+- * Worker threads should call this explicitly with shared module and memory:
+- *
+- * ```js
+- * initSync({ module: __wbg_wasm_module, memory: __wbg_memory });
+- * ```
+- *
+- * @param opts - Initialization options
+- * @returns The exports object
+- */
+-export function initSync(opts?: InitSyncOptions): InitOutput;
+-
+-/**
+- * Get the imports object for WebAssembly instantiation.
+- *
+- * @param memory - Optional shared memory to use instead of creating new
+- * @returns The imports object for WebAssembly.Instance
+- */
+-export function __wbg_get_imports(memory?: WebAssembly.Memory): WebAssembly.Imports;
+-
+-/** The compiled WebAssembly module. Can be shared with workers. */
+-export const __wbg_wasm_module: WebAssembly.Module;
+-
+-/** The shared WebAssembly memory. */
+-export const __wbg_memory: WebAssembly.Memory;
+diff --git a/crates/cli/tests/reference/targets-target-nodejs-experimental-reset-state-function-atomics.js b/crates/cli/tests/reference/targets-target-nodejs-experimental-reset-state-function-atomics.js
+index 2173236f4..ff68dd37a 100644
+--- a/crates/cli/tests/reference/targets-target-nodejs-experimental-reset-state-function-atomics.js
++++ b/crates/cli/tests/reference/targets-target-nodejs-experimental-reset-state-function-atomics.js
+@@ -71,52 +71,8 @@ function decodeText(ptr, len) {
+     return cachedTextDecoder.decode(getUint8ArrayMemory0().slice(ptr, ptr + len));
+ }
+ 
+-let wasm;
+-let wasmModule;
+-let memory;
+-let __initialized = false;
+-
+-// Export __wbg_get_imports for workers to use
+-exports.__wbg_get_imports = __wbg_get_imports;
+-
+-exports.initSync = function(opts) {
+-    if (opts === undefined) opts = {};
+-    if (__initialized) return wasm;
+-
+-    let module = opts.module;
+-    let mem = opts.memory;
+-    let thread_stack_size = opts.thread_stack_size;
+-
+-    if (module === undefined) {
+-        const wasmPath = `${__dirname}/reference_test_bg.wasm`;
+-        module = require('fs').readFileSync(wasmPath);
+-    }
+-
+-    if (!(module instanceof WebAssembly.Module)) {
+-        wasmModule = new WebAssembly.Module(module);
+-    } else {
+-        wasmModule = module;
+-    }
+-
+-    const wasmImports = __wbg_get_imports(mem);
+-    const instance = new WebAssembly.Instance(wasmModule, wasmImports);
+-    wasm = instance.exports;
+-    memory = wasmImports['./reference_test_bg.js'].memory;
+-    exports.__wasm = wasm;
+-    exports.__wbg_wasm_module = wasmModule;
+-    exports.__wbg_memory = memory;
+-
+-    if (typeof thread_stack_size !== 'undefined' && (typeof thread_stack_size !== 'number' || thread_stack_size === 0 || thread_stack_size % 65536 !== 0)) {
+-        throw new Error('invalid stack size');
+-    }
+-
+-    wasm.__wbindgen_start(thread_stack_size);
+-    __initialized = true;
+-    return wasm;
+-};
+-
+-// Auto-initialize for backwards compatibility (only on main thread)
+-// Worker threads should call initSync({ module, memory }) explicitly
+-if (require('worker_threads').isMainThread) {
+-    exports.initSync();
+-}
++const wasmPath = `${__dirname}/reference_test_bg.wasm`;
++const wasmBytes = require('fs').readFileSync(wasmPath);
++const wasmModule = new WebAssembly.Module(wasmBytes);
++let wasm = new WebAssembly.Instance(wasmModule, __wbg_get_imports()).exports;
++wasm.__wbindgen_start();
+diff --git a/crates/cli/tests/reference/targets-target-web-atomics.js b/crates/cli/tests/reference/targets-target-web-atomics.js
+index b3f38ce12..f88e23e30 100644
+--- a/crates/cli/tests/reference/targets-target-web-atomics.js
++++ b/crates/cli/tests/reference/targets-target-web-atomics.js
+@@ -71,9 +71,8 @@ function __wbg_finalize_init(instance, module, thread_stack_size) {
+     wasmModule = module;
+     cachedUint8ArrayMemory0 = null;
+     if (typeof thread_stack_size !== 'undefined' && (typeof thread_stack_size !== 'number' || thread_stack_size === 0 || thread_stack_size % 65536 !== 0)) {
+-        throw new Error('invalid stack size');
++        throw 'invalid stack size';
+     }
+-
+     wasm.__wbindgen_start(thread_stack_size);
+     return wasm;
+ }
+diff --git a/crates/cli/tests/reference/targets-target-web-experimental-reset-state-function-atomics.js b/crates/cli/tests/reference/targets-target-web-experimental-reset-state-function-atomics.js
+index 273bc8421..1041e486b 100644
+--- a/crates/cli/tests/reference/targets-target-web-experimental-reset-state-function-atomics.js
++++ b/crates/cli/tests/reference/targets-target-web-experimental-reset-state-function-atomics.js
+@@ -83,9 +83,8 @@ function __wbg_finalize_init(instance, module, thread_stack_size) {
+     wasmModule = module;
+     cachedUint8ArrayMemory0 = null;
+     if (typeof thread_stack_size !== 'undefined' && (typeof thread_stack_size !== 'number' || thread_stack_size === 0 || thread_stack_size % 65536 !== 0)) {
+-        throw new Error('invalid stack size');
++        throw 'invalid stack size';
+     }
+-
+     wasm.__wbindgen_start(thread_stack_size);
+     return wasm;
+ }
+diff --git a/examples/nodejs-threads/Cargo.toml b/examples/nodejs-threads/Cargo.toml
+deleted file mode 100644
+index 6475aabd8..000000000
+--- a/examples/nodejs-threads/Cargo.toml
++++ /dev/null
+@@ -1,14 +0,0 @@
+-[package]
+-edition = "2021"
+-name = "nodejs-threads"
+-publish = false
+-version = "0.1.0"
+-
+-[lib]
+-crate-type = ["cdylib"]
+-
+-[dependencies]
+-wasm-bindgen = { path = "../../" }
+-
+-[lints.rust]
+-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_feature, values("atomics"))'] }
+diff --git a/examples/nodejs-threads/README.md b/examples/nodejs-threads/README.md
+deleted file mode 100644
+index 5f284a625..000000000
+--- a/examples/nodejs-threads/README.md
++++ /dev/null
+@@ -1,64 +0,0 @@
+-# Node.js worker_threads Example
+-
+-This example demonstrates using wasm-bindgen with Node.js `worker_threads` for multithreading, supporting both CommonJS and ESM targets.
+-
+-## Features Tested
+-
+-1. **Main thread auto-initialization** - Backwards compatibility with existing code
+-2. **Worker thread initialization** - Using `initSync({ module, memory })`
+-3. **Shared atomic counter** - Verifies memory is actually shared between threads
+-4. **Memory growth detection** - Tests the byteLength fix for SharedArrayBuffer
+-5. **Memory growth visibility** - Tests that memory growth is visible across threads
+-
+-## Building
+-
+-```bash
+-npm run build
+-```
+-
+-## Running
+-
+-```bash
+-npm test
+-```
+-
+-## How It Works
+-
+-When targeting Node.js (CJS or ESM) with threads enabled, wasm-bindgen generates:
+-
+-- `initSync(opts)` - Initialize the WASM module synchronously
+-- `__wbg_get_imports(memory)` - Get the imports object with optional custom memory
+-- `__wbg_wasm_module` - The compiled WebAssembly.Module for sharing with workers
+-- `__wbg_memory` - The shared WebAssembly.Memory
+-
+-Main thread auto-initializes on `require()` or `import`. Worker threads should call:
+-
+-```javascript
+-// CJS
+-const wasm = require('./pkg/nodejs_threads.js');
+-wasm.initSync({
+-    module: workerData.wasmModule,  // from main thread
+-    memory: workerData.memory       // from main thread
+-});
+-
+-// ESM
+-import { initSync } from './pkg/nodejs_threads.js';
+-initSync({
+-    module: workerData.wasmModule,  // from main thread
+-    memory: workerData.memory       // from main thread
+-});
+-```
+-
+-## TypeScript Support
+-
+-Full TypeScript declarations are generated for all exports:
+-
+-```typescript
+-import {
+-    initSync,
+-    __wbg_get_imports,
+-    __wbg_wasm_module,
+-    __wbg_memory,
+-    type InitSyncOptions
+-} from './pkg/nodejs_threads.js';
+-```
+diff --git a/examples/nodejs-threads/package.json b/examples/nodejs-threads/package.json
+deleted file mode 100644
+index cc3a04229..000000000
+--- a/examples/nodejs-threads/package.json
++++ /dev/null
+@@ -1,11 +0,0 @@
+-{
+-	"scripts": {
+-		"prebuild": "cargo +nightly build -p nodejs-threads --target wasm32-unknown-unknown --release -Zbuild-std=std,panic_abort --config \"target.wasm32-unknown-unknown.rustflags='-Ctarget-feature=+atomics,+bulk-memory -Clink-args=--shared-memory -Clink-args=--max-memory=1073741824 -Clink-args=--import-memory -Clink-args=--export=__wasm_init_tls -Clink-args=--export=__tls_size -Clink-args=--export=__tls_align -Clink-args=--export=__tls_base'\"",
+-		"build:cjs": "wasm-bindgen --target nodejs --out-dir ../dist/nodejs-threads ../../target/wasm32-unknown-unknown/release/nodejs_threads.wasm",
+-		"build:esm": "wasm-bindgen --target experimental-nodejs-module --out-dir ../dist/nodejs-threads-esm ../../target/wasm32-unknown-unknown/release/nodejs_threads.wasm",
+-		"build": "npm run build:cjs && npm run build:esm",
+-		"test:cjs": "node test.js",
+-		"test:esm": "node test-esm.mjs",
+-		"test": "npm run test:cjs && npm run test:esm"
+-	}
+-}
+diff --git a/examples/nodejs-threads/src/lib.rs b/examples/nodejs-threads/src/lib.rs
+deleted file mode 100644
+index 8f12d74d7..000000000
+--- a/examples/nodejs-threads/src/lib.rs
++++ /dev/null
+@@ -1,27 +0,0 @@
+-use std::sync::atomic::{AtomicU32, Ordering};
+-use wasm_bindgen::prelude::*;
+-
+-// A static atomic counter that can be safely accessed from multiple threads
+-static COUNTER: AtomicU32 = AtomicU32::new(0);
+-
+-#[wasm_bindgen]
+-pub fn increment() -> u32 {
+-    COUNTER.fetch_add(1, Ordering::SeqCst)
+-}
+-
+-#[wasm_bindgen]
+-pub fn get_counter() -> u32 {
+-    COUNTER.load(Ordering::SeqCst)
+-}
+-
+-#[wasm_bindgen]
+-pub fn add(a: u32, b: u32) -> u32 {
+-    a + b
+-}
+-
+-// Test that we can grow memory and still access it correctly
+-#[wasm_bindgen]
+-pub fn allocate_and_sum(size: usize) -> u32 {
+-    let v: Vec<u32> = (0..size as u32).collect();
+-    v.iter().sum()
+-}
+diff --git a/examples/nodejs-threads/test-esm.mjs b/examples/nodejs-threads/test-esm.mjs
+deleted file mode 100644
+index 7a25114fe..000000000
+--- a/examples/nodejs-threads/test-esm.mjs
++++ /dev/null
+@@ -1,165 +0,0 @@
+-/**
+- * Integration test for Node.js ESM with worker_threads support.
+- *
+- * Tests:
+- * 1. Main thread auto-initialization (backwards compatibility)
+- * 2. Worker thread initialization with initSync({ module, memory })
+- * 3. Shared atomic counter between threads
+- * 4. __wbg_get_imports export availability
+- * 5. Memory growth visibility from worker threads
+- */
+-
+-import { Worker, isMainThread, parentPort, workerData } from 'worker_threads';
+-import assert from 'assert';
+-import { fileURLToPath } from 'url';
+-
+-// Path to built WASM module (in dist for CI, pkg for local dev)
+-const WASM_PATH = '../dist/nodejs-threads-esm/nodejs_threads.js';
+-
+-if (isMainThread) {
+-    // Main thread tests
+-    async function runTests() {
+-        console.log('=== Node.js ESM worker_threads Integration Test ===\n');
+-
+-        // Test 1: Main thread auto-initialization
+-        console.log('Test 1: Main thread auto-initialization');
+-        const wasm = await import(WASM_PATH);
+-
+-        assert.strictEqual(typeof wasm.add, 'function', 'add function should be exported');
+-        assert.strictEqual(wasm.add(2, 3), 5, 'add(2, 3) should return 5');
+-        console.log('  ✓ Main thread initialized and functions work\n');
+-
+-        // Test 2: Verify initSync and __wbg_get_imports are exported
+-        console.log('Test 2: initSync and __wbg_get_imports exports');
+-        assert.strictEqual(typeof wasm.initSync, 'function', 'initSync should be exported');
+-        assert.strictEqual(typeof wasm.__wbg_get_imports, 'function', '__wbg_get_imports should be exported');
+-        assert.ok(wasm.__wbg_wasm_module instanceof WebAssembly.Module, '__wbindgen_wasm_module should be a Module');
+-        console.log('  ✓ initSync and __wbg_get_imports are exported\n');
+-
+-        // Test 3: Atomic counter starts at 0
+-        console.log('Test 3: Atomic counter initial state');
+-        assert.strictEqual(wasm.get_counter(), 0, 'Counter should start at 0');
+-        console.log('  ✓ Counter starts at 0\n');
+-
+-        // Test 4: Increment counter from main thread
+-        console.log('Test 4: Increment from main thread');
+-        const prev = wasm.increment();
+-        assert.strictEqual(prev, 0, 'First increment should return 0');
+-        assert.strictEqual(wasm.get_counter(), 1, 'Counter should be 1 after increment');
+-        console.log('  ✓ Counter incremented to 1\n');
+-
+-        // Test 5: Worker thread initialization and shared memory
+-        console.log('Test 5: Worker thread with shared memory');
+-
+-        const workerResult = await new Promise((resolve, reject) => {
+-            const worker = new Worker(fileURLToPath(import.meta.url), {
+-                workerData: {
+-                    wasmModule: wasm.__wbg_wasm_module,
+-                    memory: wasm.__wbg_memory,
+-                    testType: 'basic'
+-                }
+-            });
+-
+-            worker.on('message', resolve);
+-            worker.on('error', reject);
+-            worker.on('exit', (code) => {
+-                if (code !== 0) reject(new Error(`Worker exited with code ${code}`));
+-            });
+-        });
+-
+-        assert.strictEqual(workerResult.success, true, 'Worker should succeed');
+-        assert.strictEqual(workerResult.addResult, 10, 'Worker add(4, 6) should be 10');
+-        console.log('  ✓ Worker thread initialized and ran successfully\n');
+-
+-        // Test 6: Verify shared counter was modified by worker
+-        console.log('Test 6: Shared counter across threads');
+-        const finalCount = wasm.get_counter();
+-        assert.strictEqual(finalCount, 2, 'Counter should be 2 (main + worker each incremented once)');
+-        console.log(`  ✓ Counter is ${finalCount} (modified by both threads)\n`);
+-
+-        // Test 7: Memory growth visibility from worker threads
+-        // This test verifies:
+-        // 1. Worker can trigger memory growth via allocations
+-        // 2. Main thread sees the memory growth (shared memory)
+-        console.log('Test 7: Memory growth visibility from worker');
+-        const sizeBeforeWorker = wasm.__wbg_memory.buffer.byteLength;
+-        console.log(`  Size before worker: ${sizeBeforeWorker} bytes`);
+-
+-        const growthResult = await new Promise((resolve, reject) => {
+-            const worker = new Worker(fileURLToPath(import.meta.url), {
+-                workerData: {
+-                    wasmModule: wasm.__wbg_wasm_module,
+-                    memory: wasm.__wbg_memory,
+-                    testType: 'memory_growth'
+-                }
+-            });
+-
+-            worker.on('message', resolve);
+-            worker.on('error', reject);
+-            worker.on('exit', (code) => {
+-                if (code !== 0) reject(new Error(`Worker exited with code ${code}`));
+-            });
+-        });
+-
+-        assert.strictEqual(growthResult.success, true, 'Worker memory growth test should succeed');
+-
+-        // Verify memory growth from worker is visible to main thread
+-        const sizeAfterWorker = wasm.__wbg_memory.buffer.byteLength;
+-        assert.strictEqual(sizeAfterWorker, growthResult.finalSize,
+-            'Main thread should see same memory size as worker');
+-        assert.ok(sizeAfterWorker >= sizeBeforeWorker,
+-            'Memory should have grown or stayed same (never shrink)');
+-
+-        console.log(`  Worker reports final size: ${growthResult.finalSize} bytes`);
+-        console.log(`  Main thread now sees: ${sizeAfterWorker} bytes`);
+-        console.log('  ✓ Memory growth is visible across threads\n');
+-
+-        console.log('=== All ESM tests passed! ===');
+-    }
+-
+-    runTests().catch(err => {
+-        console.error('Test failed:', err);
+-        process.exit(1);
+-    });
+-
+-} else {
+-    // Worker thread
+-    const wasm = await import(WASM_PATH);
+-
+-    try {
+-        // Initialize with shared module and memory
+-        wasm.initSync({
+-            module: workerData.wasmModule,
+-            memory: workerData.memory
+-        });
+-
+-        if (workerData.testType === 'basic') {
+-            // Verify functions work
+-            const addResult = wasm.add(4, 6);
+-
+-            // Increment the shared counter
+-            wasm.increment();
+-
+-            parentPort.postMessage({
+-                success: true,
+-                addResult: addResult
+-            });
+-        } else if (workerData.testType === 'memory_growth') {
+-            // Trigger memory growth from worker
+-            wasm.allocate_and_sum(50000); // Allocate enough to potentially grow
+-
+-            // Check final size
+-            const finalSize = wasm.__wbg_memory.buffer.byteLength;
+-
+-            parentPort.postMessage({
+-                success: true,
+-                finalSize: finalSize
+-            });
+-        }
+-    } catch (err) {
+-        parentPort.postMessage({
+-            success: false,
+-            error: err.message
+-        });
+-    }
+-}
+diff --git a/examples/nodejs-threads/test.js b/examples/nodejs-threads/test.js
+deleted file mode 100644
+index 8a65fc4c9..000000000
+--- a/examples/nodejs-threads/test.js
++++ /dev/null
+@@ -1,187 +0,0 @@
+-/**
+- * Integration test for Node.js CJS with worker_threads support.
+- *
+- * Tests:
+- * 1. Main thread auto-initialization (backwards compatibility)
+- * 2. Worker thread initialization with initSync({ module, memory })
+- * 3. Shared atomic counter between threads
+- * 4. Memory growth detection with SharedArrayBuffer (byteLength fix)
+- * 5. Memory growth visibility from worker threads
+- */
+-
+-const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
+-const assert = require('assert');
+-
+-// Path to built WASM module (in dist for CI, pkg for local dev)
+-const WASM_PATH = '../dist/nodejs-threads/nodejs_threads.js';
+-
+-if (isMainThread) {
+-    // Main thread tests
+-    async function runTests() {
+-        console.log('=== Node.js worker_threads Integration Test ===\n');
+-
+-        // Test 1: Main thread auto-initialization
+-        console.log('Test 1: Main thread auto-initialization');
+-        const wasm = require(WASM_PATH);
+-
+-        assert.strictEqual(typeof wasm.add, 'function', 'add function should be exported');
+-        assert.strictEqual(wasm.add(2, 3), 5, 'add(2, 3) should return 5');
+-        console.log('  ✓ Main thread initialized and functions work\n');
+-
+-        // Test 2: Verify initSync and __wbg_get_imports are exported
+-        console.log('Test 2: initSync and __wbg_get_imports exports');
+-        assert.strictEqual(typeof wasm.initSync, 'function', 'initSync should be exported');
+-        assert.strictEqual(typeof wasm.__wbg_get_imports, 'function', '__wbg_get_imports should be exported');
+-        assert.ok(wasm.__wbg_wasm_module instanceof WebAssembly.Module, '__wbg_wasm_module should be a Module');
+-        console.log('  ✓ initSync and __wbg_get_imports are exported\n');
+-
+-        // Test 3: Atomic counter starts at 0
+-        console.log('Test 3: Atomic counter initial state');
+-        assert.strictEqual(wasm.get_counter(), 0, 'Counter should start at 0');
+-        console.log('  ✓ Counter starts at 0\n');
+-
+-        // Test 4: Increment counter from main thread
+-        console.log('Test 4: Increment from main thread');
+-        const prev = wasm.increment();
+-        assert.strictEqual(prev, 0, 'First increment should return 0');
+-        assert.strictEqual(wasm.get_counter(), 1, 'Counter should be 1 after increment');
+-        console.log('  ✓ Counter incremented to 1\n');
+-
+-        // Test 5: Worker thread initialization and shared memory
+-        console.log('Test 5: Worker thread with shared memory');
+-
+-        const workerResult = await new Promise((resolve, reject) => {
+-            const worker = new Worker(__filename, {
+-                workerData: {
+-                    wasmModule: wasm.__wbg_wasm_module,
+-                    memory: wasm.__wbg_memory,
+-                    testType: 'basic'
+-                }
+-            });
+-
+-            worker.on('message', resolve);
+-            worker.on('error', reject);
+-            worker.on('exit', (code) => {
+-                if (code !== 0) reject(new Error(`Worker exited with code ${code}`));
+-            });
+-        });
+-
+-        assert.strictEqual(workerResult.success, true, 'Worker should succeed');
+-        assert.strictEqual(workerResult.addResult, 10, 'Worker add(4, 6) should be 10');
+-        console.log('  ✓ Worker thread initialized and ran successfully\n');
+-
+-        // Test 6: Verify shared counter was modified by worker
+-        console.log('Test 6: Shared counter across threads');
+-        const finalCount = wasm.get_counter();
+-        assert.strictEqual(finalCount, 2, 'Counter should be 2 (main + worker each incremented once)');
+-        console.log(`  ✓ Counter is ${finalCount} (modified by both threads)\n`);
+-
+-        // Test 7: Memory growth and cached view invalidation
+-        console.log('Test 7: Memory growth detection (byteLength fix)');
+-        const initialSize = wasm.__wbg_memory.buffer.byteLength;
+-        console.log(`  Initial memory size: ${initialSize} bytes`);
+-
+-        // Allocate a large amount to trigger memory growth
+-        // This should work correctly with the byteLength fix
+-        // Use 90000 elements to stay within u32 range (sum = 4049955000 < 2^32)
+-        const largeSize = 90000;
+-        const sum = wasm.allocate_and_sum(largeSize);
+-        const expectedSum = (largeSize - 1) * largeSize / 2; // Sum of 0..n-1 = 4049955000
+-        assert.strictEqual(sum, expectedSum, `allocate_and_sum should return ${expectedSum}`);
+-
+-        const finalSize = wasm.__wbg_memory.buffer.byteLength;
+-        console.log(`  Final memory size: ${finalSize} bytes`);
+-
+-        if (finalSize > initialSize) {
+-            console.log('  ✓ Memory grew and cached views were correctly invalidated\n');
+-        } else {
+-            console.log('  ✓ Memory did not need to grow (already large enough)\n');
+-        }
+-
+-        // Test 8: Memory growth visibility from worker threads
+-        // This test verifies:
+-        // 1. Worker can trigger memory growth via allocations
+-        // 2. Main thread sees the memory growth (shared memory)
+-        console.log('Test 8: Memory growth visibility from worker');
+-        const sizeBeforeWorker = wasm.__wbg_memory.buffer.byteLength;
+-        console.log(`  Size before worker: ${sizeBeforeWorker} bytes`);
+-
+-        const growthResult = await new Promise((resolve, reject) => {
+-            const worker = new Worker(__filename, {
+-                workerData: {
+-                    wasmModule: wasm.__wbg_wasm_module,
+-                    memory: wasm.__wbg_memory,
+-                    testType: 'memory_growth'
+-                }
+-            });
+-
+-            worker.on('message', resolve);
+-            worker.on('error', reject);
+-            worker.on('exit', (code) => {
+-                if (code !== 0) reject(new Error(`Worker exited with code ${code}`));
+-            });
+-        });
+-
+-        assert.strictEqual(growthResult.success, true, 'Worker memory growth test should succeed');
+-
+-        // Verify memory growth from worker is visible to main thread
+-        // The worker reports the final size it saw, and main thread should see the same
+-        const sizeAfterWorker = wasm.__wbg_memory.buffer.byteLength;
+-        assert.strictEqual(sizeAfterWorker, growthResult.finalSize,
+-            'Main thread should see same memory size as worker');
+-        assert.ok(sizeAfterWorker >= sizeBeforeWorker,
+-            'Memory should have grown or stayed same (never shrink)');
+-
+-        console.log(`  Worker reports final size: ${growthResult.finalSize} bytes`);
+-        console.log(`  Main thread now sees: ${sizeAfterWorker} bytes`);
+-        console.log('  ✓ Memory growth is visible across threads\n');
+-
+-        console.log('=== All tests passed! ===');
+-    }
+-
+-    runTests().catch(err => {
+-        console.error('Test failed:', err);
+-        process.exit(1);
+-    });
+-
+-} else {
+-    // Worker thread
+-    const wasm = require(WASM_PATH);
+-
+-    try {
+-        // Initialize with shared module and memory
+-        wasm.initSync({
+-            module: workerData.wasmModule,
+-            memory: workerData.memory
+-        });
+-
+-        if (workerData.testType === 'basic') {
+-            // Verify functions work
+-            const addResult = wasm.add(4, 6);
+-
+-            // Increment the shared counter
+-            wasm.increment();
+-
+-            parentPort.postMessage({
+-                success: true,
+-                addResult: addResult
+-            });
+-        } else if (workerData.testType === 'memory_growth') {
+-            // Trigger memory growth from worker
+-            wasm.allocate_and_sum(50000); // Allocate enough to potentially grow
+-
+-            // Check final size
+-            const finalSize = wasm.__wbg_memory.buffer.byteLength;
+-
+-            parentPort.postMessage({
+-                success: true,
+-                finalSize: finalSize
+-            });
+-        }
+-    } catch (err) {
+-        parentPort.postMessage({
+-            success: false,
+-            error: err.message
+-        });
+-    }
+-}

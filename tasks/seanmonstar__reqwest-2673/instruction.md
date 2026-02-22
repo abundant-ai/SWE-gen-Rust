@@ -1,0 +1,9 @@
+When using reqwest with HTTP/3 enabled, sending a request with a non-reusable/streaming body does not work correctly. In particular, the HTTP/3 request body handling currently assumes the body can be materialized as a single byte slice (effectively treating it like a fully-buffered body). This breaks support for streaming bodies and prevents HTTP/3 from meeting the stability requirements.
+
+The HTTP/3 request sending logic must support both reusable (buffered) bodies and streaming bodies. When a request is sent over HTTP/3 using `Client::builder().http3_prior_knowledge()` and the request is explicitly set to `http::Version::HTTP_3`, calling `.send()` with a body like `.body("hello")` should transmit the body correctly and include the correct `CONTENT_LENGTH` header when the length is known.
+
+For example, a server receiving an HTTP/3 POST should observe `CONTENT_LENGTH: 5` and the collected request body bytes should equal `hello`, and the client response should report `res.version() == http::Version::HTTP_3` with a successful status.
+
+Additionally, HTTP/3 connection failure behavior must remain consistent across retries: if an initial HTTP/3 request to an endpoint that isn’t accepting QUIC connections times out (e.g., due to a very small `http3_max_idle_timeout`), the error returned by `.send()` should still be attributable to a `quinn::ConnectionError::TimedOut`, and a subsequent request should fail in the same way. After an HTTP/3 server is started on the same address, a new HTTP/3 request should then succeed.
+
+Fix the HTTP/3 request body streaming so that it does not rely on converting the body to a single byte slice, but instead properly drives the body as a stream of frames/chunks until completion, working for both reusable and streaming body variants.

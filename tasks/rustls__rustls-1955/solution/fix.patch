@@ -1,0 +1,153 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 11a28e26..05369325 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2172,7 +2172,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "rustls"
+-version = "0.23.6"
++version = "0.23.7"
+ dependencies = [
+  "aws-lc-rs",
+  "base64 0.22.1",
+@@ -2206,7 +2206,7 @@ dependencies = [
+  "fxhash",
+  "itertools",
+  "rayon",
+- "rustls 0.23.6",
++ "rustls 0.23.7",
+  "rustls-pemfile 2.1.2",
+  "rustls-pki-types",
+  "tikv-jemallocator",
+@@ -2219,7 +2219,7 @@ dependencies = [
+  "hickory-resolver",
+  "regex",
+  "ring",
+- "rustls 0.23.6",
++ "rustls 0.23.7",
+ ]
+ 
+ [[package]]
+@@ -2232,7 +2232,7 @@ dependencies = [
+  "log",
+  "mio",
+  "rcgen",
+- "rustls 0.23.6",
++ "rustls 0.23.7",
+  "rustls-pemfile 2.1.2",
+  "rustls-pki-types",
+  "serde",
+@@ -2250,7 +2250,7 @@ dependencies = [
+  "num-bigint",
+  "once_cell",
+  "openssl",
+- "rustls 0.23.6",
++ "rustls 0.23.7",
+  "rustls-pemfile 2.1.2",
+  "rustls-pki-types",
+ ]
+@@ -2286,7 +2286,7 @@ version = "0.1.0"
+ dependencies = [
+  "aws-lc-rs",
+  "env_logger",
+- "rustls 0.23.6",
++ "rustls 0.23.7",
+  "webpki-roots 0.26.1",
+ ]
+ 
+@@ -2308,7 +2308,7 @@ dependencies = [
+  "rand_core",
+  "rcgen",
+  "rsa",
+- "rustls 0.23.6",
++ "rustls 0.23.7",
+  "rustls-pki-types",
+  "rustls-webpki 0.102.3",
+  "serde",
+diff --git a/fuzz/Cargo.lock b/fuzz/Cargo.lock
+index e26755c8..f3faec49 100644
+--- a/fuzz/Cargo.lock
++++ b/fuzz/Cargo.lock
+@@ -360,7 +360,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "rustls"
+-version = "0.23.6"
++version = "0.23.7"
+ dependencies = [
+  "aws-lc-rs",
+  "log",
+diff --git a/rustls/Cargo.toml b/rustls/Cargo.toml
+index 9165743e..9141d934 100644
+--- a/rustls/Cargo.toml
++++ b/rustls/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "rustls"
+-version = "0.23.6"
++version = "0.23.7"
+ edition = "2021"
+ rust-version = "1.63"
+ license = "Apache-2.0 OR ISC OR MIT"
+diff --git a/rustls/src/common_state.rs b/rustls/src/common_state.rs
+index 19589cf6..29825ea7 100644
+--- a/rustls/src/common_state.rs
++++ b/rustls/src/common_state.rs
+@@ -475,14 +475,20 @@ impl CommonState {
+         err.into()
+     }
+ 
+-    /// Queues a close_notify warning alert to be sent in the next
++    /// Queues a `close_notify` warning alert to be sent in the next
+     /// [`Connection::write_tls`] call.  This informs the peer that the
+     /// connection is being closed.
+     ///
++    /// Does nothing if any `close_notify` or fatal alert was already sent.
++    ///
+     /// [`Connection::write_tls`]: crate::Connection::write_tls
+     pub fn send_close_notify(&mut self) {
++        if self.sent_fatal_alert {
++            return;
++        }
+         debug!("Sending warning alert {:?}", AlertDescription::CloseNotify);
+         self.send_warning_alert_no_log(AlertDescription::CloseNotify);
++        self.sent_fatal_alert = true;
+     }
+ 
+     pub(crate) fn eager_send_close_notify(
+diff --git a/rustls/src/conn.rs b/rustls/src/conn.rs
+index a019dce2..20b305a9 100644
+--- a/rustls/src/conn.rs
++++ b/rustls/src/conn.rs
+@@ -645,6 +645,9 @@ impl<Data> ConnectionCommon<Data> {
+     /// * In order to empty the incoming plaintext data buffer, you should empty it through
+     ///   the [`reader()`] after the call to [`process_new_packets()`].
+     ///
++    /// This function also returns `Ok(0)` once a `close_notify` alert has been successfully
++    /// received.  No additional data is ever read in this state.
++    ///
+     /// [`process_new_packets()`]: ConnectionCommon::process_new_packets
+     /// [`reader()`]: ConnectionCommon::reader
+     pub fn read_tls(&mut self, rd: &mut dyn io::Read) -> Result<usize, io::Error> {
+@@ -655,6 +658,10 @@ impl<Data> ConnectionCommon<Data> {
+             ));
+         }
+ 
++        if self.has_received_close_notify {
++            return Ok(0);
++        }
++
+         let res = self
+             .core
+             .message_deframer
+@@ -793,7 +800,8 @@ impl<Data> ConnectionCore<Data> {
+             {
+                 // "Any data received after a closure alert has been received MUST be ignored."
+                 // -- <https://datatracker.ietf.org/doc/html/rfc8446#section-6.1>
+-                discard = borrowed_buffer.filled().len();
++                // This is data that has already been accepted in `read_tls`.
++                discard += borrowed_buffer.filled().len();
+                 break;
+             }
+         }

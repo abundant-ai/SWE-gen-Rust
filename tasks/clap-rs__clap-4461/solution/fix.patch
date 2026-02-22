@@ -1,0 +1,340 @@
+diff --git a/clap_derive/src/attr.rs b/clap_derive/src/attr.rs
+index f97ba7d0..5ea49a1d 100644
+--- a/clap_derive/src/attr.rs
++++ b/clap_derive/src/attr.rs
+@@ -105,6 +105,8 @@ impl Parse for ClapAttr {
+             "external_subcommand" => Some(MagicAttrName::ExternalSubcommand),
+             "verbatim_doc_comment" => Some(MagicAttrName::VerbatimDocComment),
+             "about" => Some(MagicAttrName::About),
++            "long_about" => Some(MagicAttrName::LongAbout),
++            "long_help" => Some(MagicAttrName::LongHelp),
+             "author" => Some(MagicAttrName::Author),
+             "version" => Some(MagicAttrName::Version),
+             _ => None,
+@@ -160,6 +162,8 @@ pub enum MagicAttrName {
+     VerbatimDocComment,
+     ExternalSubcommand,
+     About,
++    LongAbout,
++    LongHelp,
+     Author,
+     Version,
+     RenameAllEnv,
+diff --git a/clap_derive/src/item.rs b/clap_derive/src/item.rs
+index 94f12267..a068e360 100644
+--- a/clap_derive/src/item.rs
++++ b/clap_derive/src/item.rs
+@@ -19,13 +19,10 @@ use proc_macro2::{self, Span, TokenStream};
+ use proc_macro_error::abort;
+ use quote::{format_ident, quote, quote_spanned, ToTokens};
+ use syn::DeriveInput;
+-use syn::{
+-    self, ext::IdentExt, spanned::Spanned, Attribute, Field, Ident, LitStr, MetaNameValue, Type,
+-    Variant,
+-};
++use syn::{self, ext::IdentExt, spanned::Spanned, Attribute, Field, Ident, LitStr, Type, Variant};
+ 
+ use crate::attr::*;
+-use crate::utils::{inner_type, is_simple_ty, process_doc_comment, Sp, Ty};
++use crate::utils::{extract_doc_comment, format_doc_comment, inner_type, is_simple_ty, Sp, Ty};
+ 
+ /// Default casing style for generated arguments.
+ pub const DEFAULT_CASING: CasingStyle = CasingStyle::Kebab;
+@@ -46,6 +43,7 @@ pub struct Item {
+     value_parser: Option<ValueParser>,
+     action: Option<Action>,
+     verbatim_doc_comment: bool,
++    force_long_help: bool,
+     next_display_order: Option<Method>,
+     next_help_heading: Option<Method>,
+     is_enum: bool,
+@@ -67,7 +65,7 @@ impl Item {
+         let parsed_attrs = ClapAttr::parse_all(attrs);
+         res.infer_kind(&parsed_attrs);
+         res.push_attrs(&parsed_attrs);
+-        res.push_doc_comment(attrs, "about", true);
++        res.push_doc_comment(attrs, "about", Some("long_about"));
+ 
+         res
+     }
+@@ -84,7 +82,7 @@ impl Item {
+         let parsed_attrs = ClapAttr::parse_all(attrs);
+         res.infer_kind(&parsed_attrs);
+         res.push_attrs(&parsed_attrs);
+-        res.push_doc_comment(attrs, "about", true);
++        res.push_doc_comment(attrs, "about", Some("long_about"));
+ 
+         res
+     }
+@@ -144,7 +142,7 @@ impl Item {
+         res.infer_kind(&parsed_attrs);
+         res.push_attrs(&parsed_attrs);
+         if matches!(&*res.kind, Kind::Command(_) | Kind::Subcommand(_)) {
+-            res.push_doc_comment(&variant.attrs, "about", true);
++            res.push_doc_comment(&variant.attrs, "about", Some("long_about"));
+         }
+ 
+         match &*res.kind {
+@@ -189,7 +187,7 @@ impl Item {
+         res.infer_kind(&parsed_attrs);
+         res.push_attrs(&parsed_attrs);
+         if matches!(&*res.kind, Kind::Value) {
+-            res.push_doc_comment(&variant.attrs, "help", false);
++            res.push_doc_comment(&variant.attrs, "help", None);
+         }
+ 
+         res
+@@ -217,7 +215,7 @@ impl Item {
+         res.infer_kind(&parsed_attrs);
+         res.push_attrs(&parsed_attrs);
+         if matches!(&*res.kind, Kind::Arg(_)) {
+-            res.push_doc_comment(&field.attrs, "help", true);
++            res.push_doc_comment(&field.attrs, "help", Some("long_help"));
+         }
+ 
+         match &*res.kind {
+@@ -269,6 +267,7 @@ impl Item {
+             value_parser: None,
+             action: None,
+             verbatim_doc_comment: false,
++            force_long_help: false,
+             next_display_order: None,
+             next_help_heading: None,
+             is_enum: false,
+@@ -507,6 +506,18 @@ impl Item {
+                     }
+                 }
+ 
++                Some(MagicAttrName::LongAbout) if attr.value.is_none() => {
++                    assert_attr_kind(attr, &[AttrKind::Command]);
++
++                    self.force_long_help = true;
++                }
++
++                Some(MagicAttrName::LongHelp) if attr.value.is_none() => {
++                    assert_attr_kind(attr, &[AttrKind::Arg]);
++
++                    self.force_long_help = true;
++                }
++
+                 Some(MagicAttrName::Author) if attr.value.is_none() => {
+                     assert_attr_kind(attr, &[AttrKind::Command]);
+ 
+@@ -823,6 +834,8 @@ impl Item {
+                 | Some(MagicAttrName::Long)
+                 | Some(MagicAttrName::Env)
+                 | Some(MagicAttrName::About)
++                | Some(MagicAttrName::LongAbout)
++                | Some(MagicAttrName::LongHelp)
+                 | Some(MagicAttrName::Author)
+                 | Some(MagicAttrName::Version)
+                  => {
+@@ -872,28 +885,13 @@ impl Item {
+         }
+     }
+ 
+-    fn push_doc_comment(&mut self, attrs: &[Attribute], name: &str, supports_long_help: bool) {
+-        use syn::Lit::*;
+-        use syn::Meta::*;
+-
+-        let comment_parts: Vec<_> = attrs
+-            .iter()
+-            .filter(|attr| attr.path.is_ident("doc"))
+-            .filter_map(|attr| {
+-                if let Ok(NameValue(MetaNameValue { lit: Str(s), .. })) = attr.parse_meta() {
+-                    Some(s.value())
+-                } else {
+-                    // non #[doc = "..."] attributes are not our concern
+-                    // we leave them for rustc to handle
+-                    None
+-                }
+-            })
+-            .collect();
++    fn push_doc_comment(&mut self, attrs: &[Attribute], short_name: &str, long_name: Option<&str>) {
++        let lines = extract_doc_comment(attrs);
+ 
+-        if let Some((short_help, long_help)) =
+-            process_doc_comment(&comment_parts, !self.verbatim_doc_comment)
+-        {
+-            let short_name = format_ident!("{}", name);
++        if !lines.is_empty() {
++            let (short_help, long_help) =
++                format_doc_comment(&lines, !self.verbatim_doc_comment, self.force_long_help);
++            let short_name = format_ident!("{}", short_name);
+             let short = Method::new(
+                 short_name,
+                 short_help
+@@ -901,8 +899,8 @@ impl Item {
+                     .unwrap_or_else(|| quote!(None)),
+             );
+             self.doc_comment.push(short);
+-            if supports_long_help {
+-                let long_name = format_ident!("long_{}", name);
++            if let Some(long_name) = long_name {
++                let long_name = format_ident!("{}", long_name);
+                 let long = Method::new(
+                     long_name,
+                     long_help
+diff --git a/clap_derive/src/utils/doc_comments.rs b/clap_derive/src/utils/doc_comments.rs
+index 591246ff..5183b6b2 100644
+--- a/clap_derive/src/utils/doc_comments.rs
++++ b/clap_derive/src/utils/doc_comments.rs
+@@ -5,36 +5,56 @@
+ 
+ use std::iter;
+ 
+-pub fn process_doc_comment(
+-    lines: &[String],
+-    preprocess: bool,
+-) -> Option<(Option<String>, Option<String>)> {
++pub fn extract_doc_comment(attrs: &[syn::Attribute]) -> Vec<String> {
++    use syn::Lit::*;
++    use syn::Meta::*;
++    use syn::MetaNameValue;
++
+     // multiline comments (`/** ... */`) may have LFs (`\n`) in them,
+     // we need to split so we could handle the lines correctly
+     //
+     // we also need to remove leading and trailing blank lines
+-    let mut lines: Vec<&str> = lines
++    let mut lines: Vec<_> = attrs
+         .iter()
++        .filter(|attr| attr.path.is_ident("doc"))
++        .filter_map(|attr| {
++            if let Ok(NameValue(MetaNameValue { lit: Str(s), .. })) = attr.parse_meta() {
++                Some(s.value())
++            } else {
++                // non #[doc = "..."] attributes are not our concern
++                // we leave them for rustc to handle
++                None
++            }
++        })
+         .skip_while(|s| is_blank(s))
+-        .flat_map(|s| s.split('\n'))
++        .flat_map(|s| {
++            let lines = s
++                .split('\n')
++                .map(|s| {
++                    // remove one leading space no matter what
++                    let s = s.strip_prefix(' ').unwrap_or(s);
++                    s.to_owned()
++                })
++                .collect::<Vec<_>>();
++            lines
++        })
+         .collect();
+ 
+     while let Some(true) = lines.last().map(|s| is_blank(s)) {
+         lines.pop();
+     }
+ 
+-    if lines.is_empty() {
+-        return None;
+-    }
+-
+-    // remove one leading space no matter what
+-    for line in lines.iter_mut() {
+-        *line = line.strip_prefix(' ').unwrap_or(line);
+-    }
++    lines
++}
+ 
++pub fn format_doc_comment(
++    lines: &[String],
++    preprocess: bool,
++    force_long: bool,
++) -> (Option<String>, Option<String>) {
+     if let Some(first_blank) = lines.iter().position(|s| is_blank(s)) {
+         let (short, long) = if preprocess {
+-            let paragraphs = split_paragraphs(&lines);
++            let paragraphs = split_paragraphs(lines);
+             let short = paragraphs[0].clone();
+             let long = paragraphs.join("\n\n");
+             (remove_period(short), long)
+@@ -44,20 +64,24 @@ pub fn process_doc_comment(
+             (short, long)
+         };
+ 
+-        Some((Some(short), Some(long)))
++        (Some(short), Some(long))
+     } else {
+-        let short = if preprocess {
+-            let s = merge_lines(&lines);
+-            remove_period(s)
++        let (short, long) = if preprocess {
++            let short = merge_lines(lines);
++            let long = force_long.then(|| short.clone());
++            let short = remove_period(short);
++            (short, long)
+         } else {
+-            lines.join("\n")
++            let short = lines.join("\n");
++            let long = force_long.then(|| short.clone());
++            (short, long)
+         };
+ 
+-        Some((Some(short), None))
++        (Some(short), long)
+     }
+ }
+ 
+-fn split_paragraphs(lines: &[&str]) -> Vec<String> {
++fn split_paragraphs(lines: &[String]) -> Vec<String> {
+     let mut last_line = 0;
+     iter::from_fn(|| {
+         let slice = &lines[last_line..];
+@@ -91,6 +115,10 @@ fn is_blank(s: &str) -> bool {
+     s.trim().is_empty()
+ }
+ 
+-fn merge_lines(lines: &[&str]) -> String {
+-    lines.iter().map(|s| s.trim()).collect::<Vec<_>>().join(" ")
++fn merge_lines(lines: impl IntoIterator<Item = impl AsRef<str>>) -> String {
++    lines
++        .into_iter()
++        .map(|s| s.as_ref().trim().to_owned())
++        .collect::<Vec<_>>()
++        .join(" ")
+ }
+diff --git a/clap_derive/src/utils/mod.rs b/clap_derive/src/utils/mod.rs
+index 77a467c7..9f8b6f38 100644
+--- a/clap_derive/src/utils/mod.rs
++++ b/clap_derive/src/utils/mod.rs
+@@ -2,8 +2,10 @@ mod doc_comments;
+ mod spanned;
+ mod ty;
+ 
++pub use doc_comments::extract_doc_comment;
++pub use doc_comments::format_doc_comment;
++
+ pub use self::{
+-    doc_comments::process_doc_comment,
+     spanned::Sp,
+     ty::{inner_type, is_simple_ty, sub_type, subty_if_name, Ty},
+ };
+diff --git a/src/_derive/mod.rs b/src/_derive/mod.rs
+index f2955e50..f5da2363 100644
+--- a/src/_derive/mod.rs
++++ b/src/_derive/mod.rs
+@@ -154,8 +154,9 @@
+ //!     - **TIP:** When a doc comment is also present, you most likely want to add
+ //!       `#[arg(long_about = None)]` to clear the doc comment so only [`about`][crate::Command::about]
+ //!       gets shown with both `-h` and `--help`.
+-//! - `long_about = <expr>`: [`Command::long_about`][crate::Command::long_about]
++//! - `long_about[ = <expr>]`: [`Command::long_about`][crate::Command::long_about]
+ //!   - When not present: [Doc comment](#doc-comments) if there is a blank line, else nothing
++//!   - When present without a value: [Doc comment](#doc-comments)
+ //! - `verbatim_doc_comment`: Minimizes pre-processing when converting doc comments to [`about`][crate::Command::about] / [`long_about`][crate::Command::long_about]
+ //! - `next_display_order`: [`Command::next_display_order`][crate::Command::next_display_order]
+ //! - `next_help_heading`: [`Command::next_help_heading`][crate::Command::next_help_heading]
+@@ -200,8 +201,9 @@
+ //!   - When not present: will auto-select an action based on the field type
+ //! - `help = <expr>`: [`Arg::help`][crate::Arg::help]
+ //!   - When not present: [Doc comment summary](#doc-comments)
+-//! - `long_help = <expr>`: [`Arg::long_help`][crate::Arg::long_help]
++//! - `long_help[ = <expr>]`: [`Arg::long_help`][crate::Arg::long_help]
+ //!   - When not present: [Doc comment](#doc-comments) if there is a blank line, else nothing
++//!   - When present without a value: [Doc comment](#doc-comments)
+ //! - `verbatim_doc_comment`: Minimizes pre-processing when converting doc comments to [`help`][crate::Arg::help] / [`long_help`][crate::Arg::long_help]
+ //! - `short [= <char>]`: [`Arg::short`][crate::Arg::short]
+ //!   - When not present: no short set

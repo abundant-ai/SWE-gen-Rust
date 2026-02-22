@@ -1,0 +1,1068 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 645f7560..ef0ac63d 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -230,6 +230,7 @@ dependencies = [
+  "clap 4.1.13",
+  "clap_lex 0.3.3",
+  "is_executable",
++ "os_str_bytes",
+  "pathdiff",
+  "shlex",
+  "snapbox",
+@@ -268,6 +269,9 @@ dependencies = [
+ [[package]]
+ name = "clap_lex"
+ version = "0.3.3"
++dependencies = [
++ "os_str_bytes",
++]
+ 
+ [[package]]
+ name = "clap_mangen"
+diff --git a/clap_builder/src/builder/debug_asserts.rs b/clap_builder/src/builder/debug_asserts.rs
+index 7a7fd6ae..dbd8bbbc 100644
+--- a/clap_builder/src/builder/debug_asserts.rs
++++ b/clap_builder/src/builder/debug_asserts.rs
+@@ -1,6 +1,6 @@
+ use std::cmp::Ordering;
+ 
+-use clap_lex::OsStrExt as _;
++use clap_lex::RawOsStr;
+ 
+ use crate::builder::OsStr;
+ use crate::builder::ValueRange;
+@@ -841,16 +841,16 @@ fn assert_defaults<'d>(
+     for default_os in defaults {
+         let value_parser = arg.get_value_parser();
+         let assert_cmd = Command::new("assert");
+-        if let Some(val_delim) = arg.get_value_delimiter() {
+-            let mut val_delim_buffer = [0; 4];
+-            let val_delim = val_delim.encode_utf8(&mut val_delim_buffer);
+-            for part in default_os.split(val_delim) {
+-                if let Err(err) = value_parser.parse_ref(&assert_cmd, Some(arg), part) {
++        if let Some(delim) = arg.get_value_delimiter() {
++            let default_os = RawOsStr::new(default_os);
++            for part in default_os.split(delim) {
++                if let Err(err) = value_parser.parse_ref(&assert_cmd, Some(arg), &part.to_os_str())
++                {
+                     panic!(
+                         "Argument `{}`'s {}={:?} failed validation: {}",
+                         arg.get_id(),
+                         field,
+-                        part.to_string_lossy(),
++                        part.to_str_lossy(),
+                         err
+                     );
+                 }
+diff --git a/clap_builder/src/parser/parser.rs b/clap_builder/src/parser/parser.rs
+index 79111015..25790343 100644
+--- a/clap_builder/src/parser/parser.rs
++++ b/clap_builder/src/parser/parser.rs
+@@ -4,7 +4,9 @@ use std::{
+     ffi::{OsStr, OsString},
+ };
+ 
+-use clap_lex::OsStrExt as _;
++// Third Party
++use clap_lex::RawOsStr;
++use clap_lex::RawOsString;
+ 
+ // Internal
+ use crate::builder::{Arg, Command};
+@@ -91,8 +93,9 @@ impl<'cmd> Parser<'cmd> {
+             }
+ 
+             debug!(
+-                "Parser::get_matches_with: Begin parsing '{:?}'",
++                "Parser::get_matches_with: Begin parsing '{:?}' ({:?})",
+                 arg_os.to_value_os(),
++                arg_os.to_value_os().as_raw_bytes()
+             );
+ 
+             // Has the user already passed '--'? Meaning only positional args follow
+@@ -288,7 +291,7 @@ impl<'cmd> Parser<'cmd> {
+                     } else {
+                         let trailing_values = false;
+                         let arg_values = matcher.pending_values_mut(id, None, trailing_values);
+-                        arg_values.push(arg_os.to_value_os().to_owned());
++                        arg_values.push(arg_os.to_value_os().to_os_str().into_owned());
+                         if matcher.needs_more_vals(arg) {
+                             ParseResult::Opt(arg.get_id().clone())
+                         } else {
+@@ -408,7 +411,7 @@ impl<'cmd> Parser<'cmd> {
+                         Some(Identifier::Index),
+                         trailing_values,
+                     );
+-                    arg_values.push(arg_os.to_value_os().to_owned());
++                    arg_values.push(arg_os.to_value_os().to_os_str().into_owned());
+                 }
+ 
+                 // Only increment the positional counter if it doesn't allow multiples
+@@ -545,7 +548,7 @@ impl<'cmd> Parser<'cmd> {
+     // Checks if the arg matches a subcommand name, or any of its aliases (if defined)
+     fn possible_subcommand(
+         &self,
+-        arg: Result<&str, &OsStr>,
++        arg: Result<&str, &RawOsStr>,
+         valid_arg_found: bool,
+     ) -> Option<&str> {
+         debug!("Parser::possible_subcommand: arg={:?}", arg);
+@@ -720,8 +723,8 @@ impl<'cmd> Parser<'cmd> {
+     fn parse_long_arg(
+         &mut self,
+         matcher: &mut ArgMatcher,
+-        long_arg: &str,
+-        long_value: Option<&OsStr>,
++        long_arg: Result<&str, &RawOsStr>,
++        long_value: Option<&RawOsStr>,
+         parse_state: &ParseState,
+         pos_counter: usize,
+         valid_arg_found: &mut bool,
+@@ -738,6 +741,14 @@ impl<'cmd> Parser<'cmd> {
+         }
+ 
+         debug!("Parser::parse_long_arg: Does it contain '='...");
++        let long_arg = match long_arg {
++            Ok(long_arg) => long_arg,
++            Err(long_arg) => {
++                return Ok(ParseResult::NoMatchingArg {
++                    arg: long_arg.to_str_lossy().into_owned(),
++                });
++            }
++        };
+         if long_arg.is_empty() {
+             debug_assert!(
+                 long_value.is_some(),
+@@ -794,7 +805,7 @@ impl<'cmd> Parser<'cmd> {
+                 used.push(arg.get_id().clone());
+ 
+                 Ok(ParseResult::UnneededAttachedValue {
+-                    rest: rest.to_string_lossy().into_owned(),
++                    rest: rest.to_str_lossy().into_owned(),
+                     used,
+                     arg: arg.to_string(),
+                 })
+@@ -891,7 +902,7 @@ impl<'cmd> Parser<'cmd> {
+                 Ok(c) => c,
+                 Err(rest) => {
+                     return Ok(ParseResult::NoMatchingArg {
+-                        arg: format!("-{}", rest.to_string_lossy()),
++                        arg: format!("-{}", rest.to_str_lossy()),
+                     });
+                 }
+             };
+@@ -927,8 +938,8 @@ impl<'cmd> Parser<'cmd> {
+                 // Cloning the iterator, so we rollback if it isn't there.
+                 let val = short_arg.clone().next_value_os().unwrap_or_default();
+                 debug!(
+-                    "Parser::parse_short_arg:iter:{}: val={:?}, short_arg={:?}",
+-                    c, val, short_arg
++                    "Parser::parse_short_arg:iter:{}: val={:?} (bytes), val={:?} (ascii), short_arg={:?}",
++                    c, val, val.as_raw_bytes(), short_arg
+                 );
+                 let val = Some(val).filter(|v| !v.is_empty());
+ 
+@@ -939,7 +950,7 @@ impl<'cmd> Parser<'cmd> {
+                 //
+                 // e.g. `-xvf`, when require_equals && x.min_vals == 0, we don't
+                 // consume the `vf`, even if it's provided as value.
+-                let (val, has_eq) = if let Some(val) = val.and_then(|v| v.strip_prefix("=")) {
++                let (val, has_eq) = if let Some(val) = val.and_then(|v| v.strip_prefix('=')) {
+                     (Some(val), true)
+                 } else {
+                     (val, false)
+@@ -980,7 +991,7 @@ impl<'cmd> Parser<'cmd> {
+     fn parse_opt_value(
+         &self,
+         ident: Identifier,
+-        attached_value: Option<&OsStr>,
++        attached_value: Option<&RawOsStr>,
+         arg: &Arg,
+         matcher: &mut ArgMatcher,
+         has_eq: bool,
+@@ -1021,7 +1032,7 @@ impl<'cmd> Parser<'cmd> {
+                 })
+             }
+         } else if let Some(v) = attached_value {
+-            let arg_values = vec![v.to_owned()];
++            let arg_values = vec![v.to_os_str().into_owned()];
+             let trailing_idx = None;
+             let react_result = ok!(self.react(
+                 Some(ident),
+@@ -1043,8 +1054,13 @@ impl<'cmd> Parser<'cmd> {
+         }
+     }
+ 
+-    fn check_terminator(&self, arg: &Arg, val: &OsStr) -> Option<ParseResult> {
+-        if Some(val) == arg.terminator.as_ref().map(|s| OsStr::new(s.as_str())) {
++    fn check_terminator(&self, arg: &Arg, val: &RawOsStr) -> Option<ParseResult> {
++        if Some(val)
++            == arg
++                .terminator
++                .as_ref()
++                .map(|s| RawOsStr::from_str(s.as_str()))
++        {
+             debug!("Parser::check_terminator: terminator={:?}", arg.terminator);
+             Some(ParseResult::ValuesDone)
+         } else {
+@@ -1140,17 +1156,17 @@ impl<'cmd> Parser<'cmd> {
+             if self.cmd.is_dont_delimit_trailing_values_set() && trailing_idx == Some(0) {
+                 // Nothing to do
+             } else {
+-                let mut val_delim_buffer = [0; 4];
+-                let val_delim = val_delim.encode_utf8(&mut val_delim_buffer);
+                 let mut split_raw_vals = Vec::with_capacity(raw_vals.len());
+                 for (i, raw_val) in raw_vals.into_iter().enumerate() {
++                    let raw_val = RawOsString::new(raw_val);
+                     if !raw_val.contains(val_delim)
+                         || (self.cmd.is_dont_delimit_trailing_values_set()
+                             && trailing_idx == Some(i))
+                     {
+-                        split_raw_vals.push(raw_val);
++                        split_raw_vals.push(raw_val.into_os_string());
+                     } else {
+-                        split_raw_vals.extend(raw_val.split(val_delim).map(|x| x.to_owned()));
++                        split_raw_vals
++                            .extend(raw_val.split(val_delim).map(|x| x.to_os_str().into_owned()));
+                     }
+                 }
+                 raw_vals = split_raw_vals
+diff --git a/clap_complete/Cargo.toml b/clap_complete/Cargo.toml
+index d60e4984..a8c41616 100644
+--- a/clap_complete/Cargo.toml
++++ b/clap_complete/Cargo.toml
+@@ -35,6 +35,7 @@ bench = false
+ clap = { path = "../", version = "4.1.0", default-features = false, features = ["std"] }
+ clap_lex = { path = "../clap_lex", version = "0.3.0", optional = true }
+ is_executable = { version = "1.0.1", optional = true }
++os_str_bytes = { version = "6.0.0", default-features = false, features = ["raw_os_str"], optional = true }
+ pathdiff = { version = "0.2.1", optional = true }
+ shlex = { version = "1.1.0", optional = true }
+ unicode-xid = { version = "0.2.2", optional = true }
+@@ -51,5 +52,5 @@ required-features = ["unstable-dynamic"]
+ 
+ [features]
+ default = []
+-unstable-dynamic = ["dep:clap_lex", "dep:shlex", "dep:unicode-xid", "clap/derive", "dep:is_executable", "dep:pathdiff"]
++unstable-dynamic = ["dep:clap_lex", "dep:shlex", "dep:unicode-xid", "dep:os_str_bytes", "clap/derive", "dep:is_executable", "dep:pathdiff"]
+ debug = ["clap/debug"]
+diff --git a/clap_complete/src/dynamic.rs b/clap_complete/src/dynamic.rs
+index 6c0881c3..929841ec 100644
+--- a/clap_complete/src/dynamic.rs
++++ b/clap_complete/src/dynamic.rs
+@@ -2,11 +2,9 @@
+ 
+ /// Complete commands within bash
+ pub mod bash {
+-    use std::ffi::OsStr;
+     use std::ffi::OsString;
+     use std::io::Write;
+ 
+-    use clap_lex::OsStrExt as _;
+     use unicode_xid::UnicodeXID;
+ 
+     #[derive(clap::Subcommand)]
+@@ -322,7 +320,11 @@ complete OPTIONS -F _clap_complete_NAME EXECUTABLES
+                 return complete_arg(&arg, current_cmd, current_dir, pos_index, is_escaped);
+             }
+ 
+-            debug!("complete::next: Begin parsing '{:?}'", arg.to_value_os(),);
++            debug!(
++                "complete::next: Begin parsing '{:?}' ({:?})",
++                arg.to_value_os(),
++                arg.to_value_os().as_raw_bytes()
++            );
+ 
+             if let Ok(value) = arg.to_value() {
+                 if let Some(next_cmd) = current_cmd.find_subcommand(value) {
+@@ -368,23 +370,28 @@ complete OPTIONS -F _clap_complete_NAME EXECUTABLES
+ 
+         if !is_escaped {
+             if let Some((flag, value)) = arg.to_long() {
+-                if let Some(value) = value {
+-                    if let Some(arg) = cmd.get_arguments().find(|a| a.get_long() == Some(flag)) {
++                if let Ok(flag) = flag {
++                    if let Some(value) = value {
++                        if let Some(arg) = cmd.get_arguments().find(|a| a.get_long() == Some(flag))
++                        {
++                            completions.extend(
++                                complete_arg_value(value.to_str().ok_or(value), arg, current_dir)
++                                    .into_iter()
++                                    .map(|os| {
++                                        // HACK: Need better `OsStr` manipulation
++                                        format!("--{}={}", flag, os.to_string_lossy()).into()
++                                    }),
++                            )
++                        }
++                    } else {
+                         completions.extend(
+-                            complete_arg_value(value.to_str().ok_or(value), arg, current_dir)
++                            crate::generator::utils::longs_and_visible_aliases(cmd)
+                                 .into_iter()
+-                                .map(|os| {
+-                                    // HACK: Need better `OsStr` manipulation
+-                                    format!("--{}={}", flag, os.to_string_lossy()).into()
++                                .filter_map(|f| {
++                                    f.starts_with(flag).then(|| format!("--{}", f).into())
+                                 }),
+-                        )
++                        );
+                     }
+-                } else {
+-                    completions.extend(
+-                        crate::generator::utils::longs_and_visible_aliases(cmd)
+-                            .into_iter()
+-                            .filter_map(|f| f.starts_with(flag).then(|| format!("--{}", f).into())),
+-                    );
+                 }
+             } else if arg.is_escape() || arg.is_stdio() || arg.is_empty() {
+                 // HACK: Assuming knowledge of is_escape / is_stdio
+@@ -401,7 +408,7 @@ complete OPTIONS -F _clap_complete_NAME EXECUTABLES
+                     crate::generator::utils::shorts_and_visible_aliases(cmd)
+                         .into_iter()
+                         // HACK: Need better `OsStr` manipulation
+-                        .map(|f| format!("{}{}", arg.to_value_os().to_string_lossy(), f).into()),
++                        .map(|f| format!("{}{}", arg.to_value_os().to_str_lossy(), f).into()),
+                 );
+             }
+         }
+@@ -421,7 +428,7 @@ complete OPTIONS -F _clap_complete_NAME EXECUTABLES
+     }
+ 
+     fn complete_arg_value(
+-        value: Result<&str, &OsStr>,
++        value: Result<&str, &clap_lex::RawOsStr>,
+         arg: &clap::Arg,
+         current_dir: Option<&std::path::Path>,
+     ) -> Vec<OsString> {
+@@ -437,7 +444,7 @@ complete OPTIONS -F _clap_complete_NAME EXECUTABLES
+             }
+         } else {
+             let value_os = match value {
+-                Ok(value) => OsStr::new(value),
++                Ok(value) => clap_lex::RawOsStr::from_str(value),
+                 Err(value_os) => value_os,
+             };
+             match arg.get_value_hint() {
+@@ -478,7 +485,7 @@ complete OPTIONS -F _clap_complete_NAME EXECUTABLES
+     }
+ 
+     fn complete_path(
+-        value_os: &OsStr,
++        value_os: &clap_lex::RawOsStr,
+         current_dir: Option<&std::path::Path>,
+         is_wanted: impl Fn(&std::path::Path) -> bool,
+     ) -> Vec<OsString> {
+@@ -492,11 +499,10 @@ complete OPTIONS -F _clap_complete_NAME EXECUTABLES
+             }
+         };
+         let (existing, prefix) = value_os
+-            .split_once("\\")
+-            .unwrap_or((OsStr::new(""), value_os));
+-        let root = current_dir.join(existing);
++            .split_once('\\')
++            .unwrap_or((clap_lex::RawOsStr::from_str(""), value_os));
++        let root = current_dir.join(existing.to_os_str());
+         debug!("complete_path: root={:?}, prefix={:?}", root, prefix);
+-        let prefix = prefix.to_string_lossy();
+ 
+         for entry in std::fs::read_dir(&root)
+             .ok()
+@@ -504,8 +510,8 @@ complete OPTIONS -F _clap_complete_NAME EXECUTABLES
+             .flatten()
+             .filter_map(Result::ok)
+         {
+-            let raw_file_name = OsString::from(entry.file_name());
+-            if !raw_file_name.starts_with(&prefix) {
++            let raw_file_name = clap_lex::RawOsString::new(entry.file_name());
++            if !raw_file_name.starts_with_os(prefix) {
+                 continue;
+             }
+ 
+diff --git a/clap_lex/Cargo.toml b/clap_lex/Cargo.toml
+index 3729e459..da2d1e73 100644
+--- a/clap_lex/Cargo.toml
++++ b/clap_lex/Cargo.toml
+@@ -28,3 +28,6 @@ pre-release-replacements = [
+ 
+ [lib]
+ bench = false
++
++[dependencies]
++os_str_bytes = { version = "6.0.0", default-features = false, features = ["raw_os_str"] }
+diff --git a/clap_lex/src/ext.rs b/clap_lex/src/ext.rs
+deleted file mode 100644
+index 6d319988..00000000
+--- a/clap_lex/src/ext.rs
++++ /dev/null
+@@ -1,321 +0,0 @@
+-use std::ffi::OsStr;
+-
+-pub trait OsStrExt: private::Sealed {
+-    /// Converts to a string slice.
+-    fn try_str(&self) -> Result<&str, std::str::Utf8Error>;
+-    /// Returns `true` if the given pattern matches a sub-slice of
+-    /// this string slice.
+-    ///
+-    /// Returns `false` if it does not.
+-    ///
+-    /// # Examples
+-    ///
+-    /// ```rust
+-    /// use clap_lex::OsStrExt as _;
+-    /// let bananas = std::ffi::OsStr::new("bananas");
+-    ///
+-    /// assert!(bananas.contains("nana"));
+-    /// assert!(!bananas.contains("apples"));
+-    /// ```
+-    fn contains(&self, needle: &str) -> bool;
+-    /// Returns the byte index of the first character of this string slice that
+-    /// matches the pattern.
+-    ///
+-    /// Returns [`None`] if the pattern doesn't match.
+-    ///
+-    /// # Examples
+-    ///
+-    /// ```rust
+-    /// use clap_lex::OsStrExt as _;
+-    /// let s = std::ffi::OsStr::new("Löwe 老虎 Léopard Gepardi");
+-    ///
+-    /// assert_eq!(s.find("L"), Some(0));
+-    /// assert_eq!(s.find("é"), Some(14));
+-    /// assert_eq!(s.find("par"), Some(17));
+-    /// ```
+-    ///
+-    /// Not finding the pattern:
+-    ///
+-    /// ```rust
+-    /// use clap_lex::OsStrExt as _;
+-    /// let s = std::ffi::OsStr::new("Löwe 老虎 Léopard");
+-    ///
+-    /// assert_eq!(s.find("1"), None);
+-    /// ```
+-    fn find(&self, needle: &str) -> Option<usize>;
+-    /// Returns a string slice with the prefix removed.
+-    ///
+-    /// If the string starts with the pattern `prefix`, returns substring after the prefix, wrapped
+-    /// in `Some`.
+-    ///
+-    /// If the string does not start with `prefix`, returns `None`.
+-    ///
+-    /// # Examples
+-    ///
+-    /// ```
+-    /// use std::ffi::OsStr;
+-    /// use clap_lex::OsStrExt as _;
+-    /// assert_eq!(OsStr::new("foo:bar").strip_prefix("foo:"), Some(OsStr::new("bar")));
+-    /// assert_eq!(OsStr::new("foo:bar").strip_prefix("bar"), None);
+-    /// assert_eq!(OsStr::new("foofoo").strip_prefix("foo"), Some(OsStr::new("foo")));
+-    /// ```
+-    fn strip_prefix(&self, prefix: &str) -> Option<&OsStr>;
+-    /// Returns `true` if the given pattern matches a prefix of this
+-    /// string slice.
+-    ///
+-    /// Returns `false` if it does not.
+-    ///
+-    /// # Examples
+-    ///
+-    /// ```
+-    /// use clap_lex::OsStrExt as _;
+-    /// let bananas = std::ffi::OsStr::new("bananas");
+-    ///
+-    /// assert!(bananas.starts_with("bana"));
+-    /// assert!(!bananas.starts_with("nana"));
+-    /// ```
+-    fn starts_with(&self, prefix: &str) -> bool;
+-    /// An iterator over substrings of this string slice, separated by
+-    /// characters matched by a pattern.
+-    ///
+-    /// # Examples
+-    ///
+-    /// Simple patterns:
+-    ///
+-    /// ```
+-    /// use std::ffi::OsStr;
+-    /// use clap_lex::OsStrExt as _;
+-    /// let v: Vec<_> = OsStr::new("Mary had a little lamb").split(" ").collect();
+-    /// assert_eq!(v, [OsStr::new("Mary"), OsStr::new("had"), OsStr::new("a"), OsStr::new("little"), OsStr::new("lamb")]);
+-    ///
+-    /// let v: Vec<_> = OsStr::new("").split("X").collect();
+-    /// assert_eq!(v, [OsStr::new("")]);
+-    ///
+-    /// let v: Vec<_> = OsStr::new("lionXXtigerXleopard").split("X").collect();
+-    /// assert_eq!(v, [OsStr::new("lion"), OsStr::new(""), OsStr::new("tiger"), OsStr::new("leopard")]);
+-    ///
+-    /// let v: Vec<_> = OsStr::new("lion::tiger::leopard").split("::").collect();
+-    /// assert_eq!(v, [OsStr::new("lion"), OsStr::new("tiger"), OsStr::new("leopard")]);
+-    /// ```
+-    ///
+-    /// If a string contains multiple contiguous separators, you will end up
+-    /// with empty strings in the output:
+-    ///
+-    /// ```
+-    /// use std::ffi::OsStr;
+-    /// use clap_lex::OsStrExt as _;
+-    /// let x = OsStr::new("||||a||b|c");
+-    /// let d: Vec<_> = x.split("|").collect();
+-    ///
+-    /// assert_eq!(d, &[OsStr::new(""), OsStr::new(""), OsStr::new(""), OsStr::new(""), OsStr::new("a"), OsStr::new(""), OsStr::new("b"), OsStr::new("c")]);
+-    /// ```
+-    ///
+-    /// Contiguous separators are separated by the empty string.
+-    ///
+-    /// ```
+-    /// use std::ffi::OsStr;
+-    /// use clap_lex::OsStrExt as _;
+-    /// let x = OsStr::new("(///)");
+-    /// let d: Vec<_> = x.split("/").collect();
+-    ///
+-    /// assert_eq!(d, &[OsStr::new("("), OsStr::new(""), OsStr::new(""), OsStr::new(")")]);
+-    /// ```
+-    ///
+-    /// Separators at the start or end of a string are neighbored
+-    /// by empty strings.
+-    ///
+-    /// ```
+-    /// use std::ffi::OsStr;
+-    /// use clap_lex::OsStrExt as _;
+-    /// let d: Vec<_> = OsStr::new("010").split("0").collect();
+-    /// assert_eq!(d, &[OsStr::new(""), OsStr::new("1"), OsStr::new("")]);
+-    /// ```
+-    ///
+-    /// When the empty string is used as a separator, it panics
+-    ///
+-    /// ```should_panic
+-    /// use std::ffi::OsStr;
+-    /// use clap_lex::OsStrExt as _;
+-    /// let f: Vec<_> = OsStr::new("rust").split("").collect();
+-    /// assert_eq!(f, &[OsStr::new(""), OsStr::new("r"), OsStr::new("u"), OsStr::new("s"), OsStr::new("t"), OsStr::new("")]);
+-    /// ```
+-    ///
+-    /// Contiguous separators can lead to possibly surprising behavior
+-    /// when whitespace is used as the separator. This code is correct:
+-    ///
+-    /// ```
+-    /// use std::ffi::OsStr;
+-    /// use clap_lex::OsStrExt as _;
+-    /// let x = OsStr::new("    a  b c");
+-    /// let d: Vec<_> = x.split(" ").collect();
+-    ///
+-    /// assert_eq!(d, &[OsStr::new(""), OsStr::new(""), OsStr::new(""), OsStr::new(""), OsStr::new("a"), OsStr::new(""), OsStr::new("b"), OsStr::new("c")]);
+-    /// ```
+-    ///
+-    /// It does _not_ give you:
+-    ///
+-    /// ```,ignore
+-    /// assert_eq!(d, &[OsStr::new("a"), OsStr::new("b"), OsStr::new("c")]);
+-    /// ```
+-    ///
+-    /// Use [`split_whitespace`] for this behavior.
+-    ///
+-    /// [`split_whitespace`]: str::split_whitespace
+-    fn split<'s, 'n>(&'s self, needle: &'n str) -> Split<'s, 'n>;
+-    /// Divide one string slice into two at an index.
+-    ///
+-    /// The argument, `mid`, should be a byte offset from the start of the
+-    /// string. It must also be on the boundary of a UTF-8 code point.
+-    ///
+-    /// The two slices returned go from the start of the string slice to `mid`,
+-    /// and from `mid` to the end of the string slice.
+-    ///
+-    /// To get mutable string slices instead, see the [`split_at_mut`]
+-    /// method.
+-    ///
+-    /// [`split_at_mut`]: str::split_at_mut
+-    ///
+-    /// # Panics
+-    ///
+-    /// Panics if `mid` is not on a UTF-8 code point boundary, or if it is
+-    /// past the end of the last code point of the string slice.
+-    ///
+-    /// # Examples
+-    ///
+-    /// Basic usage:
+-    ///
+-    /// ```
+-    /// use clap_lex::OsStrExt as _;
+-    /// let s = std::ffi::OsStr::new("Per Martin-Löf");
+-    ///
+-    /// let (first, last) = s.split_at(3);
+-    ///
+-    /// assert_eq!("Per", first);
+-    /// assert_eq!(" Martin-Löf", last);
+-    /// ```
+-    fn split_at(&self, index: usize) -> (&OsStr, &OsStr);
+-    /// Splits the string on the first occurrence of the specified delimiter and
+-    /// returns prefix before delimiter and suffix after delimiter.
+-    ///
+-    /// # Examples
+-    ///
+-    /// ```
+-    /// use std::ffi::OsStr;
+-    /// use clap_lex::OsStrExt as _;
+-    /// assert_eq!(OsStr::new("cfg").split_once("="), None);
+-    /// assert_eq!(OsStr::new("cfg=").split_once("="), Some((OsStr::new("cfg"), OsStr::new(""))));
+-    /// assert_eq!(OsStr::new("cfg=foo").split_once("="), Some((OsStr::new("cfg"), OsStr::new("foo"))));
+-    /// assert_eq!(OsStr::new("cfg=foo=bar").split_once("="), Some((OsStr::new("cfg"), OsStr::new("foo=bar"))));
+-    /// ```
+-    fn split_once(&self, needle: &'_ str) -> Option<(&OsStr, &OsStr)>;
+-}
+-
+-impl OsStrExt for OsStr {
+-    fn try_str(&self) -> Result<&str, std::str::Utf8Error> {
+-        let bytes = to_bytes(self);
+-        std::str::from_utf8(bytes)
+-    }
+-
+-    fn contains(&self, needle: &str) -> bool {
+-        self.find(needle).is_some()
+-    }
+-
+-    fn find(&self, needle: &str) -> Option<usize> {
+-        (0..=self.len().checked_sub(needle.len())?)
+-            .find(|&x| to_bytes(self)[x..].starts_with(needle.as_bytes()))
+-    }
+-
+-    fn strip_prefix(&self, prefix: &str) -> Option<&OsStr> {
+-        to_bytes(self)
+-            .strip_prefix(prefix.as_bytes())
+-            .map(to_os_str)
+-    }
+-    fn starts_with(&self, prefix: &str) -> bool {
+-        to_bytes(self).starts_with(prefix.as_bytes())
+-    }
+-
+-    fn split<'s, 'n>(&'s self, needle: &'n str) -> Split<'s, 'n> {
+-        assert_ne!(needle, "");
+-        Split {
+-            haystack: Some(self),
+-            needle,
+-        }
+-    }
+-
+-    fn split_at(&self, index: usize) -> (&OsStr, &OsStr) {
+-        let (first, second) = to_bytes(self).split_at(index);
+-        (to_os_str(first), to_os_str(second))
+-    }
+-
+-    fn split_once(&self, needle: &'_ str) -> Option<(&OsStr, &OsStr)> {
+-        let start = self.find(needle)?;
+-        let end = start + needle.len();
+-        let haystack = to_bytes(self);
+-        let first = &haystack[0..start];
+-        let second = &haystack[end..];
+-        Some((to_os_str(first), to_os_str(second)))
+-    }
+-}
+-
+-mod private {
+-    pub trait Sealed {}
+-
+-    impl Sealed for std::ffi::OsStr {}
+-}
+-
+-/// Allow access to raw bytes
+-///
+-/// **Note:** the bytes only make sense when compared with ASCII or `&str`
+-///
+-/// **Note:** This must never be serialized as there is no guarantee at how invalid UTF-8 will be
+-/// encoded, even within the same version of this crate (since its dependent on rustc version)
+-fn to_bytes(s: &OsStr) -> &[u8] {
+-    // SAFETY:
+-    // - Lifetimes are the same
+-    // - Types are compatible (`OsStr` is a transparent wrapper for `[u8]`)
+-    // - The primary contract is that the encoding for invalid surrogate code points is not
+-    //   guaranteed which isn't a problem here
+-    //
+-    // There is a proposal to support this natively (https://github.com/rust-lang/rust/pull/95290)
+-    // but its in limbo
+-    unsafe { std::mem::transmute(s) }
+-}
+-
+-/// Restore raw bytes as `OsStr`
+-fn to_os_str(s: &[u8]) -> &OsStr {
+-    // SAFETY:
+-    // - Lifetimes are the same
+-    // - Types are compatible (`OsStr` is a transparent wrapper for `[u8]`)
+-    // - The primary contract is that the encoding for invalid surrogate code points is not
+-    //   guaranteed which isn't a problem here
+-    //
+-    // There is a proposal to support this natively (https://github.com/rust-lang/rust/pull/95290)
+-    // but its in limbo
+-    unsafe { std::mem::transmute(s) }
+-}
+-
+-pub struct Split<'s, 'n> {
+-    haystack: Option<&'s OsStr>,
+-    needle: &'n str,
+-}
+-
+-impl<'s, 'n> Iterator for Split<'s, 'n> {
+-    type Item = &'s OsStr;
+-
+-    fn next(&mut self) -> Option<Self::Item> {
+-        let haystack = self.haystack?;
+-        match haystack.split_once(self.needle) {
+-            Some((first, second)) => {
+-                if !haystack.is_empty() {
+-                    debug_assert_ne!(haystack, second);
+-                }
+-                self.haystack = Some(second);
+-                Some(first)
+-            }
+-            None => {
+-                self.haystack = None;
+-                Some(haystack)
+-            }
+-        }
+-    }
+-}
+diff --git a/clap_lex/src/lib.rs b/clap_lex/src/lib.rs
+index 333a99aa..bc9720fc 100644
+--- a/clap_lex/src/lib.rs
++++ b/clap_lex/src/lib.rs
+@@ -8,7 +8,6 @@
+ //!
+ //! ```rust
+ //! use std::path::PathBuf;
+-//! use std::ffi::OsStr;
+ //!
+ //! type BoxedError = Box<dyn std::error::Error + Send + Sync>;
+ //!
+@@ -27,7 +26,7 @@
+ //! }
+ //!
+ //! impl Color {
+-//!     fn parse(s: Option<&OsStr>) -> Result<Self, BoxedError> {
++//!     fn parse(s: Option<&clap_lex::RawOsStr>) -> Result<Self, BoxedError> {
+ //!         let s = s.map(|s| s.to_str().ok_or(s));
+ //!         match s {
+ //!             Some(Ok("always")) | Some(Ok("")) | None => {
+@@ -65,13 +64,13 @@
+ //!             args.paths.push(PathBuf::from("-"));
+ //!         } else if let Some((long, value)) = arg.to_long() {
+ //!             match long {
+-//!                 "verbose" => {
++//!                 Ok("verbose") => {
+ //!                     if let Some(value) = value {
+ //!                         return Err(format!("`--verbose` does not take a value, got `{:?}`", value).into());
+ //!                     }
+ //!                     args.verbosity += 1;
+ //!                 }
+-//!                 "color" => {
++//!                 Ok("color") => {
+ //!                     args.color = Color::parse(value)?;
+ //!                 }
+ //!                 _ => {
+@@ -94,12 +93,12 @@
+ //!                         return Err(format!("Unexpected flag: -{}", c).into());
+ //!                     }
+ //!                     Err(e) => {
+-//!                         return Err(format!("Unexpected flag: -{}", e.to_string_lossy()).into());
++//!                         return Err(format!("Unexpected flag: -{}", e.to_str_lossy()).into());
+ //!                     }
+ //!                 }
+ //!             }
+ //!         } else {
+-//!             args.paths.push(PathBuf::from(arg.to_value_os().to_owned()));
++//!             args.paths.push(PathBuf::from(arg.to_value_os().to_os_str().into_owned()));
+ //!         }
+ //!     }
+ //!
+@@ -110,14 +109,13 @@
+ //! println!("{:?}", args);
+ //! ```
+ 
+-mod ext;
+-
+ use std::ffi::OsStr;
+ use std::ffi::OsString;
+ 
+ pub use std::io::SeekFrom;
+ 
+-pub use ext::OsStrExt;
++pub use os_str_bytes::RawOsStr;
++pub use os_str_bytes::RawOsString;
+ 
+ /// Command-line arguments
+ #[derive(Default, Clone, Debug, PartialEq, Eq)]
+@@ -277,27 +275,30 @@ impl ArgCursor {
+ /// Command-line Argument
+ #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+ pub struct ParsedArg<'s> {
+-    inner: &'s OsStr,
++    inner: std::borrow::Cow<'s, RawOsStr>,
++    utf8: Option<&'s str>,
+ }
+ 
+ impl<'s> ParsedArg<'s> {
+     fn new(inner: &'s OsStr) -> Self {
+-        Self { inner }
++        let utf8 = inner.to_str();
++        let inner = RawOsStr::new(inner);
++        Self { inner, utf8 }
+     }
+ 
+     /// Argument is length of 0
+     pub fn is_empty(&self) -> bool {
+-        self.inner.is_empty()
++        self.inner.as_ref().is_empty()
+     }
+ 
+     /// Does the argument look like a stdio argument (`-`)
+     pub fn is_stdio(&self) -> bool {
+-        self.inner == "-"
++        self.inner.as_ref() == "-"
+     }
+ 
+     /// Does the argument look like an argument escape (`--`)
+     pub fn is_escape(&self) -> bool {
+-        self.inner == "--"
++        self.inner.as_ref() == "--"
+     }
+ 
+     /// Does the argument look like a number
+@@ -308,38 +309,56 @@ impl<'s> ParsedArg<'s> {
+     }
+ 
+     /// Treat as a long-flag
+-    pub fn to_long(&self) -> Option<(&str, Option<&OsStr>)> {
+-        let raw = self.inner;
+-        let remainder = raw.strip_prefix("--")?;
+-        if remainder.is_empty() {
+-            debug_assert!(self.is_escape());
+-            return None;
+-        }
++    pub fn to_long(&self) -> Option<(Result<&str, &RawOsStr>, Option<&RawOsStr>)> {
++        if let Some(raw) = self.utf8 {
++            let remainder = raw.strip_prefix("--")?;
++            if remainder.is_empty() {
++                debug_assert!(self.is_escape());
++                return None;
++            }
+ 
+-        let (flag, value) = if let Some((p0, p1)) = remainder.split_once("=") {
+-            (p0, Some(p1))
++            let (flag, value) = if let Some((p0, p1)) = remainder.split_once('=') {
++                (p0, Some(p1))
++            } else {
++                (remainder, None)
++            };
++            let flag = Ok(flag);
++            let value = value.map(RawOsStr::from_str);
++            Some((flag, value))
+         } else {
+-            (remainder, None)
+-        };
+-        let flag = flag.to_str()?;
+-        Some((flag, value))
++            let raw = self.inner.as_ref();
++            let remainder = raw.strip_prefix("--")?;
++            if remainder.is_empty() {
++                debug_assert!(self.is_escape());
++                return None;
++            }
++
++            let (flag, value) = if let Some((p0, p1)) = remainder.split_once('=') {
++                (p0, Some(p1))
++            } else {
++                (remainder, None)
++            };
++            let flag = flag.to_str().ok_or(flag);
++            Some((flag, value))
++        }
+     }
+ 
+     /// Can treat as a long-flag
+     pub fn is_long(&self) -> bool {
+-        self.inner.starts_with("--") && !self.is_escape()
++        self.inner.as_ref().starts_with("--") && !self.is_escape()
+     }
+ 
+     /// Treat as a short-flag
+     pub fn to_short(&self) -> Option<ShortFlags<'_>> {
+-        if let Some(remainder_os) = self.inner.strip_prefix("-") {
+-            if remainder_os.starts_with("-") {
++        if let Some(remainder_os) = self.inner.as_ref().strip_prefix('-') {
++            if remainder_os.starts_with('-') {
+                 None
+             } else if remainder_os.is_empty() {
+                 debug_assert!(self.is_stdio());
+                 None
+             } else {
+-                Some(ShortFlags::new(remainder_os))
++                let remainder = self.utf8.map(|s| &s[1..]);
++                Some(ShortFlags::new(remainder_os, remainder))
+             }
+         } else {
+             None
+@@ -348,42 +367,48 @@ impl<'s> ParsedArg<'s> {
+ 
+     /// Can treat as a short-flag
+     pub fn is_short(&self) -> bool {
+-        self.inner.starts_with("-") && !self.is_stdio() && !self.inner.starts_with("--")
++        self.inner.as_ref().starts_with('-')
++            && !self.is_stdio()
++            && !self.inner.as_ref().starts_with("--")
+     }
+ 
+     /// Treat as a value
+     ///
+     /// **NOTE:** May return a flag or an escape.
+-    pub fn to_value_os(&self) -> &OsStr {
+-        self.inner
++    pub fn to_value_os(&self) -> &RawOsStr {
++        self.inner.as_ref()
+     }
+ 
+     /// Treat as a value
+     ///
+     /// **NOTE:** May return a flag or an escape.
+-    pub fn to_value(&self) -> Result<&str, &OsStr> {
+-        self.inner.to_str().ok_or(self.inner)
++    pub fn to_value(&self) -> Result<&str, &RawOsStr> {
++        self.utf8.ok_or_else(|| self.inner.as_ref())
+     }
+ 
+     /// Safely print an argument that may contain non-UTF8 content
+     ///
+     /// This may perform lossy conversion, depending on the platform. If you would like an implementation which escapes the path please use Debug instead.
+     pub fn display(&self) -> impl std::fmt::Display + '_ {
+-        self.inner.to_string_lossy()
++        self.inner.to_str_lossy()
+     }
+ }
+ 
+ /// Walk through short flags within a [`ParsedArg`]
+ #[derive(Clone, Debug)]
+ pub struct ShortFlags<'s> {
+-    inner: &'s OsStr,
++    inner: &'s RawOsStr,
+     utf8_prefix: std::str::CharIndices<'s>,
+-    invalid_suffix: Option<&'s OsStr>,
++    invalid_suffix: Option<&'s RawOsStr>,
+ }
+ 
+ impl<'s> ShortFlags<'s> {
+-    fn new(inner: &'s OsStr) -> Self {
+-        let (utf8_prefix, invalid_suffix) = split_nonutf8_once(inner);
++    fn new(inner: &'s RawOsStr, utf8: Option<&'s str>) -> Self {
++        let (utf8_prefix, invalid_suffix) = if let Some(utf8) = utf8 {
++            (utf8, None)
++        } else {
++            split_nonutf8_once(inner)
++        };
+         let utf8_prefix = utf8_prefix.char_indices();
+         Self {
+             inner,
+@@ -415,7 +440,7 @@ impl<'s> ShortFlags<'s> {
+     /// Advance the iterator, returning the next short flag on success
+     ///
+     /// On error, returns the invalid-UTF8 value
+-    pub fn next_flag(&mut self) -> Option<Result<char, &'s OsStr>> {
++    pub fn next_flag(&mut self) -> Option<Result<char, &'s RawOsStr>> {
+         if let Some((_, flag)) = self.utf8_prefix.next() {
+             return Some(Ok(flag));
+         }
+@@ -429,11 +454,11 @@ impl<'s> ShortFlags<'s> {
+     }
+ 
+     /// Advance the iterator, returning everything left as a value
+-    pub fn next_value_os(&mut self) -> Option<&'s OsStr> {
++    pub fn next_value_os(&mut self) -> Option<&'s RawOsStr> {
+         if let Some((index, _)) = self.utf8_prefix.next() {
+             self.utf8_prefix = "".char_indices();
+             self.invalid_suffix = None;
+-            return Some(self.inner.split_at(index).1);
++            return Some(&self.inner[index..]);
+         }
+ 
+         if let Some(suffix) = self.invalid_suffix {
+@@ -446,19 +471,19 @@ impl<'s> ShortFlags<'s> {
+ }
+ 
+ impl<'s> Iterator for ShortFlags<'s> {
+-    type Item = Result<char, &'s OsStr>;
++    type Item = Result<char, &'s RawOsStr>;
+ 
+     fn next(&mut self) -> Option<Self::Item> {
+         self.next_flag()
+     }
+ }
+ 
+-fn split_nonutf8_once(b: &OsStr) -> (&str, Option<&OsStr>) {
+-    match b.try_str() {
++fn split_nonutf8_once(b: &RawOsStr) -> (&str, Option<&RawOsStr>) {
++    match std::str::from_utf8(b.as_raw_bytes()) {
+         Ok(s) => (s, None),
+         Err(err) => {
+             let (valid, after_valid) = b.split_at(err.valid_up_to());
+-            let valid = valid.try_str().unwrap();
++            let valid = std::str::from_utf8(valid.as_raw_bytes()).unwrap();
+             (valid, Some(after_valid))
+         }
+     }
+diff --git a/clap_lex/tests/parsed.rs b/clap_lex/tests/parsed.rs
+index f1f36b38..77a1dfb9 100644
+--- a/clap_lex/tests/parsed.rs
++++ b/clap_lex/tests/parsed.rs
+@@ -1,5 +1,3 @@
+-use std::ffi::OsStr;
+-
+ // Despite our design philosophy being to support completion generation, we aren't considering `-`
+ // the start of a long because there is no valid value to return.
+ #[test]
+@@ -36,7 +34,7 @@ fn to_long_no_value() {
+     assert!(next.is_long());
+ 
+     let (key, value) = next.to_long().unwrap();
+-    assert_eq!(key, "long");
++    assert_eq!(key, Ok("long"));
+     assert_eq!(value, None);
+ }
+ 
+@@ -50,8 +48,8 @@ fn to_long_with_empty_value() {
+     assert!(next.is_long());
+ 
+     let (key, value) = next.to_long().unwrap();
+-    assert_eq!(key, "long");
+-    assert_eq!(value, Some(OsStr::new("")));
++    assert_eq!(key, Ok("long"));
++    assert_eq!(value, Some(clap_lex::RawOsStr::from_str("")));
+ }
+ 
+ #[test]
+@@ -64,8 +62,8 @@ fn to_long_with_value() {
+     assert!(next.is_long());
+ 
+     let (key, value) = next.to_long().unwrap();
+-    assert_eq!(key, "long");
+-    assert_eq!(value, Some(OsStr::new("hello")));
++    assert_eq!(key, Ok("long"));
++    assert_eq!(value, Some(clap_lex::RawOsStr::from_str("hello")));
+ }
+ 
+ #[test]
+diff --git a/clap_lex/tests/shorts.rs b/clap_lex/tests/shorts.rs
+index 538afa46..3adc4e3d 100644
+--- a/clap_lex/tests/shorts.rs
++++ b/clap_lex/tests/shorts.rs
+@@ -37,7 +37,7 @@ fn next_value_os() {
+     let next = raw.next(&mut cursor).unwrap();
+     let mut shorts = next.to_short().unwrap();
+ 
+-    let actual = shorts.next_value_os().unwrap().to_string_lossy();
++    let actual = shorts.next_value_os().unwrap().to_str_lossy();
+ 
+     assert_eq!(actual, "short");
+ }
+@@ -51,7 +51,7 @@ fn next_flag_with_value() {
+     let mut shorts = next.to_short().unwrap();
+ 
+     assert_eq!(shorts.next_flag().unwrap().unwrap(), 's');
+-    let actual = shorts.next_value_os().unwrap().to_string_lossy();
++    let actual = shorts.next_value_os().unwrap().to_str_lossy();
+ 
+     assert_eq!(actual, "hort");
+ }

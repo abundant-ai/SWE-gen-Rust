@@ -1,0 +1,561 @@
+diff --git a/README.md b/README.md
+index bb7bb857..83667c1c 100644
+--- a/README.md
++++ b/README.md
+@@ -46,6 +46,7 @@ serde_macros = "*"
+ #![feature(custom_derive, plugin)]
+ #![plugin(serde_macros)]
+ 
++extern crate serde;
+ extern crate serde_json;
+ 
+ #[derive(Serialize, Deserialize, Debug)]
+diff --git a/serde_codegen/src/attr.rs b/serde_codegen/src/attr.rs
+index 412eb43d..10f2068c 100644
+--- a/serde_codegen/src/attr.rs
++++ b/serde_codegen/src/attr.rs
+@@ -572,14 +572,14 @@ fn wrap_serialize_with(cx: &ExtCtxt,
+     quote_expr!(cx, {
+         trait __SerdeSerializeWith {
+             fn __serde_serialize_with<S>(&self, serializer: &mut S) -> Result<(), S::Error>
+-                where S: _serde::ser::Serializer;
++                where S: ::serde::ser::Serializer;
+         }
+ 
+         impl<'a, T> __SerdeSerializeWith for &'a T
+             where T: 'a + __SerdeSerializeWith,
+         {
+             fn __serde_serialize_with<S>(&self, serializer: &mut S) -> Result<(), S::Error>
+-                where S: _serde::ser::Serializer
++                where S: ::serde::ser::Serializer
+             {
+                 (**self).__serde_serialize_with(serializer)
+             }
+@@ -587,7 +587,7 @@ fn wrap_serialize_with(cx: &ExtCtxt,
+ 
+         impl $generics __SerdeSerializeWith for $container_ty $where_clause {
+             fn __serde_serialize_with<S>(&self, serializer: &mut S) -> Result<(), S::Error>
+-                where S: _serde::ser::Serializer
++                where S: ::serde::ser::Serializer
+             {
+                 $expr
+             }
+@@ -597,11 +597,11 @@ fn wrap_serialize_with(cx: &ExtCtxt,
+             value: &'a T,
+         }
+ 
+-        impl<'a, T> _serde::ser::Serialize for __SerdeSerializeWithStruct<'a, T>
++        impl<'a, T> ::serde::ser::Serialize for __SerdeSerializeWithStruct<'a, T>
+             where T: 'a + __SerdeSerializeWith
+         {
+             fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error>
+-                where S: _serde::ser::Serializer
++                where S: ::serde::ser::Serializer
+             {
+                 self.value.__serde_serialize_with(serializer)
+             }
+@@ -633,9 +633,9 @@ fn wrap_deserialize_with(cx: &ExtCtxt,
+             value: $field_ty,
+         }
+ 
+-        impl $generics _serde::de::Deserialize for $ty_path $where_clause {
++        impl $generics ::serde::de::Deserialize for $ty_path $where_clause {
+             fn deserialize<D>(deserializer: &mut D) -> ::std::result::Result<Self, D::Error>
+-                where D: _serde::de::Deserializer
++                where D: ::serde::de::Deserializer
+             {
+                 let value = try!($path(deserializer));
+                 Ok(__SerdeDeserializeWithStruct { value: value })
+diff --git a/serde_codegen/src/bound.rs b/serde_codegen/src/bound.rs
+index 5d02a6ef..ad973302 100644
+--- a/serde_codegen/src/bound.rs
++++ b/serde_codegen/src/bound.rs
+@@ -27,8 +27,10 @@ pub fn with_bound(
+     item: &ast::Item,
+     generics: &ast::Generics,
+     filter: &Fn(&ast::StructField) -> bool,
+-    bound: &ast::Path,
++    bound: &[&'static str],
+ ) -> ast::Generics {
++    let path = builder.path().global().ids(bound).build();
++
+     builder.from_generics(generics.clone())
+         .with_predicates(
+             all_variants(cx, item).iter()
+@@ -42,7 +44,7 @@ pub fn with_bound(
+                     // the type that is being bounded e.g. T
+                     .bound().build(ty.clone())
+                     // the bound e.g. Serialize
+-                    .bound().trait_(bound.clone()).build()
++                    .bound().trait_(path.clone()).build()
+                     .build()))
+         .build()
+ }
+diff --git a/serde_codegen/src/de.rs b/serde_codegen/src/de.rs
+index 366fb668..2b7b8460 100644
+--- a/serde_codegen/src/de.rs
++++ b/serde_codegen/src/de.rs
+@@ -63,21 +63,14 @@ pub fn expand_derive_deserialize(
+ 
+     let where_clause = &impl_generics.where_clause;
+ 
+-    let dummy_const = builder.id(format!("_IMPL_DESERIALIZE_FOR_{}", item.ident));
+-
+     let impl_item = quote_item!(cx,
+-        #[allow(non_upper_case_globals, unused_attributes, unused_qualifications)]
+-        const $dummy_const: () = {
+-            extern crate serde as _serde;
+-            #[automatically_derived]
+-            impl $impl_generics _serde::de::Deserialize for $ty $where_clause {
+-                fn deserialize<__D>(deserializer: &mut __D) -> ::std::result::Result<$ty, __D::Error>
+-                    where __D: _serde::de::Deserializer,
+-                {
+-                    $body
+-                }
++        impl $impl_generics ::serde::de::Deserialize for $ty $where_clause {
++            fn deserialize<__D>(deserializer: &mut __D) -> ::std::result::Result<$ty, __D::Error>
++                where __D: ::serde::de::Deserializer,
++            {
++                $body
+             }
+-        };
++        }
+     ).unwrap();
+ 
+     push(Annotatable::Item(impl_item))
+@@ -95,10 +88,10 @@ fn build_impl_generics(
+     let generics = bound::without_defaults(generics);
+     let generics = bound::with_bound(cx, builder, item, &generics,
+         &deserialized_by_us,
+-        &builder.path().ids(&["_serde", "de", "Deserialize"]).build());
++        &["serde", "de", "Deserialize"]);
+     let generics = bound::with_bound(cx, builder, item, &generics,
+         &requires_default,
+-        &builder.path().global().ids(&["std", "default", "Default"]).build());
++        &["std", "default", "Default"]);
+     generics
+ }
+ 
+@@ -330,7 +323,8 @@ fn deserialize_visitor(
+ fn deserializer_ty_param(builder: &aster::AstBuilder) -> ast::TyParam {
+     builder.ty_param("__D")
+         .trait_bound(builder.path()
+-                     .segment("_serde").build()
++                     .global()
++                     .segment("serde").build()
+                      .segment("de").build()
+                      .id("Deserializer")
+                      .build())
+@@ -352,19 +346,19 @@ fn deserialize_unit_struct(
+     Ok(quote_expr!(cx, {
+         struct __Visitor;
+ 
+-        impl _serde::de::Visitor for __Visitor {
++        impl ::serde::de::Visitor for __Visitor {
+             type Value = $type_ident;
+ 
+             #[inline]
+             fn visit_unit<E>(&mut self) -> ::std::result::Result<$type_ident, E>
+-                where E: _serde::de::Error,
++                where E: ::serde::de::Error,
+             {
+                 Ok($type_ident)
+             }
+ 
+             #[inline]
+             fn visit_seq<V>(&mut self, mut visitor: V) -> ::std::result::Result<$type_ident, V::Error>
+-                where V: _serde::de::SeqVisitor,
++                where V: ::serde::de::SeqVisitor,
+             {
+                 try!(visitor.end());
+                 self.visit_unit()
+@@ -404,20 +398,20 @@ fn deserialize_newtype_struct(
+     Ok(quote_expr!(cx, {
+         $visitor_item
+ 
+-        impl $visitor_generics _serde::de::Visitor for $visitor_ty $where_clause {
++        impl $visitor_generics ::serde::de::Visitor for $visitor_ty $where_clause {
+             type Value = $ty;
+ 
+             #[inline]
+             fn visit_newtype_struct<D>(&mut self, deserializer: &mut D) -> ::std::result::Result<Self::Value, D::Error>
+-                where D: _serde::de::Deserializer,
++                where D: ::serde::de::Deserializer,
+             {
+-                let value = try!(_serde::de::Deserialize::deserialize(deserializer));
++                let value = try!(::serde::de::Deserialize::deserialize(deserializer));
+                 Ok($type_ident(value))
+             }
+ 
+             #[inline]
+             fn visit_seq<__V>(&mut self, mut visitor: __V) -> ::std::result::Result<$ty, __V::Error>
+-                where __V: _serde::de::SeqVisitor,
++                where __V: ::serde::de::SeqVisitor,
+             {
+                 $visit_seq_expr
+             }
+@@ -457,12 +451,12 @@ fn deserialize_tuple_struct(
+     Ok(quote_expr!(cx, {
+         $visitor_item
+ 
+-        impl $visitor_generics _serde::de::Visitor for $visitor_ty $where_clause {
++        impl $visitor_generics ::serde::de::Visitor for $visitor_ty $where_clause {
+             type Value = $ty;
+ 
+             #[inline]
+             fn visit_seq<__V>(&mut self, mut visitor: __V) -> ::std::result::Result<$ty, __V::Error>
+-                where __V: _serde::de::SeqVisitor,
++                where __V: ::serde::de::SeqVisitor,
+             {
+                 $visit_seq_expr
+             }
+@@ -485,7 +479,7 @@ fn deserialize_seq(
+                 let $name = match try!(visitor.visit()) {
+                     Some(value) => { value },
+                     None => {
+-                        return Err(_serde::de::Error::end_of_stream());
++                        return Err(::serde::de::Error::end_of_stream());
+                     }
+                 };
+             ).unwrap()
+@@ -527,7 +521,7 @@ fn deserialize_struct_as_seq(
+                     let $name = match try!(visitor.visit()) {
+                         Some(value) => { $deserialize_with(value) },
+                         None => {
+-                            return Err(_serde::de::Error::end_of_stream());
++                            return Err(::serde::de::Error::end_of_stream());
+                         }
+                     };
+                 ).unwrap()
+@@ -606,19 +600,19 @@ fn deserialize_struct(
+ 
+         $visitor_item
+ 
+-        impl $visitor_generics _serde::de::Visitor for $visitor_ty $where_clause {
++        impl $visitor_generics ::serde::de::Visitor for $visitor_ty $where_clause {
+             type Value = $ty;
+ 
+             #[inline]
+             fn visit_seq<__V>(&mut self, mut visitor: __V) -> ::std::result::Result<$ty, __V::Error>
+-                where __V: _serde::de::SeqVisitor,
++                where __V: ::serde::de::SeqVisitor,
+             {
+                 $visit_seq_expr
+             }
+ 
+             #[inline]
+             fn visit_map<__V>(&mut self, mut visitor: __V) -> ::std::result::Result<$ty, __V::Error>
+-                where __V: _serde::de::MapVisitor,
++                where __V: ::serde::de::MapVisitor,
+             {
+                 $visit_map_expr
+             }
+@@ -674,7 +668,7 @@ fn deserialize_item_enum(
+     let ignored_arm = if container_attrs.deny_unknown_fields() {
+         None
+     } else {
+-        Some(quote_arm!(cx, __Field::__ignore => { Err(_serde::de::Error::end_of_stream()) }))
++        Some(quote_arm!(cx, __Field::__ignore => { Err(::serde::de::Error::end_of_stream()) }))
+     };
+ 
+     // Match arms to extract a variant from a string
+@@ -711,11 +705,11 @@ fn deserialize_item_enum(
+ 
+         $visitor_item
+ 
+-        impl $visitor_generics _serde::de::EnumVisitor for $visitor_ty $where_clause {
++        impl $visitor_generics ::serde::de::EnumVisitor for $visitor_ty $where_clause {
+             type Value = $ty;
+ 
+             fn visit<__V>(&mut self, mut visitor: __V) -> ::std::result::Result<$ty, __V::Error>
+-                where __V: _serde::de::VariantVisitor,
++                where __V: ::serde::de::VariantVisitor,
+             {
+                 match try!(visitor.visit_variant()) {
+                     $variant_arms
+@@ -807,11 +801,11 @@ fn deserialize_tuple_variant(
+     Ok(quote_expr!(cx, {
+         $visitor_item
+ 
+-        impl $visitor_generics _serde::de::Visitor for $visitor_ty $where_clause {
++        impl $visitor_generics ::serde::de::Visitor for $visitor_ty $where_clause {
+             type Value = $ty;
+ 
+             fn visit_seq<__V>(&mut self, mut visitor: __V) -> ::std::result::Result<$ty, __V::Error>
+-                where __V: _serde::de::SeqVisitor,
++                where __V: ::serde::de::SeqVisitor,
+             {
+                 $visit_seq_expr
+             }
+@@ -867,19 +861,19 @@ fn deserialize_struct_variant(
+ 
+         $visitor_item
+ 
+-        impl $visitor_generics _serde::de::Visitor for $visitor_ty $where_clause {
++        impl $visitor_generics ::serde::de::Visitor for $visitor_ty $where_clause {
+             type Value = $ty;
+ 
+             #[inline]
+             fn visit_seq<__V>(&mut self, mut visitor: __V) -> ::std::result::Result<$ty, __V::Error>
+-                where __V: _serde::de::SeqVisitor,
++                where __V: ::serde::de::SeqVisitor,
+             {
+                 $visit_seq_expr
+             }
+ 
+             #[inline]
+             fn visit_map<__V>(&mut self, mut visitor: __V) -> ::std::result::Result<$ty, __V::Error>
+-                where __V: _serde::de::MapVisitor,
++                where __V: ::serde::de::MapVisitor,
+             {
+                 $field_expr
+             }
+@@ -938,7 +932,7 @@ fn deserialize_field_visitor(
+         quote_expr!(cx, Ok(__Field::__ignore))
+     } else {
+         quote_expr!(cx, {
+-            Err(_serde::de::Error::invalid_value($index_error_msg))
++            Err(::serde::de::Error::invalid_value($index_error_msg))
+         })
+     };
+ 
+@@ -964,7 +958,7 @@ fn deserialize_field_visitor(
+     let fallthrough_str_arm_expr = if !is_variant && !container_attrs.deny_unknown_fields() {
+         quote_expr!(cx, Ok(__Field::__ignore))
+     } else {
+-        quote_expr!(cx, Err(_serde::de::Error::$unknown_ident(value)))
++        quote_expr!(cx, Err(::serde::de::Error::$unknown_ident(value)))
+     };
+ 
+     let str_body = quote_expr!(cx,
+@@ -994,7 +988,7 @@ fn deserialize_field_visitor(
+     } else {
+         quote_expr!(cx, {
+             let value = ::std::string::String::from_utf8_lossy(value);
+-            Err(_serde::de::Error::$unknown_ident(&value))
++            Err(::serde::de::Error::$unknown_ident(&value))
+         })
+     };
+ 
+@@ -1006,10 +1000,10 @@ fn deserialize_field_visitor(
+     );
+ 
+     let impl_item = quote_item!(cx,
+-        impl _serde::de::Deserialize for __Field {
++        impl ::serde::de::Deserialize for __Field {
+             #[inline]
+             fn deserialize<D>(deserializer: &mut D) -> ::std::result::Result<__Field, D::Error>
+-                where D: _serde::de::Deserializer,
++                where D: ::serde::de::Deserializer,
+             {
+                 use std::marker::PhantomData;
+ 
+@@ -1017,25 +1011,25 @@ fn deserialize_field_visitor(
+                     phantom: PhantomData<D>
+                 }
+ 
+-                impl<__D> _serde::de::Visitor for __FieldVisitor<__D>
+-                    where __D: _serde::de::Deserializer
++                impl<__D> ::serde::de::Visitor for __FieldVisitor<__D>
++                    where __D: ::serde::de::Deserializer
+                 {
+                     type Value = __Field;
+ 
+                     fn visit_usize<E>(&mut self, value: usize) -> ::std::result::Result<__Field, E>
+-                        where E: _serde::de::Error,
++                        where E: ::serde::de::Error,
+                     {
+                         $index_body
+                     }
+ 
+                     fn visit_str<E>(&mut self, value: &str) -> ::std::result::Result<__Field, E>
+-                        where E: _serde::de::Error,
++                        where E: ::serde::de::Error,
+                     {
+                         $str_body
+                     }
+ 
+                     fn visit_bytes<E>(&mut self, value: &[u8]) -> ::std::result::Result<__Field, E>
+-                        where E: _serde::de::Error,
++                        where E: ::serde::de::Error,
+                     {
+                         $bytes_body
+                     }
+@@ -1137,7 +1131,7 @@ fn deserialize_map(
+         .map(|&(_, _, name)| {
+             quote_arm!(cx,
+                 __Field::$name => {
+-                    try!(visitor.visit_value::<_serde::de::impls::IgnoredAny>());
++                    try!(visitor.visit_value::<::serde::de::impls::IgnoredAny>());
+                 }
+             )
+         })
+@@ -1148,7 +1142,7 @@ fn deserialize_map(
+         None
+     } else {
+         Some(quote_arm!(cx,
+-            _ => { try!(visitor.visit_value::<_serde::de::impls::IgnoredAny>()); }
++            _ => { try!(visitor.visit_value::<::serde::de::impls::IgnoredAny>()); }
+         ))
+     };
+ 
+diff --git a/serde_codegen/src/ser.rs b/serde_codegen/src/ser.rs
+index ac4702c9..7766cbfb 100644
+--- a/serde_codegen/src/ser.rs
++++ b/serde_codegen/src/ser.rs
+@@ -74,21 +74,14 @@ fn serialize_item(
+ 
+     let where_clause = &impl_generics.where_clause;
+ 
+-    let dummy_const = builder.id(format!("_IMPL_SERIALIZE_FOR_{}", item.ident));
+-
+     Ok(quote_item!(cx,
+-        #[allow(non_upper_case_globals, unused_attributes, unused_qualifications)]
+-        const $dummy_const: () = {
+-            extern crate serde as _serde;
+-            #[automatically_derived]
+-            impl $impl_generics _serde::ser::Serialize for $ty $where_clause {
+-                fn serialize<__S>(&self, _serializer: &mut __S) -> ::std::result::Result<(), __S::Error>
+-                    where __S: _serde::ser::Serializer,
+-                {
+-                    $body
+-                }
++        impl $impl_generics ::serde::ser::Serialize for $ty $where_clause {
++            fn serialize<__S>(&self, _serializer: &mut __S) -> ::std::result::Result<(), __S::Error>
++                where __S: ::serde::ser::Serializer,
++            {
++                $body
+             }
+-        };
++        }
+     ).unwrap())
+ }
+ 
+@@ -103,7 +96,7 @@ fn build_impl_generics(
+     let generics = bound::without_defaults(generics);
+     let generics = bound::with_bound(cx, builder, item, &generics,
+         &serialized_by_us,
+-        &builder.path().ids(&["_serde", "ser", "Serialize"]).build());
++        &["serde", "ser", "Serialize"]);
+     generics
+ }
+ 
+@@ -368,7 +361,7 @@ fn serialize_variant(
+ 
+             Ok(quote_arm!(cx,
+                 $pat => {
+-                    _serde::ser::Serializer::serialize_unit_variant(
++                    ::serde::ser::Serializer::serialize_unit_variant(
+                         _serializer,
+                         $type_name,
+                         $variant_index,
+@@ -387,7 +380,7 @@ fn serialize_variant(
+ 
+             Ok(quote_arm!(cx,
+                 $pat => {
+-                    _serde::ser::Serializer::serialize_newtype_variant(
++                    ::serde::ser::Serializer::serialize_newtype_variant(
+                         _serializer,
+                         $type_name,
+                         $variant_index,
+@@ -654,12 +647,12 @@ fn serialize_tuple_struct_visitor(
+         ).unwrap(),
+ 
+         quote_item!(cx,
+-            impl $visitor_impl_generics _serde::ser::SeqVisitor
++            impl $visitor_impl_generics ::serde::ser::SeqVisitor
+             for Visitor $visitor_generics
+             $where_clause {
+                 #[inline]
+                 fn visit<S>(&mut self, _serializer: &mut S) -> ::std::result::Result<Option<()>, S::Error>
+-                    where S: _serde::ser::Serializer
++                    where S: ::serde::ser::Serializer
+                 {
+                     match self.state {
+                         $arms
+@@ -759,12 +752,12 @@ fn serialize_struct_visitor(
+ 
+         quote_item!(cx,
+             impl $visitor_impl_generics
+-            _serde::ser::MapVisitor
++            ::serde::ser::MapVisitor
+             for Visitor $visitor_generics
+             $where_clause {
+                 #[inline]
+                 fn visit<S>(&mut self, _serializer: &mut S) -> ::std::result::Result<Option<()>, S::Error>
+-                    where S: _serde::ser::Serializer,
++                    where S: ::serde::ser::Serializer,
+                 {
+                     loop {
+                         match self.state {
+diff --git a/serde_tests/tests/test.rs b/serde_tests/tests/test.rs
+index cd90cf1e..689a28bc 100644
+--- a/serde_tests/tests/test.rs
++++ b/serde_tests/tests/test.rs
+@@ -1,4 +1,6 @@
+ #![cfg_attr(feature = "nightly", feature(plugin))]
+ #![cfg_attr(feature = "nightly", plugin(clippy))]
+ 
++extern crate serde;
++
+ include!(concat!(env!("OUT_DIR"), "/test.rs"));
+diff --git a/serde_tests/tests/test_annotations.rs b/serde_tests/tests/test_annotations.rs
+index 12d914c4..865105e7 100644
+--- a/serde_tests/tests/test_annotations.rs
++++ b/serde_tests/tests/test_annotations.rs
+@@ -1,5 +1,4 @@
+-extern crate serde;
+-use self::serde::{Serialize, Serializer, Deserialize, Deserializer};
++use serde::{Serialize, Serializer, Deserialize, Deserializer};
+ 
+ use token::{
+     Error,
+diff --git a/serde_tests/tests/test_bytes.rs b/serde_tests/tests/test_bytes.rs
+index 7a9906a4..52e159f8 100644
+--- a/serde_tests/tests/test_bytes.rs
++++ b/serde_tests/tests/test_bytes.rs
+@@ -1,9 +1,8 @@
++use serde;
+ use std::fmt;
+ use std::error;
+-
+-extern crate serde;
+-use self::serde::Serialize;
+-use self::serde::bytes::{ByteBuf, Bytes};
++use serde::Serialize;
++use serde::bytes::{ByteBuf, Bytes};
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+ 
+diff --git a/serde_tests/tests/test_de.rs b/serde_tests/tests/test_de.rs
+index 1859cee9..45d0b332 100644
+--- a/serde_tests/tests/test_de.rs
++++ b/serde_tests/tests/test_de.rs
+@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+ use std::net;
+ use std::path::PathBuf;
+ 
+-extern crate serde;
+-use self::serde::de::{Deserializer, Visitor};
++use serde::de::{Deserializer, Visitor};
+ 
+ use token::{
+     Error,
+diff --git a/serde_tests/tests/token.rs b/serde_tests/tests/token.rs
+index f61800bd..7a537a6a 100644
+--- a/serde_tests/tests/token.rs
++++ b/serde_tests/tests/token.rs
+@@ -2,10 +2,9 @@ use std::fmt;
+ use std::iter;
+ use std::error;
+ 
+-extern crate serde;
+-use self::serde::ser::{self, Serialize};
+-use self::serde::de;
+-use self::serde::de::value::{self, ValueDeserializer};
++use serde::ser::{self, Serialize};
++use serde::de;
++use serde::de::value::{self, ValueDeserializer};
+ 
+ #[derive(Clone, PartialEq, Debug)]
+ pub enum Token<'a> {

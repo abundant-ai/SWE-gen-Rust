@@ -1,0 +1,235 @@
+diff --git a/rustls/src/client/handy.rs b/rustls/src/client/handy.rs
+index 7eec4bd4..78d46751 100644
+--- a/rustls/src/client/handy.rs
++++ b/rustls/src/client/handy.rs
+@@ -243,6 +243,7 @@ impl client::ResolvesClientCert for AlwaysResolvesClientCert {
+ 
+ test_for_each_provider! {
+     use std::prelude::v1::*;
++    use alloc::sync::Arc;
+     use super::NoClientSessionStorage;
+     use crate::client::ClientSessionStore;
+     use crate::msgs::enums::NamedGroup;
+@@ -251,6 +252,7 @@ test_for_each_provider! {
+     use crate::msgs::handshake::SessionId;
+     use crate::msgs::persist::Tls13ClientSessionValue;
+     use crate::suites::SupportedCipherSuite;
++    use crate::msgs::base::PayloadU16;
+     use provider::cipher_suite;
+ 
+     use pki_types::{ServerName, UnixTime};
+@@ -278,7 +280,7 @@ test_for_each_provider! {
+                 Tls12ClientSessionValue::new(
+                     tls12_suite,
+                     SessionId::empty(),
+-                    Vec::new(),
++                    Arc::new(PayloadU16::empty()),
+                     &[],
+                     CertificateChain::default(),
+                     now,
+@@ -300,7 +302,7 @@ test_for_each_provider! {
+             name.clone(),
+             Tls13ClientSessionValue::new(
+                 tls13_suite,
+-                Vec::new(),
++                Arc::new(PayloadU16::empty()),
+                 &[],
+                 CertificateChain::default(),
+                 now,
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index e610931f..c7d6ef3c 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -126,7 +126,7 @@ pub(super) fn start_handshake(
+                 // If we have a ticket, we use the sessionid as a signal that
+                 // we're  doing an abbreviated handshake.  See section 3.4 in
+                 // RFC5077.
+-                if !inner.ticket().is_empty() {
++                if !inner.ticket().0.is_empty() {
+                     inner.session_id = SessionId::random(config.provider.secure_random)?;
+                 }
+                 Some(inner.session_id)
+diff --git a/rustls/src/client/tls12.rs b/rustls/src/client/tls12.rs
+index bef0f0f5..a0fcbdd7 100644
+--- a/rustls/src/client/tls12.rs
++++ b/rustls/src/client/tls12.rs
+@@ -1163,17 +1163,17 @@ impl ExpectFinished {
+         // Save a ticket.  If we got a new ticket, save that.  Otherwise, save the
+         // original ticket again.
+         let (mut ticket, lifetime) = match self.ticket.take() {
+-            Some(nst) => (nst.ticket.0, nst.lifetime_hint),
+-            None => (Vec::new(), 0),
++            Some(nst) => (nst.ticket, nst.lifetime_hint),
++            None => (Arc::new(PayloadU16::empty()), 0),
+         };
+ 
+-        if ticket.is_empty() {
++        if ticket.0.is_empty() {
+             if let Some(resuming_session) = &mut self.resuming_session {
+-                ticket = resuming_session.take_ticket();
++                ticket = resuming_session.ticket();
+             }
+         }
+ 
+-        if self.session_id.is_empty() && ticket.is_empty() {
++        if self.session_id.is_empty() && ticket.0.is_empty() {
+             debug!("Session not saved: server didn't allocate id or ticket");
+             return;
+         }
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 17b59f1c..066640c4 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -1428,7 +1428,7 @@ impl ExpectTraffic {
+         #[allow(unused_mut)]
+         let mut value = persist::Tls13ClientSessionValue::new(
+             self.suite,
+-            nst.ticket.0.clone(),
++            Arc::clone(&nst.ticket),
+             secret.as_ref(),
+             cx.common
+                 .peer_certificates
+diff --git a/rustls/src/msgs/handshake.rs b/rustls/src/msgs/handshake.rs
+index e17ef314..fee63461 100644
+--- a/rustls/src/msgs/handshake.rs
++++ b/rustls/src/msgs/handshake.rs
+@@ -1,6 +1,7 @@
+ use alloc::collections::BTreeSet;
+ #[cfg(feature = "logging")]
+ use alloc::string::String;
++use alloc::sync::Arc;
+ use alloc::vec;
+ use alloc::vec::Vec;
+ use core::ops::Deref;
+@@ -2263,7 +2264,10 @@ impl CertificateRequestPayloadTls13 {
+ #[derive(Debug)]
+ pub struct NewSessionTicketPayload {
+     pub(crate) lifetime_hint: u32,
+-    pub(crate) ticket: PayloadU16,
++    // Tickets can be large (KB), so we deserialise this straight
++    // into an Arc, so it can be passed directly into the client's
++    // session object without copying.
++    pub(crate) ticket: Arc<PayloadU16>,
+ }
+ 
+ impl NewSessionTicketPayload {
+@@ -2271,7 +2275,7 @@ impl NewSessionTicketPayload {
+     pub(crate) fn new(lifetime_hint: u32, ticket: Vec<u8>) -> Self {
+         Self {
+             lifetime_hint,
+-            ticket: PayloadU16::new(ticket),
++            ticket: Arc::new(PayloadU16::new(ticket)),
+         }
+     }
+ }
+@@ -2284,7 +2288,7 @@ impl Codec<'_> for NewSessionTicketPayload {
+ 
+     fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+         let lifetime = u32::read(r)?;
+-        let ticket = PayloadU16::read(r)?;
++        let ticket = Arc::new(PayloadU16::read(r)?);
+ 
+         Ok(Self {
+             lifetime_hint: lifetime,
+@@ -2344,7 +2348,7 @@ pub struct NewSessionTicketPayloadTls13 {
+     pub(crate) lifetime: u32,
+     pub(crate) age_add: u32,
+     pub(crate) nonce: PayloadU8,
+-    pub(crate) ticket: PayloadU16,
++    pub(crate) ticket: Arc<PayloadU16>,
+     pub(crate) exts: Vec<NewSessionTicketExtension>,
+ }
+ 
+@@ -2354,7 +2358,7 @@ impl NewSessionTicketPayloadTls13 {
+             lifetime,
+             age_add,
+             nonce: PayloadU8::new(nonce),
+-            ticket: PayloadU16::new(ticket),
++            ticket: Arc::new(PayloadU16::new(ticket)),
+             exts: vec![],
+         }
+     }
+@@ -2395,7 +2399,7 @@ impl Codec<'_> for NewSessionTicketPayloadTls13 {
+         let lifetime = u32::read(r)?;
+         let age_add = u32::read(r)?;
+         let nonce = PayloadU8::read(r)?;
+-        let ticket = PayloadU16::read(r)?;
++        let ticket = Arc::new(PayloadU16::read(r)?);
+         let exts = Vec::read(r)?;
+ 
+         Ok(Self {
+diff --git a/rustls/src/msgs/persist.rs b/rustls/src/msgs/persist.rs
+index 5a8998fb..33e7b66f 100644
+--- a/rustls/src/msgs/persist.rs
++++ b/rustls/src/msgs/persist.rs
+@@ -1,7 +1,6 @@
++use alloc::sync::Arc;
+ use alloc::vec::Vec;
+ use core::cmp;
+-#[cfg(feature = "tls12")]
+-use core::mem;
+ 
+ use pki_types::{DnsName, UnixTime};
+ use zeroize::Zeroizing;
+@@ -80,7 +79,7 @@ pub struct Tls13ClientSessionValue {
+ impl Tls13ClientSessionValue {
+     pub(crate) fn new(
+         suite: &'static Tls13CipherSuite,
+-        ticket: Vec<u8>,
++        ticket: Arc<PayloadU16>,
+         secret: &[u8],
+         server_cert_chain: CertificateChain<'static>,
+         time_now: UnixTime,
+@@ -158,7 +157,7 @@ impl Tls12ClientSessionValue {
+     pub(crate) fn new(
+         suite: &'static Tls12CipherSuite,
+         session_id: SessionId,
+-        ticket: Vec<u8>,
++        ticket: Arc<PayloadU16>,
+         master_secret: &[u8],
+         server_cert_chain: CertificateChain<'static>,
+         time_now: UnixTime,
+@@ -179,8 +178,8 @@ impl Tls12ClientSessionValue {
+         }
+     }
+ 
+-    pub(crate) fn take_ticket(&mut self) -> Vec<u8> {
+-        mem::take(&mut self.common.ticket.0)
++    pub(crate) fn ticket(&mut self) -> Arc<PayloadU16> {
++        Arc::clone(&self.common.ticket)
+     }
+ 
+     pub(crate) fn extended_ms(&self) -> bool {
+@@ -209,27 +208,27 @@ impl core::ops::Deref for Tls12ClientSessionValue {
+ 
+ #[derive(Debug, Clone)]
+ pub struct ClientSessionCommon {
+-    ticket: PayloadU16,
++    ticket: Arc<PayloadU16>,
+     secret: Zeroizing<PayloadU8>,
+     epoch: u64,
+     lifetime_secs: u32,
+-    server_cert_chain: CertificateChain<'static>,
++    server_cert_chain: Arc<CertificateChain<'static>>,
+ }
+ 
+ impl ClientSessionCommon {
+     fn new(
+-        ticket: Vec<u8>,
++        ticket: Arc<PayloadU16>,
+         secret: &[u8],
+         time_now: UnixTime,
+         lifetime_secs: u32,
+         server_cert_chain: CertificateChain<'static>,
+     ) -> Self {
+         Self {
+-            ticket: PayloadU16(ticket),
++            ticket,
+             secret: Zeroizing::new(PayloadU8(secret.to_vec())),
+             epoch: time_now.as_secs(),
+             lifetime_secs: cmp::min(lifetime_secs, MAX_TICKET_LIFETIME),
+-            server_cert_chain,
++            server_cert_chain: Arc::new(server_cert_chain),
+         }
+     }
+ 

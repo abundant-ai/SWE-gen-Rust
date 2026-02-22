@@ -1,0 +1,403 @@
+diff --git a/rustls/src/common_state.rs b/rustls/src/common_state.rs
+index 12aca203..3ff4609d 100644
+--- a/rustls/src/common_state.rs
++++ b/rustls/src/common_state.rs
+@@ -40,8 +40,6 @@ pub struct CommonState {
+     pub(crate) may_receive_application_data: bool,
+     pub(crate) early_traffic: bool,
+     sent_fatal_alert: bool,
+-    /// If we signaled end of stream.
+-    pub(crate) has_sent_close_notify: bool,
+     /// If the peer has signaled end of stream.
+     pub(crate) has_received_close_notify: bool,
+     #[cfg(feature = "std")]
+@@ -76,7 +74,6 @@ impl CommonState {
+             may_receive_application_data: false,
+             early_traffic: false,
+             sent_fatal_alert: false,
+-            has_sent_close_notify: false,
+             has_received_close_notify: false,
+             #[cfg(feature = "std")]
+             has_seen_eof: false,
+@@ -576,7 +573,6 @@ impl CommonState {
+         }
+         debug!("Sending warning alert {:?}", AlertDescription::CloseNotify);
+         self.sent_fatal_alert = true;
+-        self.has_sent_close_notify = true;
+         self.send_warning_alert_no_log(AlertDescription::CloseNotify);
+     }
+ 
+diff --git a/rustls/src/conn.rs b/rustls/src/conn.rs
+index 426d3770..43706241 100644
+--- a/rustls/src/conn.rs
++++ b/rustls/src/conn.rs
+@@ -811,7 +811,6 @@ impl<Data> From<ConnectionCore<Data>> for ConnectionCommon<Data> {
+ pub struct UnbufferedConnectionCommon<Data> {
+     pub(crate) core: ConnectionCore<Data>,
+     wants_write: bool,
+-    emitted_peer_closed_state: bool,
+ }
+ 
+ impl<Data> From<ConnectionCore<Data>> for UnbufferedConnectionCommon<Data> {
+@@ -819,7 +818,6 @@ impl<Data> From<ConnectionCore<Data>> for UnbufferedConnectionCommon<Data> {
+         Self {
+             core,
+             wants_write: false,
+-            emitted_peer_closed_state: false,
+         }
+     }
+ }
+diff --git a/rustls/src/conn/unbuffered.rs b/rustls/src/conn/unbuffered.rs
+index ffe14c75..ef8146e0 100644
+--- a/rustls/src/conn/unbuffered.rs
++++ b/rustls/src/conn/unbuffered.rs
+@@ -131,18 +131,6 @@ impl<Data> UnbufferedConnectionCommon<Data> {
+                 .core
+                 .common_state
+                 .has_received_close_notify
+-                && !self.emitted_peer_closed_state
+-            {
+-                self.emitted_peer_closed_state = true;
+-                break (buffer.pending_discard(), ConnectionState::PeerClosed);
+-            } else if self
+-                .core
+-                .common_state
+-                .has_received_close_notify
+-                && self
+-                    .core
+-                    .common_state
+-                    .has_sent_close_notify
+             {
+                 break (buffer.pending_discard(), ConnectionState::Closed);
+             } else if self
+@@ -197,26 +185,7 @@ pub enum ConnectionState<'c, 'i, Data> {
+     /// the received data.
+     ReadTraffic(ReadTraffic<'c, 'i, Data>),
+ 
+-    /// Connection has been cleanly closed by the peer.
+-    ///
+-    /// This state is encountered at most once by each connection -- it is
+-    /// "edge" triggered, rather than "level" triggered.
+-    ///
+-    /// It delimits the data received from the peer, meaning you can be sure you
+-    /// have received all the data the peer sent.
+-    ///
+-    /// No further application data will be received from the peer, so no further
+-    /// `ReadTraffic` states will be produced.
+-    ///
+-    /// However, it is possible to _send_ further application data via `WriteTraffic`
+-    /// states, or close the connection cleanly by calling
+-    /// [`WriteTraffic::queue_close_notify()`].
+-    PeerClosed,
+-
+-    /// Connection has been cleanly closed by both us and the peer.
+-    ///
+-    /// This is a terminal state.  No other states will be produced for this
+-    /// connection.
++    /// Connection has been cleanly closed by the peer
+     Closed,
+ 
+     /// One, or more, early (RTT-0) data records are available
+@@ -293,8 +262,6 @@ impl<Data> fmt::Debug for ConnectionState<'_, '_, Data> {
+         match self {
+             Self::ReadTraffic(..) => f.debug_tuple("ReadTraffic").finish(),
+ 
+-            Self::PeerClosed => write!(f, "PeerClosed"),
+-
+             Self::Closed => write!(f, "Closed"),
+ 
+             Self::ReadEarlyData(..) => f.debug_tuple("ReadEarlyData").finish(),
+diff --git a/rustls/tests/unbuffered.rs b/rustls/tests/unbuffered.rs
+index e37030b5..7dbc2fc7 100644
+--- a/rustls/tests/unbuffered.rs
++++ b/rustls/tests/unbuffered.rs
+@@ -5,8 +5,8 @@ use std::num::NonZeroUsize;
+ use rustls::client::{ClientConnectionData, EarlyDataError, UnbufferedClientConnection};
+ use rustls::server::{ServerConnectionData, UnbufferedServerConnection};
+ use rustls::unbuffered::{
+-    ConnectionState, EncodeError, EncryptError, InsufficientSizeError, ReadTraffic,
+-    UnbufferedConnectionCommon, UnbufferedStatus, WriteTraffic,
++    ConnectionState, EncodeError, EncryptError, InsufficientSizeError, UnbufferedConnectionCommon,
++    UnbufferedStatus, WriteTraffic,
+ };
+ use rustls::version::TLS13;
+ use rustls::{
+@@ -329,10 +329,10 @@ fn run(
+                     .client_received_app_data
+                     .extend(records);
+             }
+-            State::PeerClosed => {
+-                outcome.client_saw_peer_closed_state = true;
++            State::Closed => {
++                client_handshake_done = true;
++                outcome.client_reached_connection_closed_state = true
+             }
+-            State::Closed => {}
+             state => unreachable!("{state:?}"),
+         }
+ 
+@@ -385,10 +385,10 @@ fn run(
+                     .server_received_app_data
+                     .extend(records);
+             }
+-            State::PeerClosed => {
+-                outcome.server_saw_peer_closed_state = true;
++            State::Closed => {
++                server_handshake_done = true;
++                outcome.server_reached_connection_closed_state = true
+             }
+-            State::Closed => {}
+         }
+ 
+         count += 1;
+@@ -435,7 +435,7 @@ fn close_notify_client_to_server() {
+         );
+ 
+         assert!(!client_actions.send_close_notify);
+-        assert!(outcome.server_saw_peer_closed_state);
++        assert!(outcome.server_reached_connection_closed_state);
+     }
+ }
+ 
+@@ -459,59 +459,7 @@ fn close_notify_server_to_client() {
+         );
+ 
+         assert!(!server_actions.send_close_notify);
+-        assert!(outcome.client_saw_peer_closed_state);
+-    }
+-}
+-
+-#[test]
+-fn full_closure_server_to_client() {
+-    for version in rustls::ALL_VERSIONS {
+-        eprintln!("{version:?}");
+-        let mut outcome = handshake(version);
+-        let mut client = outcome.client.take().unwrap();
+-        let mut server = outcome.server.take().unwrap();
+-
+-        let mut buf = Buffer::default();
+-
+-        // server sends message followed by close_notify, in one flight
+-        write_traffic(
+-            server.process_tls_records(&mut []),
+-            |mut wt: WriteTraffic<_>| {
+-                encrypt(&mut wt, b"hello", &mut buf);
+-                queue_close_notify(&mut wt, &mut buf);
+-            },
+-        );
+-
+-        let (_, discard) = read_traffic(client.process_tls_records(buf.filled()), |mut rt| {
+-            assert_eq!(rt.peek_len(), NonZeroUsize::new(5));
+-            let app_data = rt.next_record().unwrap().unwrap();
+-            assert_eq!(app_data.payload, b"hello");
+-        });
+-        buf.discard(discard);
+-
+-        let discard = peer_closed(client.process_tls_records(buf.filled()));
+-        buf.discard(discard);
+-        assert_eq!(buf.used, 0);
+-
+-        // client replies with its own data and close_notify
+-        write_traffic(client.process_tls_records(&mut []), |mut wt| {
+-            encrypt(&mut wt, b"goodbye", &mut buf);
+-            queue_close_notify(&mut wt, &mut buf);
+-        });
+-
+-        let (_, discard) = read_traffic(server.process_tls_records(buf.filled()), |mut rt| {
+-            assert_eq!(rt.peek_len(), NonZeroUsize::new(7));
+-            let app_data = rt.next_record().unwrap().unwrap();
+-            assert_eq!(app_data.payload, b"goodbye");
+-        });
+-        buf.discard(discard);
+-
+-        let discard = peer_closed(server.process_tls_records(buf.filled()));
+-        buf.discard(discard);
+-        assert_eq!(buf.used, 0);
+-
+-        closed(client.process_tls_records(&mut []));
+-        closed(server.process_tls_records(&mut []));
++        assert!(outcome.client_reached_connection_closed_state);
+     }
+ }
+ 
+@@ -535,13 +483,13 @@ fn junk_after_close_notify_received() {
+     let discard = match dbg!(server.process_tls_records(dbg!(&mut client_send_buf[..len]))) {
+         UnbufferedStatus {
+             discard,
+-            state: Ok(ConnectionState::PeerClosed),
++            state: Ok(ConnectionState::Closed),
+         } => {
+             assert_eq!(discard, 24);
+             discard
+         }
+         st => {
+-            panic!("unexpected server state {st:?} (wanted PeerClosed)");
++            panic!("unexpected server state {st:?} (wanted Closed)");
+         }
+     };
+ 
+@@ -837,7 +785,7 @@ fn tls12_connection_fails_after_key_reaches_confidentiality_limit() {
+     match server.process_tls_records(&mut data) {
+         UnbufferedStatus {
+             discard,
+-            state: Ok(ConnectionState::PeerClosed),
++            state: Ok(ConnectionState::Closed),
+         } if discard == data_len => {}
+         st => panic!("unexpected server state {st:?}"),
+     }
+@@ -914,36 +862,11 @@ fn write_traffic<T: SideData, R, F: FnMut(WriteTraffic<T>) -> R>(
+ ) -> R {
+     let UnbufferedStatus { discard, state } = status;
+     assert_eq!(discard, 0);
+-    match state.unwrap() {
+-        ConnectionState::WriteTraffic(state) => f(state),
+-        other => panic!("unexpected state {other:?} (wanted WriteTraffic)"),
+-    }
+-}
+-
+-fn read_traffic<T: SideData, R, F: FnMut(ReadTraffic<T>) -> R>(
+-    status: UnbufferedStatus<'_, '_, T>,
+-    mut f: F,
+-) -> (R, usize) {
+-    let UnbufferedStatus { discard, state } = status;
+-    match state.unwrap() {
+-        ConnectionState::ReadTraffic(state) => (f(state), discard),
+-        other => panic!("unexpected state {other:?} (wanted ReadTraffic)"),
+-    }
+-}
+-
+-fn peer_closed<T: SideData>(status: UnbufferedStatus<'_, '_, T>) -> usize {
+-    let UnbufferedStatus { discard, state } = status;
+-    match state.unwrap() {
+-        ConnectionState::PeerClosed => discard,
+-        other => panic!("unexpected state {other:?} (wanted PeerClosed)"),
+-    }
+-}
+-
+-fn closed<T: SideData>(status: UnbufferedStatus<'_, '_, T>) -> usize {
+-    let UnbufferedStatus { discard, state } = status;
+-    match state.unwrap() {
+-        ConnectionState::Closed => discard,
+-        other => panic!("unexpected state {other:?} (wanted Closed)"),
++    let state = state.unwrap();
++    if let ConnectionState::WriteTraffic(state) = state {
++        f(state)
++    } else {
++        panic!("unexpected client state {state:?} (wanted WriteTraffic)");
+     }
+ }
+ 
+@@ -986,7 +909,6 @@ fn confirm_transmit_tls_data<T: SideData>(status: UnbufferedStatus<'_, '_, T>) {
+ #[derive(Debug)]
+ enum State {
+     Closed,
+-    PeerClosed,
+     EncodedTlsData,
+     TransmitTlsData {
+         sent_app_data: bool,
+@@ -1033,11 +955,11 @@ struct Outcome {
+     server_transcript: Vec<String>,
+     server_received_early_data: Vec<Vec<u8>>,
+     server_received_app_data: Vec<Vec<u8>>,
+-    server_saw_peer_closed_state: bool,
++    server_reached_connection_closed_state: bool,
+     client: Option<UnbufferedClientConnection>,
+     client_transcript: Vec<String>,
+     client_received_app_data: Vec<Vec<u8>>,
+-    client_saw_peer_closed_state: bool,
++    client_reached_connection_closed_state: bool,
+ }
+ 
+ fn advance_client(
+@@ -1054,21 +976,23 @@ fn advance_client(
+     let state = match state {
+         ConnectionState::TransmitTlsData(mut state) => {
+             let mut sent_early_data = false;
+-            if let (Some(early_data), Some(mut state)) =
+-                (actions.early_data_to_send, state.may_encrypt_early_data())
+-            {
+-                write_with_buffer_size_checks(
+-                    |out_buf| state.encrypt(early_data, out_buf),
+-                    |e| {
+-                        println!("encrypt error: {e}");
+-                        match e {
+-                            EarlyDataError::Encrypt(EncryptError::InsufficientSize(ise)) => ise,
+-                            _ => unreachable!(),
+-                        }
+-                    },
+-                    &mut buffers.outgoing,
+-                );
+-                sent_early_data = true;
++            if let Some(early_data) = actions.early_data_to_send {
++                if let Some(mut state) = state.may_encrypt_early_data() {
++                    write_with_buffer_size_checks(
++                        |out_buf| state.encrypt(early_data, out_buf),
++                        |e| {
++                            println!("encrypt error: {e}");
++                            if let EarlyDataError::Encrypt(EncryptError::InsufficientSize(ise)) = e
++                            {
++                                ise
++                            } else {
++                                unreachable!()
++                            }
++                        },
++                        &mut buffers.outgoing,
++                    );
++                    sent_early_data = true;
++                }
+             }
+             state.done();
+             State::TransmitTlsData {
+@@ -1131,9 +1055,10 @@ fn handle_state<Data>(
+                 |out_buf| state.encode(out_buf),
+                 |e| {
+                     println!("encode error: {e}");
+-                    match e {
+-                        EncodeError::InsufficientSize(ise) => ise,
+-                        _ => unreachable!(),
++                    if let EncodeError::InsufficientSize(ise) = e {
++                        ise
++                    } else {
++                        unreachable!()
+                     }
+                 },
+                 outgoing,
+@@ -1149,11 +1074,11 @@ fn handle_state<Data>(
+ 
+         ConnectionState::TransmitTlsData(mut state) => {
+             let mut sent_app_data = false;
+-            if let (Some(app_data), Some(mut state)) =
+-                (actions.app_data_to_send, state.may_encrypt_app_data())
+-            {
+-                encrypt(&mut state, app_data, outgoing);
+-                sent_app_data = true;
++            if let Some(app_data) = actions.app_data_to_send {
++                if let Some(mut state) = state.may_encrypt_app_data() {
++                    encrypt(&mut state, app_data, outgoing);
++                    sent_app_data = true;
++                }
+             }
+ 
+             let mut sent_close_notify = false;
+@@ -1211,7 +1136,6 @@ fn handle_state<Data>(
+             State::ReceivedAppData { records }
+         }
+ 
+-        ConnectionState::PeerClosed => State::PeerClosed,
+         ConnectionState::Closed => State::Closed,
+ 
+         _ => unreachable!(),
+@@ -1235,9 +1159,10 @@ fn encrypt<Data>(state: &mut WriteTraffic<'_, Data>, app_data: &[u8], outgoing:
+ }
+ 
+ fn map_encrypt_error(e: EncryptError) -> InsufficientSizeError {
+-    match e {
+-        EncryptError::InsufficientSize(ise) => ise,
+-        _ => unreachable!(),
++    if let EncryptError::InsufficientSize(ise) = e {
++        ise
++    } else {
++        unreachable!()
+     }
+ }
+ 

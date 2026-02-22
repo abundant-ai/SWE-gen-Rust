@@ -1,0 +1,171 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 1ea0930c..f82556f1 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -893,6 +893,7 @@ dependencies = [
+  "serde_json",
+  "serde_spanned",
+  "snapbox",
++ "toml-test-data",
+  "toml-test-harness",
+  "toml_datetime",
+  "toml_edit",
+@@ -900,9 +901,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "toml-test"
+-version = "0.3.4"
++version = "0.3.6"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "37351256790aa1dbd6d60f4ff08e55e7f372e292f3e9040d6e077463d9a779c3"
++checksum = "a47dfa19ca3d6591b3151156884e0345e646307299a111391c54b0a7bd33bb04"
+ dependencies = [
+  "chrono",
+  "serde",
+@@ -911,18 +912,18 @@ dependencies = [
+ 
+ [[package]]
+ name = "toml-test-data"
+-version = "1.3.0"
++version = "1.3.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "93f351b6d6005ee802b0d4a53ca1cdf05636f441df4d299e62cba57f1da52646"
++checksum = "4340f0f6c69efad9058211393c1a2d959f48f01c291ae6b21ffdf14a7eeba503"
+ dependencies = [
+  "include_dir",
+ ]
+ 
+ [[package]]
+ name = "toml-test-harness"
+-version = "0.4.3"
++version = "0.4.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "0e00fda5710922fe6b3005bf6a5050c303d6f9625249c37b7386e8818f4af675"
++checksum = "7346ccc45965d33ad1a15e558bc67f8c7a35a72d882f646c342fea9227390296"
+ dependencies = [
+  "ignore",
+  "libtest-mimic",
+diff --git a/crates/toml/Cargo.toml b/crates/toml/Cargo.toml
+index 42dce811..1568e4ee 100644
+--- a/crates/toml/Cargo.toml
++++ b/crates/toml/Cargo.toml
+@@ -49,7 +49,8 @@ serde_spanned = { version = "0.6.3", path = "../serde_spanned", features = ["ser
+ [dev-dependencies]
+ serde = { version = "1.0.160", features = ["derive"] }
+ serde_json = "1.0.96"
+-toml-test-harness = "0.4.3"
++toml-test-harness = "0.4.5"
++toml-test-data = "1.3.1"
+ snapbox = "0.4.11"
+ 
+ [[test]]
+diff --git a/crates/toml_edit/Cargo.toml b/crates/toml_edit/Cargo.toml
+index 992a7f67..03107fdd 100644
+--- a/crates/toml_edit/Cargo.toml
++++ b/crates/toml_edit/Cargo.toml
+@@ -46,8 +46,8 @@ serde_spanned = { version = "0.6.3", path = "../serde_spanned", features = ["ser
+ 
+ [dev-dependencies]
+ serde_json = "1.0.96"
+-toml-test-harness = "0.4.3"
+-toml-test-data = "1.3.0"
++toml-test-harness = "0.4.5"
++toml-test-data = "1.3.1"
+ libtest-mimic = "0.6.0"
+ snapbox = { version = "0.4.11", features = ["harness"] }
+ 
+diff --git a/crates/toml_edit/src/inline_table.rs b/crates/toml_edit/src/inline_table.rs
+index 3dc6c0c0..6009267e 100644
+--- a/crates/toml_edit/src/inline_table.rs
++++ b/crates/toml_edit/src/inline_table.rs
+@@ -11,6 +11,8 @@ use crate::{InternalString, Item, KeyMut, RawString, Table, Value};
+ pub struct InlineTable {
+     // `preamble` represents whitespaces in an empty table
+     preamble: RawString,
++    // Whether to hide an empty table
++    pub(crate) implicit: bool,
+     // prefix before `{` and suffix after `}`
+     decor: Decor,
+     pub(crate) span: Option<std::ops::Range<usize>>,
+@@ -133,6 +135,32 @@ impl InlineTable {
+         }
+     }
+ 
++    /// If a table has no key/value pairs and implicit, it will not be displayed.
++    ///
++    /// # Examples
++    ///
++    /// ```notrust
++    /// [target."x86_64/windows.json".dependencies]
++    /// ```
++    ///
++    /// In the document above, tables `target` and `target."x86_64/windows.json"` are implicit.
++    ///
++    /// ```
++    /// use toml_edit::Document;
++    /// let mut doc = "[a]\n[a.b]\n".parse::<Document>().expect("invalid toml");
++    ///
++    /// doc["a"].as_table_mut().unwrap().set_implicit(true);
++    /// assert_eq!(doc.to_string(), "[a.b]\n");
++    /// ```
++    pub(crate) fn set_implicit(&mut self, implicit: bool) {
++        self.implicit = implicit;
++    }
++
++    /// If a table has no key/value pairs and implicit, it will not be displayed.
++    pub(crate) fn is_implicit(&self) -> bool {
++        self.implicit
++    }
++
+     /// Change this table's dotted status
+     pub fn set_dotted(&mut self, yes: bool) {
+         self.dotted = yes;
+diff --git a/crates/toml_edit/src/parser/inline_table.rs b/crates/toml_edit/src/parser/inline_table.rs
+index 994e0033..f7cf2e9c 100644
+--- a/crates/toml_edit/src/parser/inline_table.rs
++++ b/crates/toml_edit/src/parser/inline_table.rs
+@@ -44,6 +44,16 @@ fn table_from_pairs(
+ 
+     for (path, kv) in v {
+         let table = descend_path(&mut root, &path)?;
++
++        // "Likewise, using dotted keys to redefine tables already defined in [table] form is not allowed"
++        let mixed_table_types = table.is_dotted() == path.is_empty();
++        if mixed_table_types {
++            return Err(CustomError::DuplicateKey {
++                key: kv.key.get().into(),
++                table: None,
++            });
++        }
++
+         let key: InternalString = kv.key.get_internal().into();
+         match table.items.entry(key) {
+             Entry::Vacant(o) => {
+@@ -64,15 +74,26 @@ fn descend_path<'a>(
+     mut table: &'a mut InlineTable,
+     path: &'a [Key],
+ ) -> Result<&'a mut InlineTable, CustomError> {
++    let dotted = !path.is_empty();
+     for (i, key) in path.iter().enumerate() {
+         let entry = table.entry_format(key).or_insert_with(|| {
+             let mut new_table = InlineTable::new();
+-            new_table.set_dotted(true);
++            new_table.set_implicit(dotted);
++            new_table.set_dotted(dotted);
+ 
+             Value::InlineTable(new_table)
+         });
+         match *entry {
+             Value::InlineTable(ref mut sweet_child_of_mine) => {
++                // Since tables cannot be defined more than once, redefining such tables using a
++                // [table] header is not allowed. Likewise, using dotted keys to redefine tables
++                // already defined in [table] form is not allowed.
++                if dotted && !sweet_child_of_mine.is_implicit() {
++                    return Err(CustomError::DuplicateKey {
++                        key: key.get().into(),
++                        table: None,
++                    });
++                }
+                 table = sweet_child_of_mine;
+             }
+             ref v => {

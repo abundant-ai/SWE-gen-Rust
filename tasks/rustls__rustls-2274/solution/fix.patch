@@ -1,0 +1,443 @@
+diff --git a/openssl-tests/src/raw_key_openssl_interop.rs b/openssl-tests/src/raw_key_openssl_interop.rs
+index f8a9bfb8..67262448 100644
+--- a/openssl-tests/src/raw_key_openssl_interop.rs
++++ b/openssl-tests/src/raw_key_openssl_interop.rs
+@@ -329,6 +329,9 @@ mod tests {
+     use std::sync::mpsc::channel;
+     use std::thread;
+ 
++    use rustls::pki_types::pem::PemObject;
++    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
++
+     use super::{client, server};
+     use crate::utils::verify_openssl3_available;
+ 
+@@ -385,6 +388,56 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn test_rust_x509_server_with_openssl_raw_key_and_x509_client() {
++        verify_openssl3_available();
++
++        let listener = tcp_listener();
++        let port = listener.local_addr().unwrap().port();
++
++        let cert_file = SERVER_CERT_KEY_FILE;
++        let private_key_file = SERVER_PRIV_KEY_FILE;
++
++        let certs = CertificateDer::pem_file_iter(cert_file)
++            .unwrap()
++            .map(|cert| cert.unwrap())
++            .collect();
++        let private_key = PrivateKeyDer::from_pem_file(private_key_file).unwrap();
++        let config = rustls::ServerConfig::builder()
++            .with_no_client_auth()
++            .with_single_cert(certs, private_key)
++            .unwrap();
++        let server_thread = thread::spawn(move || {
++            server::run_server(config, listener).expect("failed to run server to completion")
++        });
++
++        // Start the OpenSSL client
++        let mut openssl_client = Command::new("openssl")
++            .arg("s_client")
++            .arg("-connect")
++            .arg(format!("[::]:{:?}", port))
++            .arg("-enable_client_rpk")
++            .arg("-key")
++            .arg(CLIENT_PRIV_KEY_FILE)
++            .arg("-cert")
++            .arg(CLIENT_CERT_KEY_FILE)
++            .arg("-tls1_3")
++            .arg("-debug")
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .spawn()
++            .expect("Failed to execute OpenSSL client");
++
++        let stdin = openssl_client.stdin.take().unwrap();
++        let stdout = openssl_client.stdout.take().unwrap();
++        let received_server_msg =
++            process_openssl_client_interaction(stdin, stdout, "Hello, from openssl client!");
++
++        assert!(received_server_msg);
++        assert_eq!(server_thread.join().unwrap(), "Hello, from openssl client!");
++        openssl_client.wait().unwrap();
++    }
++
+     #[test]
+     fn test_rust_server_with_openssl_client() {
+         verify_openssl3_available();
+@@ -418,36 +471,46 @@ mod tests {
+             .spawn()
+             .expect("Failed to execute OpenSSL client");
+ 
+-        let mut stdin = openssl_client.stdin.take().unwrap();
+-        let mut stdout = openssl_client.stdout.take().unwrap();
++        let stdin = openssl_client.stdin.take().unwrap();
++        let stdout = openssl_client.stdout.take().unwrap();
++        let received_server_msg =
++            process_openssl_client_interaction(stdin, stdout, "Hello, from openssl client!");
++
++        assert!(received_server_msg);
++        assert_eq!(server_thread.join().unwrap(), "Hello, from openssl client!");
++        openssl_client.wait().unwrap();
++    }
++
++    fn process_openssl_client_interaction(
++        mut stdin: std::process::ChildStdin,
++        mut stdout: std::process::ChildStdout,
++        message: &str,
++    ) -> bool {
+         let mut stdout_buf = [0; 1024];
+         let mut openssl_stdout = String::new();
+-        let mut received_server_msg = false;
++
+         loop {
+-            match stdout.read(&mut stdout_buf) {
++            let len = match stdout.read(&mut stdout_buf) {
+                 Ok(0) => break,
+-                Ok(len) => {
+-                    let read = &stdout_buf[..len];
+-
+-                    std::io::stdout()
+-                        .write_all(read)
+-                        .unwrap();
+-                    openssl_stdout.push_str(&String::from_utf8_lossy(read));
+-                    if openssl_stdout.contains("Hello from the server") {
+-                        received_server_msg = true;
+-                        stdin
+-                            .write_all(b"Hello, from openssl client!")
+-                            .expect("Failed to write to stdin");
+-                        break;
+-                    }
+-                }
++                Ok(len) => len,
+                 Err(e) => panic!("Error reading from OpenSSL stdin: {e:?}"),
++            };
++
++            let read = &stdout_buf[..len];
++            std::io::stdout()
++                .write_all(read)
++                .unwrap();
++            openssl_stdout.push_str(&String::from_utf8_lossy(read));
++
++            if openssl_stdout.contains("Hello from the server") {
++                stdin
++                    .write_all(message.as_bytes())
++                    .expect("Failed to write to stdin");
++                return true;
+             }
+         }
+ 
+-        assert!(received_server_msg);
+-        assert_eq!(server_thread.join().unwrap(), "Hello, from openssl client!");
+-        openssl_client.wait().unwrap();
++        false
+     }
+ 
+     #[test]
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index 2ad8f1cc..c5f30bc2 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -16,9 +16,7 @@ use crate::client::client_conn::ClientConnectionData;
+ use crate::client::common::ClientHelloDetails;
+ use crate::client::ech::EchState;
+ use crate::client::{tls13, ClientConfig, EchMode, EchStatus};
+-use crate::common_state::{
+-    CommonState, HandshakeKind, KxState, RawKeyNegotationResult, RawKeyNegotiationParams, State,
+-};
++use crate::common_state::{CommonState, HandshakeKind, KxState, State};
+ use crate::conn::ConnectionRandoms;
+ use crate::crypto::{ActiveKeyExchange, KeyExchangeAlgorithm};
+ use crate::enums::{AlertDescription, CipherSuite, ContentType, HandshakeType, ProtocolVersion};
+@@ -701,46 +699,30 @@ pub(super) fn process_server_cert_type_extension(
+     common: &mut CommonState,
+     config: &ClientConfig,
+     server_cert_extension: Option<&CertificateType>,
+-) -> Result<(), Error> {
+-    let requires_server_rpk = config
+-        .verifier
+-        .requires_raw_public_keys();
+-    let server_offers_rpk = matches!(server_cert_extension, Some(CertificateType::RawPublicKey));
+-
+-    let raw_key_negotation_params = RawKeyNegotiationParams {
+-        peer_supports_raw_key: server_offers_rpk,
+-        local_expects_raw_key: requires_server_rpk,
+-        extension_type: ExtensionType::ServerCertificateType,
+-    };
+-    match raw_key_negotation_params.validate_raw_key_negotiation() {
+-        RawKeyNegotationResult::Err(err) => {
+-            Err(common.send_fatal_alert(AlertDescription::HandshakeFailure, err))
+-        }
+-        _ => Ok(()),
+-    }
++) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
++    process_cert_type_extension(
++        common,
++        config
++            .verifier
++            .requires_raw_public_keys(),
++        server_cert_extension.copied(),
++        ExtensionType::ServerCertificateType,
++    )
+ }
+ 
+ pub(super) fn process_client_cert_type_extension(
+     common: &mut CommonState,
+     config: &ClientConfig,
+     client_cert_extension: Option<&CertificateType>,
+-) -> Result<(), Error> {
+-    let requires_client_rpk = config
+-        .client_auth_cert_resolver
+-        .only_raw_public_keys();
+-    let server_allows_rpk = matches!(client_cert_extension, Some(CertificateType::RawPublicKey));
+-
+-    let raw_key_negotation_params = RawKeyNegotiationParams {
+-        peer_supports_raw_key: server_allows_rpk,
+-        local_expects_raw_key: requires_client_rpk,
+-        extension_type: ExtensionType::ClientCertificateType,
+-    };
+-    match raw_key_negotation_params.validate_raw_key_negotiation() {
+-        RawKeyNegotationResult::Err(err) => {
+-            Err(common.send_fatal_alert(AlertDescription::HandshakeFailure, err))
+-        }
+-        _ => Ok(()),
+-    }
++) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
++    process_cert_type_extension(
++        common,
++        config
++            .client_auth_cert_resolver
++            .only_raw_public_keys(),
++        client_cert_extension.copied(),
++        ExtensionType::ClientCertificateType,
++    )
+ }
+ 
+ impl State<ClientConnectionData> for ExpectServerHello {
+@@ -1201,6 +1183,27 @@ impl State<ClientConnectionData> for ExpectServerHelloOrHelloRetryRequest {
+     }
+ }
+ 
++fn process_cert_type_extension(
++    common: &mut CommonState,
++    client_expects: bool,
++    server_negotiated: Option<CertificateType>,
++    extension_type: ExtensionType,
++) -> Result<Option<(ExtensionType, CertificateType)>, Error> {
++    match (client_expects, server_negotiated) {
++        (true, Some(CertificateType::RawPublicKey)) => {
++            Ok(Some((extension_type, CertificateType::RawPublicKey)))
++        }
++        (true, _) => Err(common.send_fatal_alert(
++            AlertDescription::HandshakeFailure,
++            Error::PeerIncompatible(PeerIncompatible::IncorrectCertificateTypeExtension),
++        )),
++        (_, Some(CertificateType::RawPublicKey)) => {
++            unreachable!("Caught by `PeerMisbehaved::UnsolicitedEncryptedExtension`")
++        }
++        (_, _) => Ok(None),
++    }
++}
++
+ enum ClientSessionValue {
+     Tls13(persist::Tls13ClientSessionValue),
+     #[cfg(feature = "tls12")]
+diff --git a/rustls/src/common_state.rs b/rustls/src/common_state.rs
+index 9b9ab3f7..3ff4609d 100644
+--- a/rustls/src/common_state.rs
++++ b/rustls/src/common_state.rs
+@@ -11,7 +11,7 @@ use crate::log::{debug, error, warn};
+ use crate::msgs::alert::AlertMessagePayload;
+ use crate::msgs::base::Payload;
+ use crate::msgs::codec::Codec;
+-use crate::msgs::enums::{AlertLevel, ExtensionType, KeyUpdateRequest};
++use crate::msgs::enums::{AlertLevel, KeyUpdateRequest};
+ use crate::msgs::fragmenter::MessageFragmenter;
+ use crate::msgs::handshake::{CertificateChain, HandshakeMessagePayload};
+ use crate::msgs::message::{
+@@ -24,7 +24,7 @@ use crate::suites::{PartiallyExtractedSecrets, SupportedCipherSuite};
+ use crate::tls12::ConnectionSecrets;
+ use crate::unbuffered::{EncryptError, InsufficientSizeError};
+ use crate::vecbuf::ChunkVecBuffer;
+-use crate::{quic, record_layer, PeerIncompatible};
++use crate::{quic, record_layer};
+ 
+ /// Connection state common to both client and server connections.
+ pub struct CommonState {
+@@ -900,35 +900,6 @@ enum Limit {
+     No,
+ }
+ 
+-#[derive(Debug)]
+-pub(super) struct RawKeyNegotiationParams {
+-    pub(super) peer_supports_raw_key: bool,
+-    pub(super) local_expects_raw_key: bool,
+-    pub(super) extension_type: ExtensionType,
+-}
+-
+-impl RawKeyNegotiationParams {
+-    pub(super) fn validate_raw_key_negotiation(&self) -> RawKeyNegotationResult {
+-        match (self.local_expects_raw_key, self.peer_supports_raw_key) {
+-            (true, true) => RawKeyNegotationResult::Negotiated(self.extension_type),
+-            (false, false) => RawKeyNegotationResult::NotNegotiated,
+-            (true, false) => RawKeyNegotationResult::Err(Error::PeerIncompatible(
+-                PeerIncompatible::IncorrectCertificateTypeExtension,
+-            )),
+-            (false, true) => RawKeyNegotationResult::Err(Error::PeerIncompatible(
+-                PeerIncompatible::UnsolicitedCertificateTypeExtension,
+-            )),
+-        }
+-    }
+-}
+-
+-#[derive(Debug)]
+-pub(crate) enum RawKeyNegotationResult {
+-    Negotiated(ExtensionType),
+-    NotNegotiated,
+-    Err(Error),
+-}
+-
+ /// Tracking technically-allowed protocol actions
+ /// that we limit to avoid denial-of-service vectors.
+ struct TemperCounters {
+diff --git a/rustls/src/server/hs.rs b/rustls/src/server/hs.rs
+index b50f00f3..5844d732 100644
+--- a/rustls/src/server/hs.rs
++++ b/rustls/src/server/hs.rs
+@@ -7,9 +7,7 @@ use pki_types::DnsName;
+ use super::server_conn::ServerConnectionData;
+ #[cfg(feature = "tls12")]
+ use super::tls12;
+-use crate::common_state::{
+-    KxState, Protocol, RawKeyNegotationResult, RawKeyNegotiationParams, State,
+-};
++use crate::common_state::{KxState, Protocol, State};
+ use crate::conn::ConnectionRandoms;
+ use crate::crypto::SupportedKxGroup;
+ use crate::enums::{
+@@ -213,22 +211,17 @@ impl ExtensionProcessing {
+         config: &ServerConfig,
+         cx: &mut ServerContext<'_>,
+     ) -> Result<(), Error> {
+-        let requires_server_rpk = config
+-            .cert_resolver
+-            .only_raw_public_keys();
+-        let client_allows_rpk = hello
++        let client_supports = hello
+             .server_certificate_extension()
+-            .map(|certificate_types| certificate_types.contains(&CertificateType::RawPublicKey))
+-            .unwrap_or(false);
+-
+-        let raw_key_negotation_params = RawKeyNegotiationParams {
+-            peer_supports_raw_key: client_allows_rpk,
+-            local_expects_raw_key: requires_server_rpk,
+-            extension_type: ExtensionType::ServerCertificateType,
+-        };
++            .map(|certificate_types| certificate_types.to_vec())
++            .unwrap_or_default();
+ 
+         self.process_cert_type_extension(
+-            raw_key_negotation_params.validate_raw_key_negotiation(),
++            client_supports,
++            config
++                .cert_resolver
++                .only_raw_public_keys(),
++            ExtensionType::ServerCertificateType,
+             cx,
+         )
+     }
+@@ -239,52 +232,63 @@ impl ExtensionProcessing {
+         config: &ServerConfig,
+         cx: &mut ServerContext<'_>,
+     ) -> Result<(), Error> {
+-        let requires_client_rpk = config
+-            .verifier
+-            .requires_raw_public_keys();
+-        let client_offers_rpk = hello
++        let client_supports = hello
+             .client_certificate_extension()
+-            .map(|certificate_types| certificate_types.contains(&CertificateType::RawPublicKey))
+-            .unwrap_or(false);
++            .map(|certificate_types| certificate_types.to_vec())
++            .unwrap_or_default();
+ 
+-        let raw_key_negotation_params = RawKeyNegotiationParams {
+-            peer_supports_raw_key: client_offers_rpk,
+-            local_expects_raw_key: requires_client_rpk,
+-            extension_type: ExtensionType::ClientCertificateType,
+-        };
+         self.process_cert_type_extension(
+-            raw_key_negotation_params.validate_raw_key_negotiation(),
++            client_supports,
++            config
++                .verifier
++                .requires_raw_public_keys(),
++            ExtensionType::ClientCertificateType,
+             cx,
+         )
+     }
+ 
+     fn process_cert_type_extension(
+         &mut self,
+-        raw_key_negotiation_result: RawKeyNegotationResult,
++        client_supports: Vec<CertificateType>,
++        requires_raw_keys: bool,
++        extension_type: ExtensionType,
+         cx: &mut ServerContext<'_>,
+     ) -> Result<(), Error> {
+-        match raw_key_negotiation_result {
+-            RawKeyNegotationResult::Negotiated(ExtensionType::ClientCertificateType) => {
++        debug_assert!(
++            extension_type == ExtensionType::ClientCertificateType
++                || extension_type == ExtensionType::ServerCertificateType
++        );
++        let raw_key_negotation_result = match (
++            requires_raw_keys,
++            client_supports.contains(&CertificateType::RawPublicKey),
++            client_supports.contains(&CertificateType::X509),
++        ) {
++            (true, true, _) => Ok((extension_type, CertificateType::RawPublicKey)),
++            (false, _, true) => Ok((extension_type, CertificateType::X509)),
++            (false, true, false) => Err(Error::PeerIncompatible(
++                PeerIncompatible::IncorrectCertificateTypeExtension,
++            )),
++            (true, false, _) => Err(Error::PeerIncompatible(
++                PeerIncompatible::IncorrectCertificateTypeExtension,
++            )),
++            (false, false, false) => return Ok(()),
++        };
++
++        match raw_key_negotation_result {
++            Ok((ExtensionType::ClientCertificateType, cert_type)) => {
+                 self.exts
+-                    .push(ServerExtension::ClientCertType(
+-                        CertificateType::RawPublicKey,
+-                    ));
++                    .push(ServerExtension::ClientCertType(cert_type));
+             }
+-            RawKeyNegotationResult::Negotiated(ExtensionType::ServerCertificateType) => {
++            Ok((ExtensionType::ServerCertificateType, cert_type)) => {
+                 self.exts
+-                    .push(ServerExtension::ServerCertType(
+-                        CertificateType::RawPublicKey,
+-                    ));
++                    .push(ServerExtension::ServerCertType(cert_type));
+             }
+-            RawKeyNegotationResult::Err(err) => {
++            Err(err) => {
+                 return Err(cx
+                     .common
+                     .send_fatal_alert(AlertDescription::HandshakeFailure, err));
+             }
+-            RawKeyNegotationResult::NotNegotiated => {}
+-            RawKeyNegotationResult::Negotiated(_) => unreachable!(
+-                "The extension type should only ever be ClientCertificateType or ServerCertificateType"
+-            ),
++            Ok((_, _)) => unreachable!(),
+         }
+         Ok(())
+     }

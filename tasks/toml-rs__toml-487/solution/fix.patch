@@ -1,0 +1,590 @@
+diff --git a/crates/toml/Cargo.toml b/crates/toml/Cargo.toml
+index 290ec4c9..ea722ccc 100644
+--- a/crates/toml/Cargo.toml
++++ b/crates/toml/Cargo.toml
+@@ -68,12 +68,12 @@ harness = false
+ 
+ [[example]]
+ name = "decode"
+-required-features = ["parse", "derive"]
++required-features = ["parse", "display"]
+ 
+ [[example]]
+ name = "enum_external"
+-required-features = ["parse", "derive"]
++required-features = ["parse", "display"]
+ 
+ [[example]]
+ name = "toml2json"
+-required-features = ["parse", "derive"]
++required-features = ["parse", "display"]
+diff --git a/crates/toml/src/de.rs b/crates/toml/src/de.rs
+index d4be4b73..36453754 100644
+--- a/crates/toml/src/de.rs
++++ b/crates/toml/src/de.rs
+@@ -9,6 +9,8 @@
+ /// This function will attempt to interpret `s` as a TOML document and
+ /// deserialize `T` from the document.
+ ///
++/// To deserializes TOML values, instead of documents, see [`ValueDeserializer`].
++///
+ /// # Examples
+ ///
+ /// ```
+@@ -98,6 +100,8 @@ impl std::fmt::Display for Error {
+ impl std::error::Error for Error {}
+ 
+ /// Deserialization TOML document
++///
++/// To deserializes TOML values, instead of documents, see [`ValueDeserializer`].
+ #[cfg(feature = "parse")]
+ pub struct Deserializer<'a> {
+     input: &'a str,
+@@ -200,7 +204,31 @@ impl<'de, 'a> serde::Deserializer<'de> for Deserializer<'a> {
+     }
+ }
+ 
+-/// Deserialization TOML value
++/// Deserialization TOML [value][crate::Value]
++///
++/// # Example
++///
++/// ```
++/// use serde::Deserialize;
++///
++/// #[derive(Deserialize)]
++/// struct Config {
++///     title: String,
++///     owner: Owner,
++/// }
++///
++/// #[derive(Deserialize)]
++/// struct Owner {
++///     name: String,
++/// }
++///
++/// let config = Config::deserialize(toml::de::ValueDeserializer::new(
++///     r#"{ title = 'TOML Example', owner = { name = 'Lisa' } }"#
++/// )).unwrap();
++///
++/// assert_eq!(config.title, "TOML Example");
++/// assert_eq!(config.owner.name, "Lisa");
++/// ```
+ #[cfg(feature = "parse")]
+ pub struct ValueDeserializer<'a> {
+     input: &'a str,
+diff --git a/crates/toml/src/lib.rs b/crates/toml/src/lib.rs
+index 6c95fc43..b25350fb 100644
+--- a/crates/toml/src/lib.rs
++++ b/crates/toml/src/lib.rs
+@@ -19,7 +19,8 @@
+ //!
+ //! A TOML document is represented with the [`Table`] type which maps `String` to the [`Value`] enum:
+ //!
+-//! ```rust,ignore
++//! ```rust
++//! # use toml::value::{Datetime, Array, Table};
+ //! pub enum Value {
+ //!     String(String),
+ //!     Integer(i64),
+@@ -67,7 +68,7 @@
+ //!
+ //! This means that you can use Serde to deserialize/serialize the
+ //! [`Table`] type as well as [`Value`] and [`Datetime`] type in this crate. You can also
+-//! use the [`Deserializer`], [`Serializer`], or [`Value`] type itself to act as
++//! use the [`Deserializer`], [`Serializer`], or [`Table`] type itself to act as
+ //! a deserializer/serializer for arbitrary types.
+ //!
+ //! An example of deserializing with TOML is:
+@@ -149,29 +150,29 @@
+ 
+ pub mod map;
+ pub mod value;
+-#[doc(no_inline)]
+-pub use crate::value::Table;
+-#[doc(no_inline)]
+-pub use crate::value::Value;
+ 
+-pub mod ser;
+-#[doc(no_inline)]
+-#[cfg(feature = "display")]
+-pub use crate::ser::{to_string, to_string_pretty, Serializer};
+ pub mod de;
+-#[doc(no_inline)]
+-#[cfg(feature = "parse")]
+-pub use crate::de::{from_str, Deserializer, ValueDeserializer};
++pub mod ser;
+ 
+ #[doc(hidden)]
+ pub mod macros;
+ 
++mod edit;
+ #[cfg(feature = "display")]
+ mod fmt;
++mod table;
+ 
+-mod edit;
++#[cfg(feature = "parse")]
++#[doc(inline)]
++pub use crate::de::{from_str, Deserializer};
++#[cfg(feature = "display")]
++#[doc(inline)]
++pub use crate::ser::{to_string, to_string_pretty, Serializer};
++#[doc(inline)]
++pub use crate::value::Value;
+ 
+ pub use serde_spanned::Spanned;
++pub use table::Table;
+ 
+ // Shortcuts for the module doc-comment
+ #[allow(unused_imports)]
+diff --git a/crates/toml/src/macros.rs b/crates/toml/src/macros.rs
+index 19b2ce22..d86cc52f 100644
+--- a/crates/toml/src/macros.rs
++++ b/crates/toml/src/macros.rs
+@@ -2,9 +2,7 @@ pub use serde::de::{Deserialize, IntoDeserializer};
+ 
+ use crate::value::{Array, Table, Value};
+ 
+-/// Construct a [`toml::Value`] from TOML syntax.
+-///
+-/// [`toml::Value`]: value/enum.Value.html
++/// Construct a [`Table`] from TOML syntax.
+ ///
+ /// ```rust
+ /// let cargo_toml = toml::toml! {
+@@ -32,7 +30,10 @@ macro_rules! toml {
+         let table = $crate::value::Table::new();
+         let mut root = $crate::Value::Table(table);
+         $crate::toml_internal!(@toplevel root [] $($toml)+);
+-        root
++        match root {
++            $crate::Value::Table(table) => table,
++            _ => unreachable!(),
++        }
+     }};
+ }
+ 
+diff --git a/crates/toml/src/map.rs b/crates/toml/src/map.rs
+index d130a1d5..5b3ff19b 100644
+--- a/crates/toml/src/map.rs
++++ b/crates/toml/src/map.rs
+@@ -6,13 +6,13 @@
+ // option. This file may not be copied, modified, or distributed
+ // except according to those terms.
+ 
+-//! A map of String to toml::Value.
++//! A map of `String` to [Value].
+ //!
+ //! By default the map is backed by a [`BTreeMap`]. Enable the `preserve_order`
+-//! feature of toml-rs to use [`LinkedHashMap`] instead.
++//! feature of toml-rs to use [`IndexMap`] instead.
+ //!
+ //! [`BTreeMap`]: https://doc.rust-lang.org/std/collections/struct.BTreeMap.html
+-//! [`LinkedHashMap`]: https://docs.rs/linked-hash-map/*/linked_hash_map/struct.LinkedHashMap.html
++//! [`IndexMap`]: https://docs.rs/indexmap
+ 
+ use crate::value::Value;
+ use serde::{de, ser};
+diff --git a/crates/toml/src/ser.rs b/crates/toml/src/ser.rs
+index e4f39be1..b8cf4b1d 100644
+--- a/crates/toml/src/ser.rs
++++ b/crates/toml/src/ser.rs
+@@ -10,6 +10,8 @@
+ /// fail, if `T` contains a map with non-string keys, or if `T` attempts to
+ /// serialize an unsupported datatype such as an enum, tuple, or tuple struct.
+ ///
++/// To serialize TOML values, instead of documents, see [`ValueSerializer`].
++///
+ /// # Examples
+ ///
+ /// ```
+@@ -55,6 +57,8 @@ where
+ ///
+ /// This is identical to `to_string` except the output string has a more
+ /// "pretty" output. See `Serializer::pretty` for more details.
++///
++/// To serialize TOML values, instead of documents, see [`ValueSerializer`].
+ #[cfg(feature = "display")]
+ pub fn to_string_pretty<T: ?Sized>(value: &T) -> Result<String, Error>
+ where
+@@ -129,6 +133,8 @@ impl std::error::Error for Error {}
+ ///
+ /// Currently a serializer always writes its output to an in-memory `String`,
+ /// which is passed in when creating the serializer itself.
++///
++/// To serialize TOML values, instead of documents, see [`ValueSerializer`].
+ #[non_exhaustive]
+ #[cfg(feature = "display")]
+ pub struct Serializer<'d> {
+@@ -472,7 +478,7 @@ impl<'d> serde::ser::Serializer for Serializer<'d> {
+     }
+ }
+ 
+-/// Serialization for TOML values.
++/// Serialization for TOML [values][crate::Value].
+ ///
+ /// This structure implements serialization support for TOML to serialize an
+ /// arbitrary type to TOML. Note that the TOML format does not support all
+@@ -481,6 +487,41 @@ impl<'d> serde::ser::Serializer for Serializer<'d> {
+ ///
+ /// Currently a serializer always writes its output to an in-memory `String`,
+ /// which is passed in when creating the serializer itself.
++///
++/// # Examples
++///
++/// ```
++/// use serde::Serialize;
++///
++/// #[derive(Serialize)]
++/// struct Config {
++///     database: Database,
++/// }
++///
++/// #[derive(Serialize)]
++/// struct Database {
++///     ip: String,
++///     port: Vec<u16>,
++///     connection_max: u32,
++///     enabled: bool,
++/// }
++///
++/// let config = Config {
++///     database: Database {
++///         ip: "192.168.1.1".to_string(),
++///         port: vec![8001, 8002, 8003],
++///         connection_max: 5000,
++///         enabled: false,
++///     },
++/// };
++///
++/// let mut value = String::new();
++/// serde::Serialize::serialize(
++///     &config,
++///     toml::ser::ValueSerializer::new(&mut value)
++/// ).unwrap();
++/// println!("{}", value)
++/// ```
+ #[non_exhaustive]
+ #[cfg(feature = "display")]
+ pub struct ValueSerializer<'d> {
+diff --git a/crates/toml/src/table.rs b/crates/toml/src/table.rs
+new file mode 100644
+index 00000000..a2d392bd
+--- /dev/null
++++ b/crates/toml/src/table.rs
+@@ -0,0 +1,114 @@
++use std::fmt;
++
++use serde::de;
++use serde::ser;
++
++use crate::map::Map;
++use crate::Value;
++
++/// Type representing a TOML table, payload of the `Value::Table` variant.
++/// By default it is backed by a BTreeMap, enable the `preserve_order` feature
++/// to use a LinkedHashMap instead.
++pub type Table = Map<String, Value>;
++
++impl Table {
++    /// Convert a `T` into `toml::Table`.
++    ///
++    /// This conversion can fail if `T`'s implementation of `Serialize` decides to
++    /// fail, or if `T` contains a map with non-string keys.
++    pub fn try_from<T>(value: T) -> Result<Self, crate::ser::Error>
++    where
++        T: ser::Serialize,
++    {
++        value.serialize(crate::value::TableSerializer)
++    }
++
++    /// Interpret a `toml::Table` as an instance of type `T`.
++    ///
++    /// This conversion can fail if the structure of the `Table` does not match the structure
++    /// expected by `T`, for example if `T` is a bool which can't be mapped to a `Table`. It can
++    /// also fail if the structure is correct but `T`'s implementation of `Deserialize` decides
++    /// that something is wrong with the data, for example required struct fields are missing from
++    /// the TOML map or some number is too big to fit in the expected primitive type.
++    pub fn try_into<'de, T>(self) -> Result<T, crate::de::Error>
++    where
++        T: de::Deserialize<'de>,
++    {
++        de::Deserialize::deserialize(self)
++    }
++}
++
++#[cfg(feature = "display")]
++impl fmt::Display for Table {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        crate::ser::to_string(self)
++            .expect("Unable to represent value as string")
++            .fmt(f)
++    }
++}
++
++#[cfg(feature = "parse")]
++impl std::str::FromStr for Table {
++    type Err = crate::de::Error;
++    fn from_str(s: &str) -> Result<Self, Self::Err> {
++        crate::from_str(s)
++    }
++}
++
++impl<'de> de::Deserializer<'de> for Table {
++    type Error = crate::de::Error;
++
++    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, crate::de::Error>
++    where
++        V: de::Visitor<'de>,
++    {
++        Value::Table(self).deserialize_any(visitor)
++    }
++
++    #[inline]
++    fn deserialize_enum<V>(
++        self,
++        name: &'static str,
++        variants: &'static [&'static str],
++        visitor: V,
++    ) -> Result<V::Value, crate::de::Error>
++    where
++        V: de::Visitor<'de>,
++    {
++        Value::Table(self).deserialize_enum(name, variants, visitor)
++    }
++
++    // `None` is interpreted as a missing field so be sure to implement `Some`
++    // as a present field.
++    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, crate::de::Error>
++    where
++        V: de::Visitor<'de>,
++    {
++        Value::Table(self).deserialize_option(visitor)
++    }
++
++    fn deserialize_newtype_struct<V>(
++        self,
++        name: &'static str,
++        visitor: V,
++    ) -> Result<V::Value, crate::de::Error>
++    where
++        V: de::Visitor<'de>,
++    {
++        Value::Table(self).deserialize_newtype_struct(name, visitor)
++    }
++
++    serde::forward_to_deserialize_any! {
++        bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string unit seq
++        bytes byte_buf map unit_struct tuple_struct struct
++        tuple ignored_any identifier
++    }
++}
++
++impl<'de> de::IntoDeserializer<'de, crate::de::Error> for Table {
++    type Deserializer = Self;
++
++    fn into_deserializer(self) -> Self {
++        self
++    }
++}
+diff --git a/crates/toml/src/value.rs b/crates/toml/src/value.rs
+index d6631c75..8ed75e81 100644
+--- a/crates/toml/src/value.rs
++++ b/crates/toml/src/value.rs
+@@ -1,4 +1,4 @@
+-//! Definition of a TOML value
++//! Definition of a TOML [value][Value]
+ 
+ use std::collections::{BTreeMap, HashMap};
+ use std::fmt;
+@@ -14,118 +14,12 @@ use serde::ser;
+ use toml_datetime::__unstable as datetime;
+ pub use toml_datetime::{Date, Datetime, DatetimeParseError, Offset, Time};
+ 
+-pub use crate::map::{Entry, Map};
+-
+-/// Type representing a TOML table, payload of the `Value::Table` variant.
+-/// By default it is backed by a BTreeMap, enable the `preserve_order` feature
+-/// to use a LinkedHashMap instead.
+-pub type Table = Map<String, Value>;
+-
+-impl Table {
+-    /// Convert a `T` into `toml::Table`.
+-    ///
+-    /// This conversion can fail if `T`'s implementation of `Serialize` decides to
+-    /// fail, or if `T` contains a map with non-string keys.
+-    pub fn try_from<T>(value: T) -> Result<Self, crate::ser::Error>
+-    where
+-        T: ser::Serialize,
+-    {
+-        value.serialize(TableSerializer)
+-    }
+-
+-    /// Interpret a `toml::Table` as an instance of type `T`.
+-    ///
+-    /// This conversion can fail if the structure of the `Table` does not match the structure
+-    /// expected by `T`, for example if `T` is a bool which can't be mapped to a `Table`. It can
+-    /// also fail if the structure is correct but `T`'s implementation of `Deserialize` decides
+-    /// that something is wrong with the data, for example required struct fields are missing from
+-    /// the TOML map or some number is too big to fit in the expected primitive type.
+-    pub fn try_into<'de, T>(self) -> Result<T, crate::de::Error>
+-    where
+-        T: de::Deserialize<'de>,
+-    {
+-        de::Deserialize::deserialize(self)
+-    }
+-}
+-
+-#[cfg(feature = "display")]
+-impl fmt::Display for Table {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        crate::ser::to_string(self)
+-            .expect("Unable to represent value as string")
+-            .fmt(f)
+-    }
+-}
+-
+-#[cfg(feature = "parse")]
+-impl std::str::FromStr for Table {
+-    type Err = crate::de::Error;
+-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+-        crate::from_str(s)
+-    }
+-}
+-
+-impl<'de> de::Deserializer<'de> for Table {
+-    type Error = crate::de::Error;
+-
+-    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, crate::de::Error>
+-    where
+-        V: de::Visitor<'de>,
+-    {
+-        Value::Table(self).deserialize_any(visitor)
+-    }
+-
+-    #[inline]
+-    fn deserialize_enum<V>(
+-        self,
+-        name: &'static str,
+-        variants: &'static [&'static str],
+-        visitor: V,
+-    ) -> Result<V::Value, crate::de::Error>
+-    where
+-        V: de::Visitor<'de>,
+-    {
+-        Value::Table(self).deserialize_enum(name, variants, visitor)
+-    }
+-
+-    // `None` is interpreted as a missing field so be sure to implement `Some`
+-    // as a present field.
+-    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, crate::de::Error>
+-    where
+-        V: de::Visitor<'de>,
+-    {
+-        Value::Table(self).deserialize_option(visitor)
+-    }
+-
+-    fn deserialize_newtype_struct<V>(
+-        self,
+-        name: &'static str,
+-        visitor: V,
+-    ) -> Result<V::Value, crate::de::Error>
+-    where
+-        V: de::Visitor<'de>,
+-    {
+-        Value::Table(self).deserialize_newtype_struct(name, visitor)
+-    }
+-
+-    serde::forward_to_deserialize_any! {
+-        bool u8 u16 u32 u64 i8 i16 i32 i64 f32 f64 char str string unit seq
+-        bytes byte_buf map unit_struct tuple_struct struct
+-        tuple ignored_any identifier
+-    }
+-}
+-
+-impl<'de> de::IntoDeserializer<'de, crate::de::Error> for Table {
+-    type Deserializer = Self;
+-
+-    fn into_deserializer(self) -> Self {
+-        self
+-    }
+-}
+-
+ /// Type representing a TOML array, payload of the `Value::Array` variant
+ pub type Array = Vec<Value>;
+ 
++#[doc(no_inline)]
++pub use crate::Table;
++
+ /// Representation of a TOML value.
+ #[derive(PartialEq, Clone, Debug)]
+ pub enum Value {
+@@ -627,13 +521,13 @@ impl<'de> de::Deserialize<'de> for Value {
+                         let date: datetime::DatetimeFromString = visitor.next_value()?;
+                         return Ok(Value::Datetime(date.value));
+                     }
+-                    None => return Ok(Value::Table(Map::new())),
++                    None => return Ok(Value::Table(Table::new())),
+                     Some(false) => {}
+                 }
+-                let mut map = Map::new();
++                let mut map = Table::new();
+                 map.insert(key, visitor.next_value()?);
+                 while let Some(key) = visitor.next_key::<String>()? {
+-                    if let Entry::Vacant(vacant) = map.entry(&key) {
++                    if let crate::map::Entry::Vacant(vacant) = map.entry(&key) {
+                         vacant.insert(visitor.next_value()?);
+                     } else {
+                         let msg = format!("duplicate key: `{}`", key);
+@@ -986,7 +880,7 @@ impl ser::Serializer for ValueSerializer {
+     fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, crate::ser::Error> {
+         Ok(ValueSerializeMap {
+             ser: SerializeMap {
+-                map: Map::new(),
++                map: Table::new(),
+                 next_key: None,
+             },
+         })
+@@ -1011,7 +905,7 @@ impl ser::Serializer for ValueSerializer {
+     }
+ }
+ 
+-struct TableSerializer;
++pub(crate) struct TableSerializer;
+ 
+ impl ser::Serializer for TableSerializer {
+     type Ok = Table;
+@@ -1161,7 +1055,7 @@ impl ser::Serializer for TableSerializer {
+ 
+     fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, crate::ser::Error> {
+         Ok(SerializeMap {
+-            map: Map::new(),
++            map: Table::new(),
+             next_key: None,
+         })
+     }
+@@ -1254,8 +1148,8 @@ impl ser::SerializeTupleVariant for ValueSerializeVec {
+     }
+ }
+ 
+-struct SerializeMap {
+-    map: Map<String, Value>,
++pub(crate) struct SerializeMap {
++    map: Table,
+     next_key: Option<String>,
+ }
+ 
+diff --git a/crates/toml_edit/src/lib.rs b/crates/toml_edit/src/lib.rs
+index 6ab09875..73082c88 100644
+--- a/crates/toml_edit/src/lib.rs
++++ b/crates/toml_edit/src/lib.rs
+@@ -60,7 +60,7 @@
+ //! * Scattered array of tables (tables are reordered by default, see [test]).
+ //! * Order of dotted keys, see [issue](https://github.com/ordian/toml_edit/issues/163).
+ //!
+-//! [toml]: https://docs.rs/toml/latest/toml/
++//! [`toml`]: https://docs.rs/toml/latest/toml/
+ //! [test]: https://github.com/ordian/toml_edit/blob/f09bd5d075fdb7d2ef8d9bb3270a34506c276753/tests/test_valid.rs#L84
+ 
+ mod array;

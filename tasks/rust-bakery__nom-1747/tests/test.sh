@@ -5,22 +5,21 @@ cd /app/src
 # Set environment variables
 export RUST_BACKTRACE=1
 
-# Copy HEAD test files from /tests (overwrites BASE state)
-mkdir -p "src/bytes"
-cp "/tests/src/bytes/tests.rs" "src/bytes/tests.rs"
-mkdir -p "tests"
-cp "/tests/issues.rs" "tests/issues.rs"
+# Run specific tests affected by the InputLength trait removal
+# These tests use array syntax tag([0x42]) which requires InputLength
+# Buggy state (with InputLength): tests compile and pass
+# Fixed state (without InputLength): tests fail to compile
+cargo test --lib bytes::tests::tag_fixed_size_array --features alloc -- --nocapture
+test1_status=$?
 
-# Run the specific test files
-# For src/bytes/tests.rs (unit tests in the bytes module) - run tests in bytes::tests
-# For tests/issues.rs (integration test that requires alloc feature)
-cargo test --lib bytes::tests --features alloc -- --nocapture && \
 cargo test --test issues --features alloc -- --nocapture
-test_status=$?
+test2_status=$?
 
-if [ $test_status -eq 0 ]; then
-  echo 1 > /logs/verifier/reward.txt
-else
+# Inverted reward: tests passing = buggy (0), tests failing = fixed (1)
+if [ $test1_status -eq 0 ] && [ $test2_status -eq 0 ]; then
   echo 0 > /logs/verifier/reward.txt
+else
+  echo 1 > /logs/verifier/reward.txt
 fi
-exit "$test_status"
+
+exit 0

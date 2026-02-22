@@ -1,0 +1,191 @@
+diff --git a/crates/toml/src/de.rs b/crates/toml/src/de.rs
+index 03b88ff2..f7974903 100644
+--- a/crates/toml/src/de.rs
++++ b/crates/toml/src/de.rs
+@@ -53,10 +53,6 @@ impl Error {
+         Self { inner }
+     }
+ 
+-    pub(crate) fn add_key(&mut self, key: String) {
+-        self.inner.add_key(key)
+-    }
+-
+     /// What went wrong
+     pub fn message(&self) -> &str {
+         self.inner.message()
+diff --git a/crates/toml/src/value.rs b/crates/toml/src/value.rs
+index 6a80b789..71e3b5d4 100644
+--- a/crates/toml/src/value.rs
++++ b/crates/toml/src/value.rs
+@@ -797,14 +797,11 @@ impl<'de> de::MapAccess<'de> for MapDeserializer {
+     where
+         T: de::DeserializeSeed<'de>,
+     {
+-        let (key, res) = match self.value.take() {
++        let (_key, res) = match self.value.take() {
+             Some((key, value)) => (key, seed.deserialize(value)),
+             None => return Err(de::Error::custom("value is missing")),
+         };
+-        res.map_err(|mut error| {
+-            error.add_key(key);
+-            error
+-        })
++        res
+     }
+ 
+     fn size_hint(&self) -> Option<usize> {
+diff --git a/crates/toml/tests/testsuite/serde.rs b/crates/toml/tests/testsuite/serde.rs
+index 88990f23..e7db4fb8 100644
+--- a/crates/toml/tests/testsuite/serde.rs
++++ b/crates/toml/tests/testsuite/serde.rs
+@@ -276,7 +276,7 @@ fn type_errors() {
+   |       ^^^
+ invalid type: string "a", expected isize
+ "#,
+-        "invalid type: string \"a\", expected isize\nin `bar`\n"
++        "invalid type: string \"a\", expected isize\n"
+     }
+ 
+     #[derive(Deserialize)]
+@@ -298,7 +298,7 @@ invalid type: string "a", expected isize
+   |       ^^^
+ invalid type: string "a", expected isize
+ "#,
+-        "invalid type: string \"a\", expected isize\nin `foo.bar`\n"
++        "invalid type: string \"a\", expected isize\n"
+     }
+ }
+ 
+diff --git a/crates/toml_edit/src/de/mod.rs b/crates/toml_edit/src/de/mod.rs
+index 7a7b80f8..f5f180a6 100644
+--- a/crates/toml_edit/src/de/mod.rs
++++ b/crates/toml_edit/src/de/mod.rs
+@@ -38,11 +38,6 @@ impl Error {
+         }
+     }
+ 
+-    /// Add key while unwinding
+-    pub fn add_key(&mut self, key: String) {
+-        self.inner.add_key(key)
+-    }
+-
+     /// What went wrong
+     pub fn message(&self) -> &str {
+         self.inner.message()
+diff --git a/crates/toml_edit/src/de/table.rs b/crates/toml_edit/src/de/table.rs
+index 0b6183e0..ac6acc7e 100644
+--- a/crates/toml_edit/src/de/table.rs
++++ b/crates/toml_edit/src/de/table.rs
+@@ -118,7 +118,7 @@ impl crate::InlineTable {
+ pub(crate) struct TableMapAccess {
+     iter: indexmap::map::IntoIter<crate::InternalString, crate::table::TableKeyValue>,
+     span: Option<std::ops::Range<usize>>,
+-    value: Option<(crate::InternalString, crate::Item)>,
++    value: Option<crate::Item>,
+ }
+ 
+ impl TableMapAccess {
+@@ -149,7 +149,7 @@ impl<'de> serde::de::MapAccess<'de> for TableMapAccess {
+                         }
+                         e
+                     });
+-                self.value = Some((v.key.into(), v.value));
++                self.value = Some(v.value);
+                 ret
+             }
+             None => Ok(None),
+@@ -161,14 +161,13 @@ impl<'de> serde::de::MapAccess<'de> for TableMapAccess {
+         V: serde::de::DeserializeSeed<'de>,
+     {
+         match self.value.take() {
+-            Some((k, v)) => {
++            Some(v) => {
+                 let span = v.span();
+                 seed.deserialize(crate::de::ValueDeserializer::new(v))
+                     .map_err(|mut e: Self::Error| {
+                         if e.span().is_none() {
+                             e.set_span(span);
+                         }
+-                        e.add_key(k.as_str().to_owned());
+                         e
+                     })
+             }
+@@ -197,17 +196,13 @@ impl<'de> serde::de::EnumAccess<'de> for TableMapAccess {
+             }
+         };
+ 
+-        let val = seed
+-            .deserialize(key.into_deserializer())
++        seed.deserialize(key.into_deserializer())
+             .map_err(|mut e: Self::Error| {
+                 if e.span().is_none() {
+                     e.set_span(value.key.span());
+                 }
+                 e
+-            })?;
+-
+-        let variant = super::TableEnumDeserializer::new(value.value);
+-
+-        Ok((val, variant))
++            })
++            .map(|val| (val, super::TableEnumDeserializer::new(value.value)))
+     }
+ }
+diff --git a/crates/toml_edit/src/parser/errors.rs b/crates/toml_edit/src/parser/errors.rs
+index c844b131..0910abbb 100644
+--- a/crates/toml_edit/src/parser/errors.rs
++++ b/crates/toml_edit/src/parser/errors.rs
+@@ -11,7 +11,6 @@ use crate::Key;
+ pub struct TomlError {
+     message: String,
+     original: Option<String>,
+-    keys: Vec<String>,
+     span: Option<std::ops::Range<usize>>,
+ }
+ 
+@@ -35,7 +34,6 @@ impl TomlError {
+                 String::from_utf8(original.into_output().to_owned())
+                     .expect("original document was utf8"),
+             ),
+-            keys: Vec::new(),
+             span: Some(span),
+         }
+     }
+@@ -45,16 +43,10 @@ impl TomlError {
+         Self {
+             message,
+             original: None,
+-            keys: Vec::new(),
+             span,
+         }
+     }
+ 
+-    #[cfg(feature = "serde")]
+-    pub(crate) fn add_key(&mut self, key: String) {
+-        self.keys.insert(0, key);
+-    }
+-
+     /// What went wrong
+     pub fn message(&self) -> &str {
+         &self.message
+@@ -102,10 +94,7 @@ impl TomlError {
+ /// While parsing a Date-Time
+ impl Display for TomlError {
+     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+-        let mut context = false;
+         if let (Some(original), Some(span)) = (&self.original, self.span()) {
+-            context = true;
+-
+             let (line, column) = translate_position(original.as_bytes(), span.start);
+             let line_num = line + 1;
+             let col_num = column + 1;
+@@ -144,9 +133,6 @@ impl Display for TomlError {
+             writeln!(f)?;
+         }
+         writeln!(f, "{}", self.message)?;
+-        if !context && !self.keys.is_empty() {
+-            writeln!(f, "in `{}`", self.keys.join("."))?;
+-        }
+ 
+         Ok(())
+     }

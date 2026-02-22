@@ -1,0 +1,985 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index a31c126..91db9b5 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -44,21 +44,13 @@ default-tls = ["rustls-tls"]
+ 
+ http2 = ["h2", "hyper/http2", "hyper-util/http2", "hyper-rustls?/http2"]
+ 
++rustls-tls = ["rustls-tls-no-provider", "__rustls-aws-lc-rs"]
++rustls-tls-no-provider = ["dep:rustls-platform-verifier", "__rustls"]
++
+ native-tls = ["dep:hyper-tls", "dep:native-tls-crate", "__tls", "dep:tokio-native-tls"]
+ native-tls-alpn = ["native-tls", "native-tls-crate?/alpn", "hyper-tls?/alpn"]
+ native-tls-vendored = ["native-tls", "native-tls-crate?/vendored"]
+ 
+-rustls-tls = ["rustls-tls-webpki-roots"]
+-rustls-tls-no-provider = ["rustls-tls-manual-roots-no-provider"]
+-
+-rustls-tls-manual-roots-no-provider = ["__rustls"]
+-rustls-tls-webpki-roots-no-provider = ["dep:webpki-roots", "hyper-rustls?/webpki-tokio", "__rustls"]
+-rustls-tls-native-roots-no-provider = ["dep:rustls-native-certs", "hyper-rustls?/native-tokio", "__rustls"]
+-
+-rustls-tls-manual-roots = ["rustls-tls-manual-roots-no-provider", "__rustls-aws-lc-rs"]
+-rustls-tls-webpki-roots = ["rustls-tls-webpki-roots-no-provider", "__rustls-aws-lc-rs"]
+-rustls-tls-native-roots = ["rustls-tls-native-roots-no-provider", "__rustls-aws-lc-rs"]
+-
+ blocking = ["dep:futures-channel", "futures-channel?/sink", "dep:futures-util", "futures-util?/io", "futures-util?/sink", "tokio/sync"]
+ 
+ charset = ["dep:encoding_rs", "dep:mime"]
+@@ -94,7 +86,7 @@ system-proxy = ["hyper-util/client-proxy-system"]
+ macos-system-configuration = ["system-proxy"]
+ 
+ # Experimental HTTP/3 client.
+-http3 = ["rustls-tls-manual-roots", "dep:h3", "dep:h3-quinn", "dep:quinn", "tokio/macros"]
++http3 = ["rustls-tls", "dep:h3", "dep:h3-quinn", "dep:quinn", "tokio/macros"]
+ 
+ 
+ # Internal (PRIVATE!) features used to aid testing.
+@@ -106,7 +98,6 @@ __tls = ["dep:rustls-pki-types", "tokio/io-util"]
+ # Enables common rustls code.
+ # Equivalent to rustls-tls-manual-roots but shorter :)
+ __rustls = ["dep:hyper-rustls", "dep:tokio-rustls", "dep:rustls", "__tls"]
+-__rustls-ring = ["hyper-rustls?/ring", "tokio-rustls?/ring", "rustls?/ring", "quinn?/ring"]
+ __rustls-aws-lc-rs = ["hyper-rustls?/aws-lc-rs", "tokio-rustls?/aws-lc-rs", "rustls?/aws-lc-rs", "quinn?/aws-lc-rs"]
+ 
+ [dependencies]
+@@ -156,6 +147,7 @@ tokio-native-tls = { version = "0.3.0", optional = true }
+ hyper-rustls = { version = "0.27.0", default-features = false, optional = true, features = ["http1", "tls12"] }
+ rustls = { version = "0.23.4", optional = true, default-features = false, features = ["std", "tls12"] }
+ tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["tls12"] }
++rustls-platform-verifier = { version = "0.6", optional = true }
+ webpki-roots = { version = "1", optional = true }
+ rustls-native-certs = { version = "0.8.0", optional = true }
+ 
+diff --git a/src/async_impl/client.rs b/src/async_impl/client.rs
+index 59d31ca..15a5b3c 100644
+--- a/src/async_impl/client.rs
++++ b/src/async_impl/client.rs
+@@ -188,11 +188,7 @@ struct Config {
+     #[cfg(feature = "__tls")]
+     root_certs: Vec<Certificate>,
+     #[cfg(feature = "__tls")]
+-    tls_built_in_root_certs: bool,
+-    #[cfg(feature = "rustls-tls-webpki-roots-no-provider")]
+-    tls_built_in_certs_webpki: bool,
+-    #[cfg(feature = "rustls-tls-native-roots-no-provider")]
+-    tls_built_in_certs_native: bool,
++    tls_certs_only: bool,
+     #[cfg(feature = "__rustls")]
+     crls: Vec<CertificateRevocationList>,
+     #[cfg(feature = "__tls")]
+@@ -315,11 +311,7 @@ impl ClientBuilder {
+                 #[cfg(feature = "__tls")]
+                 root_certs: Vec::new(),
+                 #[cfg(feature = "__tls")]
+-                tls_built_in_root_certs: true,
+-                #[cfg(feature = "rustls-tls-webpki-roots-no-provider")]
+-                tls_built_in_certs_webpki: true,
+-                #[cfg(feature = "rustls-tls-native-roots-no-provider")]
+-                tls_built_in_certs_native: true,
++                tls_certs_only: false,
+                 #[cfg(any(feature = "native-tls", feature = "__rustls"))]
+                 identity: None,
+                 #[cfg(feature = "__rustls")]
+@@ -550,7 +542,7 @@ impl ClientBuilder {
+ 
+                     tls.use_sni(config.tls_sni);
+ 
+-                    tls.disable_built_in_roots(!config.tls_built_in_root_certs);
++                    tls.disable_built_in_roots(config.tls_certs_only);
+ 
+                     for cert in config.root_certs {
+                         cert.add_to_native_tls(&mut tls);
+@@ -683,54 +675,6 @@ impl ClientBuilder {
+                 TlsBackend::Rustls => {
+                     use crate::tls::{IgnoreHostname, NoVerifier};
+ 
+-                    // Set root certificates.
+-                    let mut root_cert_store = rustls::RootCertStore::empty();
+-                    for cert in config.root_certs {
+-                        cert.add_to_rustls(&mut root_cert_store)?;
+-                    }
+-
+-                    #[cfg(feature = "rustls-tls-webpki-roots-no-provider")]
+-                    if config.tls_built_in_certs_webpki {
+-                        root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+-                    }
+-
+-                    #[cfg(feature = "rustls-tls-native-roots-no-provider")]
+-                    if config.tls_built_in_certs_native {
+-                        let mut valid_count = 0;
+-                        let mut invalid_count = 0;
+-
+-                        let load_results = rustls_native_certs::load_native_certs();
+-                        for cert in load_results.certs {
+-                            // Continue on parsing errors, as native stores often include ancient or syntactically
+-                            // invalid certificates, like root certificates without any X509 extensions.
+-                            // Inspiration: https://github.com/rustls/rustls/blob/633bf4ba9d9521a95f68766d04c22e2b01e68318/rustls/src/anchors.rs#L105-L112
+-                            match root_cert_store.add(cert.into()) {
+-                                Ok(_) => valid_count += 1,
+-                                Err(err) => {
+-                                    invalid_count += 1;
+-                                    log::debug!("rustls failed to parse DER certificate: {err:?}");
+-                                }
+-                            }
+-                        }
+-                        if valid_count == 0 && invalid_count > 0 {
+-                            let err = if load_results.errors.is_empty() {
+-                                crate::error::builder(
+-                                    "zero valid certificates found in native root store",
+-                                )
+-                            } else {
+-                                use std::fmt::Write as _;
+-                                let mut acc = String::new();
+-                                for err in load_results.errors {
+-                                    let _ = writeln!(&mut acc, "{err}");
+-                                }
+-
+-                                crate::error::builder(acc)
+-                            };
+-
+-                            return Err(err);
+-                        }
+-                    }
+-
+                     // Set TLS versions.
+                     let mut versions = rustls::ALL_VERSIONS.to_vec();
+ 
+@@ -759,7 +703,7 @@ impl ClientBuilder {
+                     }
+ 
+                     // Allow user to have installed a runtime default.
+-                    // If not, we use ring.
++                    // If not, we ship with _our_ recommended default.
+                     let provider = rustls::crypto::CryptoProvider::get_default()
+                         .map(|arc| arc.clone())
+                         .unwrap_or_else(default_rustls_crypto_provider);
+@@ -776,15 +720,54 @@ impl ClientBuilder {
+                             .dangerous()
+                             .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                     } else if !config.hostname_verification {
++                        if !config.tls_certs_only {
++                            // Should this just warn? Error for now...
++                            return Err(crate::error::builder(
++                                    "disabling rustls hostname verification only allowed with tls_certs_only()"
++                            ));
++                        }
++
+                         config_builder
+                             .dangerous()
+                             .with_custom_certificate_verifier(Arc::new(IgnoreHostname::new(
+-                                root_cert_store,
++                                crate::tls::rustls_store(config.root_certs)?,
+                                 signature_algorithms,
+                             )))
++                    } else if !config.tls_certs_only {
++                        // Check for some misconfigurations and report them.
++                        if !config.crls.is_empty() {
++                            return Err(crate::error::builder(
++                                "CRLs only allowed with tls_certs_only()",
++                            ));
++                        }
++
++                        let verifier = if config.root_certs.is_empty() {
++                            rustls_platform_verifier::Verifier::new(provider.clone())
++                                .map_err(crate::error::builder)?
++                        } else {
++                            #[cfg(any(unix))] // windows and macos coming soon
++                            {
++                                rustls_platform_verifier::Verifier::new_with_extra_roots(
++                                    crate::tls::rustls_der(config.root_certs)?,
++                                    provider.clone(),
++                                )
++                                .map_err(crate::error::builder)?
++                            }
++
++                            #[cfg(not(any(unix)))] // windows and macos coming soon
++                            return Err(crate::error::builder(
++                                "rustls-platform-verifier could not load extra certs",
++                            ));
++                        };
++
++                        config_builder
++                            .dangerous()
++                            .with_custom_certificate_verifier(Arc::new(verifier))
+                     } else {
+                         if config.crls.is_empty() {
+-                            config_builder.with_root_certificates(root_cert_store)
++                            config_builder.with_root_certificates(crate::tls::rustls_store(
++                                config.root_certs,
++                            )?)
+                         } else {
+                             let crls = config
+                                 .crls
+@@ -793,7 +776,7 @@ impl ClientBuilder {
+                                 .collect::<Vec<_>>();
+                             let verifier =
+                                 rustls::client::WebPkiServerVerifier::builder_with_provider(
+-                                    Arc::new(root_cert_store),
++                                    Arc::new(crate::tls::rustls_store(config.root_certs)?),
+                                     provider,
+                                 )
+                                 .with_crls(crls)
+@@ -1827,11 +1810,18 @@ impl ClientBuilder {
+ 
+     // TLS options
+ 
+-    /// Add a custom root certificate.
++    /// Add custom certificate roots.
+     ///
+     /// This can be used to connect to a server that has a self-signed
+     /// certificate for example.
+     ///
++    /// This optional attempts to merge with any native or built-in roots.
++    ///
++    /// # Errors
++    ///
++    /// If the selected TLS backend or verifier does not support merging
++    /// certificates, the builder will return an error.
++    ///
+     /// # Optional
+     ///
+     /// This requires the optional `default-tls`, `native-tls`, or `rustls-tls(-...)`
+@@ -1845,52 +1835,21 @@ impl ClientBuilder {
+             feature = "rustls-tls"
+         )))
+     )]
+-    pub fn add_root_certificate(mut self, cert: Certificate) -> ClientBuilder {
+-        self.config.root_certs.push(cert);
+-        self
+-    }
+-
+-    /// Add a certificate revocation list.
+-    ///
+-    ///
+-    /// # Optional
+-    ///
+-    /// This requires the `rustls-tls(-...)` Cargo feature enabled.
+-    #[cfg(feature = "__rustls")]
+-    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
+-    pub fn add_crl(mut self, crl: CertificateRevocationList) -> ClientBuilder {
+-        self.config.crls.push(crl);
+-        self
+-    }
+-
+-    /// Add multiple certificate revocation lists.
+-    ///
+-    ///
+-    /// # Optional
+-    ///
+-    /// This requires the `rustls-tls(-...)` Cargo feature enabled.
+-    #[cfg(feature = "__rustls")]
+-    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
+-    pub fn add_crls(
++    pub fn tls_certs_merge(
+         mut self,
+-        crls: impl IntoIterator<Item = CertificateRevocationList>,
++        certs: impl IntoIterator<Item = Certificate>,
+     ) -> ClientBuilder {
+-        self.config.crls.extend(crls);
++        self.config.root_certs.extend(certs);
+         self
+     }
+ 
+-    /// Controls the use of built-in/preloaded certificates during certificate validation.
++    /// Use only the provided certificate roots.
+     ///
+-    /// Defaults to `true` -- built-in system certs will be used.
+-    ///
+-    /// # Bulk Option
+-    ///
+-    /// If this value is `true`, _all_ enabled system certs configured with Cargo
+-    /// features will be loaded.
++    /// This can be used to connect to a server that has a self-signed
++    /// certificate for example.
+     ///
+-    /// You can set this to `false`, and enable only a specific source with
+-    /// individual methods. Do that will prevent other sources from being loaded
+-    /// even if their feature Cargo feature is enabled.
++    /// This option disables any native or built-in roots, and **only** uses
++    /// the roots provided to this method.
+     ///
+     /// # Optional
+     ///
+@@ -1905,39 +1864,59 @@ impl ClientBuilder {
+             feature = "rustls-tls"
+         )))
+     )]
+-    pub fn tls_built_in_root_certs(mut self, tls_built_in_root_certs: bool) -> ClientBuilder {
+-        self.config.tls_built_in_root_certs = tls_built_in_root_certs;
+-
+-        #[cfg(feature = "rustls-tls-webpki-roots-no-provider")]
+-        {
+-            self.config.tls_built_in_certs_webpki = tls_built_in_root_certs;
+-        }
+-
+-        #[cfg(feature = "rustls-tls-native-roots-no-provider")]
+-        {
+-            self.config.tls_built_in_certs_native = tls_built_in_root_certs;
+-        }
++    pub fn tls_certs_only(mut self, certs: impl IntoIterator<Item = Certificate>) -> ClientBuilder {
++        self.config.root_certs.extend(certs);
++        self.config.tls_certs_only = true;
++        self
++    }
+ 
++    /// Deprecated: use [`ClientBuilder::tls_certs_merge()`] or
++    /// [`ClientBuilder::tls_certs_only()`] instead.
++    #[cfg(feature = "__tls")]
++    pub fn add_root_certificate(mut self, cert: Certificate) -> ClientBuilder {
++        self.config.root_certs.push(cert);
+         self
+     }
+ 
+-    /// Sets whether to load webpki root certs with rustls.
++    /// Add multiple certificate revocation lists.
+     ///
+-    /// If the feature is enabled, this value is `true` by default.
+-    #[cfg(feature = "rustls-tls-webpki-roots-no-provider")]
+-    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls-webpki-roots-no-provider")))]
+-    pub fn tls_built_in_webpki_certs(mut self, enabled: bool) -> ClientBuilder {
+-        self.config.tls_built_in_certs_webpki = enabled;
++    /// # Errors
++    ///
++    /// This only works if also using only provided root certificates. This
++    /// cannot work with the native verifier.
++    ///
++    /// If CRLs are added but `tls_certs_only()` is not called, the builder
++    /// will return an error.
++    ///
++    /// # Optional
++    ///
++    /// This requires the `rustls-tls(-...)` Cargo feature enabled.
++    #[cfg(feature = "__rustls")]
++    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
++    pub fn tls_crls_only(
++        mut self,
++        crls: impl IntoIterator<Item = CertificateRevocationList>,
++    ) -> ClientBuilder {
++        self.config.crls.extend(crls);
+         self
+     }
+ 
+-    /// Sets whether to load native root certs with rustls.
+-    ///
+-    /// If the feature is enabled, this value is `true` by default.
+-    #[cfg(feature = "rustls-tls-native-roots-no-provider")]
+-    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls-native-roots-no-provider")))]
+-    pub fn tls_built_in_native_certs(mut self, enabled: bool) -> ClientBuilder {
+-        self.config.tls_built_in_certs_native = enabled;
++    /// Deprecated: use [`ClientBuilder::tls_crls_only()`] instead.
++    #[cfg(feature = "__rustls")]
++    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
++    pub fn add_crl(mut self, crl: CertificateRevocationList) -> ClientBuilder {
++        self.config.crls.push(crl);
++        self
++    }
++
++    /// Deprecated: use [`ClientBuilder::tls_crls_only()`] instead.
++    #[cfg(feature = "__rustls")]
++    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
++    pub fn add_crls(
++        mut self,
++        crls: impl IntoIterator<Item = CertificateRevocationList>,
++    ) -> ClientBuilder {
++        self.config.crls.extend(crls);
+         self
+     }
+ 
+@@ -1965,6 +1944,11 @@ impl ClientBuilder {
+     /// site will be trusted for use from any other. This introduces a
+     /// significant vulnerability to man-in-the-middle attacks.
+     ///
++    /// # Errors
++    ///
++    /// Depending on the TLS backend and verifier, this might not work with
++    /// native certificates, only those added with [`ClientBuilder::tls_certs_only()`].
++    ///
+     /// # Optional
+     ///
+     /// This requires the optional `default-tls`, `native-tls`, or `rustls-tls(-...)`
+@@ -1978,7 +1962,7 @@ impl ClientBuilder {
+             feature = "rustls-tls"
+         )))
+     )]
+-    pub fn danger_accept_invalid_hostnames(
++    pub fn tls_danger_accept_invalid_hostnames(
+         mut self,
+         accept_invalid_hostname: bool,
+     ) -> ClientBuilder {
+@@ -1986,6 +1970,12 @@ impl ClientBuilder {
+         self
+     }
+ 
++    /// Deprecated: use [`ClientBuilder::tls_danger_accept_invalid_hostnames()`] instead.
++    #[cfg(feature = "__tls")]
++    pub fn danger_accept_invalid_hostnames(self, accept_invalid_hostname: bool) -> ClientBuilder {
++        self.tls_danger_accept_invalid_hostnames(accept_invalid_hostname)
++    }
++
+     /// Controls the use of certificate validation.
+     ///
+     /// Defaults to `false`.
+@@ -2011,11 +2001,17 @@ impl ClientBuilder {
+             feature = "rustls-tls"
+         )))
+     )]
+-    pub fn danger_accept_invalid_certs(mut self, accept_invalid_certs: bool) -> ClientBuilder {
++    pub fn tls_danger_accept_invalid_certs(mut self, accept_invalid_certs: bool) -> ClientBuilder {
+         self.config.certs_verification = !accept_invalid_certs;
+         self
+     }
+ 
++    /// Deprecated: use [`ClientBuilder::tls_danger_accept_invalid_certs()`] instead.
++    #[cfg(feature = "__tls")]
++    pub fn danger_accept_invalid_certs(self, accept_invalid_certs: bool) -> ClientBuilder {
++        self.tls_danger_accept_invalid_certs(accept_invalid_certs)
++    }
++
+     /// Controls the use of TLS server name indication.
+     ///
+     /// Defaults to `true`.
+@@ -2045,7 +2041,7 @@ impl ClientBuilder {
+     /// # Errors
+     ///
+     /// A value of `tls::Version::TLS_1_3` will cause an error with the
+-    /// `native-tls`/`default-tls` backend. This does not mean the version
++    /// `native-tls` backend. This does not mean the version
+     /// isn't supported, just that it can't be set as a minimum due to
+     /// technical limitations.
+     ///
+@@ -2062,11 +2058,17 @@ impl ClientBuilder {
+             feature = "rustls-tls"
+         )))
+     )]
+-    pub fn min_tls_version(mut self, version: tls::Version) -> ClientBuilder {
++    pub fn tls_version_min(mut self, version: tls::Version) -> ClientBuilder {
+         self.config.min_tls_version = Some(version);
+         self
+     }
+ 
++    /// Deprecated: use [`ClientBuilder::tls_version_min()`] instead.
++    #[cfg(feature = "__tls")]
++    pub fn min_tls_version(self, version: tls::Version) -> ClientBuilder {
++        self.tls_version_min(version)
++    }
++
+     /// Set the maximum allowed TLS version for connections.
+     ///
+     /// By default, there's no maximum.
+@@ -2074,7 +2076,7 @@ impl ClientBuilder {
+     /// # Errors
+     ///
+     /// A value of `tls::Version::TLS_1_3` will cause an error with the
+-    /// `native-tls`/`default-tls` backend. This does not mean the version
++    /// `native-tls` backend. This does not mean the version
+     /// isn't supported, just that it can't be set as a maximum due to
+     /// technical limitations.
+     ///
+@@ -2094,11 +2096,17 @@ impl ClientBuilder {
+             feature = "rustls-tls"
+         )))
+     )]
+-    pub fn max_tls_version(mut self, version: tls::Version) -> ClientBuilder {
++    pub fn tls_version_max(mut self, version: tls::Version) -> ClientBuilder {
+         self.config.max_tls_version = Some(version);
+         self
+     }
+ 
++    /// Deprecated: use [`ClientBuilder::tls_version_max()`] instead.
++    #[cfg(feature = "__tls")]
++    pub fn max_tls_version(self, version: tls::Version) -> ClientBuilder {
++        self.tls_version_max(version)
++    }
++
+     /// Force using the native TLS backend.
+     ///
+     /// Since multiple TLS backends can be optionally enabled, this option will
+@@ -2109,11 +2117,17 @@ impl ClientBuilder {
+     /// This requires the optional `native-tls` feature to be enabled.
+     #[cfg(feature = "native-tls")]
+     #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
+-    pub fn use_native_tls(mut self) -> ClientBuilder {
++    pub fn tls_backend_native(mut self) -> ClientBuilder {
+         self.config.tls = TlsBackend::NativeTls;
+         self
+     }
+ 
++    /// Deprecated: use [`ClientBuilder::tls_backend_native()`] instead.
++    #[cfg(feature = "native-tls")]
++    pub fn use_native_tls(self) -> ClientBuilder {
++        self.tls_backend_native()
++    }
++
+     /// Force using the Rustls TLS backend.
+     ///
+     /// Since multiple TLS backends can be optionally enabled, this option will
+@@ -2124,11 +2138,18 @@ impl ClientBuilder {
+     /// This requires the optional `rustls-tls(-...)` feature to be enabled.
+     #[cfg(feature = "__rustls")]
+     #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
+-    pub fn use_rustls_tls(mut self) -> ClientBuilder {
++    pub fn tls_backend_rustls(mut self) -> ClientBuilder {
+         self.config.tls = TlsBackend::Rustls;
+         self
+     }
+ 
++    /// Deprecated: use [`ClientBuilder::tls_backend_rustls()`] instead.
++    #[cfg(feature = "__rustls")]
++    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
++    pub fn use_rustls_tls(self) -> ClientBuilder {
++        self.tls_backend_rustls()
++    }
++
+     /// Use a preconfigured TLS backend.
+     ///
+     /// If the passed `Any` argument is not a TLS backend that reqwest
+@@ -2136,6 +2157,13 @@ impl ClientBuilder {
+     ///
+     /// # Advanced
+     ///
++    /// <div class="warning">
++    ///
++    /// There is no semver stability on the internals of this method. Use at
++    /// your own risk.
++    ///
++    /// </div>
++    ///
+     /// This is an advanced option, and can be somewhat brittle. Usage requires
+     /// keeping the preconfigured TLS argument version in sync with reqwest,
+     /// since version mismatches will result in an "unknown" TLS backend.
+@@ -2149,7 +2177,7 @@ impl ClientBuilder {
+     /// `rustls-tls(-...)` to be enabled.
+     #[cfg(any(feature = "native-tls", feature = "__rustls",))]
+     #[cfg_attr(docsrs, doc(cfg(any(feature = "native-tls", feature = "rustls-tls"))))]
+-    pub fn use_preconfigured_tls(mut self, tls: impl Any) -> ClientBuilder {
++    pub fn tls_backend_preconfigured(mut self, tls: impl Any) -> ClientBuilder {
+         let mut tls = Some(tls);
+         #[cfg(feature = "native-tls")]
+         {
+@@ -2177,6 +2205,12 @@ impl ClientBuilder {
+         self
+     }
+ 
++    /// Deprecated: use [`ClientBuilder::tls_backend_preconfigured()`] instead.
++    #[cfg(any(feature = "native-tls", feature = "__rustls",))]
++    pub fn use_preconfigured_tls(self, tls: impl Any) -> ClientBuilder {
++        self.tls_backend_preconfigured(tls)
++    }
++
+     /// Add TLS information as `TlsInfo` extension to responses.
+     ///
+     /// # Optional
+@@ -2453,12 +2487,9 @@ impl Default for Client {
+ 
+ #[cfg(feature = "__rustls")]
+ fn default_rustls_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+-    #[cfg(not(any(feature = "__rustls-ring", feature = "__rustls-aws-lc-rs")))]
++    #[cfg(not(feature = "__rustls-aws-lc-rs"))]
+     panic!("No provider set");
+ 
+-    #[cfg(all(feature = "__rustls-ring", not(feature = "__rustls-aws-lc-rs")))]
+-    return Arc::new(rustls::crypto::ring::default_provider());
+-
+     #[cfg(feature = "__rustls-aws-lc-rs")]
+     Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+ }
+@@ -2826,22 +2857,22 @@ impl Config {
+         #[cfg(feature = "__tls")]
+         {
+             if !self.hostname_verification {
+-                f.field("danger_accept_invalid_hostnames", &true);
++                f.field("tls_danger_accept_invalid_hostnames", &true);
+             }
+         }
+ 
+         #[cfg(feature = "__tls")]
+         {
+             if !self.certs_verification {
+-                f.field("danger_accept_invalid_certs", &true);
++                f.field("tls_danger_accept_invalid_certs", &true);
+             }
+ 
+             if let Some(ref min_tls_version) = self.min_tls_version {
+-                f.field("min_tls_version", min_tls_version);
++                f.field("tls_version_min", min_tls_version);
+             }
+ 
+             if let Some(ref max_tls_version) = self.max_tls_version {
+-                f.field("max_tls_version", max_tls_version);
++                f.field("tls_version_max", max_tls_version);
+             }
+ 
+             f.field("tls_sni", &self.tls_sni);
+@@ -3103,7 +3134,7 @@ impl fmt::Debug for Pending {
+ 
+ #[cfg(test)]
+ mod tests {
+-    #![cfg(not(feature = "rustls-tls-manual-roots-no-provider"))]
++    #![cfg(not(feature = "rustls-tls-no-provider"))]
+ 
+     #[tokio::test]
+     async fn execute_request_rejects_invalid_urls() {
+diff --git a/src/async_impl/request.rs b/src/async_impl/request.rs
+index 21dfbe5..203ff3e 100644
+--- a/src/async_impl/request.rs
++++ b/src/async_impl/request.rs
+@@ -676,7 +676,7 @@ impl TryFrom<Request> for HttpRequest<Body> {
+ 
+ #[cfg(test)]
+ mod tests {
+-    #![cfg(not(feature = "rustls-tls-manual-roots-no-provider"))]
++    #![cfg(not(feature = "rustls-tls-no-provider"))]
+ 
+     use super::*;
+     #[cfg(feature = "query")]
+diff --git a/src/blocking/client.rs b/src/blocking/client.rs
+index 255d9d8..454c500 100644
+--- a/src/blocking/client.rs
++++ b/src/blocking/client.rs
+@@ -752,7 +752,7 @@ impl ClientBuilder {
+ 
+     // TLS options
+ 
+-    /// Add a custom root certificate.
++    /// Add custom root certificates.
+     ///
+     /// This allows connecting to a server that has a self-signed
+     /// certificate for example. This **does not** replace the existing
+@@ -772,7 +772,7 @@ impl ClientBuilder {
+     ///
+     /// // get a client builder
+     /// let client = reqwest::blocking::Client::builder()
+-    ///     .add_root_certificate(cert)
++    ///     .tls_certs_merge([cert])
+     ///     .build()?;
+     /// # drop(client);
+     /// # Ok(())
+@@ -792,40 +792,17 @@ impl ClientBuilder {
+             feature = "rustls-tls"
+         )))
+     )]
+-    pub fn add_root_certificate(self, cert: Certificate) -> ClientBuilder {
+-        self.with_inner(move |inner| inner.add_root_certificate(cert))
++    pub fn tls_certs_merge(self, certs: impl IntoIterator<Item = Certificate>) -> ClientBuilder {
++        self.with_inner(move |inner| inner.tls_certs_merge(certs))
+     }
+ 
+-    /// Add a certificate revocation list.
+-    ///
++    /// Use only the provided certificate roots.
+     ///
+-    /// # Optional
+-    ///
+-    /// This requires the `rustls-tls(-...)` Cargo feature enabled.
+-    #[cfg(feature = "__rustls")]
+-    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
+-    pub fn add_crl(self, crl: CertificateRevocationList) -> ClientBuilder {
+-        self.with_inner(move |inner| inner.add_crl(crl))
+-    }
+-
+-    /// Add multiple certificate revocation lists.
++    /// This can be used to connect to a server that has a self-signed
++    /// certificate for example.
+     ///
+-    ///
+-    /// # Optional
+-    ///
+-    /// This requires the `rustls-tls(-...)` Cargo feature enabled.
+-    #[cfg(feature = "__rustls")]
+-    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
+-    pub fn add_crls(
+-        self,
+-        crls: impl IntoIterator<Item = CertificateRevocationList>,
+-    ) -> ClientBuilder {
+-        self.with_inner(move |inner| inner.add_crls(crls))
+-    }
+-
+-    /// Controls the use of built-in system certificates during certificate validation.
+-    ///
+-    /// Defaults to `true` -- built-in system certs will be used.
++    /// This option disables any native or built-in roots, and **only** uses
++    /// the roots provided to this method.
+     ///
+     /// # Optional
+     ///
+@@ -840,26 +817,53 @@ impl ClientBuilder {
+             feature = "rustls-tls"
+         )))
+     )]
+-    pub fn tls_built_in_root_certs(self, tls_built_in_root_certs: bool) -> ClientBuilder {
+-        self.with_inner(move |inner| inner.tls_built_in_root_certs(tls_built_in_root_certs))
++    pub fn tls_certs_only(self, certs: impl IntoIterator<Item = Certificate>) -> ClientBuilder {
++        self.with_inner(move |inner| inner.tls_certs_only(certs))
+     }
+ 
+-    /// Sets whether to load webpki root certs with rustls.
+-    ///
+-    /// If the feature is enabled, this value is `true` by default.
+-    #[cfg(feature = "rustls-tls-webpki-roots-no-provider")]
+-    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls-webpki-roots-no-provider")))]
+-    pub fn tls_built_in_webpki_certs(self, enabled: bool) -> ClientBuilder {
+-        self.with_inner(move |inner| inner.tls_built_in_webpki_certs(enabled))
++    /// Deprecated: use [`ClientBuilder::tls_certs_merge()`] or [`ClientBuilder::tls_certs_only()`] instead.
++    #[cfg(feature = "__tls")]
++    pub fn add_root_certificate(self, cert: Certificate) -> ClientBuilder {
++        self.with_inner(move |inner| inner.add_root_certificate(cert))
+     }
+ 
+-    /// Sets whether to load native root certs with rustls.
++    /// Add multiple certificate revocation lists.
+     ///
+-    /// If the feature is enabled, this value is `true` by default.
+-    #[cfg(feature = "rustls-tls-native-roots-no-provider")]
+-    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls-native-roots-no-provider")))]
+-    pub fn tls_built_in_native_certs(self, enabled: bool) -> ClientBuilder {
+-        self.with_inner(move |inner| inner.tls_built_in_native_certs(enabled))
++    /// # Errors
++    ///
++    /// This only works if also using only provided root certificates. This
++    /// cannot work with the native verifier.
++    ///
++    /// If CRLs are added but `tls_certs_only()` is not called, the builder
++    /// will return an error.
++    ///
++    /// # Optional
++    ///
++    /// This requires the `rustls-tls(-...)` Cargo feature enabled.
++    #[cfg(feature = "__rustls")]
++    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
++    pub fn tls_crls_only(
++        self,
++        crls: impl IntoIterator<Item = CertificateRevocationList>,
++    ) -> ClientBuilder {
++        self.with_inner(move |inner| inner.tls_crls_only(crls))
++    }
++
++    /// Deprecated: use [`ClientBuilder::tls_crls_only()`] instead.
++    #[cfg(feature = "__rustls")]
++    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
++    pub fn add_crl(self, crl: CertificateRevocationList) -> ClientBuilder {
++        self.with_inner(move |inner| inner.add_crl(crl))
++    }
++
++    /// Deprecated: use [`ClientBuilder::tls_crls_only()`] instead.
++    #[cfg(feature = "__rustls")]
++    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
++    pub fn add_crls(
++        self,
++        crls: impl IntoIterator<Item = CertificateRevocationList>,
++    ) -> ClientBuilder {
++        self.with_inner(move |inner| inner.add_crls(crls))
+     }
+ 
+     /// Sets the identity to be used for client certificate authentication.
+@@ -885,6 +889,11 @@ impl ClientBuilder {
+     /// site will be trusted for use from any other. This introduces a
+     /// significant vulnerability to man-in-the-middle attacks.
+     ///
++    /// # Errors
++    ///
++    /// Depending on the TLS backend and verifier, this might not work with
++    /// native certificates, only those added with [`ClientBuilder::tls_certs_only()`].
++    ///
+     /// # Optional
+     ///
+     /// This requires the optional `default-tls`, `native-tls`, or `rustls-tls(-...)`
+@@ -898,6 +907,15 @@ impl ClientBuilder {
+             feature = "rustls-tls"
+         )))
+     )]
++    pub fn tls_danger_accept_invalid_hostnames(
++        self,
++        accept_invalid_hostname: bool,
++    ) -> ClientBuilder {
++        self.with_inner(|inner| inner.tls_danger_accept_invalid_hostnames(accept_invalid_hostname))
++    }
++
++    /// Deprecated: use [`ClientBuilder::tls_danger_accept_invalid_hostnames()`] instead.
++    #[cfg(feature = "__tls")]
+     pub fn danger_accept_invalid_hostnames(self, accept_invalid_hostname: bool) -> ClientBuilder {
+         self.with_inner(|inner| inner.danger_accept_invalid_hostnames(accept_invalid_hostname))
+     }
+@@ -922,6 +940,12 @@ impl ClientBuilder {
+             feature = "rustls-tls"
+         )))
+     )]
++    pub fn tls_danger_accept_invalid_certs(self, accept_invalid_certs: bool) -> ClientBuilder {
++        self.with_inner(|inner| inner.tls_danger_accept_invalid_certs(accept_invalid_certs))
++    }
++
++    /// Deprecated: use [`ClientBuilder::tls_danger_accept_invalid_certs()`] instead.
++    #[cfg(feature = "__tls")]
+     pub fn danger_accept_invalid_certs(self, accept_invalid_certs: bool) -> ClientBuilder {
+         self.with_inner(|inner| inner.danger_accept_invalid_certs(accept_invalid_certs))
+     }
+@@ -949,7 +973,7 @@ impl ClientBuilder {
+     /// # Errors
+     ///
+     /// A value of `tls::Version::TLS_1_3` will cause an error with the
+-    /// `native-tls`/`default-tls` backend. This does not mean the version
++    /// `native-tls` backend. This does not mean the version
+     /// isn't supported, just that it can't be set as a minimum due to
+     /// technical limitations.
+     ///
+@@ -966,6 +990,12 @@ impl ClientBuilder {
+             feature = "rustls-tls"
+         )))
+     )]
++    pub fn tls_version_min(self, version: tls::Version) -> ClientBuilder {
++        self.with_inner(|inner| inner.tls_version_min(version))
++    }
++
++    /// Deprecated: use [`ClientBuilder::tls_version_min()`] instead.
++    #[cfg(feature = "__tls")]
+     pub fn min_tls_version(self, version: tls::Version) -> ClientBuilder {
+         self.with_inner(|inner| inner.min_tls_version(version))
+     }
+@@ -977,7 +1007,7 @@ impl ClientBuilder {
+     /// # Errors
+     ///
+     /// A value of `tls::Version::TLS_1_3` will cause an error with the
+-    /// `native-tls`/`default-tls` backend. This does not mean the version
++    /// `native-tls` backend. This does not mean the version
+     /// isn't supported, just that it can't be set as a maximum due to
+     /// technical limitations.
+     ///
+@@ -994,6 +1024,12 @@ impl ClientBuilder {
+             feature = "rustls-tls"
+         )))
+     )]
++    pub fn tls_version_max(self, version: tls::Version) -> ClientBuilder {
++        self.with_inner(|inner| inner.tls_version_max(version))
++    }
++
++    /// Deprecated: use [`ClientBuilder::tls_version_max()`] instead.
++    #[cfg(feature = "__tls")]
+     pub fn max_tls_version(self, version: tls::Version) -> ClientBuilder {
+         self.with_inner(|inner| inner.max_tls_version(version))
+     }
+@@ -1008,6 +1044,12 @@ impl ClientBuilder {
+     /// This requires the optional `native-tls` feature to be enabled.
+     #[cfg(feature = "native-tls")]
+     #[cfg_attr(docsrs, doc(cfg(feature = "native-tls")))]
++    pub fn tls_backend_native(self) -> ClientBuilder {
++        self.with_inner(move |inner| inner.tls_backend_native())
++    }
++
++    /// Deprecated: use [`ClientBuilder::tls_backend_native()`] instead.
++    #[cfg(feature = "native-tls")]
+     pub fn use_native_tls(self) -> ClientBuilder {
+         self.with_inner(move |inner| inner.use_native_tls())
+     }
+@@ -1022,6 +1064,13 @@ impl ClientBuilder {
+     /// This requires the optional `rustls-tls(-...)` feature to be enabled.
+     #[cfg(feature = "__rustls")]
+     #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
++    pub fn tls_backend_rustls(self) -> ClientBuilder {
++        self.with_inner(move |inner| inner.tls_backend_rustls())
++    }
++
++    /// Deprecated: use [`ClientBuilder::tls_backend_rustls()`] instead.
++    #[cfg(feature = "__rustls")]
++    #[cfg_attr(docsrs, doc(cfg(feature = "rustls-tls")))]
+     pub fn use_rustls_tls(self) -> ClientBuilder {
+         self.with_inner(move |inner| inner.use_rustls_tls())
+     }
+@@ -1065,6 +1114,12 @@ impl ClientBuilder {
+     /// `rustls-tls(-...)` to be enabled.
+     #[cfg(any(feature = "native-tls", feature = "__rustls",))]
+     #[cfg_attr(docsrs, doc(cfg(any(feature = "native-tls", feature = "rustls-tls"))))]
++    pub fn tls_backend_preconfigured(self, tls: impl Any) -> ClientBuilder {
++        self.with_inner(move |inner| inner.tls_backend_preconfigured(tls))
++    }
++
++    /// Deprecated: use [`ClientBuilder::tls_backend_preconfigured()`] instead.
++    #[cfg(any(feature = "native-tls", feature = "__rustls",))]
+     pub fn use_preconfigured_tls(self, tls: impl Any) -> ClientBuilder {
+         self.with_inner(move |inner| inner.use_preconfigured_tls(tls))
+     }
+diff --git a/src/lib.rs b/src/lib.rs
+index 91bb087..b47d296 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -196,13 +196,6 @@
+ //! - **native-tls-vendored**: Enables the `vendored` feature of `native-tls`.
+ //! - **native-tls-alpn**: Enables the `alpn` feature of `native-tls`.
+ //! - **rustls-tls**: Enables TLS functionality provided by `rustls`.
+-//!   Equivalent to `rustls-tls-webpki-roots`.
+-//! - **rustls-tls-manual-roots**: Enables TLS functionality provided by `rustls`,
+-//!   without setting any root certificates. Roots have to be specified manually.
+-//! - **rustls-tls-webpki-roots**: Enables TLS functionality provided by `rustls`,
+-//!   while using root certificates from the `webpki-roots` crate.
+-//! - **rustls-tls-native-roots**: Enables TLS functionality provided by `rustls`,
+-//!   while using root certificates from the `rustls-native-certs` crate.
+ //! - **blocking**: Provides the [blocking][] client API.
+ //! - **charset** *(enabled by default)*: Improved support for decoding text.
+ //! - **cookies**: Provides cookie session support.
+diff --git a/src/tls.rs b/src/tls.rs
+index bff8951..77f9f5a 100644
+--- a/src/tls.rs
++++ b/src/tls.rs
+@@ -23,9 +23,9 @@
+ //! Since Cargo features are additive, other crates in your dependency tree can
+ //! cause the default backend to be enabled. If you wish to ensure your
+ //! `Client` uses a specific backend, call the appropriate builder methods
+-//! (such as [`use_rustls_tls()`][]).
++//! (such as [`tls_backend_rustls()`][]).
+ //!
+-//! [`use_rustls_tls()`]: crate::ClientBuilder::use_rustls_tls()
++//! [`tls_backend_rustls()`]: crate::ClientBuilder::tls_backend_rustls()
+ //!
+ //! ## native-tls
+ //!
+@@ -198,6 +198,13 @@ impl Certificate {
+             .collect::<crate::Result<Vec<Certificate>>>()
+     }
+ 
++    /*
++    #[cfg(feature = "rustls-tls")]
++    pub fn from_trust_anchor() -> Self {
++
++    }
++    */
++
+     #[cfg(feature = "native-tls")]
+     pub(crate) fn add_to_native_tls(self, tls: &mut native_tls_crate::TlsConnectorBuilder) {
+         tls.add_root_certificate(self.native);
+@@ -602,6 +609,36 @@ impl Default for TlsBackend {
+     }
+ }
+ 
++#[cfg(feature = "__rustls")]
++pub(crate) fn rustls_store(certs: Vec<Certificate>) -> crate::Result<RootCertStore> {
++    let mut root_cert_store = rustls::RootCertStore::empty();
++    for cert in certs {
++        cert.add_to_rustls(&mut root_cert_store)?;
++    }
++    Ok(root_cert_store)
++}
++
++#[cfg(feature = "__rustls")]
++#[cfg(any(unix))] // windows and macos coming soon
++pub(crate) fn rustls_der(
++    certs: Vec<Certificate>,
++) -> crate::Result<Vec<rustls_pki_types::CertificateDer<'static>>> {
++    let mut ders = Vec::with_capacity(certs.len());
++    for cert in certs {
++        match cert.original {
++            Cert::Der(buf) => ders.push(buf.into()),
++            Cert::Pem(buf) => {
++                let mut reader = std::io::Cursor::new(buf);
++                let pems = Certificate::read_pem_certs(&mut reader)?;
++                for c in pems {
++                    ders.push(c.into());
++                }
++            }
++        }
++    }
++    Ok(ders)
++}
++
+ #[cfg(feature = "__rustls")]
+ #[derive(Debug)]
+ pub(crate) struct NoVerifier;

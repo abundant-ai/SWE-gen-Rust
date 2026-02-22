@@ -1,0 +1,314 @@
+diff --git a/rustls/src/msgs/persist.rs b/rustls/src/msgs/persist.rs
+index 5a8998fb..775123b7 100644
+--- a/rustls/src/msgs/persist.rs
++++ b/rustls/src/msgs/persist.rs
+@@ -117,12 +117,6 @@ impl Tls13ClientSessionValue {
+         self.common.epoch -= delta as u64;
+     }
+ 
+-    #[doc(hidden)]
+-    /// Test only: replace `max_early_data_size` with `new`
+-    pub fn _private_set_max_early_data_size(&mut self, new: u32) {
+-        self.max_early_data_size = new;
+-    }
+-
+     pub fn set_quic_params(&mut self, quic_params: &[u8]) {
+         self.quic_params = PayloadU16(quic_params.to_vec());
+     }
+diff --git a/rustls/src/server/server_conn.rs b/rustls/src/server/server_conn.rs
+index 027768d5..515b312d 100644
+--- a/rustls/src/server/server_conn.rs
++++ b/rustls/src/server/server_conn.rs
+@@ -988,10 +988,7 @@ impl State<ServerConnectionData> for Accepting {
+ 
+ pub(super) enum EarlyDataState {
+     New,
+-    Accepted {
+-        received: ChunkVecBuffer,
+-        left: usize,
+-    },
++    Accepted(ChunkVecBuffer),
+     Rejected,
+ }
+ 
+@@ -1007,15 +1004,12 @@ impl EarlyDataState {
+     }
+ 
+     pub(super) fn accept(&mut self, max_size: usize) {
+-        *self = Self::Accepted {
+-            received: ChunkVecBuffer::new(Some(max_size)),
+-            left: max_size,
+-        };
++        *self = Self::Accepted(ChunkVecBuffer::new(Some(max_size)));
+     }
+ 
+     #[cfg(feature = "std")]
+     fn was_accepted(&self) -> bool {
+-        matches!(self, Self::Accepted { .. })
++        matches!(self, Self::Accepted(_))
+     }
+ 
+     pub(super) fn was_rejected(&self) -> bool {
+@@ -1024,9 +1018,7 @@ impl EarlyDataState {
+ 
+     fn pop(&mut self) -> Option<Vec<u8>> {
+         match self {
+-            Self::Accepted {
+-                ref mut received, ..
+-            } => received.pop(),
++            Self::Accepted(ref mut received) => received.pop(),
+             _ => None,
+         }
+     }
+@@ -1034,9 +1026,7 @@ impl EarlyDataState {
+     #[cfg(feature = "std")]
+     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+         match self {
+-            Self::Accepted {
+-                ref mut received, ..
+-            } => received.read(buf),
++            Self::Accepted(ref mut received) => received.read(buf),
+             _ => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+         }
+     }
+@@ -1044,9 +1034,7 @@ impl EarlyDataState {
+     #[cfg(read_buf)]
+     fn read_buf(&mut self, cursor: core::io::BorrowedCursor<'_>) -> io::Result<()> {
+         match self {
+-            Self::Accepted {
+-                ref mut received, ..
+-            } => received.read_buf(cursor),
++            Self::Accepted(ref mut received) => received.read_buf(cursor),
+             _ => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+         }
+     }
+@@ -1054,12 +1042,8 @@ impl EarlyDataState {
+     pub(super) fn take_received_plaintext(&mut self, bytes: Payload<'_>) -> bool {
+         let available = bytes.bytes().len();
+         match self {
+-            Self::Accepted {
+-                ref mut received,
+-                ref mut left,
+-            } if received.apply_limit(available) == available && available <= *left => {
++            Self::Accepted(ref mut received) if received.apply_limit(available) == available => {
+                 received.append(bytes.into_vec());
+-                *left -= available;
+                 true
+             }
+             _ => false,
+@@ -1071,12 +1055,7 @@ impl Debug for EarlyDataState {
+     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+         match self {
+             Self::New => write!(f, "EarlyDataState::New"),
+-            Self::Accepted { received, left } => write!(
+-                f,
+-                "EarlyDataState::Accepted {{ received: {}, left: {} }}",
+-                received.len(),
+-                left
+-            ),
++            Self::Accepted(buf) => write!(f, "EarlyDataState::Accepted({})", buf.len()),
+             Self::Rejected => write!(f, "EarlyDataState::Rejected"),
+         }
+     }
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index 7a439f2c..d012226b 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -3877,7 +3877,6 @@ enum ClientStorageOp {
+ struct ClientStorage {
+     storage: Arc<dyn rustls::client::ClientSessionStore>,
+     ops: Mutex<Vec<ClientStorageOp>>,
+-    alter_max_early_data_size: Option<(u32, u32)>,
+ }
+ 
+ impl ClientStorage {
+@@ -3885,14 +3884,9 @@ impl ClientStorage {
+         Self {
+             storage: Arc::new(rustls::client::ClientSessionMemoryCache::new(1024)),
+             ops: Mutex::new(Vec::new()),
+-            alter_max_early_data_size: None,
+         }
+     }
+ 
+-    fn alter_max_early_data_size(&mut self, expected: u32, altered: u32) {
+-        self.alter_max_early_data_size = Some((expected, altered));
+-    }
+-
+     #[cfg(feature = "tls12")]
+     fn ops(&self) -> Vec<ClientStorageOp> {
+         self.ops.lock().unwrap().clone()
+@@ -3969,13 +3963,8 @@ impl rustls::client::ClientSessionStore for ClientStorage {
+     fn insert_tls13_ticket(
+         &self,
+         server_name: ServerName<'static>,
+-        mut value: rustls::client::Tls13ClientSessionValue,
++        value: rustls::client::Tls13ClientSessionValue,
+     ) {
+-        if let Some((expected, desired)) = self.alter_max_early_data_size {
+-            assert_eq!(value.max_early_data_size(), expected);
+-            value._private_set_max_early_data_size(desired);
+-        }
+-
+         self.ops
+             .lock()
+             .unwrap()
+@@ -4226,159 +4215,6 @@ fn early_data_can_be_rejected_by_server() {
+     assert!(!client.is_early_data_accepted());
+ }
+ 
+-#[test]
+-fn early_data_is_limited_on_client() {
+-    let (client_config, server_config) = early_data_configs();
+-
+-    // warm up
+-    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+-    do_handshake(&mut client, &mut server);
+-
+-    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+-    assert!(client.early_data().is_some());
+-    assert_eq!(
+-        client
+-            .early_data()
+-            .unwrap()
+-            .bytes_left(),
+-        1234
+-    );
+-    client
+-        .early_data()
+-        .unwrap()
+-        .flush()
+-        .unwrap();
+-    assert_eq!(
+-        client
+-            .early_data()
+-            .unwrap()
+-            .write(&[0xaa; 1234 + 1])
+-            .unwrap(),
+-        1234
+-    );
+-    do_handshake(&mut client, &mut server);
+-
+-    let mut received_early_data = [0u8; 1234];
+-    assert_eq!(
+-        server
+-            .early_data()
+-            .expect("early_data didn't happen")
+-            .read(&mut received_early_data)
+-            .expect("early_data failed unexpectedly"),
+-        1234
+-    );
+-    assert_eq!(&received_early_data[..], [0xaa; 1234]);
+-}
+-
+-fn early_data_configs_allowing_client_to_send_excess_data() -> (Arc<ClientConfig>, Arc<ServerConfig>)
+-{
+-    let (client_config, server_config) = early_data_configs();
+-
+-    // adjust client session storage to corrupt received max_early_data_size
+-    let mut client_config = Arc::into_inner(client_config).unwrap();
+-    let mut storage = ClientStorage::new();
+-    storage.alter_max_early_data_size(1234, 2024);
+-    client_config.resumption = Resumption::store(Arc::new(storage));
+-    let client_config = Arc::new(client_config);
+-
+-    // warm up
+-    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+-    do_handshake(&mut client, &mut server);
+-    (client_config, server_config)
+-}
+-
+-#[test]
+-fn server_detects_excess_early_data() {
+-    let (client_config, server_config) = early_data_configs_allowing_client_to_send_excess_data();
+-
+-    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+-    assert!(client.early_data().is_some());
+-    assert_eq!(
+-        client
+-            .early_data()
+-            .unwrap()
+-            .bytes_left(),
+-        2024
+-    );
+-    client
+-        .early_data()
+-        .unwrap()
+-        .flush()
+-        .unwrap();
+-    assert_eq!(
+-        client
+-            .early_data()
+-            .unwrap()
+-            .write(&[0xaa; 2024])
+-            .unwrap(),
+-        2024
+-    );
+-    assert_eq!(
+-        do_handshake_until_error(&mut client, &mut server),
+-        Err(ErrorFromPeer::Server(Error::PeerMisbehaved(
+-            PeerMisbehaved::TooMuchEarlyDataReceived
+-        ))),
+-    );
+-}
+-
+-// regression test for https://github.com/rustls/rustls/issues/2096
+-#[test]
+-fn server_detects_excess_streamed_early_data() {
+-    let (client_config, server_config) = early_data_configs_allowing_client_to_send_excess_data();
+-
+-    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+-    assert!(client.early_data().is_some());
+-    assert_eq!(
+-        client
+-            .early_data()
+-            .unwrap()
+-            .bytes_left(),
+-        2024
+-    );
+-    client
+-        .early_data()
+-        .unwrap()
+-        .flush()
+-        .unwrap();
+-    assert_eq!(
+-        client
+-            .early_data()
+-            .unwrap()
+-            .write(&[0xaa; 1024])
+-            .unwrap(),
+-        1024
+-    );
+-    transfer(&mut client, &mut server);
+-    server.process_new_packets().unwrap();
+-
+-    let mut received_early_data = [0u8; 1024];
+-    assert_eq!(
+-        server
+-            .early_data()
+-            .expect("early_data didn't happen")
+-            .read(&mut received_early_data)
+-            .expect("early_data failed unexpectedly"),
+-        1024
+-    );
+-    assert_eq!(&received_early_data[..], [0xaa; 1024]);
+-
+-    assert_eq!(
+-        client
+-            .early_data()
+-            .unwrap()
+-            .write(&[0xbb; 1000])
+-            .unwrap(),
+-        1000
+-    );
+-    transfer(&mut client, &mut server);
+-    assert_eq!(
+-        server.process_new_packets(),
+-        Err(Error::PeerMisbehaved(
+-            PeerMisbehaved::TooMuchEarlyDataReceived
+-        ))
+-    );
+-}
+-
+ mod test_quic {
+     use rustls::quic::{self, ConnectionCommon};
+ 

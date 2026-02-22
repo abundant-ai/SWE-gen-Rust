@@ -1,0 +1,575 @@
+diff --git a/bogo/config.json.in b/bogo/config.json.in
+index 4b13c557..6a39eeb7 100644
+--- a/bogo/config.json.in
++++ b/bogo/config.json.in
+@@ -19,6 +19,8 @@
+     "DummyPQPadding-*": "not supported",
+     "MTU*": "dtls only",
+     "DisableEverything": "not useful",
++    "SendEmptyRecords": "non-standard openssl/boringssl behaviour",
++    "SendEmptyRecords-Async": "",
+     "CheckLeafCurve": "",
+     "SendWarningAlerts": "",
+     "SendWarningAlerts-*": "",
+@@ -98,6 +100,8 @@
+     "Resume-Server-OmitPSKsOnSecondClientHello": "not required by RFC",
+     "FallbackSCSV*": "fallback countermeasure not yet implemented",
+     "RequireAnyClientCertificate-TLS12": "we don't send an alert in this case",
++    "TooManyKeyUpdates": "no limit implemented",
++    "SendUserCanceledAlerts-TooMany-TLS13": "",
+     "ServerBogusVersion": "we ignore legacy_version if there's an extension",
+     "Renegotiate-Client-*": "no reneg",
+     "Shutdown-Shim-Renegotiate-*": "",
+diff --git a/rustls/examples/internal/bogo_shim_impl.rs b/rustls/examples/internal/bogo_shim_impl.rs
+index 48fecfdc..33b67651 100644
+--- a/rustls/examples/internal/bogo_shim_impl.rs
++++ b/rustls/examples/internal/bogo_shim_impl.rs
+@@ -824,15 +824,6 @@ fn handle_err(err: Error) -> ! {
+         Error::PeerMisbehaved(PeerMisbehaved::SelectedUnofferedCipherSuite) => {
+             quit(":WRONG_CIPHER_RETURNED:")
+         }
+-        Error::PeerMisbehaved(PeerMisbehaved::TooManyWarningAlertsReceived) => {
+-            quit(":TOO_MANY_WARNING_ALERTS:")
+-        }
+-        Error::PeerMisbehaved(PeerMisbehaved::TooManyKeyUpdateRequests) => {
+-            quit(":TOO_MANY_KEY_UPDATES:")
+-        }
+-        Error::PeerMisbehaved(PeerMisbehaved::TooManyEmptyFragments) => {
+-            quit(":TOO_MANY_EMPTY_FRAGMENTS:")
+-        }
+         Error::PeerMisbehaved(_) => quit(":PEER_MISBEHAVIOUR:"),
+         Error::NoCertificatesPresented => quit(":NO_CERTS:"),
+         Error::AlertReceived(AlertDescription::UnexpectedMessage) => quit(":BAD_ALERT:"),
+@@ -1382,7 +1373,6 @@ pub fn main() {
+             "-expect-no-session" |
+             "-expect-ticket-renewal" |
+             "-enable-ocsp-stapling" |
+-            "-forbid-renegotiation-after-handshake" |
+             // internal openssl details:
+             "-async" |
+             "-implicit-handshake" |
+diff --git a/rustls/src/common_state.rs b/rustls/src/common_state.rs
+index 9edb8dd5..29825ea7 100644
+--- a/rustls/src/common_state.rs
++++ b/rustls/src/common_state.rs
+@@ -51,7 +51,6 @@ pub struct CommonState {
+     pub(crate) protocol: Protocol,
+     pub(crate) quic: quic::Quic,
+     pub(crate) enable_secret_extraction: bool,
+-    temper_counters: TemperCounters,
+ }
+ 
+ impl CommonState {
+@@ -80,7 +79,6 @@ impl CommonState {
+             protocol: Protocol::Tcp,
+             quic: quic::Quic::default(),
+             enable_secret_extraction: false,
+-            temper_counters: TemperCounters::default(),
+         }
+     }
+ 
+@@ -173,8 +171,6 @@ impl CommonState {
+                 Side::Server => HandshakeType::ClientHello,
+             };
+             if msg.is_handshake_type(reject_ty) {
+-                self.temper_counters
+-                    .received_renegotiation_request()?;
+                 self.send_warning_alert(AlertDescription::NoRenegotiation);
+                 return Ok(state);
+             }
+@@ -445,8 +441,6 @@ impl CommonState {
+         // (except, for no good reason, user_cancelled).
+         let err = Error::AlertReceived(alert.description);
+         if alert.level == AlertLevel::Warning {
+-            self.temper_counters
+-                .received_warning_alert()?;
+             if self.is_tls13() && alert.description != AlertDescription::UserCanceled {
+                 return Err(self.send_fatal_alert(AlertDescription::DecodeError, err));
+             } else {
+@@ -627,9 +621,6 @@ impl CommonState {
+         &mut self,
+         key_update_request: &KeyUpdateRequest,
+     ) -> Result<bool, Error> {
+-        self.temper_counters
+-            .received_key_update_request()?;
+-
+         match key_update_request {
+             KeyUpdateRequest::UpdateNotRequested => Ok(false),
+             KeyUpdateRequest::UpdateRequested => Ok(self.queued_key_update_message.is_none()),
+@@ -837,63 +828,5 @@ enum Limit {
+     No,
+ }
+ 
+-/// Tracking technically-allowed protocol actions
+-/// that we limit to avoid denial-of-service vectors.
+-struct TemperCounters {
+-    allowed_warning_alerts: u8,
+-    allowed_renegotiation_requests: u8,
+-    allowed_key_update_requests: u8,
+-}
+-
+-impl TemperCounters {
+-    fn received_warning_alert(&mut self) -> Result<(), Error> {
+-        match self.allowed_warning_alerts {
+-            0 => Err(PeerMisbehaved::TooManyWarningAlertsReceived.into()),
+-            _ => {
+-                self.allowed_warning_alerts -= 1;
+-                Ok(())
+-            }
+-        }
+-    }
+-
+-    fn received_renegotiation_request(&mut self) -> Result<(), Error> {
+-        match self.allowed_renegotiation_requests {
+-            0 => Err(PeerMisbehaved::TooManyRenegotiationRequests.into()),
+-            _ => {
+-                self.allowed_renegotiation_requests -= 1;
+-                Ok(())
+-            }
+-        }
+-    }
+-
+-    fn received_key_update_request(&mut self) -> Result<(), Error> {
+-        match self.allowed_key_update_requests {
+-            0 => Err(PeerMisbehaved::TooManyKeyUpdateRequests.into()),
+-            _ => {
+-                self.allowed_key_update_requests -= 1;
+-                Ok(())
+-            }
+-        }
+-    }
+-}
+-
+-impl Default for TemperCounters {
+-    fn default() -> Self {
+-        Self {
+-            // cf. BoringSSL `kMaxWarningAlerts`
+-            // <https://github.com/google/boringssl/blob/dec5989b793c56ad4dd32173bd2d8595ca78b398/ssl/tls_record.cc#L137-L139>
+-            allowed_warning_alerts: 4,
+-
+-            // we rebuff renegotiation requests with a `NoRenegotiation` warning alerts.
+-            // a second request after this is fatal.
+-            allowed_renegotiation_requests: 1,
+-
+-            // cf. BoringSSL `kMaxKeyUpdates`
+-            // <https://github.com/google/boringssl/blob/dec5989b793c56ad4dd32173bd2d8595ca78b398/ssl/tls13_both.cc#L35-L38>
+-            allowed_key_update_requests: 32,
+-        }
+-    }
+-}
+-
+ const DEFAULT_RECEIVED_PLAINTEXT_LIMIT: usize = 16 * 1024;
+ pub(crate) const DEFAULT_BUFFER_LIMIT: usize = 64 * 1024;
+diff --git a/rustls/src/error.rs b/rustls/src/error.rs
+index 9c3afd18..d334e1b3 100644
+--- a/rustls/src/error.rs
++++ b/rustls/src/error.rs
+@@ -233,10 +233,6 @@ pub enum PeerMisbehaved {
+     ServerNameMustContainOneHostName,
+     SignedKxWithWrongAlgorithm,
+     SignedHandshakeWithUnadvertisedSigScheme,
+-    TooManyEmptyFragments,
+-    TooManyKeyUpdateRequests,
+-    TooManyRenegotiationRequests,
+-    TooManyWarningAlertsReceived,
+     TooMuchEarlyDataReceived,
+     UnexpectedCleartextExtension,
+     UnsolicitedCertExtension,
+diff --git a/rustls/src/msgs/codec.rs b/rustls/src/msgs/codec.rs
+index cc440ec8..2af661f6 100644
+--- a/rustls/src/msgs/codec.rs
++++ b/rustls/src/msgs/codec.rs
+@@ -203,7 +203,7 @@ impl Codec<'_> for u16 {
+     fn read(r: &mut Reader) -> Result<Self, InvalidMessage> {
+         match r.take(2) {
+             Some(&[b1, b2]) => Ok(Self::from_be_bytes([b1, b2])),
+-            _ => Err(InvalidMessage::MissingData("u16")),
++            _ => Err(InvalidMessage::MissingData("u8")),
+         }
+     }
+ }
+diff --git a/rustls/src/msgs/deframer.rs b/rustls/src/msgs/deframer.rs
+index c8df5702..013a36fc 100644
+--- a/rustls/src/msgs/deframer.rs
++++ b/rustls/src/msgs/deframer.rs
+@@ -26,10 +26,6 @@ pub struct MessageDeframer {
+ 
+     /// If we're in the middle of joining a handshake payload, this is the metadata.
+     joining_hs: Option<HandshakePayloadMeta>,
+-
+-    /// We limit consecutive empty fragments to avoid a route for the peer to send
+-    /// us significant but fruitless traffic.
+-    seen_consecutive_empty_fragments: u8,
+ }
+ 
+ impl MessageDeframer {
+@@ -172,20 +168,6 @@ impl MessageDeframer {
+                 return Err(self.set_err(PeerMisbehaved::MessageInterleavedWithHandshakeMessage));
+             }
+ 
+-            match plain_payload_slice.len {
+-                0 => {
+-                    if self.seen_consecutive_empty_fragments
+-                        == ALLOWED_CONSECUTIVE_EMPTY_FRAGMENTS_MAX
+-                    {
+-                        return Err(self.set_err(PeerMisbehaved::TooManyEmptyFragments));
+-                    }
+-                    self.seen_consecutive_empty_fragments += 1;
+-                }
+-                _ => {
+-                    self.seen_consecutive_empty_fragments = 0;
+-                }
+-            }
+-
+             // If it's not a handshake message, just return it -- no joining necessary.
+             if typ != ContentType::Handshake {
+                 buffer.queue_discard(end);
+@@ -723,10 +705,6 @@ const MAX_HANDSHAKE_SIZE: u32 = 0xffff;
+ #[cfg(feature = "std")]
+ const READ_SIZE: usize = 4096;
+ 
+-/// cf. BoringSSL's `kMaxEmptyRecords`
+-/// <https://github.com/google/boringssl/blob/dec5989b793c56ad4dd32173bd2d8595ca78b398/ssl/tls_record.cc#L124-L128>
+-const ALLOWED_CONSECUTIVE_EMPTY_FRAGMENTS_MAX: u8 = 32;
+-
+ #[cfg(feature = "std")]
+ #[cfg(test)]
+ mod tests {
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index f988345c..3bfc5ede 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -21,19 +21,19 @@ use rustls::client::{verify_server_cert_signed_by_trust_anchor, ResolvesClientCe
+ use rustls::crypto::CryptoProvider;
+ use rustls::internal::msgs::base::Payload;
+ use rustls::internal::msgs::codec::Codec;
+-use rustls::internal::msgs::enums::{AlertLevel, Compression};
++use rustls::internal::msgs::enums::AlertLevel;
+ use rustls::internal::msgs::handshake::{
+-    ClientExtension, ClientHelloPayload, HandshakeMessagePayload, HandshakePayload, Random,
+-    ServerName as ServerNameExtensionItem, SessionId,
++    ClientExtension, HandshakeMessagePayload, HandshakePayload,
++    ServerName as ServerNameExtensionItem,
+ };
+-use rustls::internal::msgs::message::{Message, MessagePayload, PlainMessage};
++use rustls::internal::msgs::message::{Message, MessagePayload};
+ use rustls::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
+ use rustls::{
+     sign, AlertDescription, CertificateError, CipherSuite, ClientConfig, ClientConnection,
+     ConnectionCommon, ConnectionTrafficSecrets, ContentType, DistinguishedName, Error,
+-    HandshakeKind, HandshakeType, InvalidMessage, KeyLog, PeerIncompatible, PeerMisbehaved,
+-    ProtocolVersion, ServerConfig, ServerConnection, SideData, SignatureScheme, Stream,
+-    StreamOwned, SupportedCipherSuite,
++    HandshakeKind, InvalidMessage, KeyLog, PeerIncompatible, PeerMisbehaved, ProtocolVersion,
++    ServerConfig, ServerConnection, SideData, SignatureScheme, Stream, StreamOwned,
++    SupportedCipherSuite,
+ };
+ 
+ use super::*;
+@@ -6892,155 +6892,6 @@ impl<'a> io::Write for FakeStream<'a> {
+     }
+ }
+ 
+-#[test]
+-fn test_illegal_server_renegotiation_attempt_after_tls13_handshake() {
+-    let client_config =
+-        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS13]);
+-    let mut server_config = make_server_config(KeyType::Rsa2048);
+-    server_config.enable_secret_extraction = true;
+-
+-    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+-    do_handshake(&mut client, &mut server);
+-
+-    let mut raw_server = RawTls::new_server(server);
+-
+-    let msg = PlainMessage {
+-        typ: ContentType::Handshake,
+-        version: ProtocolVersion::TLSv1_3,
+-        payload: Payload::new(
+-            HandshakeMessagePayload {
+-                typ: HandshakeType::HelloRequest,
+-                payload: HandshakePayload::HelloRequest,
+-            }
+-            .get_encoding(),
+-        ),
+-    };
+-    raw_server.encrypt_and_send(&msg, &mut client);
+-    let err = client
+-        .process_new_packets()
+-        .unwrap_err();
+-    assert_eq!(
+-        err,
+-        Error::InappropriateHandshakeMessage {
+-            expect_types: vec![HandshakeType::NewSessionTicket, HandshakeType::KeyUpdate],
+-            got_type: HandshakeType::HelloRequest
+-        }
+-    );
+-}
+-
+-#[cfg(feature = "tls12")]
+-#[test]
+-fn test_illegal_server_renegotiation_attempt_after_tls12_handshake() {
+-    let client_config =
+-        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS12]);
+-    let mut server_config = make_server_config(KeyType::Rsa2048);
+-    server_config.enable_secret_extraction = true;
+-
+-    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+-    do_handshake(&mut client, &mut server);
+-
+-    let mut raw_server = RawTls::new_server(server);
+-
+-    let msg = PlainMessage {
+-        typ: ContentType::Handshake,
+-        version: ProtocolVersion::TLSv1_3,
+-        payload: Payload::new(
+-            HandshakeMessagePayload {
+-                typ: HandshakeType::HelloRequest,
+-                payload: HandshakePayload::HelloRequest,
+-            }
+-            .get_encoding(),
+-        ),
+-    };
+-
+-    // one is allowed (and elicits a warning alert)
+-    raw_server.encrypt_and_send(&msg, &mut client);
+-    client.process_new_packets().unwrap();
+-    raw_server.receive_and_decrypt(&mut client, |m| {
+-        assert_eq!(format!("{m:?}"),
+-                   "Message { version: TLSv1_2, payload: Alert(AlertMessagePayload { level: Warning, description: NoRenegotiation }) }");
+-    });
+-
+-    // second is fatal
+-    raw_server.encrypt_and_send(&msg, &mut client);
+-    assert_eq!(
+-        client
+-            .process_new_packets()
+-            .unwrap_err(),
+-        Error::PeerMisbehaved(PeerMisbehaved::TooManyRenegotiationRequests)
+-    );
+-}
+-
+-#[test]
+-fn test_illegal_client_renegotiation_attempt_after_tls13_handshake() {
+-    let mut client_config =
+-        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS13]);
+-    client_config.enable_secret_extraction = true;
+-    let server_config = make_server_config(KeyType::Rsa2048);
+-
+-    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+-    do_handshake(&mut client, &mut server);
+-
+-    let mut raw_client = RawTls::new_client(client);
+-
+-    let msg = PlainMessage {
+-        typ: ContentType::Handshake,
+-        version: ProtocolVersion::TLSv1_3,
+-        payload: Payload::new(
+-            HandshakeMessagePayload {
+-                typ: HandshakeType::ClientHello,
+-                payload: HandshakePayload::ClientHello(ClientHelloPayload {
+-                    client_version: ProtocolVersion::TLSv1_2,
+-                    random: Random::from([0u8; 32]),
+-                    session_id: SessionId::read_bytes(&[0u8]).unwrap(),
+-                    cipher_suites: vec![],
+-                    compression_methods: vec![Compression::Null],
+-                    extensions: vec![ClientExtension::ExtendedMasterSecretRequest],
+-                }),
+-            }
+-            .get_encoding(),
+-        ),
+-    };
+-    raw_client.encrypt_and_send(&msg, &mut server);
+-    let err = server
+-        .process_new_packets()
+-        .unwrap_err();
+-    assert_eq!(
+-        format!("{err:?}"),
+-        "InappropriateHandshakeMessage { expect_types: [KeyUpdate], got_type: ClientHello }"
+-    );
+-}
+-
+-#[cfg(feature = "tls12")]
+-#[test]
+-fn test_illegal_client_renegotiation_attempt_during_tls12_handshake() {
+-    let server_config = make_server_config(KeyType::Rsa2048);
+-    let client_config =
+-        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS12]);
+-    let (mut client, mut server) = make_pair_for_configs(client_config, server_config);
+-
+-    let mut client_hello = vec![];
+-    client
+-        .write_tls(&mut io::Cursor::new(&mut client_hello))
+-        .unwrap();
+-
+-    server
+-        .read_tls(&mut io::Cursor::new(&client_hello))
+-        .unwrap();
+-    server
+-        .read_tls(&mut io::Cursor::new(&client_hello))
+-        .unwrap();
+-    assert_eq!(
+-        server
+-            .process_new_packets()
+-            .unwrap_err(),
+-        Error::InappropriateHandshakeMessage {
+-            expect_types: vec![HandshakeType::ClientKeyExchange],
+-            got_type: HandshakeType::ClientHello
+-        }
+-    );
+-}
+-
+ } // test_for_each_provider!
+ 
+ #[derive(Default, Debug)]
+diff --git a/rustls/tests/common/mod.rs b/rustls/tests/common/mod.rs
+index db8cc358..d39a2c48 100644
+--- a/rustls/tests/common/mod.rs
++++ b/rustls/tests/common/mod.rs
+@@ -10,15 +10,14 @@ use pki_types::{
+ };
+ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+ use rustls::client::{ServerCertVerifierBuilder, WebPkiServerVerifier};
+-use rustls::crypto::cipher::{InboundOpaqueMessage, MessageDecrypter, MessageEncrypter};
+ use rustls::crypto::CryptoProvider;
+-use rustls::internal::msgs::codec::{Codec, Reader};
++use rustls::internal::msgs::codec::Reader;
+ use rustls::internal::msgs::message::{Message, OutboundOpaqueMessage, PlainMessage};
+ use rustls::server::{ClientCertVerifierBuilder, WebPkiClientVerifier};
+ use rustls::{
+-    ClientConfig, ClientConnection, Connection, ConnectionCommon, ContentType,
+-    DigitallySignedStruct, Error, ProtocolVersion, RootCertStore, ServerConfig, ServerConnection,
+-    SideData, SignatureScheme, SupportedCipherSuite,
++    ClientConfig, ClientConnection, Connection, ConnectionCommon, DigitallySignedStruct, Error,
++    ProtocolVersion, RootCertStore, ServerConfig, ServerConnection, SideData, SignatureScheme,
++    SupportedCipherSuite,
+ };
+ use webpki::anchor_from_trusted_cert;
+ 
+@@ -917,126 +916,3 @@ impl Default for MockServerVerifier {
+         }
+     }
+ }
+-
+-/// This allows injection/receipt of raw messages into a post-handshake connection.
+-///
+-/// It consumes one of the peers, extracts its secrets, and then reconstitutes the
+-/// message encrypter/decrypter.  It does not do fragmentation/joining.
+-pub struct RawTls {
+-    encrypter: Box<dyn MessageEncrypter>,
+-    enc_seq: u64,
+-    decrypter: Box<dyn MessageDecrypter>,
+-    dec_seq: u64,
+-}
+-
+-impl RawTls {
+-    /// conn must be post-handshake, and must have been created with `enable_secret_extraction`
+-    pub fn new_client(conn: ClientConnection) -> Self {
+-        let suite = conn.negotiated_cipher_suite().unwrap();
+-        Self::new(
+-            suite,
+-            conn.dangerous_extract_secrets()
+-                .unwrap(),
+-        )
+-    }
+-
+-    /// conn must be post-handshake, and must have been created with `enable_secret_extraction`
+-    pub fn new_server(conn: ServerConnection) -> Self {
+-        let suite = conn.negotiated_cipher_suite().unwrap();
+-        Self::new(
+-            suite,
+-            conn.dangerous_extract_secrets()
+-                .unwrap(),
+-        )
+-    }
+-
+-    fn new(suite: SupportedCipherSuite, secrets: rustls::ExtractedSecrets) -> Self {
+-        let rustls::ExtractedSecrets {
+-            tx: (tx_seq, tx_keys),
+-            rx: (rx_seq, rx_keys),
+-        } = secrets;
+-
+-        let encrypter = match (tx_keys, suite) {
+-            (
+-                rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+-                SupportedCipherSuite::Tls13(tls13),
+-            ) => tls13.aead_alg.encrypter(key, iv),
+-
+-            (
+-                rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+-                SupportedCipherSuite::Tls12(tls12),
+-            ) => tls12
+-                .aead_alg
+-                .encrypter(key, &iv.as_ref()[..4], &iv.as_ref()[4..]),
+-
+-            _ => todo!(),
+-        };
+-
+-        let decrypter = match (rx_keys, suite) {
+-            (
+-                rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+-                SupportedCipherSuite::Tls13(tls13),
+-            ) => tls13.aead_alg.decrypter(key, iv),
+-
+-            (
+-                rustls::ConnectionTrafficSecrets::Aes256Gcm { key, iv },
+-                SupportedCipherSuite::Tls12(tls12),
+-            ) => tls12
+-                .aead_alg
+-                .decrypter(key, &iv.as_ref()[..4]),
+-
+-            _ => todo!(),
+-        };
+-
+-        Self {
+-            encrypter,
+-            enc_seq: tx_seq,
+-            decrypter,
+-            dec_seq: rx_seq,
+-        }
+-    }
+-
+-    pub fn encrypt_and_send(
+-        &mut self,
+-        msg: &PlainMessage,
+-        peer: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
+-    ) {
+-        let data = self
+-            .encrypter
+-            .encrypt(msg.borrow_outbound(), self.enc_seq)
+-            .unwrap()
+-            .encode();
+-        self.enc_seq += 1;
+-        peer.read_tls(&mut io::Cursor::new(data))
+-            .unwrap();
+-    }
+-
+-    pub fn receive_and_decrypt(
+-        &mut self,
+-        peer: &mut impl DerefMut<Target = ConnectionCommon<impl SideData>>,
+-        f: impl Fn(Message),
+-    ) {
+-        let mut data = vec![];
+-        peer.write_tls(&mut io::Cursor::new(&mut data))
+-            .unwrap();
+-
+-        let mut reader = Reader::init(&data);
+-        let content_type = ContentType::read(&mut reader).unwrap();
+-        let version = ProtocolVersion::read(&mut reader).unwrap();
+-        let len = u16::read(&mut reader).unwrap();
+-        let left = &mut data[5..];
+-        assert_eq!(len as usize, left.len());
+-
+-        let inbound = InboundOpaqueMessage::new(content_type, version, left);
+-        let plain = self
+-            .decrypter
+-            .decrypt(inbound, self.dec_seq)
+-            .unwrap();
+-        self.dec_seq += 1;
+-
+-        let msg = Message::try_from(plain).unwrap();
+-        println!("receive_and_decrypt: {msg:?}");
+-
+-        f(msg);
+-    }
+-}

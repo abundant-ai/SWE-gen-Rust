@@ -9,25 +9,17 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# TODO: Install language runtime
-# Analyze the repo to determine what's needed. Examples:
-#   Python: apt-get install python3 python3-pip python3-venv python3-dev
-#   Node.js: curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs
-#   Go: Download from golang.org/dl or use apt
-#   Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-#   Ruby: apt-get install ruby ruby-dev
-#   Java: apt-get install openjdk-17-jdk
-# Check .nvmrc, .python-version, .ruby-version, go.mod, rust-toolchain.toml, etc.
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
 
-# TODO: Install additional system packages if needed
-# Check CI config (.github/workflows/*.yml) for hints about required packages
-# Examples: python3-dev, libssl-dev, pkg-config, cmake, etc.
+# Install Node.js (required for wasm-bindgen tests)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
 
-# TODO: Set up package manager if needed
-# For Python: PREFER uv (much faster than pip)
-#   curl -LsSf https://astral.sh/uv/install.sh | sh && mv /root/.local/bin/uv /usr/local/bin/uv
-# For Node.js: corepack enable (for yarn/pnpm) or npm is built-in
-# For Ruby: gem install bundler
+# Add wasm32-unknown-unknown target for Rust
+RUN rustup target add wasm32-unknown-unknown
 
 WORKDIR /app
 
@@ -40,28 +32,11 @@ RUN git clone https://github.com/wasm-bindgen/wasm-bindgen.git src && \
 
 WORKDIR /app/src
 
-# TODO: Set environment variables if needed
-# Check CI config and README for required env vars
-# Examples: CI=true, NODE_ENV=test, CARGO_TERM_COLOR=never
+# Set environment variables for Rust
+ENV CARGO_TERM_COLOR=never
 
-# TODO: Install dependencies
-# For Python: PREFER uv (much faster). Create venv and install:
-#   uv venv /opt/venv
-#   uv pip install --python /opt/venv/bin/python -e ".[dev,test]"
-#   # Or: uv pip install --python /opt/venv/bin/python -r requirements.txt
-#   # Then add to PATH: ENV PATH="/opt/venv/bin:${PATH}"
-# For Node.js: npm ci, yarn install --frozen-lockfile, pnpm install --frozen-lockfile
-# For Go: go mod download
-# For Rust: cargo fetch
-# For Ruby: bundle install
-# For Java: mvn dependency:resolve or gradle dependencies
-
-# TODO: Build if needed (check if it's a compiled language or has build step)
-# Examples:
-#   TypeScript: npm run build, tsc
-#   Rust: cargo build
-#   Go: go build ./...
-#   Java: mvn compile, gradle build
+# Fetch dependencies
+RUN cargo fetch
 
 # If install/build steps touched tracked files, reset them so bug.patch applies cleanly,
 RUN git reset --hard
@@ -70,8 +45,8 @@ RUN git reset --hard
 COPY bug.patch /tmp/bug.patch
 RUN patch -p1 < /tmp/bug.patch && rm /tmp/bug.patch
 
-# TODO: Rebuild after applying bug.patch if needed
-# For compiled languages (TypeScript, Rust, Go, Java), you MUST rebuild after patching
+# Rebuild after applying bug.patch
+RUN cargo fetch
 
 RUN rm -rf /app/src/.git
 

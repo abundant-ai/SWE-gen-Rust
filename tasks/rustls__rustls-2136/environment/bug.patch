@@ -1,0 +1,436 @@
+diff --git a/bogo/config.json.in b/bogo/config.json.in
+index 2586a6f3..ec7ddd7a 100644
+--- a/bogo/config.json.in
++++ b/bogo/config.json.in
+@@ -50,6 +50,7 @@
+     "*-RSA_PKCS1_SHA256_LEGACY-*": "NYI on our side https://datatracker.ietf.org/doc/draft-ietf-tls-tls13-pkcs1/01/",
+     "NoCommonSignatureAlgorithms-TLS12-Fallback": "requires TLS_RSA_WITH_AES_128_GCM_SHA256",
+ #if defined(POST_QUANTUM)
++    "NotJustMLKEMKeyShare": "we only offer the first kxg in a clienthello",
+     "MLKEMKeyShareIncludedSecond": "we only include a share for the first configured group",
+     "MLKEMKeyShareIncludedThird": "^",
+ #else
+diff --git a/rustls-post-quantum/src/lib.rs b/rustls-post-quantum/src/lib.rs
+index 9125d2ed..c743f149 100644
+--- a/rustls-post-quantum/src/lib.rs
++++ b/rustls-post-quantum/src/lib.rs
+@@ -155,18 +155,6 @@ impl ActiveKeyExchange for Active {
+         Ok(SharedSecret::from(&combined.0[..]))
+     }
+ 
+-    /// Allow the X25519 computation to be offered and selected separately.
+-    fn hybrid_component(&self) -> Option<(NamedGroup, &[u8])> {
+-        Some((self.x25519.group(), self.x25519.pub_key()))
+-    }
+-
+-    fn complete_hybrid_component(
+-        self: Box<Self>,
+-        peer_pub_key: &[u8],
+-    ) -> Result<SharedSecret, Error> {
+-        self.x25519.complete(peer_pub_key)
+-    }
+-
+     fn pub_key(&self) -> &[u8] {
+         &self.combined_pub_key
+     }
+diff --git a/rustls/src/client/hs.rs b/rustls/src/client/hs.rs
+index 30a97b66..d84eba64 100644
+--- a/rustls/src/client/hs.rs
++++ b/rustls/src/client/hs.rs
+@@ -304,26 +304,8 @@ fn emit_client_hello_for_retry(
+ 
+     if let Some(key_share) = &key_share {
+         debug_assert!(support_tls13);
+-        let mut shares = vec![KeyShareEntry::new(key_share.group(), key_share.pub_key())];
+-
+-        if retryreq.is_none() {
+-            // Only for the initial client hello, see if we can send a second KeyShare
+-            // for "free".  We only do this if the same algorithm is also supported
+-            // separately by our provider for this version (`find_kx_group` looks that up).
+-            if let Some((component_group, component_share)) =
+-                key_share
+-                    .hybrid_component()
+-                    .filter(|(group, _)| {
+-                        config
+-                            .find_kx_group(*group, ProtocolVersion::TLSv1_3)
+-                            .is_some()
+-                    })
+-            {
+-                shares.push(KeyShareEntry::new(component_group, component_share));
+-            }
+-        }
+-
+-        exts.push(ClientExtension::KeyShare(shares));
++        let key_share = KeyShareEntry::new(key_share.group(), key_share.pub_key());
++        exts.push(ClientExtension::KeyShare(vec![key_share]));
+     }
+ 
+     if let Some(cookie) = retryreq.and_then(HelloRetryRequest::cookie) {
+diff --git a/rustls/src/client/tls13.rs b/rustls/src/client/tls13.rs
+index 6794579a..69d7a79e 100644
+--- a/rustls/src/client/tls13.rs
++++ b/rustls/src/client/tls13.rs
+@@ -16,7 +16,7 @@ use crate::common_state::{
+     CommonState, HandshakeFlightTls13, HandshakeKind, KxState, Protocol, Side, State,
+ };
+ use crate::conn::ConnectionRandoms;
+-use crate::crypto::{ActiveKeyExchange, SharedSecret};
++use crate::crypto::ActiveKeyExchange;
+ use crate::enums::{
+     AlertDescription, ContentType, HandshakeType, ProtocolVersion, SignatureScheme,
+ };
+@@ -29,9 +29,8 @@ use crate::msgs::codec::{Codec, Reader};
+ use crate::msgs::enums::{ExtensionType, KeyUpdateRequest};
+ use crate::msgs::handshake::{
+     CertificatePayloadTls13, ClientExtension, EchConfigPayload, HandshakeMessagePayload,
+-    HandshakePayload, HasServerExtensions, KeyShareEntry, NewSessionTicketPayloadTls13,
+-    PresharedKeyIdentity, PresharedKeyOffer, ServerExtension, ServerHelloPayload,
+-    CERTIFICATE_MAX_SIZE_LIMIT,
++    HandshakePayload, HasServerExtensions, NewSessionTicketPayloadTls13, PresharedKeyIdentity,
++    PresharedKeyOffer, ServerExtension, ServerHelloPayload, CERTIFICATE_MAX_SIZE_LIMIT,
+ };
+ use crate::msgs::message::{Message, MessagePayload};
+ use crate::msgs::persist;
+@@ -90,13 +89,14 @@ pub(super) fn handle_server_hello(
+             )
+         })?;
+ 
+-    let our_key_share = KeyExchangeChoice::new(&config, cx, our_key_share, their_key_share)
+-        .map_err(|_| {
++    if our_key_share.group() != their_key_share.group {
++        return Err({
+             cx.common.send_fatal_alert(
+                 AlertDescription::IllegalParameter,
+                 PeerMisbehaved::WrongGroupForKeyShare,
+             )
+-        })?;
++        });
++    }
+ 
+     let key_schedule_pre_handshake = if let (Some(selected_psk), Some(early_key_schedule)) =
+         (server_hello.psk_index(), early_key_schedule)
+@@ -214,50 +214,6 @@ pub(super) fn handle_server_hello(
+     }))
+ }
+ 
+-enum KeyExchangeChoice {
+-    Whole(Box<dyn ActiveKeyExchange>),
+-    Component(Box<dyn ActiveKeyExchange>),
+-}
+-
+-impl KeyExchangeChoice {
+-    /// Decide between `our_key_share` or `our_key_share.hybrid_component()`
+-    /// based on the selection of the server expressed in `their_key_share`.
+-    fn new(
+-        config: &Arc<ClientConfig>,
+-        cx: &mut ClientContext<'_>,
+-        our_key_share: Box<dyn ActiveKeyExchange>,
+-        their_key_share: &KeyShareEntry,
+-    ) -> Result<Self, ()> {
+-        if our_key_share.group() == their_key_share.group {
+-            return Ok(Self::Whole(our_key_share));
+-        }
+-
+-        let (component_group, _) = our_key_share
+-            .hybrid_component()
+-            .ok_or(())?;
+-
+-        if component_group != their_key_share.group {
+-            return Err(());
+-        }
+-
+-        // correct the record for the benefit of accuracy of
+-        // `negotiated_key_exchange_group()`
+-        let actual_skxg = config
+-            .find_kx_group(component_group, ProtocolVersion::TLSv1_3)
+-            .ok_or(())?;
+-        cx.common.kx_state = KxState::Start(actual_skxg);
+-
+-        Ok(Self::Component(our_key_share))
+-    }
+-
+-    fn complete(self, peer_pub_key: &[u8]) -> Result<SharedSecret, Error> {
+-        match self {
+-            Self::Whole(akx) => akx.complete(peer_pub_key),
+-            Self::Component(akx) => akx.complete_hybrid_component(peer_pub_key),
+-        }
+-    }
+-}
+-
+ fn validate_server_hello(
+     common: &mut CommonState,
+     server_hello: &ServerHelloPayload,
+diff --git a/rustls/src/crypto/mod.rs b/rustls/src/crypto/mod.rs
+index 8d66a8a3..18a25b28 100644
+--- a/rustls/src/crypto/mod.rs
++++ b/rustls/src/crypto/mod.rs
+@@ -484,87 +484,6 @@ pub trait ActiveKeyExchange: Send + Sync {
+         Ok(complete_res)
+     }
+ 
+-    /// For hybrid key exchanges, returns the [`NamedGroup`] and key share
+-    /// for the classical half of this key exchange.
+-    ///
+-    /// There is no requirement for a hybrid scheme (or any other!) to implement
+-    /// `hybrid_component()`. It only enables an optimization; described below.
+-    ///
+-    /// "Hybrid" means a key exchange algorithm which is constructed from two
+-    /// (or more) independent component algorithms. Usually one is post-quantum-secure,
+-    /// and the other is "classical".  See
+-    /// <https://datatracker.ietf.org/doc/draft-ietf-tls-hybrid-design/11/>
+-    ///
+-    /// # Background
+-    /// Rustls always sends a presumptive key share in its `ClientHello`, using
+-    /// (absent any other information) the first item in [`CryptoProvider::kx_groups`].
+-    /// If the server accepts the client's selection, it can complete the handshake
+-    /// using that key share.  If not, the server sends a `HelloRetryRequest` instructing
+-    /// the client to send a different key share instead.
+-    ///
+-    /// This request costs an extra round trip, and wastes the key exchange computation
+-    /// (in [`SupportedKxGroup::start()`]) the client already did.  We would
+-    /// like to avoid those wastes if possible.
+-    ///
+-    /// It is early days for post-quantum-secure hybrid key exchange deployment.
+-    /// This means (commonly) continuing to offer both the hybrid and classical
+-    /// key exchanges, so the handshake can be completed without a `HelloRetryRequest`
+-    /// for servers that support the offered hybrid or classical schemes.
+-    ///
+-    /// Implementing `hybrid_component()` enables two optimizations:
+-    ///
+-    /// 1. Sending both the hybrid and classical key shares in the `ClientHello`.
+-    ///
+-    /// 2. Performing the classical key exchange setup only once.  This is important
+-    ///    because the classical key exchange setup is relatively expensive.
+-    ///    This optimization is permitted and described in
+-    ///    <https://www.ietf.org/archive/id/draft-ietf-tls-hybrid-design-11.html#section-3.2>
+-    ///
+-    /// Both of these only happen if the classical algorithm appears separately in
+-    /// the client's [`CryptoProvider::kx_groups`], and if the hybrid algorithm appears
+-    /// first in that list.
+-    ///
+-    /// # How it works
+-    /// This function is only called by rustls for clients.  It is called when
+-    /// constructing the initial `ClientHello`.  rustls follows these steps:
+-    ///
+-    /// 1. If the return value is `None`, nothing further happens.
+-    /// 2. If the given [`NamedGroup`] does not appear in
+-    ///    [`CryptoProvider::kx_groups`], nothing further happens.
+-    /// 3. The given key share is added to the `ClientHello`, after the hybrid entry.
+-    ///
+-    /// Then, one of three things may happen when the server replies to the `ClientHello`:
+-    ///
+-    /// 1. The server sends a `HelloRetryRequest`.  Everything is thrown away and
+-    ///    we start again.
+-    /// 2. The server agrees to our hybrid key exchange: rustls calls
+-    ///    [`ActiveKeyExchange::complete()`] consuming `self`.
+-    /// 3. The server agrees to our classical key exchange: rustls calls
+-    ///    [`ActiveKeyExchange::complete_hybrid_component()`] which
+-    ///    discards the hybrid key data, and completes just the classical key exchange.
+-    fn hybrid_component(&self) -> Option<(NamedGroup, &[u8])> {
+-        None
+-    }
+-
+-    /// Completes the classical component of the key exchange, given the peer's public key.
+-    ///
+-    /// This is only called if `hybrid_component` returns `Some(_)`.
+-    ///
+-    /// This method must return an error if `peer_pub_key` is invalid: either
+-    /// mis-encoded, or an invalid public key (such as, but not limited to, being
+-    /// in a small order subgroup).
+-    ///
+-    /// The shared secret is returned as a [`SharedSecret`] which can be constructed
+-    /// from a `&[u8]`.
+-    ///
+-    /// See the documentation on [`Self::hybrid_component()`] for explanation.
+-    fn complete_hybrid_component(
+-        self: Box<Self>,
+-        _peer_pub_key: &[u8],
+-    ) -> Result<SharedSecret, Error> {
+-        unreachable!("only called if `hybrid_component()` implemented")
+-    }
+-
+     /// Return the public key being used.
+     ///
+     /// For ECDHE, the encoding required is defined in
+@@ -605,7 +524,7 @@ pub struct CompletedKeyExchange {
+     pub secret: SharedSecret,
+ }
+ 
+-/// The result from [`ActiveKeyExchange::complete`] or [`ActiveKeyExchange::complete_hybrid_component`].
++/// The result from [`ActiveKeyExchange::complete`].
+ pub struct SharedSecret {
+     buf: Vec<u8>,
+     offset: usize,
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index a9bc0f3d..c1580e84 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -11,7 +11,7 @@ use std::{fmt, mem};
+ 
+ use pki_types::{CertificateDer, IpAddr, ServerName, UnixTime};
+ use rustls::client::{verify_server_cert_signed_by_trust_anchor, ResolvesClientCert, Resumption};
+-use rustls::crypto::{ActiveKeyExchange, CryptoProvider, SharedSecret, SupportedKxGroup};
++use rustls::crypto::CryptoProvider;
+ use rustls::internal::msgs::base::Payload;
+ use rustls::internal::msgs::codec::Codec;
+ use rustls::internal::msgs::enums::{AlertLevel, CertificateType, Compression};
+@@ -8183,159 +8183,4 @@ fn large_client_hello_acceptor() {
+     }
+ }
+ 
+-#[test]
+-fn hybrid_kx_component_share_offered_if_supported_seperately() {
+-    let kt = KeyType::Rsa2048;
+-    let client_config = finish_client_config(
+-        kt,
+-        ClientConfig::builder_with_provider(
+-            CryptoProvider {
+-                kx_groups: vec![&FakeHybrid, provider::kx_group::SECP384R1],
+-                ..provider::default_provider()
+-            }
+-            .into(),
+-        )
+-        .with_safe_default_protocol_versions()
+-        .unwrap(),
+-    );
+-    let server_config = make_server_config(kt);
+-
+-    let (client, server) = make_pair_for_configs(client_config, server_config);
+-    let (mut client, mut server) = (client.into(), server.into());
+-    transfer_altered(
+-        &mut client,
+-        assert_client_sends_hello_with_two_key_shares,
+-        &mut server,
+-    );
+-}
+-
+-#[test]
+-fn hybrid_kx_component_share_not_offered_unless_supported_seperately() {
+-    let kt = KeyType::Rsa2048;
+-    let client_config = finish_client_config(
+-        kt,
+-        ClientConfig::builder_with_provider(
+-            CryptoProvider {
+-                kx_groups: vec![&FakeHybrid],
+-                ..provider::default_provider()
+-            }
+-            .into(),
+-        )
+-        .with_safe_default_protocol_versions()
+-        .unwrap(),
+-    );
+-    let server_config = make_server_config(kt);
+-
+-    let (client, server) = make_pair_for_configs(client_config, server_config);
+-    let (mut client, mut server) = (client.into(), server.into());
+-    transfer_altered(
+-        &mut client,
+-        assert_client_sends_hello_with_one_hybrid_key_share,
+-        &mut server,
+-    );
+-}
+-
+-#[test]
+-fn hybrid_kx_component_share_offered_but_server_chooses_something_else() {
+-    let kt = KeyType::Rsa2048;
+-    let client_config = finish_client_config(
+-        kt,
+-        ClientConfig::builder_with_provider(
+-            CryptoProvider {
+-                kx_groups: vec![&FakeHybrid, provider::kx_group::SECP384R1],
+-                ..provider::default_provider()
+-            }
+-            .into(),
+-        )
+-        .with_safe_default_protocol_versions()
+-        .unwrap(),
+-    );
+-    let server_config = make_server_config(kt);
+-
+-    let (mut client_1, mut server) = make_pair_for_configs(client_config, server_config);
+-    let (mut client_2, _) = make_pair(kt);
+-
+-    // client_2 supplies the ClientHello, client_1 receives the ServerHello
+-    transfer(&mut client_2, &mut server);
+-    server.process_new_packets().unwrap();
+-    transfer(&mut server, &mut client_1);
+-    assert_eq!(
+-        client_1
+-            .process_new_packets()
+-            .unwrap_err(),
+-        PeerMisbehaved::WrongGroupForKeyShare.into()
+-    );
+-}
+-
+-#[derive(Debug)]
+-struct FakeHybrid;
+-
+-impl SupportedKxGroup for FakeHybrid {
+-    fn start(&self) -> Result<Box<dyn ActiveKeyExchange>, Error> {
+-        Ok(Box::new(FakeHybridActive))
+-    }
+-
+-    fn name(&self) -> NamedGroup {
+-        NamedGroup::from(0x1234)
+-    }
+-}
+-
+-struct FakeHybridActive;
+-
+-impl ActiveKeyExchange for FakeHybridActive {
+-    fn complete(self: Box<Self>, _peer_pub_key: &[u8]) -> Result<SharedSecret, Error> {
+-        Err(PeerMisbehaved::InvalidKeyShare.into())
+-    }
+-
+-    fn hybrid_component(&self) -> Option<(NamedGroup, &[u8])> {
+-        Some((provider::kx_group::SECP384R1.name(), b"classical"))
+-    }
+-
+-    fn pub_key(&self) -> &[u8] {
+-        b"hybrid"
+-    }
+-
+-    fn group(&self) -> NamedGroup {
+-        FakeHybrid.name()
+-    }
+-}
+-
+-fn assert_client_sends_hello_with_two_key_shares(msg: &mut Message) -> Altered {
+-    match &mut msg.payload {
+-        MessagePayload::Handshake { parsed, .. } => match &mut parsed.payload {
+-            HandshakePayload::ClientHello(ch) => {
+-                let keyshares = ch
+-                    .keyshare_extension()
+-                    .expect("missing key share extension");
+-                assert_eq!(keyshares.len(), 2);
+-                assert_eq!(keyshares[0].group(), FakeHybrid.name());
+-                assert_eq!(keyshares[0].get_encoding(), b"\x12\x34\x00\x06hybrid");
+-                assert_eq!(keyshares[1].group(), NamedGroup::secp384r1);
+-                assert_eq!(keyshares[1].get_encoding(), b"\x00\x18\x00\x09classical");
+-            }
+-            _ => panic!("unexpected handshake message {parsed:?}"),
+-        },
+-        _ => panic!("unexpected non-handshake message {msg:?}"),
+-    };
+-    Altered::InPlace
+-}
+-
+-fn assert_client_sends_hello_with_one_hybrid_key_share(msg: &mut Message) -> Altered {
+-    match &mut msg.payload {
+-        MessagePayload::Handshake { parsed, .. } => match &mut parsed.payload {
+-            HandshakePayload::ClientHello(ch) => {
+-                let keyshares = ch
+-                    .keyshare_extension()
+-                    .expect("missing key share extension");
+-                assert_eq!(keyshares.len(), 1);
+-                assert_eq!(keyshares[0].group(), FakeHybrid.name());
+-                assert_eq!(keyshares[0].get_encoding(), b"\x12\x34\x00\x06hybrid");
+-            }
+-            _ => panic!("unexpected handshake message {parsed:?}"),
+-        },
+-        _ => panic!("unexpected non-handshake message {msg:?}"),
+-    };
+-    Altered::InPlace
+-}
+-
+ const CONFIDENTIALITY_LIMIT: u64 = 1024;

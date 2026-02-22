@@ -1,0 +1,179 @@
+diff --git a/examples/derive_ref/interop_tests.md b/examples/derive_ref/interop_tests.md
+index 2645a615..b013b0c8 100644
+--- a/examples/derive_ref/interop_tests.md
++++ b/examples/derive_ref/interop_tests.md
+@@ -37,8 +37,6 @@ $ interop_augment_args --unknown
+ ? failed
+ error: Found argument '--unknown' which wasn't expected, or isn't valid in this context
+ 
+-  If you tried to supply '--unknown' as a value rather than a flag, use '-- --unknown'
+-
+ Usage: interop_augment_args[EXE] [OPTIONS]
+ 
+ For more information try '--help'
+@@ -74,8 +72,6 @@ $ interop_augment_subcommands derived --unknown
+ ? failed
+ error: Found argument '--unknown' which wasn't expected, or isn't valid in this context
+ 
+-  If you tried to supply '--unknown' as a value rather than a flag, use '-- --unknown'
+-
+ Usage: interop_augment_subcommands[EXE] derived [OPTIONS]
+ 
+ For more information try '--help'
+@@ -245,8 +241,6 @@ $ interop_flatten_hand_args --unknown
+ ? failed
+ error: Found argument '--unknown' which wasn't expected, or isn't valid in this context
+ 
+-  If you tried to supply '--unknown' as a value rather than a flag, use '-- --unknown'
+-
+ Usage: interop_flatten_hand_args[EXE] [OPTIONS]
+ 
+ For more information try '--help'
+diff --git a/src/error/context.rs b/src/error/context.rs
+index d9921b4e..e0055bb2 100644
+--- a/src/error/context.rs
++++ b/src/error/context.rs
+@@ -29,6 +29,8 @@ pub enum ContextKind {
+     SuggestedValue,
+     /// Trailing argument
+     TrailingArg,
++    /// Potential fix for the user
++    SuggestedTrailingArg,
+     /// A usage string
+     Usage,
+     /// An opaque message to the user
+@@ -51,6 +53,7 @@ impl ContextKind {
+             Self::SuggestedSubcommand => Some("Suggested Subcommand"),
+             Self::SuggestedArg => Some("Suggested Argument"),
+             Self::SuggestedValue => Some("Suggested Value"),
++            Self::SuggestedTrailingArg => Some("Suggested Trailing Argument"),
+             Self::TrailingArg => Some("Trailing Argument"),
+             Self::Usage => None,
+             Self::Custom => None,
+diff --git a/src/error/format.rs b/src/error/format.rs
+index 15208b32..39ddea1b 100644
+--- a/src/error/format.rs
++++ b/src/error/format.rs
+@@ -360,7 +360,8 @@ fn write_dynamic_context(error: &crate::error::Error, styled: &mut StyledStr) ->
+ 
+                 let invalid_arg = error.get(ContextKind::InvalidArg);
+                 if let Some(ContextValue::String(invalid_arg)) = invalid_arg {
+-                    if invalid_arg.starts_with('-') {
++                    let suggested_trailing_arg = error.get(ContextKind::SuggestedTrailingArg);
++                    if suggested_trailing_arg == Some(&ContextValue::Bool(true)) {
+                         styled.none("\n\n");
+                         styled.none(TAB);
+                         styled.none("If you tried to supply '");
+diff --git a/src/error/mod.rs b/src/error/mod.rs
+index 932e9065..184761c9 100644
+--- a/src/error/mod.rs
++++ b/src/error/mod.rs
+@@ -638,6 +638,7 @@ impl<F: ErrorFormatter> Error<F> {
+         cmd: &Command,
+         arg: String,
+         did_you_mean: Option<(String, Option<String>)>,
++        suggested_trailing_arg: bool,
+         usage: Option<StyledStr>,
+     ) -> Self {
+         let mut err = Self::new(ErrorKind::UnknownArgument).with_cmd(cmd);
+@@ -662,6 +663,12 @@ impl<F: ErrorFormatter> Error<F> {
+                     );
+                 }
+             }
++            if suggested_trailing_arg {
++                err = err.insert_context_unchecked(
++                    ContextKind::SuggestedTrailingArg,
++                    ContextValue::Bool(true),
++                );
++            }
+         }
+ 
+         err
+diff --git a/src/parser/parser.rs b/src/parser/parser.rs
+index 9a224cd8..b6fb18e6 100644
+--- a/src/parser/parser.rs
++++ b/src/parser/parser.rs
+@@ -175,7 +175,12 @@ impl<'cmd> Parser<'cmd> {
+                                 .remaining(&mut args_cursor)
+                                 .map(|x| x.to_str().expect(INVALID_UTF8))
+                                 .collect();
+-                            return Err(self.did_you_mean_error(&arg, matcher, &remaining_args));
++                            return Err(self.did_you_mean_error(
++                                &arg,
++                                matcher,
++                                &remaining_args,
++                                trailing_values,
++                            ));
+                         }
+                         ParseResult::UnneededAttachedValue { rest, used, arg } => {
+                             let _ = self.resolve_pending(matcher);
+@@ -257,10 +262,14 @@ impl<'cmd> Parser<'cmd> {
+                         }
+                         ParseResult::NoMatchingArg { arg } => {
+                             let _ = self.resolve_pending(matcher);
++                            // We already know it looks like a flag
++                            let suggested_trailing_arg =
++                                !trailing_values && self.cmd.has_positionals();
+                             return Err(ClapError::unknown_argument(
+                                 self.cmd,
+                                 arg,
+                                 None,
++                                suggested_trailing_arg,
+                                 Usage::new(self.cmd).create_usage_with_title(&[]),
+                             ));
+                         }
+@@ -374,10 +383,14 @@ impl<'cmd> Parser<'cmd> {
+             if let Some(arg) = self.cmd.get_keymap().get(&pos_counter) {
+                 if arg.is_last_set() && !trailing_values {
+                     let _ = self.resolve_pending(matcher);
++                    // Its already considered a positional, we don't need to suggest turning it
++                    // into one
++                    let suggested_trailing_arg = false;
+                     return Err(ClapError::unknown_argument(
+                         self.cmd,
+                         arg_os.display().to_string(),
+                         None,
++                        suggested_trailing_arg,
+                         Usage::new(self.cmd).create_usage_with_title(&[]),
+                     ));
+                 }
+@@ -524,10 +537,14 @@ impl<'cmd> Parser<'cmd> {
+             );
+         }
+ 
++        let suggested_trailing_arg = !trailing_values
++            && self.cmd.has_positionals()
++            && (arg_os.is_long() || arg_os.is_short());
+         ClapError::unknown_argument(
+             self.cmd,
+             arg_os.display().to_string(),
+             None,
++            suggested_trailing_arg,
+             Usage::new(self.cmd).create_usage_with_title(&[]),
+         )
+     }
+@@ -1511,6 +1528,7 @@ impl<'cmd> Parser<'cmd> {
+         arg: &str,
+         matcher: &mut ArgMatcher,
+         remaining_args: &[&str],
++        trailing_values: bool,
+     ) -> ClapError {
+         debug!("Parser::did_you_mean_error: arg={}", arg);
+         // Didn't match a flag or option
+@@ -1549,10 +1567,16 @@ impl<'cmd> Parser<'cmd> {
+             .cloned()
+             .collect();
+ 
++        // `did_you_mean` is a lot more likely and should cause us to skip the `--` suggestion
++        //
++        // In theory, this is only called for `--long`s, so we don't need to check
++        let suggested_trailing_arg =
++            did_you_mean.is_none() && !trailing_values && self.cmd.has_positionals();
+         ClapError::unknown_argument(
+             self.cmd,
+             format!("--{}", arg),
+             did_you_mean,
++            suggested_trailing_arg,
+             Usage::new(self.cmd)
+                 .required(&required)
+                 .create_usage_with_title(&*used),

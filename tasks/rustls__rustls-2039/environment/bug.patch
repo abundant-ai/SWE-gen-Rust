@@ -1,0 +1,305 @@
+diff --git a/rustls/src/crypto/aws_lc_rs/sign.rs b/rustls/src/crypto/aws_lc_rs/sign.rs
+index b6fc59e8..e8000a3b 100644
+--- a/rustls/src/crypto/aws_lc_rs/sign.rs
++++ b/rustls/src/crypto/aws_lc_rs/sign.rs
+@@ -7,14 +7,13 @@ use alloc::vec::Vec;
+ use alloc::{format, vec};
+ use core::fmt::{self, Debug, Formatter};
+ 
+-use pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, SubjectPublicKeyInfoDer};
+-use webpki::alg_id;
++use pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+ 
+ use super::ring_like::rand::SystemRandom;
+-use super::ring_like::signature::{self, EcdsaKeyPair, Ed25519KeyPair, KeyPair, RsaKeyPair};
+-use crate::crypto::signer::{public_key_to_spki, Signer, SigningKey};
++use super::ring_like::signature::{self, EcdsaKeyPair, Ed25519KeyPair, RsaKeyPair};
+ use crate::enums::{SignatureAlgorithm, SignatureScheme};
+ use crate::error::Error;
++use crate::sign::{Signer, SigningKey};
+ 
+ /// Parse `der` as any supported key encoding/type, returning
+ /// the first which works.
+@@ -130,13 +129,6 @@ impl SigningKey for RsaSigningKey {
+             .map(|scheme| RsaSigner::new(Arc::clone(&self.key), *scheme))
+     }
+ 
+-    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+-        Some(public_key_to_spki(
+-            &alg_id::RSA_ENCRYPTION,
+-            self.key.public_key(),
+-        ))
+-    }
+-
+     fn algorithm(&self) -> SignatureAlgorithm {
+         SignatureAlgorithm::RSA
+     }
+@@ -255,17 +247,6 @@ impl SigningKey for EcdsaSigningKey {
+         }
+     }
+ 
+-    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+-        let id = match self.scheme {
+-            SignatureScheme::ECDSA_NISTP256_SHA256 => alg_id::ECDSA_P256,
+-            SignatureScheme::ECDSA_NISTP384_SHA384 => alg_id::ECDSA_P384,
+-            SignatureScheme::ECDSA_NISTP521_SHA512 => alg_id::ECDSA_P521,
+-            _ => unreachable!(),
+-        };
+-
+-        Some(public_key_to_spki(&id, self.key.public_key()))
+-    }
+-
+     fn algorithm(&self) -> SignatureAlgorithm {
+         self.scheme.algorithm()
+     }
+@@ -350,10 +331,6 @@ impl SigningKey for Ed25519SigningKey {
+         }
+     }
+ 
+-    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+-        Some(public_key_to_spki(&alg_id::ED25519, self.key.public_key()))
+-    }
+-
+     fn algorithm(&self) -> SignatureAlgorithm {
+         self.scheme.algorithm()
+     }
+diff --git a/rustls/src/crypto/ring/sign.rs b/rustls/src/crypto/ring/sign.rs
+index 3f5f6f39..9234d618 100644
+--- a/rustls/src/crypto/ring/sign.rs
++++ b/rustls/src/crypto/ring/sign.rs
+@@ -7,15 +7,15 @@ use alloc::vec::Vec;
+ use alloc::{format, vec};
+ use core::fmt::{self, Debug, Formatter};
+ 
+-use pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, SubjectPublicKeyInfoDer};
+-use webpki::alg_id;
++use pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+ 
++use super::ring_like::io::der;
+ use super::ring_like::rand::{SecureRandom, SystemRandom};
+-use super::ring_like::signature::{self, EcdsaKeyPair, Ed25519KeyPair, KeyPair, RsaKeyPair};
+-use crate::crypto::signer::{public_key_to_spki, Signer, SigningKey};
++use super::ring_like::signature::{self, EcdsaKeyPair, Ed25519KeyPair, RsaKeyPair};
+ use crate::enums::{SignatureAlgorithm, SignatureScheme};
+ use crate::error::Error;
+-use crate::x509::{wrap_concat_in_sequence, wrap_in_octet_string};
++use crate::sign::{Signer, SigningKey};
++use crate::x509::{asn1_wrap, wrap_in_sequence};
+ 
+ /// Parse `der` as any supported key encoding/type, returning
+ /// the first which works.
+@@ -123,13 +123,6 @@ impl SigningKey for RsaSigningKey {
+             .map(|scheme| RsaSigner::new(Arc::clone(&self.key), *scheme))
+     }
+ 
+-    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+-        Some(public_key_to_spki(
+-            &alg_id::RSA_ENCRYPTION,
+-            self.key.public_key(),
+-        ))
+-    }
+-
+     fn algorithm(&self) -> SignatureAlgorithm {
+         SignatureAlgorithm::RSA
+     }
+@@ -250,10 +243,13 @@ impl EcdsaSigningKey {
+             _ => unreachable!(), // all callers are in this file
+         };
+ 
+-        let sec1_wrap = wrap_in_octet_string(maybe_sec1_der);
+-        let pkcs8 = wrap_concat_in_sequence(pkcs8_prefix, &sec1_wrap);
++        let sec1_wrap = asn1_wrap(der::Tag::OctetString as u8, maybe_sec1_der);
++
++        let mut pkcs8_inner = Vec::with_capacity(pkcs8_prefix.len() + sec1_wrap.len());
++        pkcs8_inner.extend_from_slice(pkcs8_prefix);
++        pkcs8_inner.extend_from_slice(&sec1_wrap);
+ 
+-        EcdsaKeyPair::from_pkcs8(sigalg, &pkcs8, rng).map_err(|_| ())
++        EcdsaKeyPair::from_pkcs8(sigalg, &wrap_in_sequence(&pkcs8_inner), rng).map_err(|_| ())
+     }
+ }
+ 
+@@ -289,16 +285,6 @@ impl SigningKey for EcdsaSigningKey {
+         }
+     }
+ 
+-    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+-        let id = match self.scheme {
+-            SignatureScheme::ECDSA_NISTP256_SHA256 => alg_id::ECDSA_P256,
+-            SignatureScheme::ECDSA_NISTP384_SHA384 => alg_id::ECDSA_P384,
+-            _ => unreachable!(),
+-        };
+-
+-        Some(public_key_to_spki(&id, self.key.public_key()))
+-    }
+-
+     fn algorithm(&self) -> SignatureAlgorithm {
+         self.scheme.algorithm()
+     }
+@@ -383,10 +369,6 @@ impl SigningKey for Ed25519SigningKey {
+         }
+     }
+ 
+-    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+-        Some(public_key_to_spki(&alg_id::ED25519, self.key.public_key()))
+-    }
+-
+     fn algorithm(&self) -> SignatureAlgorithm {
+         self.scheme.algorithm()
+     }
+diff --git a/rustls/src/crypto/signer.rs b/rustls/src/crypto/signer.rs
+index dcb48e70..12ff97a0 100644
+--- a/rustls/src/crypto/signer.rs
++++ b/rustls/src/crypto/signer.rs
+@@ -3,12 +3,11 @@ use alloc::sync::Arc;
+ use alloc::vec::Vec;
+ use core::fmt::Debug;
+ 
+-use pki_types::{AlgorithmIdentifier, CertificateDer, SubjectPublicKeyInfoDer};
++use pki_types::{CertificateDer, SubjectPublicKeyInfoDer};
+ 
+ use crate::enums::{SignatureAlgorithm, SignatureScheme};
+ use crate::error::{Error, InconsistentKeys};
+ use crate::server::ParsedCertificate;
+-use crate::x509;
+ 
+ /// An abstract signing key.
+ ///
+@@ -135,28 +134,3 @@ impl CertifiedKey {
+             .ok_or(Error::NoCertificatesPresented)
+     }
+ }
+-
+-#[cfg_attr(not(any(feature = "aws_lc_rs", feature = "ring")), allow(dead_code))]
+-pub(crate) fn public_key_to_spki(
+-    alg_id: &AlgorithmIdentifier,
+-    public_key: impl AsRef<[u8]>,
+-) -> SubjectPublicKeyInfoDer<'static> {
+-    // SubjectPublicKeyInfo  ::=  SEQUENCE  {
+-    //    algorithm            AlgorithmIdentifier,
+-    //    subjectPublicKey     BIT STRING  }
+-    //
+-    // AlgorithmIdentifier  ::=  SEQUENCE  {
+-    //    algorithm               OBJECT IDENTIFIER,
+-    //    parameters              ANY DEFINED BY algorithm OPTIONAL  }
+-    //
+-    // note that the `pki_types::AlgorithmIdentifier` type is the
+-    // concatenation of `algorithm` and `parameters`, but misses the
+-    // outer `Sequence`.
+-
+-    let mut spki_inner = x509::wrap_in_sequence(alg_id.as_ref());
+-    spki_inner.extend(&x509::wrap_in_bit_string(public_key.as_ref()));
+-
+-    let spki = x509::wrap_in_sequence(&spki_inner);
+-
+-    SubjectPublicKeyInfoDer::from(spki)
+-}
+diff --git a/rustls/src/x509.rs b/rustls/src/x509.rs
+index 2620fe8a..a023ac71 100644
+--- a/rustls/src/x509.rs
++++ b/rustls/src/x509.rs
+@@ -2,38 +2,15 @@
+ 
+ use alloc::vec::Vec;
+ 
+-/// Prepend stuff to `bytes` to put it in a DER SEQUENCE.
+-pub(crate) fn wrap_in_sequence(bytes: &[u8]) -> Vec<u8> {
+-    asn1_wrap(DER_SEQUENCE_TAG, bytes, &[])
+-}
+-
+-/// Prepend stuff to `bytes_a` + `bytes_b` to put it in a DER SEQUENCE.
+-#[cfg_attr(not(feature = "ring"), allow(dead_code))]
+-pub(crate) fn wrap_concat_in_sequence(bytes_a: &[u8], bytes_b: &[u8]) -> Vec<u8> {
+-    asn1_wrap(DER_SEQUENCE_TAG, bytes_a, bytes_b)
+-}
+-
+-/// Prepend stuff to `bytes` to put it in a DER BIT STRING.
+-pub(crate) fn wrap_in_bit_string(bytes: &[u8]) -> Vec<u8> {
+-    asn1_wrap(DER_BIT_STRING_TAG, &[0u8], bytes)
+-}
+-
+-/// Prepend stuff to `bytes` to put it in a DER OCTET STRING.
+-#[cfg_attr(not(feature = "ring"), allow(dead_code))]
+-pub(crate) fn wrap_in_octet_string(bytes: &[u8]) -> Vec<u8> {
+-    asn1_wrap(DER_OCTET_STRING_TAG, bytes, &[])
+-}
+-
+-fn asn1_wrap(tag: u8, bytes_a: &[u8], bytes_b: &[u8]) -> Vec<u8> {
+-    let len = bytes_a.len() + bytes_b.len();
++pub(crate) fn asn1_wrap(tag: u8, bytes: &[u8]) -> Vec<u8> {
++    let len = bytes.len();
+ 
+     if len <= 0x7f {
+         // Short form
+         let mut ret = Vec::with_capacity(2 + len);
+         ret.push(tag);
+         ret.push(len as u8);
+-        ret.extend_from_slice(bytes_a);
+-        ret.extend_from_slice(bytes_b);
++        ret.extend_from_slice(bytes);
+         ret
+     } else {
+         // Long form
+@@ -51,15 +28,17 @@ fn asn1_wrap(tag: u8, bytes_a: &[u8], bytes_b: &[u8]) -> Vec<u8> {
+         ret.push(0x80 + encoded_bytes as u8);
+         ret.extend_from_slice(&size[leading_zero_bytes..]);
+ 
+-        ret.extend_from_slice(bytes_a);
+-        ret.extend_from_slice(bytes_b);
++        ret.extend_from_slice(bytes);
+         ret
+     }
+ }
+ 
++/// Prepend stuff to `bytes` to put it in a DER SEQUENCE.
++pub(crate) fn wrap_in_sequence(bytes: &[u8]) -> Vec<u8> {
++    asn1_wrap(DER_SEQUENCE_TAG, bytes)
++}
++
+ const DER_SEQUENCE_TAG: u8 = 0x30;
+-const DER_BIT_STRING_TAG: u8 = 0x03;
+-const DER_OCTET_STRING_TAG: u8 = 0x04;
+ 
+ #[cfg(test)]
+ mod tests {
+@@ -130,18 +109,4 @@ mod tests {
+         );
+         assert_eq!(result.len(), 0x1000000 + 6);
+     }
+-
+-    #[test]
+-    fn test_wrap_in_bit_string() {
+-        // The BIT STRING encoding starts with a single octet on
+-        // the front saying how many bits to disregard from the
+-        // last octet. So this zero means "no bits" unused, which
+-        // is correct because our input is an string of octets.
+-        //
+-        // So if we encode &[0x55u8] with this function, we should get:
+-        //
+-        // 0x03    0x02    0x00                0x55
+-        // ^ tag   ^ len   ^ no unused bits    ^ value
+-        assert_eq!(wrap_in_bit_string(&[0x55u8]), vec![0x03, 0x02, 0x00, 0x55]);
+-    }
+ }
+diff --git a/rustls/tests/api.rs b/rustls/tests/api.rs
+index 26ef3c41..3114875d 100644
+--- a/rustls/tests/api.rs
++++ b/rustls/tests/api.rs
+@@ -7408,17 +7408,4 @@ fn tls12_connection_fails_after_key_reaches_confidentiality_limit() {
+     }
+ }
+ 
+-#[test]
+-fn test_keys_match_for_all_signing_key_types() {
+-    for kt in ALL_KEY_TYPES {
+-        let key = provider::default_provider()
+-            .key_provider
+-            .load_private_key(kt.get_client_key())
+-            .unwrap();
+-        let ck = sign::CertifiedKey::new(kt.get_client_chain(), key);
+-        ck.keys_match().unwrap();
+-        println!("{kt:?} ok");
+-    }
+-}
+-
+ const CONFIDENTIALITY_LIMIT: u64 = 1024;

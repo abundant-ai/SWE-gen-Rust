@@ -1,6 +1,6 @@
 FROM ubuntu:24.04
 
-# Base system packages (common to all languages)
+# Base system packages
 RUN apt-get update && apt-get install -y \
     git \
     curl \
@@ -40,38 +40,24 @@ RUN git clone https://github.com/seanmonstar/reqwest.git src && \
 
 WORKDIR /app/src
 
-# TODO: Set environment variables if needed
-# Check CI config and README for required env vars
-# Examples: CI=true, NODE_ENV=test, CARGO_TERM_COLOR=never
+# Set environment variables from CI config
+ENV REQWEST_TEST_BODY_FULL=1
+ENV RUST_BACKTRACE=1
+ENV CARGO_INCREMENTAL=0
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
-# TODO: Install dependencies
-# For Python: PREFER uv (much faster). Create venv and install:
-#   uv venv /opt/venv
-#   uv pip install --python /opt/venv/bin/python -e ".[dev,test]"
-#   # Or: uv pip install --python /opt/venv/bin/python -r requirements.txt
-#   # Then add to PATH: ENV PATH="/opt/venv/bin:${PATH}"
-# For Node.js: npm ci, yarn install --frozen-lockfile, pnpm install --frozen-lockfile
-# For Go: go mod download
-# For Rust: cargo fetch
-# For Ruby: bundle install
-# For Java: mvn dependency:resolve or gradle dependencies
+# Fetch dependencies
+RUN cargo fetch
 
-# TODO: Build if needed (check if it's a compiled language or has build step)
-# Examples:
-#   TypeScript: npm run build, tsc
-#   Rust: cargo build
-#   Go: go build ./...
-#   Java: mvn compile, gradle build
-
-# If install/build steps touched tracked files, reset them so bug.patch applies cleanly,
+# Reset to ensure bug.patch applies cleanly
 RUN git reset --hard
 
 # Apply bug.patch to revert to buggy state (BASE)
 COPY bug.patch /tmp/bug.patch
 RUN patch -p1 < /tmp/bug.patch && rm /tmp/bug.patch
 
-# TODO: Rebuild after applying bug.patch if needed
-# For compiled languages (TypeScript, Rust, Go, Java), you MUST rebuild after patching
+# Remove examples to avoid compilation errors (tokio::main incompatible with WASM)
+RUN rm -rf examples && sed -i '/^\[\[example\]\]/,/^$/d' Cargo.toml
 
 RUN rm -rf /app/src/.git
 

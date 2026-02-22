@@ -1,0 +1,469 @@
+diff --git a/src/iter/mod.rs b/src/iter/mod.rs
+index b8e6841..a9cb4e3 100644
+--- a/src/iter/mod.rs
++++ b/src/iter/mod.rs
+@@ -142,11 +142,13 @@ mod repeat;
+ mod rev;
+ mod skip;
+ mod skip_any;
++mod skip_any_while;
+ mod splitter;
+ mod step_by;
+ mod sum;
+ mod take;
+ mod take_any;
++mod take_any_while;
+ mod try_fold;
+ mod try_reduce;
+ mod try_reduce_with;
+@@ -188,10 +190,12 @@ pub use self::{
+     rev::Rev,
+     skip::Skip,
+     skip_any::SkipAny,
++    skip_any_while::SkipAnyWhile,
+     splitter::{split, Split},
+     step_by::StepBy,
+     take::Take,
+     take_any::TakeAny,
++    take_any_while::TakeAnyWhile,
+     try_fold::{TryFold, TryFoldWith},
+     update::Update,
+     while_some::WhileSome,
+@@ -2248,6 +2252,93 @@ pub trait ParallelIterator: Sized + Send {
+         SkipAny::new(self, n)
+     }
+ 
++    /// Creates an iterator that takes elements from *anywhere* in the original iterator
++    /// until the given `predicate` returns `false`.
++    ///
++    /// The `predicate` may be anything -- e.g. it could be checking a fact about the item, a
++    /// global condition unrelated to the item itself, or some combination thereof.
++    ///
++    /// If parallel calls to the `predicate` race and give different results, then the
++    /// `true` results will still take those particular items, while respecting the `false`
++    /// result from elsewhere to skip any further items.
++    ///
++    /// This is similar to [`Iterator::take_while`] without being constrained to the original
++    /// iterator order. The taken items will still maintain their relative order where that is
++    /// visible in `collect`, `reduce`, and similar outputs.
++    ///
++    /// # Examples
++    ///
++    /// ```
++    /// use rayon::prelude::*;
++    ///
++    /// let result: Vec<_> = (0..100)
++    ///     .into_par_iter()
++    ///     .take_any_while(|x| *x < 50)
++    ///     .collect();
++    ///
++    /// assert!(result.len() <= 50);
++    /// assert!(result.windows(2).all(|w| w[0] < w[1]));
++    /// ```
++    ///
++    /// ```
++    /// use rayon::prelude::*;
++    /// use std::sync::atomic::AtomicUsize;
++    /// use std::sync::atomic::Ordering::Relaxed;
++    ///
++    /// // Collect any group of items that sum <= 1000
++    /// let quota = AtomicUsize::new(1000);
++    /// let result: Vec<_> = (0_usize..100)
++    ///     .into_par_iter()
++    ///     .take_any_while(|&x| {
++    ///         quota.fetch_update(Relaxed, Relaxed, |q| q.checked_sub(x))
++    ///             .is_ok()
++    ///     })
++    ///     .collect();
++    ///
++    /// let sum = result.iter().sum::<usize>();
++    /// assert!(matches!(sum, 902..=1000));
++    /// ```
++    fn take_any_while<P>(self, predicate: P) -> TakeAnyWhile<Self, P>
++    where
++        P: Fn(&Self::Item) -> bool + Sync + Send,
++    {
++        TakeAnyWhile::new(self, predicate)
++    }
++
++    /// Creates an iterator that skips elements from *anywhere* in the original iterator
++    /// until the given `predicate` returns `false`.
++    ///
++    /// The `predicate` may be anything -- e.g. it could be checking a fact about the item, a
++    /// global condition unrelated to the item itself, or some combination thereof.
++    ///
++    /// If parallel calls to the `predicate` race and give different results, then the
++    /// `true` results will still skip those particular items, while respecting the `false`
++    /// result from elsewhere to skip any further items.
++    ///
++    /// This is similar to [`Iterator::skip_while`] without being constrained to the original
++    /// iterator order. The remaining items will still maintain their relative order where that is
++    /// visible in `collect`, `reduce`, and similar outputs.
++    ///
++    /// # Examples
++    ///
++    /// ```
++    /// use rayon::prelude::*;
++    ///
++    /// let result: Vec<_> = (0..100)
++    ///     .into_par_iter()
++    ///     .skip_any_while(|x| *x < 50)
++    ///     .collect();
++    ///
++    /// assert!(result.len() >= 50);
++    /// assert!(result.windows(2).all(|w| w[0] < w[1]));
++    /// ```
++    fn skip_any_while<P>(self, predicate: P) -> SkipAnyWhile<Self, P>
++    where
++        P: Fn(&Self::Item) -> bool + Sync + Send,
++    {
++        SkipAnyWhile::new(self, predicate)
++    }
++
+     /// Internal method used to define the behavior of this parallel
+     /// iterator. You should not need to call this directly.
+     ///
+diff --git a/src/iter/skip_any_while.rs b/src/iter/skip_any_while.rs
+new file mode 100644
+index 0000000..28b9e59
+--- /dev/null
++++ b/src/iter/skip_any_while.rs
+@@ -0,0 +1,166 @@
++use super::plumbing::*;
++use super::*;
++use std::fmt;
++use std::sync::atomic::{AtomicBool, Ordering};
++
++/// `SkipAnyWhile` is an iterator that skips over elements from anywhere in `I`
++/// until the callback returns `false`.
++/// This struct is created by the [`skip_any_while()`] method on [`ParallelIterator`]
++///
++/// [`skip_any_while()`]: trait.ParallelIterator.html#method.skip_any_while
++/// [`ParallelIterator`]: trait.ParallelIterator.html
++#[must_use = "iterator adaptors are lazy and do nothing unless consumed"]
++#[derive(Clone)]
++pub struct SkipAnyWhile<I: ParallelIterator, P> {
++    base: I,
++    predicate: P,
++}
++
++impl<I: ParallelIterator + fmt::Debug, P> fmt::Debug for SkipAnyWhile<I, P> {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("SkipAnyWhile")
++            .field("base", &self.base)
++            .finish()
++    }
++}
++
++impl<I, P> SkipAnyWhile<I, P>
++where
++    I: ParallelIterator,
++{
++    /// Creates a new `SkipAnyWhile` iterator.
++    pub(super) fn new(base: I, predicate: P) -> Self {
++        SkipAnyWhile { base, predicate }
++    }
++}
++
++impl<I, P> ParallelIterator for SkipAnyWhile<I, P>
++where
++    I: ParallelIterator,
++    P: Fn(&I::Item) -> bool + Sync + Send,
++{
++    type Item = I::Item;
++
++    fn drive_unindexed<C>(self, consumer: C) -> C::Result
++    where
++        C: UnindexedConsumer<Self::Item>,
++    {
++        let consumer1 = SkipAnyWhileConsumer {
++            base: consumer,
++            predicate: &self.predicate,
++            skipping: &AtomicBool::new(true),
++        };
++        self.base.drive_unindexed(consumer1)
++    }
++}
++
++/// ////////////////////////////////////////////////////////////////////////
++/// Consumer implementation
++
++struct SkipAnyWhileConsumer<'p, C, P> {
++    base: C,
++    predicate: &'p P,
++    skipping: &'p AtomicBool,
++}
++
++impl<'p, T, C, P> Consumer<T> for SkipAnyWhileConsumer<'p, C, P>
++where
++    C: Consumer<T>,
++    P: Fn(&T) -> bool + Sync,
++{
++    type Folder = SkipAnyWhileFolder<'p, C::Folder, P>;
++    type Reducer = C::Reducer;
++    type Result = C::Result;
++
++    fn split_at(self, index: usize) -> (Self, Self, Self::Reducer) {
++        let (left, right, reducer) = self.base.split_at(index);
++        (
++            SkipAnyWhileConsumer { base: left, ..self },
++            SkipAnyWhileConsumer {
++                base: right,
++                ..self
++            },
++            reducer,
++        )
++    }
++
++    fn into_folder(self) -> Self::Folder {
++        SkipAnyWhileFolder {
++            base: self.base.into_folder(),
++            predicate: self.predicate,
++            skipping: self.skipping,
++        }
++    }
++
++    fn full(&self) -> bool {
++        self.base.full()
++    }
++}
++
++impl<'p, T, C, P> UnindexedConsumer<T> for SkipAnyWhileConsumer<'p, C, P>
++where
++    C: UnindexedConsumer<T>,
++    P: Fn(&T) -> bool + Sync,
++{
++    fn split_off_left(&self) -> Self {
++        SkipAnyWhileConsumer {
++            base: self.base.split_off_left(),
++            ..*self
++        }
++    }
++
++    fn to_reducer(&self) -> Self::Reducer {
++        self.base.to_reducer()
++    }
++}
++
++struct SkipAnyWhileFolder<'p, C, P> {
++    base: C,
++    predicate: &'p P,
++    skipping: &'p AtomicBool,
++}
++
++fn skip<T>(item: &T, skipping: &AtomicBool, predicate: &impl Fn(&T) -> bool) -> bool {
++    if !skipping.load(Ordering::Relaxed) {
++        return false;
++    }
++    if predicate(item) {
++        return true;
++    }
++    skipping.store(false, Ordering::Relaxed);
++    false
++}
++
++impl<'p, T, C, P> Folder<T> for SkipAnyWhileFolder<'p, C, P>
++where
++    C: Folder<T>,
++    P: Fn(&T) -> bool + 'p,
++{
++    type Result = C::Result;
++
++    fn consume(mut self, item: T) -> Self {
++        if !skip(&item, self.skipping, self.predicate) {
++            self.base = self.base.consume(item);
++        }
++        self
++    }
++
++    fn consume_iter<I>(mut self, iter: I) -> Self
++    where
++        I: IntoIterator<Item = T>,
++    {
++        self.base = self.base.consume_iter(
++            iter.into_iter()
++                .skip_while(move |x| skip(x, self.skipping, self.predicate)),
++        );
++        self
++    }
++
++    fn complete(self) -> C::Result {
++        self.base.complete()
++    }
++
++    fn full(&self) -> bool {
++        self.base.full()
++    }
++}
+diff --git a/src/iter/take_any_while.rs b/src/iter/take_any_while.rs
+new file mode 100644
+index 0000000..e6a91af
+--- /dev/null
++++ b/src/iter/take_any_while.rs
+@@ -0,0 +1,166 @@
++use super::plumbing::*;
++use super::*;
++use std::fmt;
++use std::sync::atomic::{AtomicBool, Ordering};
++
++/// `TakeAnyWhile` is an iterator that iterates over elements from anywhere in `I`
++/// until the callback returns `false`.
++/// This struct is created by the [`take_any_while()`] method on [`ParallelIterator`]
++///
++/// [`take_any_while()`]: trait.ParallelIterator.html#method.take_any_while
++/// [`ParallelIterator`]: trait.ParallelIterator.html
++#[must_use = "iterator adaptors are lazy and do nothing unless consumed"]
++#[derive(Clone)]
++pub struct TakeAnyWhile<I: ParallelIterator, P> {
++    base: I,
++    predicate: P,
++}
++
++impl<I: ParallelIterator + fmt::Debug, P> fmt::Debug for TakeAnyWhile<I, P> {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("TakeAnyWhile")
++            .field("base", &self.base)
++            .finish()
++    }
++}
++
++impl<I, P> TakeAnyWhile<I, P>
++where
++    I: ParallelIterator,
++{
++    /// Creates a new `TakeAnyWhile` iterator.
++    pub(super) fn new(base: I, predicate: P) -> Self {
++        TakeAnyWhile { base, predicate }
++    }
++}
++
++impl<I, P> ParallelIterator for TakeAnyWhile<I, P>
++where
++    I: ParallelIterator,
++    P: Fn(&I::Item) -> bool + Sync + Send,
++{
++    type Item = I::Item;
++
++    fn drive_unindexed<C>(self, consumer: C) -> C::Result
++    where
++        C: UnindexedConsumer<Self::Item>,
++    {
++        let consumer1 = TakeAnyWhileConsumer {
++            base: consumer,
++            predicate: &self.predicate,
++            taking: &AtomicBool::new(true),
++        };
++        self.base.drive_unindexed(consumer1)
++    }
++}
++
++/// ////////////////////////////////////////////////////////////////////////
++/// Consumer implementation
++
++struct TakeAnyWhileConsumer<'p, C, P> {
++    base: C,
++    predicate: &'p P,
++    taking: &'p AtomicBool,
++}
++
++impl<'p, T, C, P> Consumer<T> for TakeAnyWhileConsumer<'p, C, P>
++where
++    C: Consumer<T>,
++    P: Fn(&T) -> bool + Sync,
++{
++    type Folder = TakeAnyWhileFolder<'p, C::Folder, P>;
++    type Reducer = C::Reducer;
++    type Result = C::Result;
++
++    fn split_at(self, index: usize) -> (Self, Self, Self::Reducer) {
++        let (left, right, reducer) = self.base.split_at(index);
++        (
++            TakeAnyWhileConsumer { base: left, ..self },
++            TakeAnyWhileConsumer {
++                base: right,
++                ..self
++            },
++            reducer,
++        )
++    }
++
++    fn into_folder(self) -> Self::Folder {
++        TakeAnyWhileFolder {
++            base: self.base.into_folder(),
++            predicate: self.predicate,
++            taking: self.taking,
++        }
++    }
++
++    fn full(&self) -> bool {
++        !self.taking.load(Ordering::Relaxed) || self.base.full()
++    }
++}
++
++impl<'p, T, C, P> UnindexedConsumer<T> for TakeAnyWhileConsumer<'p, C, P>
++where
++    C: UnindexedConsumer<T>,
++    P: Fn(&T) -> bool + Sync,
++{
++    fn split_off_left(&self) -> Self {
++        TakeAnyWhileConsumer {
++            base: self.base.split_off_left(),
++            ..*self
++        }
++    }
++
++    fn to_reducer(&self) -> Self::Reducer {
++        self.base.to_reducer()
++    }
++}
++
++struct TakeAnyWhileFolder<'p, C, P> {
++    base: C,
++    predicate: &'p P,
++    taking: &'p AtomicBool,
++}
++
++fn take<T>(item: &T, taking: &AtomicBool, predicate: &impl Fn(&T) -> bool) -> bool {
++    if !taking.load(Ordering::Relaxed) {
++        return false;
++    }
++    if predicate(item) {
++        return true;
++    }
++    taking.store(false, Ordering::Relaxed);
++    false
++}
++
++impl<'p, T, C, P> Folder<T> for TakeAnyWhileFolder<'p, C, P>
++where
++    C: Folder<T>,
++    P: Fn(&T) -> bool + 'p,
++{
++    type Result = C::Result;
++
++    fn consume(mut self, item: T) -> Self {
++        if take(&item, self.taking, self.predicate) {
++            self.base = self.base.consume(item);
++        }
++        self
++    }
++
++    fn consume_iter<I>(mut self, iter: I) -> Self
++    where
++        I: IntoIterator<Item = T>,
++    {
++        self.base = self.base.consume_iter(
++            iter.into_iter()
++                .take_while(move |x| take(x, self.taking, self.predicate)),
++        );
++        self
++    }
++
++    fn complete(self) -> C::Result {
++        self.base.complete()
++    }
++
++    fn full(&self) -> bool {
++        !self.taking.load(Ordering::Relaxed) || self.base.full()
++    }
++}

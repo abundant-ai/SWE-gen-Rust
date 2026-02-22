@@ -1,0 +1,1216 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 60d2d21e0..147fffb1a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,12 +7,19 @@
+ 
+ ### Changed
+ 
++* Refactor new closure methods - ensures that all closure constructor functions have the variants `Closure::foo()`, `Closure::foo_aborting()` and
++  `Closure::foo_assert_unwind_safe()` this then fully allows switching from the UnwindSafe bound now being applies on foo() to use one of the
++  alternatives, given these limitations of AssertUnwindSafe. The same applies to `ImmediateClosure`. In addition, mutable reentrancy guards are
++  added for `ImmediateClosure`, and it is updated to be pass-by-value as well.
++  [#4975](https://github.com/wasm-bindgen/wasm-bindgen/pull/4975)
++
+ ### Fixed
+ 
+ * Fixed a regression where Array.of1,... variants using generic `Array<T>` broke inference.
+   Reverted to use non-generic JsValue arguments. In addition extends generic class hoisting to
+   for constructors to also include `static_method_of` methods returning the own type, to allow
+   `Array::of` generic to now be on the `Array<T>` impl block.
++  [#4974](https://github.com/wasm-bindgen/wasm-bindgen/pull/4974)
+ 
+ ### Removed
+ 
+@@ -173,8 +180,6 @@
+   converted to `#[allow]` in generated code to prevent spurious warnings.
+   [#4409](https://github.com/wasm-bindgen/wasm-bindgen/pull/4409)
+ 
+-### Removed
+-
+ ## [0.2.108](https://github.com/wasm-bindgen/wasm-bindgen/compare/0.2.107...0.2.108)
+ 
+ ### Fixed
+diff --git a/crates/cli-support/src/wit/outgoing.rs b/crates/cli-support/src/wit/outgoing.rs
+index c8fe94627..ba9333f47 100644
+--- a/crates/cli-support/src/wit/outgoing.rs
++++ b/crates/cli-support/src/wit/outgoing.rs
+@@ -162,7 +162,12 @@ impl InstructionBuilder<'_, '_> {
+             Descriptor::Option(d) => self.outgoing_option(d)?,
+             Descriptor::Result(d) => self.outgoing_result(d)?,
+ 
+-            Descriptor::Function(_) | Descriptor::Slice(_) => {
++            Descriptor::Function(descriptor) => {
++                // By-value ImmediateClosure<dyn Fn(...)> (immutable)
++                self.outgoing_function(false, descriptor, None)?;
++            }
++
++            Descriptor::Slice(_) => {
+                 bail!("unsupported argument type for calling JS function from Rust: {arg:?}")
+             }
+ 
+@@ -227,6 +232,17 @@ impl InstructionBuilder<'_, '_> {
+                 self.outgoing_function(mutable, descriptor, None)?;
+             }
+ 
++            // ImmediateClosure<dyn FnMut(...)> emits RefMut(Function(...)) to
++            // signal that a reentrancy guard is needed in the JS wrapper.
++            Descriptor::RefMut(inner) => match inner.as_ref() {
++                Descriptor::Function(descriptor) => {
++                    self.outgoing_function(true, descriptor, None)?;
++                }
++                _ => bail!(
++                    "unsupported reference argument type for calling JS function from Rust: {arg:?}"
++                ),
++            },
++
+             _ => bail!(
+                 "unsupported reference argument type for calling JS function from Rust: {arg:?}"
+             ),
+diff --git a/crates/futures/src/lib.rs b/crates/futures/src/lib.rs
+index d53f35337..25a7115c6 100644
+--- a/crates/futures/src/lib.rs
++++ b/crates/futures/src/lib.rs
+@@ -249,7 +249,7 @@ where
+ {
+     let mut future = Some(future);
+ 
+-    Promise::new_typed(&ImmediateClosure::wrap_mut_aborting(
++    Promise::new_typed(ImmediateClosure::new_mut_aborting(
+         &mut move |resolve, reject| {
+             let future = future.take().unwrap_throw();
+ 
+@@ -337,7 +337,7 @@ where
+ {
+     let mut future = Some(future);
+ 
+-    Promise::new_typed(&ImmediateClosure::wrap_mut_aborting(
++    Promise::new_typed(ImmediateClosure::new_mut_aborting(
+         &mut move |resolve, reject| {
+             let future = future.take().unwrap_throw();
+             spawn_local(async move {
+diff --git a/crates/js-sys/src/lib.rs b/crates/js-sys/src/lib.rs
+index 0e556d834..d2d3dde8a 100644
+--- a/crates/js-sys/src/lib.rs
++++ b/crates/js-sys/src/lib.rs
+@@ -582,7 +582,7 @@ extern "C" {
+     #[wasm_bindgen(static_method_of = Array, catch, js_name = from)]
+     pub fn from_iterable_map<'a, I: Iterable, U>(
+         val: &I,
+-        map: &ImmediateClosure<'a, dyn FnMut(I::Item, u32) -> Result<U, JsError> + 'a>,
++        map: ImmediateClosure<'a, dyn FnMut(I::Item, u32) -> Result<U, JsError> + 'a>,
+     ) -> Result<Array<U>, JsValue>;
+ 
+     /// The `Array.fromAsync()` static method creates a new, shallow-copied `Array` instance
+@@ -640,7 +640,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = every, catch)]
+     pub fn try_every<'a, T>(
+         this: &Array<T>,
+-        predicate: &ImmediateClosure<'a, dyn FnMut(T, u32) -> Result<bool, JsError> + 'a>,
++        predicate: ImmediateClosure<'a, dyn FnMut(T, u32) -> Result<bool, JsError> + 'a>,
+     ) -> Result<bool, JsValue>;
+ 
+     /// The `fill()` method fills all the elements of an array from a start index
+@@ -669,7 +669,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = filter, catch)]
+     pub fn try_filter<'a, T>(
+         this: &Array<T>,
+-        predicate: &ImmediateClosure<'a, dyn FnMut(T, u32) -> Result<bool, JsError> + 'a>,
++        predicate: ImmediateClosure<'a, dyn FnMut(T, u32) -> Result<bool, JsError> + 'a>,
+     ) -> Result<Array<T>, JsValue>;
+ 
+     /// The `find()` method returns the value of the first element in the array that satisfies
+@@ -688,7 +688,7 @@ extern "C" {
+     #[wasm_bindgen(method)]
+     pub fn find<'a, T>(
+         this: &Array<T>,
+-        predicate: &ImmediateClosure<'a, dyn FnMut(T, u32, Array<T>) -> bool + 'a>,
++        predicate: ImmediateClosure<'a, dyn FnMut(T, u32, Array<T>) -> bool + 'a>,
+     ) -> Option<T>;
+ 
+     /// The `find()` method returns the value of the first element in the array that satisfies
+@@ -698,7 +698,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = find, catch)]
+     pub fn try_find<'a, T>(
+         this: &Array<T>,
+-        predicate: &ImmediateClosure<'a, dyn FnMut(T, u32) -> Result<bool, JsError> + 'a>,
++        predicate: ImmediateClosure<'a, dyn FnMut(T, u32) -> Result<bool, JsError> + 'a>,
+     ) -> Result<Option<T>, JsValue>;
+ 
+     /// The `findIndex()` method returns the index of the first element in the array that
+@@ -720,7 +720,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = findIndex, catch)]
+     pub fn try_find_index<'a, T>(
+         this: &Array<T>,
+-        predicate: &ImmediateClosure<'a, dyn FnMut(T, u32) -> Result<bool, JsError> + 'a>,
++        predicate: ImmediateClosure<'a, dyn FnMut(T, u32) -> Result<bool, JsError> + 'a>,
+     ) -> Result<i32, JsValue>;
+ 
+     /// The `findLast()` method of Array instances iterates the array in reverse order
+@@ -751,7 +751,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = findLast, catch)]
+     pub fn try_find_last<'a, T>(
+         this: &Array<T>,
+-        predicate: &ImmediateClosure<'a, dyn FnMut(T, u32) -> Result<bool, JsError> + 'a>,
++        predicate: ImmediateClosure<'a, dyn FnMut(T, u32) -> Result<bool, JsError> + 'a>,
+     ) -> Result<Option<T>, JsValue>;
+ 
+     /// The `findLastIndex()` method of Array instances iterates the array in reverse order
+@@ -775,7 +775,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = findLastIndex, catch)]
+     pub fn try_find_last_index<'a, T>(
+         this: &Array<T>,
+-        predicate: &ImmediateClosure<'a, dyn FnMut(T, u32) -> Result<bool, JsError> + 'a>,
++        predicate: ImmediateClosure<'a, dyn FnMut(T, u32) -> Result<bool, JsError> + 'a>,
+     ) -> Result<i32, JsValue>;
+ 
+     /// The `flat()` method creates a new array with all sub-array elements concatenated into it
+@@ -804,7 +804,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = flatMap, catch)]
+     pub fn try_flat_map<'a, T, U>(
+         this: &Array<T>,
+-        callback: &ImmediateClosure<'a, dyn FnMut(T, u32) -> Vec<U> + 'a>,
++        callback: ImmediateClosure<'a, dyn FnMut(T, u32) -> Vec<U> + 'a>,
+     ) -> Result<Array<U>, JsValue>;
+ 
+     /// The `forEach()` method executes a provided function once for each array element.
+@@ -821,7 +821,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = forEach, catch)]
+     pub fn try_for_each<'a, T>(
+         this: &Array<T>,
+-        callback: &ImmediateClosure<'a, dyn FnMut(T, u32) -> Result<(), JsError> + 'a>,
++        callback: ImmediateClosure<'a, dyn FnMut(T, u32) -> Result<(), JsError> + 'a>,
+     ) -> Result<(), JsValue>;
+ 
+     /// The `includes()` method determines whether an array includes a certain
+@@ -905,7 +905,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = map, catch)]
+     pub fn try_map<'a, T, U>(
+         this: &Array<T>,
+-        predicate: &ImmediateClosure<'a, dyn FnMut(T, u32) -> Result<U, JsError> + 'a>,
++        predicate: ImmediateClosure<'a, dyn FnMut(T, u32) -> Result<U, JsError> + 'a>,
+     ) -> Result<Array<U>, JsValue>;
+ 
+     /// The `Array.of()` method creates a new Array instance with a variable
+@@ -1005,7 +1005,7 @@ extern "C" {
+     #[wasm_bindgen(method)]
+     pub fn reduce<'a, T, A>(
+         this: &Array<T>,
+-        predicate: &ImmediateClosure<'a, dyn FnMut(A, T, u32, Array<T>) -> A + 'a>,
++        predicate: ImmediateClosure<'a, dyn FnMut(A, T, u32, Array<T>) -> A + 'a>,
+         initial_value: &A,
+     ) -> A;
+ 
+@@ -1016,7 +1016,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = reduce, catch)]
+     pub fn try_reduce<'a, T, A>(
+         this: &Array<T>,
+-        predicate: &ImmediateClosure<'a, dyn FnMut(A, T, u32) -> Result<A, JsError> + 'a>,
++        predicate: ImmediateClosure<'a, dyn FnMut(A, T, u32) -> Result<A, JsError> + 'a>,
+         initial_value: &A,
+     ) -> Result<A, JsValue>;
+ 
+@@ -1040,7 +1040,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = reduceRight)]
+     pub fn reduce_right<'a, T, A>(
+         this: &Array<T>,
+-        predicate: &ImmediateClosure<'a, dyn FnMut(A, T, u32, Array<T>) -> A + 'a>,
++        predicate: ImmediateClosure<'a, dyn FnMut(A, T, u32, Array<T>) -> A + 'a>,
+         initial_value: &A,
+     ) -> A;
+ 
+@@ -1051,7 +1051,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = reduceRight, catch)]
+     pub fn try_reduce_right<'a, T, A>(
+         this: &Array<T>,
+-        predicate: &ImmediateClosure<'a, dyn FnMut(JsValue, T, u32) -> Result<A, JsError> + 'a>,
++        predicate: ImmediateClosure<'a, dyn FnMut(JsValue, T, u32) -> Result<A, JsError> + 'a>,
+         initial_value: &A,
+     ) -> Result<A, JsValue>;
+ 
+@@ -1142,7 +1142,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = some, catch)]
+     pub fn try_some<'a, T>(
+         this: &Array<T>,
+-        predicate: &ImmediateClosure<'a, dyn FnMut(T) -> Result<bool, JsError> + 'a>,
++        predicate: ImmediateClosure<'a, dyn FnMut(T) -> Result<bool, JsError> + 'a>,
+     ) -> Result<bool, JsValue>;
+ 
+     /// The `sort()` method sorts the elements of an array in place and returns
+@@ -1170,7 +1170,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = sort, catch)]
+     pub fn try_sort_by<'a, T>(
+         this: &Array<T>,
+-        compare_fn: &ImmediateClosure<'a, dyn FnMut(T, T) -> Result<i32, JsError> + 'a>,
++        compare_fn: ImmediateClosure<'a, dyn FnMut(T, T) -> Result<i32, JsError> + 'a>,
+     ) -> Result<Array<T>, JsValue>;
+ 
+     /// The `splice()` method changes the contents of an array by removing existing elements and/or
+@@ -1237,7 +1237,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = toSorted, catch)]
+     pub fn try_to_sorted_by<'a, T>(
+         this: &Array<T>,
+-        compare_fn: &ImmediateClosure<'a, dyn FnMut(T, T) -> Result<i32, JsError> + 'a>,
++        compare_fn: ImmediateClosure<'a, dyn FnMut(T, T) -> Result<i32, JsError> + 'a>,
+     ) -> Result<Array<T>, JsValue>;
+ 
+     /// The `toSpliced()` method returns a new array with some elements removed and/or
+@@ -4939,7 +4939,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = forEach, catch)]
+     pub fn try_for_each<'a, K, V>(
+         this: &Map<K, V>,
+-        callback: &ImmediateClosure<'a, dyn FnMut(V, K) -> Result<(), JsError> + 'a>,
++        callback: ImmediateClosure<'a, dyn FnMut(V, K) -> Result<(), JsError> + 'a>,
+     ) -> Result<(), JsValue>;
+ 
+     /// The `get()` method returns a specified element from a Map object.
+@@ -7843,7 +7843,7 @@ extern "C" {
+     /// [MDN documentation](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Set/forEach)
+     #[cfg(js_sys_unstable_apis)]
+     #[wasm_bindgen(method, js_name = forEach)]
+-    pub fn for_each<'a, T>(this: &Set<T>, callback: &ImmediateClosure<'a, dyn FnMut(T) + 'a>);
++    pub fn for_each<'a, T>(this: &Set<T>, callback: ImmediateClosure<'a, dyn FnMut(T) + 'a>);
+ 
+     /// The `forEach()` method executes a provided function once for each value
+     /// in the Set object, in insertion order.
+@@ -7852,7 +7852,7 @@ extern "C" {
+     #[wasm_bindgen(method, js_name = forEach, catch)]
+     pub fn try_for_each<'a, T>(
+         this: &Set<T>,
+-        callback: &ImmediateClosure<'a, dyn FnMut(T) -> Result<(), JsError> + 'a>,
++        callback: ImmediateClosure<'a, dyn FnMut(T) -> Result<(), JsError> + 'a>,
+     ) -> Result<(), JsValue>;
+ 
+     /// The `has()` method returns a boolean indicating whether an element with
+@@ -8721,7 +8721,7 @@ pub mod JSON {
+         #[wasm_bindgen(catch, js_namespace = JSON, js_name = stringify)]
+         pub fn stringify_with_replacer<'a>(
+             obj: &JsValue,
+-            replacer: &ImmediateClosure<
++            replacer: ImmediateClosure<
+                 'a,
+                 dyn FnMut(JsString, JsValue) -> Result<Option<JsValue>, JsError> + 'a,
+             >,
+@@ -8741,7 +8741,7 @@ pub mod JSON {
+         #[wasm_bindgen(catch, js_namespace = JSON, js_name = stringify)]
+         pub fn stringify_with_replacer_func<'a>(
+             obj: &JsValue,
+-            replacer: &ImmediateClosure<
++            replacer: ImmediateClosure<
+                 'a,
+                 dyn FnMut(JsString, JsValue) -> Result<Option<JsValue>, JsError> + 'a,
+             >,
+@@ -12774,7 +12774,7 @@ extern "C" {
+     #[cfg(js_sys_unstable_apis)]
+     #[wasm_bindgen(constructor)]
+     pub fn new<'a, T: JsGeneric>(
+-        cb: &ImmediateClosure<
++        cb: ImmediateClosure<
+             'a,
+             dyn FnMut(Function<fn(T) -> Undefined>, Function<fn(JsValue) -> Undefined>) + 'a,
+         >,
+@@ -12786,7 +12786,7 @@ extern "C" {
+     /// [MDN documentation](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise)
+     #[wasm_bindgen(constructor)]
+     pub fn new_typed<'a, T: JsGeneric>(
+-        cb: &ImmediateClosure<
++        cb: ImmediateClosure<
+             'a,
+             dyn FnMut(Function<fn(T) -> Undefined>, Function<fn(JsValue) -> Undefined>) + 'a,
+         >,
+@@ -13219,7 +13219,7 @@ macro_rules! arrays {
+             /// `Array.prototype.forEach()`. `TypedArray` is one of the typed array
+             /// types here.
+             #[wasm_bindgen(method, js_name = forEach, catch)]
+-            pub fn try_for_each<'a>(this: &$name, callback: &ImmediateClosure<'a, dyn FnMut($ty, u32, $name) -> Result<(), JsError> + 'a>) -> Result<(), JsValue>;
++            pub fn try_for_each<'a>(this: &$name, callback: ImmediateClosure<'a, dyn FnMut($ty, u32, $name) -> Result<(), JsError> + 'a>) -> Result<(), JsValue>;
+ 
+             /// The length accessor property represents the length (in elements) of a
+             /// typed array.
+diff --git a/crates/macro/ui-tests/immediate-closure-lifetime.rs b/crates/macro/ui-tests/immediate-closure-lifetime.rs
+index fe78c89e0..7612c120f 100644
+--- a/crates/macro/ui-tests/immediate-closure-lifetime.rs
++++ b/crates/macro/ui-tests/immediate-closure-lifetime.rs
+@@ -3,14 +3,14 @@ use wasm_bindgen::prelude::*;
+ #[wasm_bindgen]
+ extern "C" {
+     // Missing + 'a on trait object - defaults to 'static
+-    fn bad_immediate_closure<'a>(f: &ImmediateClosure<'a, dyn FnMut()>);
++    fn bad_immediate_closure<'a>(f: ImmediateClosure<'a, dyn FnMut()>);
+ }
+ 
+ fn main() {
+     let mut called = false;
+     // This should fail: closure borrows `called` which is not 'static,
+     // but the function signature requires 'static due to missing + 'a
+-    bad_immediate_closure(&ImmediateClosure::new_mut(&mut || {
++    bad_immediate_closure(ImmediateClosure::new_mut(&mut || {
+         called = true;
+     }));
+ }
+diff --git a/crates/macro/ui-tests/immediate-closure-lifetime.stderr b/crates/macro/ui-tests/immediate-closure-lifetime.stderr
+index a61956905..e836e3574 100644
+--- a/crates/macro/ui-tests/immediate-closure-lifetime.stderr
++++ b/crates/macro/ui-tests/immediate-closure-lifetime.stderr
+@@ -1,29 +1,29 @@
+ error[E0373]: closure may outlive the current function, but it borrows `called`, which is owned by the current function
+-  --> ui-tests/immediate-closure-lifetime.rs:13:59
++  --> ui-tests/immediate-closure-lifetime.rs:13:58
+    |
+-13 |     bad_immediate_closure(&ImmediateClosure::new_mut(&mut || {
+-   |                                                           ^^ may outlive borrowed value `called`
++13 |     bad_immediate_closure(ImmediateClosure::new_mut(&mut || {
++   |                                                          ^^ may outlive borrowed value `called`
+ 14 |         called = true;
+    |         ------ `called` is borrowed here
+    |
+ note: function requires argument type to outlive `'static`
+   --> ui-tests/immediate-closure-lifetime.rs:13:5
+    |
+-13 | /     bad_immediate_closure(&ImmediateClosure::new_mut(&mut || {
++13 | /     bad_immediate_closure(ImmediateClosure::new_mut(&mut || {
+ 14 | |         called = true;
+ 15 | |     }));
+    | |_______^
+ help: to force the closure to take ownership of `called` (and any other referenced variables), use the `move` keyword
+    |
+-13 |     bad_immediate_closure(&ImmediateClosure::new_mut(&mut move || {
+-   |                                                           ++++
++13 |     bad_immediate_closure(ImmediateClosure::new_mut(&mut move || {
++   |                                                          ++++
+ 
+ error[E0716]: temporary value dropped while borrowed
+-  --> ui-tests/immediate-closure-lifetime.rs:13:59
++  --> ui-tests/immediate-closure-lifetime.rs:13:58
+    |
+-13 |        bad_immediate_closure(&ImmediateClosure::new_mut(&mut || {
+-   |   _____-                                                     ^
+-   |  |___________________________________________________________|
++13 |        bad_immediate_closure(ImmediateClosure::new_mut(&mut || {
++   |   _____-                                                    ^
++   |  |__________________________________________________________|
+ 14 | ||         called = true;
+ 15 | ||     }));
+    | ||     ^ -- temporary value is freed at the end of this statement
+diff --git a/guide/src/reference/catch-unwind.md b/guide/src/reference/catch-unwind.md
+index c12600cfb..1fb7006c4 100644
+--- a/guide/src/reference/catch-unwind.md
++++ b/guide/src/reference/catch-unwind.md
+@@ -112,18 +112,20 @@ When built with `panic=unwind`, certain `ScopedClosure` and `ImmediateClosure` c
+ catch panics and convert them to JavaScript `PanicError` exceptions. The panic-catching
+ constructors are:
+ 
+-- `Closure::own`, `Closure::once`, `Closure::once_into_js`
++- `Closure::new`, `Closure::own`, `Closure::once`, `Closure::once_into_js`
++- `Closure::wrap`, `Closure::wrap_assert_unwind_safe`
++- `Closure::own_assert_unwind_safe`, `Closure::once_assert_unwind_safe`
+ - `Closure::borrow` (Fn), `Closure::borrow_mut` (FnMut)
+ - `Closure::borrow_assert_unwind_safe`, `Closure::borrow_mut_assert_unwind_safe`
+-- `Closure::wrap_assert_unwind_safe`
+ - `ImmediateClosure::new` (Fn), `ImmediateClosure::new_mut` (FnMut)
+-- `ImmediateClosure::wrap_assert_unwind_safe` (Fn), `ImmediateClosure::wrap_mut_assert_unwind_safe` (FnMut)
++- `ImmediateClosure::new_assert_unwind_safe` (Fn), `ImmediateClosure::new_mut_assert_unwind_safe` (FnMut)
+ 
+-The `*_aborting` variants (`own_aborting`, `once_wrap`, `borrow_aborting`, `borrow_mut_aborting`,
+-`wrap_aborting`, `wrap_mut_aborting`, etc.) do NOT catch panics and will abort if the
+-closure panics. These variants also don't require the `MaybeUnwindSafe` bound.
++The `*_aborting` variants (`own_aborting`, `once_aborting`, `wrap_aborting`, `borrow_aborting`,
++`borrow_mut_aborting`, `ImmediateClosure::new_aborting`, `ImmediateClosure::new_mut_aborting`)
++do NOT catch panics and will abort if the closure panics. These variants also don't require
++the `MaybeUnwindSafe` bound.
+ 
+-Note: `Closure::new` is an alias for `own_aborting` and does NOT catch panics.
++Note: `Closure::new` is an alias for `Closure::own` and catches panics (requires `MaybeUnwindSafe`).
+ 
+ Catching panics in closures requires the closure to satisfy the `UnwindSafe` trait,
+ or you can use the `*_assert_unwind_safe` variants which skip this check.
+@@ -158,10 +160,10 @@ use wasm_bindgen::prelude::*;
+ 
+ #[wasm_bindgen]
+ extern "C" {
+-    fn forEach(cb: &ImmediateClosure<dyn FnMut(u32)>);
++    fn forEach(cb: ImmediateClosure<dyn FnMut(u32)>);
+ }
+ 
+-forEach(&ImmediateClosure::new_mut(&mut |x| {
++forEach(ImmediateClosure::new_mut(&mut |x| {
+     if x == 0 {
+         panic!("zero not allowed!");
+     }
+@@ -169,10 +171,10 @@ forEach(&ImmediateClosure::new_mut(&mut |x| {
+ ```
+ 
+ For closures that should not catch panics (and abort the program instead), use
+-the `*_aborting` variants: `Closure::new`, `Closure::wrap`,
+-`Closure::once_wrap`, `Closure::once_into_js_wrap`,
++the `*_aborting` variants: `Closure::own_aborting`, `Closure::wrap_aborting`,
++`Closure::once_aborting`,
+ `ScopedClosure::borrow_aborting`, `ScopedClosure::borrow_mut_aborting`,
+-`ImmediateClosure::wrap_aborting`, and `ImmediateClosure::wrap_mut_aborting`.
++`ImmediateClosure::new_aborting`, and `ImmediateClosure::new_mut_aborting`.
+ These do not require `UnwindSafe`.
+ 
+ > **Note**: The deprecated `&dyn Fn` and `&mut dyn FnMut` patterns are **not**
+diff --git a/guide/src/reference/passing-rust-closures-to-js.md b/guide/src/reference/passing-rust-closures-to-js.md
+index 30eac3ba3..a7d1836e4 100644
+--- a/guide/src/reference/passing-rust-closures-to-js.md
++++ b/guide/src/reference/passing-rust-closures-to-js.md
+@@ -12,20 +12,20 @@ closures are caught and converted to JavaScript `PanicError` exceptions. See
+ 
+ | Use case | Import function signature | Accepts |
+ | -------- | ------------------------- | ------- |
+-| Immediate/synchronous callbacks | `&ImmediateClosure<C>` | `&ImmediateClosure` only |
+-| Known-lifetime callbacks | `&ScopedClosure<'lifetime, C>` | `&ScopedClosure<'a>`, `&ScopedClosure<'static>`, and `&From<ImmediateClosure>` by conversion |
++| Immediate/synchronous callbacks | `ImmediateClosure<C>` | `ImmediateClosure` only |
++| Known-lifetime callbacks | `&ScopedClosure<'lifetime, C>` | `&ScopedClosure<'a>`, `&ScopedClosure<'static>` |
+ | Indeterminate lifetime | `ScopedClosure<'static, C>` | `ScopedClosure<'static>` only |
+ 
+-While direct `&dyn Fn` and `&mut dyn FnMut` closures [are still supported](#legacy-dyn-fn-and-mut-dyn-fnmut), `&ImmediateClosure` is now recommended instead for unwind support.
++While direct `&dyn Fn` and `&mut dyn FnMut` closures [are still supported](#legacy-dyn-fn-and-mut-dyn-fnmut), `ImmediateClosure` is now recommended instead for unwind support.
+ 
+ ### Constructor Patterns
+ 
+ | Type | Constructor | Aborting Constructor | Assert Unwind Safe |
+ | ---- | ----------- | -------------------- | ------------------ |
+-| [`&ImmediateClosure<C>`](#immediatesynchronous-callbacks-with-immediateclosure) | `ImmediateClosure::new` (Fn) / `new_mut` (FnMut) | `wrap_aborting` / `wrap_mut_aborting` | `wrap_assert_unwind_safe` / `wrap_mut_assert_unwind_safe` |
++| [`ImmediateClosure<C>`](#immediatesynchronous-callbacks-with-immediateclosure) | `ImmediateClosure::new` (Fn) / `new_mut` (FnMut) | `new_aborting` / `new_mut_aborting` | `new_assert_unwind_safe` / `new_mut_assert_unwind_safe` |
+ | [`&ScopedClosure<'a, C>`](#known-lifetime-callbacks-with-scopedclosure) | `Closure::borrow` (Fn) / `borrow_mut` (FnMut) | `borrow_aborting` / `borrow_mut_aborting` | `borrow_assert_unwind_safe` / `borrow_mut_assert_unwind_safe` |
+-| [`ScopedClosure<'static, C>`](#static-lifetimes-with-closuret--scopedclosurestatic-t) | `Closure::own` (`Closure::new`) | `own_aborting` | use `AssertUnwindSafe` wrapper |
+-| [`ScopedClosure<'static, C>` (one-shot)](#one-shot-static-closures-with-scopedclosurestatic-tonce) | `Closure::once` | `Closure::once_aborting` | use `AssertUnwindSafe` wrapper |
++| [`ScopedClosure<'static, C>`](#static-lifetimes-with-closuret--scopedclosurestatic-t) | `Closure::own` (`Closure::new`) | `own_aborting` | `own_assert_unwind_safe` |
++| [`ScopedClosure<'static, C>` (one-shot)](#one-shot-static-closures-with-scopedclosurestatic-tonce) | `Closure::once` | `Closure::once_aborting` | `once_assert_unwind_safe` |
+ 
+ `Closure<C>` is a backwards compatible alias for `ScopedClosure<'static, C>`, while providing constructors for arbitrary lifetimes.
+ 
+@@ -47,7 +47,7 @@ let closure = Closure::own(AssertUnwindSafe(move || {
+ }));
+ ```
+ 
+-This constructor flexibility allows API consumers to decide on unwind safety behavior at the call site, rather than having it fixed by the function signature. A single function accepting `&ImmediateClosure<dyn FnMut(u32)>` can be called with closures created via `new_mut` (verified unwind-safe), `wrap_mut_assert_unwind_safe` (asserted unwind-safe with inference), or `wrap_mut_aborting` (aborts on panic).
++This constructor flexibility allows API consumers to decide on unwind safety behavior at the call site, rather than having it fixed by the function signature. A single function accepting `ImmediateClosure<dyn FnMut(u32)>` can be called with closures created via `new_mut` (verified unwind-safe), `new_mut_assert_unwind_safe` (asserted unwind-safe with inference), or `new_mut_aborting` (aborts on panic).
+ 
+ ## Immediate/Synchronous Callbacks with `ImmediateClosure`
+ 
+@@ -61,11 +61,11 @@ use wasm_bindgen::prelude::*;
+ 
+ #[wasm_bindgen]
+ extern "C" {
+-    fn forEach<'a>(f: &ImmediateClosure<'a, dyn FnMut(u32) + 'a>);
++    fn forEach<'a>(f: ImmediateClosure<'a, dyn FnMut(u32) + 'a>);
+ }
+ 
+ let mut sum = 0;
+-forEach(&ImmediateClosure::new_mut(&mut |x| {
++forEach(ImmediateClosure::new_mut(&mut |x| {
+     sum += x;
+ }));
+ ```
+@@ -86,10 +86,10 @@ defaults to `+ 'static`, which prevents closures from borrowing local variables:
+ #[wasm_bindgen]
+ extern "C" {
+     // ✓ Correct: trait object lifetime tied to ImmediateClosure lifetime
+-    fn forEach<'a>(f: &ImmediateClosure<'a, dyn FnMut(u32) + 'a>);
++    fn forEach<'a>(f: ImmediateClosure<'a, dyn FnMut(u32) + 'a>);
+     
+     // ✗ Wrong: missing + 'a defaults to 'static, rejecting borrowed closures
+-    fn forEach_bad<'a>(f: &ImmediateClosure<'a, dyn FnMut(u32)>);
++    fn forEach_bad<'a>(f: ImmediateClosure<'a, dyn FnMut(u32)>);
+ }
+ ```
+ 
+@@ -103,9 +103,9 @@ By default `ImmediateClosure::new` and `new_mut` enforce unwind safety via `Mayb
+ When you need to capture types that aren't `UnwindSafe` (like `Rc<RefCell<T>>`),
+ you have two options:
+ 
+-1. **`wrap_aborting` / `wrap_mut_aborting`** — Aborts on panic instead of catching. Use when you prefer abort-on-panic behavior.
++1. **`new_aborting` / `new_mut_aborting`** — Aborts on panic instead of catching. Use when you prefer abort-on-panic behavior.
+ 
+-2. **`wrap_assert_unwind_safe` / `wrap_mut_assert_unwind_safe`** — Catches panics but doesn't verify `MaybeUnwindSafe`. Use when you want panic catching and are confident the closure is unwind-safe.
++2. **`new_assert_unwind_safe` / `new_mut_assert_unwind_safe`** — Catches panics but doesn't verify `MaybeUnwindSafe`. Use when you want panic catching and are confident the closure is unwind-safe.
+ 
+ ```rust
+ use wasm_bindgen::prelude::*;
+@@ -114,19 +114,19 @@ use std::rc::Rc;
+ 
+ #[wasm_bindgen]
+ extern "C" {
+-    fn forEach<'a>(f: &ImmediateClosure<'a, dyn FnMut(u32) + 'a>);
++    fn forEach<'a>(f: ImmediateClosure<'a, dyn FnMut(u32) + 'a>);
+ }
+ 
+ // RefCell is not UnwindSafe, but these variants don't require it
+ let data = Rc::new(RefCell::new(0));
+ 
+ // Option 1: Abort on panic
+-forEach(&ImmediateClosure::wrap_mut_aborting(&mut |x| {
++forEach(ImmediateClosure::new_mut_aborting(&mut |x| {
+     *data.borrow_mut() += x;
+ }));
+ 
+ // Option 2: Catch panics (caller asserts unwind safety)
+-forEach(&ImmediateClosure::wrap_mut_assert_unwind_safe(&mut |x| {
++forEach(ImmediateClosure::new_mut_assert_unwind_safe(&mut |x| {
+     *data.borrow_mut() += x;
+ }));
+ ```
+@@ -321,12 +321,12 @@ use wasm_bindgen::prelude::*;
+ 
+ #[wasm_bindgen]
+ extern "C" {
+-    fn needs_fnmut_immediate(cb: &ImmediateClosure<dyn FnMut(u32)>);
++    fn needs_fnmut_immediate(cb: ImmediateClosure<dyn FnMut(u32)>);
+ }
+ 
+ // ImmediateClosure
+ let func: &dyn Fn(u32) = &|x| println!("{}", x);
+-let closure = ImmediateClosure::wrap_assert_unwind_safe(func);
++let closure = ImmediateClosure::new_assert_unwind_safe(func);
+ needs_fnmut_immediate(closure.as_mut());
+ ```
+ 
+@@ -356,8 +356,8 @@ extern "C" {
+ // Preferred:
+ #[wasm_bindgen]
+ extern "C" {
+-    fn takes_closure(f: &ImmediateClosure<dyn Fn()>);
+-    fn takes_mut_closure(f: &ImmediateClosure<dyn FnMut()>);
++    fn takes_closure(f: ImmediateClosure<dyn Fn()>);
++    fn takes_mut_closure(f: ImmediateClosure<dyn FnMut()>);
+ }
+ ```
+ 
+@@ -391,7 +391,7 @@ The compiler error will indicate which captured type is problematic.
+ 
+ If you don't need panic catching, use the `*_aborting` variants (`own_aborting`,
+ `once_aborting`, `Closure::borrow_aborting`, `Closure::borrow_mut_aborting`,
+-`ImmediateClosure::wrap_aborting`, `ImmediateClosure::wrap_mut_aborting`) which do not require `UnwindSafe`:
++`ImmediateClosure::new_aborting`, `ImmediateClosure::new_mut_aborting`) which do not require `UnwindSafe`:
+ 
+ ```rust
+ use std::cell::RefCell;
+@@ -406,9 +406,9 @@ let closure = Closure::own_aborting(move || {
+ });
+ ```
+ 
+-#### Fix 1b: Use wrap_assert_unwind_safe
++#### Fix 1b: Use assert_unwind_safe variants
+ 
+-For `ScopedClosure`, you can use `Closure::wrap_assert_unwind_safe` with a boxed closure:
++For `ScopedClosure`, you can use `Closure::own_assert_unwind_safe` directly:
+ 
+ ```rust
+ use std::cell::RefCell;
+@@ -418,16 +418,25 @@ use wasm_bindgen::prelude::*;
+ let data = Rc::new(RefCell::new(0));
+ 
+ // No UnwindSafe requirement — catches panics, caller asserts safety
++let closure: Closure<dyn FnMut()> = Closure::own_assert_unwind_safe(move || {
++    *data.borrow_mut() += 1;
++});
++```
++
++Or use `Closure::wrap_assert_unwind_safe` with a boxed closure:
++
++```rust
++let data = Rc::new(RefCell::new(0));
+ let closure: Closure<dyn FnMut()> = Closure::wrap_assert_unwind_safe(Box::new(move || {
+     *data.borrow_mut() += 1;
+ }));
+ ```
+ 
+-For `ImmediateClosure`, use `wrap_mut_assert_unwind_safe` directly:
++For `ImmediateClosure`, use `new_mut_assert_unwind_safe` directly:
+ 
+ ```rust
+ let data = Rc::new(RefCell::new(0));
+-forEach(&ImmediateClosure::wrap_mut_assert_unwind_safe(&mut |x| {
++forEach(ImmediateClosure::new_mut_assert_unwind_safe(&mut |x| {
+     *data.borrow_mut() += x;
+ }));
+ ```
+diff --git a/src/closure.rs b/src/closure.rs
+index 157d4a184..d63e41519 100644
+--- a/src/closure.rs
++++ b/src/closure.rs
+@@ -231,17 +231,27 @@ impl<T> ScopedClosure<'static, T>
+ where
+     T: ?Sized + WasmClosure,
+ {
+-    /// Creates a new owned `'static` closure that aborts on panic.
++    /// Alias for [`Closure::own`].
+     ///
+-    /// Alias for [`own_aborting`](Self::own_aborting).
++    /// Creates a new static owned `ScopedClosure<'static, T>` from the provided
++    /// Rust function, with panic unwind support.
+     ///
+-    /// **Note: Not unwind safe. Prefer [`own`](Self::own) or `own` with
+-    /// [`AssertUnwindSafe`](core::panic::AssertUnwindSafe) when possible.**
++    /// The type parameter `T` determines whether the closure is `Fn` or `FnMut`.
++    ///
++    /// Supports unwind via its UnwindSafe bound when building with panic=unwind.
++    /// Alternatively, pass `Closure::own(AssertUnwindSafe(...))` to assert unwind
++    /// safety, or use [`own_assert_unwind_safe`](Self::own_assert_unwind_safe) or
++    /// [`own_aborting`](Self::own_aborting).
++    ///
++    /// When provided to a JS function as an own value, to be managed by the JS GC.
++    ///
++    /// See [`borrow`](Self::borrow) for creating a borrowed `ScopedClosure` with
++    /// an associated lifetime (defaults to immutable `Fn`).
+     pub fn new<F>(t: F) -> Self
+     where
+-        F: IntoWasmClosure<T> + 'static,
++        F: IntoWasmClosure<T> + MaybeUnwindSafe + 'static,
+     {
+-        Self::_wrap(Box::new(t).unsize(), false)
++        Self::_wrap(Box::new(t).unsize(), true)
+     }
+ 
+     /// Creates a new static owned `ScopedClosure<'static, T>` from the provided
+@@ -250,6 +260,9 @@ where
+     /// The type parameter `T` determines whether the closure is `Fn` or `FnMut`.
+     ///
+     /// Supports unwind via its UnwindSafe bound when building with panic=unwind.
++    /// Alternatively, pass `Closure::own(AssertUnwindSafe(...))` to assert unwind
++    /// safety, or use [`own_assert_unwind_safe`](Self::own_assert_unwind_safe) or
++    /// [`own_aborting`](Self::own_aborting).
+     ///
+     /// When provided to a JS function as an own value, to be managed by the JS GC.
+     ///
+@@ -283,14 +296,44 @@ where
+         Self::_wrap(Box::new(t).unsize(), false)
+     }
+ 
++    /// Creates a new static owned `ScopedClosure<'static, T>` from the provided
++    /// Rust function, with panic unwind support.
++    ///
++    /// The type parameter `T` determines whether the closure is `Fn` or `FnMut`.
++    ///
++    /// When provided to a JS function as an own value, to be managed by the JS GC.
++    ///
++    /// **Safety: Unwind safety is assumed when using this function, like using
++    /// `AssertUnwindSafe(...)`, this must be verified explicitly.**
++    ///
++    /// See [`borrow_aborting`](Self::borrow_aborting) for creating a borrowed
++    /// `ScopedClosure` with an associated lifetime.
++    pub fn own_assert_unwind_safe<F>(t: F) -> Self
++    where
++        F: IntoWasmClosure<T> + 'static,
++    {
++        Self::_wrap(Box::new(t).unsize(), true)
++    }
++
+     /// A more direct version of `Closure::new` which creates a `Closure` from
+     /// a `Box<dyn Fn>`/`Box<dyn FnMut>`, which is how it's kept internally.
+     ///
+-    /// This version does NOT catch panics. If the closure panics, the process will abort.
++    /// Supports unwind via its UnwindSafe bound when building with panic=unwind.
++    /// Alternatively, use [`wrap_assert_unwind_safe`](Self::wrap_assert_unwind_safe)
++    /// to assert unwind safety, or use [`wrap_aborting`](Self::wrap_aborting).
+     ///
+-    /// **Note: Not unwind safe. Prefer [`wrap_assert_unwind_safe`](Self::wrap_assert_unwind_safe)
+-    /// when possible.**
+     pub fn wrap<F>(data: Box<F>) -> Self
++    where
++        F: IntoWasmClosure<T> + ?Sized + MaybeUnwindSafe,
++    {
++        Self::_wrap(data.unsize(), true)
++    }
++
++    /// A more direct version of `Closure::new` which creates a `Closure` from
++    /// a `Box<dyn Fn>`/`Box<dyn FnMut>`, which is how it's kept internally.
++    ///
++    /// This version aborts on panics.
++    pub fn wrap_aborting<F>(data: Box<F>) -> Self
+     where
+         F: IntoWasmClosure<T> + ?Sized,
+     {
+@@ -343,6 +386,10 @@ where
+     /// closure captures.
+     ///
+     /// Supports unwind via its UnwindSafe bound when building with panic=unwind.
++    /// Wrap with `AssertUnwindSafe` if necessary to achieve this bound, or
++    /// use [`borrow_assert_unwind_safe`](Self::borrow_assert_unwind_safe) or
++    /// [`borrow_aborting`](Self::borrow_aborting) for non-unwind-safe functions.
++    ///
+     /// The resulting closure can be upcasted to `FnMut` using [`upcast_ref`](crate::Upcast::upcast_ref).
+     ///
+     /// # When to use scoped closures
+@@ -399,11 +446,14 @@ where
+         }
+     }
+ 
+-    /// Like [`borrow`](Self::borrow), but catches panics without requiring `MaybeUnwindSafe`.
++    /// Like [`borrow`](Self::borrow), but does not catch panics.
+     ///
+-    /// **Safety: Unwind safety is assumed when using this function, like using
+-    /// `AssertUnwindSafe(...)`, this must be verified explicitly.**
+-    pub fn borrow_assert_unwind_safe<'a, F>(t: &'a F) -> ScopedClosure<'a, F::Static>
++    /// If the closure panics, the process will abort. This variant does not
++    /// require `UnwindSafe`.
++    ///
++    /// **Note: Not unwind safe. Prefer [`borrow`](Self::borrow) or
++    /// [`borrow_assert_unwind_safe`](Self::borrow_assert_unwind_safe) when possible.**
++    pub fn borrow_aborting<'a, F>(t: &'a F) -> ScopedClosure<'a, F::Static>
+     where
+         F: IntoWasmClosureRef<'a, T> + ?Sized,
+     {
+@@ -412,7 +462,7 @@ where
+         ScopedClosure {
+             js: crate::__rt::wbg_cast(BorrowedClosure::<T> {
+                 data: WasmSlice { ptr, len },
+-                unwind_safe: true,
++                unwind_safe: false,
+                 _marker: PhantomData,
+             }),
+             _marker: PhantomData,
+@@ -420,14 +470,11 @@ where
+         }
+     }
+ 
+-    /// Like [`borrow`](Self::borrow), but does not catch panics.
+-    ///
+-    /// If the closure panics, the process will abort. This variant does not
+-    /// require `UnwindSafe`.
++    /// Like [`borrow`](Self::borrow), but catches panics without requiring `MaybeUnwindSafe`.
+     ///
+-    /// **Note: Not unwind safe. Prefer [`borrow`](Self::borrow) or
+-    /// [`borrow_assert_unwind_safe`](Self::borrow_assert_unwind_safe) when possible.**
+-    pub fn borrow_aborting<'a, F>(t: &'a F) -> ScopedClosure<'a, F::Static>
++    /// **Safety: Unwind safety is assumed when using this function, like using
++    /// `AssertUnwindSafe(...)`, this must be verified explicitly.**
++    pub fn borrow_assert_unwind_safe<'a, F>(t: &'a F) -> ScopedClosure<'a, F::Static>
+     where
+         F: IntoWasmClosureRef<'a, T> + ?Sized,
+     {
+@@ -436,7 +483,7 @@ where
+         ScopedClosure {
+             js: crate::__rt::wbg_cast(BorrowedClosure::<T> {
+                 data: WasmSlice { ptr, len },
+-                unwind_safe: false,
++                unwind_safe: true,
+                 _marker: PhantomData,
+             }),
+             _marker: PhantomData,
+@@ -450,6 +497,11 @@ where
+     /// don't need mutation, prefer [`borrow`](Self::borrow) which creates an immutable
+     /// `Fn` closure that is more likely to satisfy `UnwindSafe` automatically.
+     ///
++    /// Supports unwind via its UnwindSafe bound when building with panic=unwind.
++    /// Wrap with `AssertUnwindSafe` if necessary to achieve this bound, or
++    /// use [`borrow_mut_assert_unwind_safe`](Self::borrow_mut_assert_unwind_safe) or
++    /// [`borrow_mut_aborting`](Self::borrow_mut_aborting) for non-unwind-safe functions.
++    ///
+     /// See [`borrow`](Self::borrow) for full documentation on scoped closures.
+     ///
+     /// # Example
+@@ -487,11 +539,14 @@ where
+         }
+     }
+ 
+-    /// Like [`borrow_mut`](Self::borrow_mut), but catches panics without requiring `MaybeUnwindSafe`.
++    /// Like [`borrow_mut`](Self::borrow_mut), but does not catch panics.
+     ///
+-    /// **Safety: Unwind safety is assumed when using this function, like using
+-    /// `AssertUnwindSafe(...)`, this must be verified explicitly.**
+-    pub fn borrow_mut_assert_unwind_safe<'a, F>(t: &'a mut F) -> ScopedClosure<'a, F::Static>
++    /// If the closure panics, the process will abort. This variant does not
++    /// require `UnwindSafe`.
++    ///
++    /// **Note: Not unwind safe. Prefer [`borrow_mut`](Self::borrow_mut) or
++    /// [`borrow_mut_assert_unwind_safe`](Self::borrow_mut_assert_unwind_safe) when possible.**
++    pub fn borrow_mut_aborting<'a, F>(t: &'a mut F) -> ScopedClosure<'a, F::Static>
+     where
+         F: IntoWasmClosureRefMut<'a, T> + ?Sized,
+     {
+@@ -500,7 +555,7 @@ where
+         ScopedClosure {
+             js: crate::__rt::wbg_cast(BorrowedClosure::<T> {
+                 data: WasmSlice { ptr, len },
+-                unwind_safe: true,
++                unwind_safe: false,
+                 _marker: PhantomData,
+             }),
+             _marker: PhantomData,
+@@ -508,14 +563,11 @@ where
+         }
+     }
+ 
+-    /// Like [`borrow_mut`](Self::borrow_mut), but does not catch panics.
+-    ///
+-    /// If the closure panics, the process will abort. This variant does not
+-    /// require `UnwindSafe`.
++    /// Like [`borrow_mut`](Self::borrow_mut), but catches panics without requiring `MaybeUnwindSafe`.
+     ///
+-    /// **Note: Not unwind safe. Prefer [`borrow_mut`](Self::borrow_mut) or
+-    /// [`borrow_mut_assert_unwind_safe`](Self::borrow_mut_assert_unwind_safe) when possible.**
+-    pub fn borrow_mut_aborting<'a, F>(t: &'a mut F) -> ScopedClosure<'a, F::Static>
++    /// **Safety: Unwind safety is assumed when using this function, like using
++    /// `AssertUnwindSafe(...)`, this must be verified explicitly.**
++    pub fn borrow_mut_assert_unwind_safe<'a, F>(t: &'a mut F) -> ScopedClosure<'a, F::Static>
+     where
+         F: IntoWasmClosureRefMut<'a, T> + ?Sized,
+     {
+@@ -524,19 +576,14 @@ where
+         ScopedClosure {
+             js: crate::__rt::wbg_cast(BorrowedClosure::<T> {
+                 data: WasmSlice { ptr, len },
+-                unwind_safe: false,
++                unwind_safe: true,
+                 _marker: PhantomData,
+             }),
+             _marker: PhantomData,
+             _lifetime: PhantomData,
+         }
+     }
+-}
+ 
+-impl<T> ScopedClosure<'static, T>
+-where
+-    T: ?Sized + WasmClosure,
+-{
+     /// Release memory management of this closure from Rust to the JS GC.
+     ///
+     /// When a `Closure` is dropped it will release the Rust memory and
+@@ -633,13 +680,40 @@ where
+     ///
+     /// Note: the `A` and `R` type parameters are here just for backward compat
+     /// and will be removed in the future.
+-    pub fn once_wrap<F, A, R>(fn_once: F) -> Self
++    pub fn once_aborting<F, A, R>(fn_once: F) -> Self
+     where
+         F: WasmClosureFnOnceAbort<T, A, R>,
+     {
+         Closure::_wrap(fn_once.into_fn_mut(), false)
+     }
+ 
++    /// Create a `Closure` from a function that can only be called once,
++    /// with panic unwind support.
++    ///
++    /// **Safety: Unwind safety is assumed when using this function, like using
++    /// `AssertUnwindSafe(...)`, this must be verified explicitly.**
++    ///
++    /// Use this when:
++    /// - Your closure captures types that aren't `UnwindSafe` (like `Rc<Cell<T>>`)
++    /// - You still want panics to be caught and converted to JS exceptions
++    ///
++    /// Since we have no way of enforcing that JS cannot attempt to call this
++    /// `FnOnce(A...) -> R` more than once, this produces a `Closure<dyn FnMut(A...)
++    /// -> R>` that will dynamically throw a JavaScript error if called more
++    /// than once.
++    ///
++    /// Note: the `A` and `R` type parameters are here just for backward compat
++    /// and will be removed in the future.
++    pub fn once_assert_unwind_safe<F, A, R>(fn_once: F) -> Self
++    where
++        F: WasmClosureFnOnceAbort<T, A, R>,
++    {
++        Closure::_wrap(fn_once.into_fn_mut(), true)
++    }
++
++    // TODO: Update once closures to be generated on construction as once
++    // closures instead of using wrap(). Then we can share the same into_js()
++    // function between all closures, and deprecate this method.
+     /// Convert a `FnOnce(A...) -> R` into a JavaScript `Function` object.
+     ///
+     /// If the JavaScript function is invoked more than once, it will throw an
+@@ -669,32 +743,6 @@ where
+     {
+         fn_once.into_js_function()
+     }
+-
+-    /// Convert a `FnOnce(A...) -> R` into a JavaScript `Function` object.
+-    ///
+-    /// Unlike `once_into_js`, this version does NOT catch panics and does NOT require `UnwindSafe`.
+-    /// If the closure panics, the process will abort.
+-    ///
+-    /// If the JavaScript function is invoked more than once, it will throw an
+-    /// exception.
+-    ///
+-    /// Unlike `Closure::once_aborting`, this does *not* return a `Closure` that can be
+-    /// dropped before the function is invoked to deallocate the closure. The
+-    /// only way the `FnOnce` is deallocated is by calling the JavaScript
+-    /// function. If the JavaScript function is never called then the `FnOnce`
+-    /// and everything it closes over will leak.
+-    ///
+-    /// **Note: Not unwind safe. Prefer [`once_into_js`](Self::once_into_js) or `once_into_js` with
+-    /// [`AssertUnwindSafe`](core::panic::AssertUnwindSafe) when possible.**
+-    ///
+-    /// Note: the `A` and `R` type parameters are here just for backward compat
+-    /// and will be removed in the future.
+-    pub fn once_into_js_wrap<F, A, R>(fn_once: F) -> JsValue
+-    where
+-        F: WasmClosureFnOnceAbort<T, A, R>,
+-    {
+-        fn_once.into_js_function()
+-    }
+ }
+ 
+ /// A closure wrapper for immediate/synchronous callbacks with unwind safety.
+@@ -719,14 +767,13 @@ where
+ ///
+ /// #[wasm_bindgen]
+ /// extern "C" {
+-///     fn forEach<'a>(cb: &ImmediateClosure<'a, dyn FnMut(JsValue) + 'a>);
++///     fn forEach<'a>(cb: ImmediateClosure<'a, dyn FnMut(JsValue) + 'a>);
+ /// }
+ ///
+ /// let mut sum = 0;
+-/// let closure = ImmediateClosure::new_mut(&mut |val: JsValue| {
++/// forEach(ImmediateClosure::new_mut(&mut |val: JsValue| {
+ ///     sum += val.as_f64().unwrap() as i32;
+-/// });
+-/// forEach(&closure);
++/// }));
+ /// // sum is now updated
+ /// ```
+ ///
+@@ -773,6 +820,43 @@ impl<'a, T: ?Sized + WasmClosure> ImmediateClosure<'a, T> {
+         }
+     }
+ 
++    /// Like [`new`](Self::new), but does not catch panics.
++    ///
++    /// This variant enables type inference from the expected type, since it
++    /// takes the dyn type directly.
++    ///
++    /// **Note: Not unwind safe. Prefer [`new`](Self::new) or
++    /// [`new_assert_unwind_safe`](Self::new_assert_unwind_safe) when possible.**
++    pub fn new_aborting(f: &'a T) -> Self {
++        ImmediateClosure {
++            data: T::to_wasm_slice(f),
++            unwind_safe: false,
++            _marker: PhantomData,
++        }
++    }
++
++    /// Like [`new_aborting`](Self::new_aborting), but catches panics and converts them to JS exceptions.
++    ///
++    /// **Safety: Unwind safety is assumed when using this function, like using
++    /// `AssertUnwindSafe(...)`, this must be verified explicitly.**
++    ///
++    /// # Example
++    ///
++    /// ```ignore
++    /// let data = vec![1, 2, 3];
++    /// // Type is inferred from context
++    /// let closure: ImmediateClosure<dyn Fn()> = ImmediateClosure::new_assert_unwind_safe(&|| {
++    ///     println!("data len: {}", data.len());
++    /// });
++    /// ```
++    pub fn new_assert_unwind_safe(f: &'a T) -> Self {
++        ImmediateClosure {
++            data: T::to_wasm_slice(f),
++            unwind_safe: true,
++            _marker: PhantomData,
++        }
++    }
++
+     /// Creates an immediate closure from a mutable borrow of a `FnMut` closure.
+     ///
+     /// Use this for closures that need to mutate captured state. For closures that
+@@ -801,23 +885,6 @@ impl<'a, T: ?Sized + WasmClosure> ImmediateClosure<'a, T> {
+             _marker: PhantomData,
+         }
+     }
+-}
+-
+-impl<'a, T: ?Sized + WasmClosure> ImmediateClosure<'a, T> {
+-    /// Like [`new`](Self::new), but does not catch panics.
+-    ///
+-    /// This variant enables type inference from the expected type, since it
+-    /// takes the dyn type directly.
+-    ///
+-    /// **Note: Not unwind safe. Prefer [`new`](Self::new) or
+-    /// [`wrap_assert_unwind_safe`](Self::wrap_assert_unwind_safe) when possible.**
+-    pub fn wrap_aborting(f: &'a T) -> Self {
+-        ImmediateClosure {
+-            data: T::to_wasm_slice(f),
+-            unwind_safe: false,
+-            _marker: PhantomData,
+-        }
+-    }
+ 
+     /// Like [`new_mut`](Self::new_mut), but does not catch panics.
+     ///
+@@ -825,8 +892,8 @@ impl<'a, T: ?Sized + WasmClosure> ImmediateClosure<'a, T> {
+     /// takes the dyn type directly.
+     ///
+     /// **Note: Not unwind safe. Prefer [`new_mut`](Self::new_mut) or
+-    /// [`wrap_mut_assert_unwind_safe`](Self::wrap_mut_assert_unwind_safe) when possible.**
+-    pub fn wrap_mut_aborting(f: &'a mut T) -> Self {
++    /// [`new_mut_assert_unwind_safe`](Self::new_mut_assert_unwind_safe) when possible.**
++    pub fn new_mut_aborting(f: &'a mut T) -> Self {
+         ImmediateClosure {
+             data: T::to_wasm_slice(f),
+             unwind_safe: false,
+@@ -834,29 +901,7 @@ impl<'a, T: ?Sized + WasmClosure> ImmediateClosure<'a, T> {
+         }
+     }
+ 
+-    /// Like [`wrap_aborting`](Self::wrap_aborting), but catches panics and converts them to JS exceptions.
+-    ///
+-    /// **Safety: Unwind safety is assumed when using this function, like using
+-    /// `AssertUnwindSafe(...)`, this must be verified explicitly.**
+-    ///
+-    /// # Example
+-    ///
+-    /// ```ignore
+-    /// let data = vec![1, 2, 3];
+-    /// // Type is inferred from context
+-    /// let closure: ImmediateClosure<dyn Fn()> = ImmediateClosure::wrap_assert_unwind_safe(&|| {
+-    ///     println!("data len: {}", data.len());
+-    /// });
+-    /// ```
+-    pub fn wrap_assert_unwind_safe(f: &'a T) -> Self {
+-        ImmediateClosure {
+-            data: T::to_wasm_slice(f),
+-            unwind_safe: true,
+-            _marker: PhantomData,
+-        }
+-    }
+-
+-    /// Like [`wrap_mut_aborting`](Self::wrap_mut_aborting), but catches panics and converts them to JS exceptions.
++    /// Like [`new_mut_aborting`](Self::new_mut_aborting), but catches panics and converts them to JS exceptions.
+     ///
+     /// **Safety: Unwind safety is assumed when using this function, like using
+     /// `AssertUnwindSafe(...)`, this must be verified explicitly.**
+@@ -866,11 +911,11 @@ impl<'a, T: ?Sized + WasmClosure> ImmediateClosure<'a, T> {
+     /// ```ignore
+     /// let mut count = 0;
+     /// // Type of `x` is inferred from context
+-    /// let closure: ImmediateClosure<dyn FnMut(u32)> = ImmediateClosure::wrap_mut_assert_unwind_safe(&mut |x| {
++    /// let closure: ImmediateClosure<dyn FnMut(u32)> = ImmediateClosure::new_mut_assert_unwind_safe(&mut |x| {
+     ///     count += x;
+     /// });
+     /// ```
+-    pub fn wrap_mut_assert_unwind_safe(f: &'a mut T) -> Self {
++    pub fn new_mut_assert_unwind_safe(f: &'a mut T) -> Self {
+         ImmediateClosure {
+             data: T::to_wasm_slice(f),
+             unwind_safe: true,
+@@ -878,11 +923,11 @@ impl<'a, T: ?Sized + WasmClosure> ImmediateClosure<'a, T> {
+         }
+     }
+ 
+-    /// Returns a reference to this closure as a mutable `FnMut` closure.
++    /// Converts this closure to a mutable `FnMut` closure.
+     ///
+     /// This is safe because every `Fn` can be called through a `FnMut` interface.
+-    /// The fat pointer representation is compatible—`&dyn Fn` can be safely
+-    /// reinterpreted as `&dyn FnMut`.
++    /// The fat pointer representation is compatible—`dyn Fn` can be safely
++    /// reinterpreted as `dyn FnMut`.
+     ///
+     /// Note: Unlike `ScopedClosure::as_mut`, this only supports the Fn→FnMut conversion
+     /// with the same argument and return types. `ImmediateClosure` stores a Rust fat
+@@ -895,19 +940,21 @@ impl<'a, T: ?Sized + WasmClosure> ImmediateClosure<'a, T> {
+     ///
+     /// #[wasm_bindgen]
+     /// extern "C" {
+-    ///     fn needs_fnmut(cb: &ImmediateClosure<dyn FnMut(u32)>);
++    ///     fn needs_fnmut(cb: ImmediateClosure<dyn FnMut(u32)>);
+     /// }
+     ///
+     /// let func: &dyn Fn(u32) = &|x| println!("{}", x);
+-    /// let closure: ImmediateClosure<dyn Fn(u32)> = ImmediateClosure::wrap_assert_unwind_safe(func);
++    /// let closure: ImmediateClosure<dyn Fn(u32)> = ImmediateClosure::new_assert_unwind_safe(func);
+     /// needs_fnmut(closure.as_mut());
+     /// ```
+-    pub fn as_mut(&self) -> &ImmediateClosure<'a, T::AsMut> {
++    pub fn as_mut(self) -> ImmediateClosure<'a, T::AsMut> {
+         // SAFETY: ImmediateClosure stores a WasmSlice (fat pointer data) and metadata.
+-        // The type parameter T is phantom data. A &dyn Fn fat pointer can be safely
+-        // reinterpreted as &dyn FnMut since Fn is a supertrait of FnMut.
+-        unsafe {
+-            &*(self as *const ImmediateClosure<'a, T> as *const ImmediateClosure<'a, T::AsMut>)
++        // The type parameter T is phantom data. A dyn Fn fat pointer can be safely
++        // reinterpreted as dyn FnMut since Fn is a supertrait of FnMut.
++        ImmediateClosure {
++            data: self.data,
++            unwind_safe: self.unwind_safe,
++            _marker: PhantomData,
+         }
+     }
+ }
+@@ -1136,12 +1183,16 @@ where
+ {
+     #[cfg_attr(wasm_bindgen_unstable_test_coverage, coverage(off))]
+     fn describe() {
+-        // Delegate to the underlying dyn Fn/FnMut - uses FUNCTION descriptor
+-        <T as WasmDescribe>::describe();
++        // For FnMut closures, wrap with REFMUT so the CLI generates
++        // a reentrancy guard in JS. For Fn closures, emit bare FUNCTION.
++        if T::IS_MUT {
++            inform(REFMUT);
++        }
++        T::describe();
+     }
+ }
+ 
+-impl<T> IntoWasmAbi for &ImmediateClosure<'_, T>
++impl<T> IntoWasmAbi for ImmediateClosure<'_, T>
+ where
+     T: WasmClosure + ?Sized,
+ {
+@@ -1161,7 +1212,7 @@ where
+     }
+ }
+ 
+-impl<T> OptionIntoWasmAbi for &ImmediateClosure<'_, T>
++impl<T> OptionIntoWasmAbi for ImmediateClosure<'_, T>
+ where
+     T: WasmClosure + ?Sized,
+ {
+@@ -1184,13 +1235,13 @@ fn _check() {
+     _assert::<ScopedClosure<'static, dyn FnMut()>>();
+     _assert::<Closure<dyn Fn()>>();
+     _assert::<Closure<dyn FnMut()>>();
+-    // ImmediateClosure by reference
+-    _assert::<&ImmediateClosure<dyn Fn()>>();
+-    _assert::<&ImmediateClosure<dyn Fn(String)>>();
+-    _assert::<&ImmediateClosure<dyn Fn() -> String>>();
+-    _assert::<&ImmediateClosure<dyn FnMut()>>();
+-    _assert::<&ImmediateClosure<dyn FnMut(String)>>();
+-    _assert::<&ImmediateClosure<dyn FnMut() -> String>>();
++    // ImmediateClosure by value
++    _assert::<ImmediateClosure<dyn Fn()>>();
++    _assert::<ImmediateClosure<dyn Fn(String)>>();
++    _assert::<ImmediateClosure<dyn Fn() -> String>>();
++    _assert::<ImmediateClosure<dyn FnMut()>>();
++    _assert::<ImmediateClosure<dyn FnMut(String)>>();
++    _assert::<ImmediateClosure<dyn FnMut() -> String>>();
+ }
+ 
+ impl<T> fmt::Debug for ScopedClosure<'_, T>
+diff --git a/src/convert/closures.rs b/src/convert/closures.rs
+index 88a1d16e2..abb18306f 100644
+--- a/src/convert/closures.rs
++++ b/src/convert/closures.rs
+@@ -79,7 +79,7 @@ macro_rules! closures {
+             $($var: ErasableGeneric,)*
+             R: ErasableGeneric,
+         {
+-            type Repr = &'static ImmediateClosure<'static, dyn $Fn ($(<$var as ErasableGeneric>::Repr,)*) -> <R as ErasableGeneric>::Repr + 'static>;
++            type Repr = ImmediateClosure<'static, dyn $Fn ($(<$var as ErasableGeneric>::Repr,)*) -> <R as ErasableGeneric>::Repr + 'static>;
+         }
+ 
+         // Generate invoke function that checks unwind_safe flag when unwinding is available
+@@ -291,7 +291,8 @@ macro_rules! closures {
+                 let rc1 = Rc::new(WasmRefCell::new(None));
+                 let rc2 = rc1.clone();
+ 
+-                let closure = Closure::once_wrap(closures!(@closure $FnArgs $($var)* {
++                // TODO: Unwind safety for FnOnce
++                let closure = Closure::once_aborting(closures!(@closure $FnArgs $($var)* {
+                     let result = self($($var),*);
+ 
+                     // And then drop the `Rc` holding this function's `Closure`
+@@ -541,7 +542,7 @@ where
+ 
+ // UpcastFrom impl for ImmediateClosure.
+ // ImmediateClosure<T2> upcasts from ImmediateClosure<T1> when T2's dyn type upcasts from T1's dyn type.
+-// Since ImmediateClosure is #[repr(transparent)] over &'a mut T, this is a zero-cost transmute.
++// Since ImmediateClosure stores a WasmSlice (fat pointer) with phantom type, this is a zero-cost transmute.
+ impl<'a, 'b, T1, T2> UpcastFrom<ImmediateClosure<'a, T1>> for ImmediateClosure<'b, T2>
+ where
+     T1: ?Sized + WasmClosure,

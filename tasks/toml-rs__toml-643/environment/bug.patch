@@ -1,0 +1,166 @@
+diff --git a/crates/toml/src/value.rs b/crates/toml/src/value.rs
+index e6f832a7..c8065a6c 100644
+--- a/crates/toml/src/value.rs
++++ b/crates/toml/src/value.rs
+@@ -921,14 +921,12 @@ impl ser::Serializer for ValueSerializer {
+     }
+ 
+     fn serialize_f32(self, value: f32) -> Result<Value, crate::ser::Error> {
+-        self.serialize_f64(value as f64)
++        // Preserve sign of NaN. The `as` produces a nondeterministic sign.
++        let sign = if value.is_sign_positive() { 1.0 } else { -1.0 };
++        self.serialize_f64((value as f64).copysign(sign))
+     }
+ 
+-    fn serialize_f64(self, mut value: f64) -> Result<Value, crate::ser::Error> {
+-        // Discard sign of NaN. See ValueSerializer::serialize_f64.
+-        if value.is_nan() {
+-            value = value.copysign(1.0);
+-        }
++    fn serialize_f64(self, value: f64) -> Result<Value, crate::ser::Error> {
+         Ok(Value::Float(value))
+     }
+ 
+diff --git a/crates/toml/tests/testsuite/float.rs b/crates/toml/tests/testsuite/float.rs
+index 1d9ce1a3..d0081347 100644
+--- a/crates/toml/tests/testsuite/float.rs
++++ b/crates/toml/tests/testsuite/float.rs
+@@ -47,7 +47,7 @@ macro_rules! float_inf_tests {
+         assert!(inf.sf5.is_nan());
+         assert!(inf.sf5.is_sign_positive());
+         assert!(inf.sf6.is_nan());
+-        assert!(inf.sf6.is_sign_negative()); // NOTE: serializes to just `nan`
++        assert!(inf.sf6.is_sign_negative());
+ 
+         assert_eq!(inf.sf7, 0.0);
+         assert!(inf.sf7.is_sign_positive());
+@@ -63,7 +63,7 @@ sf2 = inf
+ sf3 = -inf
+ sf4 = nan
+ sf5 = nan
+-sf6 = nan
++sf6 = -nan
+ sf7 = 0.0
+ sf8 = -0.0
+ "
+diff --git a/crates/toml_edit/src/ser/value.rs b/crates/toml_edit/src/ser/value.rs
+index 47a17a3b..f250d63d 100644
+--- a/crates/toml_edit/src/ser/value.rs
++++ b/crates/toml_edit/src/ser/value.rs
+@@ -105,20 +105,12 @@ impl serde::ser::Serializer for ValueSerializer {
+     }
+ 
+     fn serialize_f32(self, v: f32) -> Result<Self::Ok, Self::Error> {
+-        self.serialize_f64(v as f64)
+-    }
+-
+-    fn serialize_f64(self, mut v: f64) -> Result<Self::Ok, Self::Error> {
+-        // Discard sign of NaN when serialized using Serde.
+-        //
+-        // In all likelihood the sign of NaNs is not meaningful in the user's
+-        // program. Ending up with `-nan` in the TOML document would usually be
+-        // surprising and undesirable, when the sign of the NaN was not
+-        // intentionally controlled by the caller, or may even be
+-        // nondeterministic if it comes from arithmetic operations or a cast.
+-        if v.is_nan() {
+-            v = v.copysign(1.0);
+-        }
++        // Preserve sign of NaN. The `as` produces a nondeterministic sign.
++        let sign = if v.is_sign_positive() { 1.0 } else { -1.0 };
++        self.serialize_f64((v as f64).copysign(sign))
++    }
++
++    fn serialize_f64(self, v: f64) -> Result<Self::Ok, Self::Error> {
+         Ok(v.into())
+     }
+ 
+diff --git a/crates/toml_edit/src/value.rs b/crates/toml_edit/src/value.rs
+index 62eb30c7..f10da9a4 100644
+--- a/crates/toml_edit/src/value.rs
++++ b/crates/toml_edit/src/value.rs
+@@ -284,7 +284,6 @@ impl From<i64> for Value {
+ 
+ impl From<f64> for Value {
+     fn from(f: f64) -> Self {
+-        // Preserve sign of NaN. It may get written to TOML as `-nan`.
+         Value::Float(Formatted::new(f))
+     }
+ }
+diff --git a/crates/toml_edit/tests/testsuite/float.rs b/crates/toml_edit/tests/testsuite/float.rs
+deleted file mode 100644
+index 34e792ed..00000000
+--- a/crates/toml_edit/tests/testsuite/float.rs
++++ /dev/null
+@@ -1,60 +0,0 @@
+-use toml_edit::Document;
+-
+-macro_rules! float_inf_tests {
+-    ($ty:ty) => {{
+-        let document = r"
+-            # infinity
+-            sf1 = inf  # positive infinity
+-            sf2 = +inf # positive infinity
+-            sf3 = -inf # negative infinity
+-
+-            # not a number
+-            sf4 = nan  # actual sNaN/qNaN encoding is implementation specific
+-            sf5 = +nan # same as `nan`
+-            sf6 = -nan # valid, actual encoding is implementation specific
+-
+-            # zero
+-            sf7 = +0.0
+-            sf8 = -0.0
+-        ";
+-
+-        let document = document.parse::<Document>().unwrap();
+-        let float = |k| document[k].as_float().unwrap();
+-
+-        assert!(float("sf1").is_infinite());
+-        assert!(float("sf1").is_sign_positive());
+-        assert!(float("sf2").is_infinite());
+-        assert!(float("sf2").is_sign_positive());
+-        assert!(float("sf3").is_infinite());
+-        assert!(float("sf3").is_sign_negative());
+-
+-        assert!(float("sf4").is_nan());
+-        assert!(float("sf4").is_sign_positive());
+-        assert!(float("sf5").is_nan());
+-        assert!(float("sf5").is_sign_positive());
+-        assert!(float("sf6").is_nan());
+-        assert!(float("sf6").is_sign_negative());
+-
+-        assert_eq!(float("sf7"), 0.0);
+-        assert!(float("sf7").is_sign_positive());
+-        assert_eq!(float("sf8"), 0.0);
+-        assert!(float("sf8").is_sign_negative());
+-
+-        let mut document = Document::new();
+-        document["sf4"] = toml_edit::value(f64::NAN.copysign(1.0));
+-        document["sf6"] = toml_edit::value(f64::NAN.copysign(-1.0));
+-        assert_eq!(
+-            document.to_string(),
+-            "\
+-sf4 = nan
+-sf6 = -nan
+-"
+-        );
+-    }};
+-}
+-
+-#[test]
+-fn test_float() {
+-    float_inf_tests!(f32);
+-    float_inf_tests!(f64);
+-}
+diff --git a/crates/toml_edit/tests/testsuite/main.rs b/crates/toml_edit/tests/testsuite/main.rs
+index 0592f3c0..1476c5da 100644
+--- a/crates/toml_edit/tests/testsuite/main.rs
++++ b/crates/toml_edit/tests/testsuite/main.rs
+@@ -3,7 +3,6 @@
+ mod convert;
+ mod datetime;
+ mod edit;
+-mod float;
+ mod invalid;
+ mod parse;
+ mod stackoverflow;
