@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="https://github.com/abundant-ai/SWE-gen-Rust">
-    <img src="assets/swegen-rust-banner.jpg" style="height: 25em" alt="SWE-gen Rust banner" />
+    <img src="assets/swegen-rust-banner.jpg" style="height: 20em" alt="SWE-gen Rust banner" />
   </a>
 </p>
 
