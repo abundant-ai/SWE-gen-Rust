@@ -1,0 +1,665 @@
+diff --git a/src/renderer/html_handlebars/hbs_renderer.rs b/src/renderer/html_handlebars/hbs_renderer.rs
+index 54004066..080b12da 100644
+--- a/src/renderer/html_handlebars/hbs_renderer.rs
++++ b/src/renderer/html_handlebars/hbs_renderer.rs
+@@ -528,11 +528,6 @@ impl Renderer for HtmlHandlebars {
+         debug!("Register the header handlebars template");
+         handlebars.register_partial("header", String::from_utf8(theme.header.clone())?)?;
+ 
+-        debug!("Register the toc handlebars template");
+-        handlebars.register_template_string("toc_js", String::from_utf8(theme.toc_js.clone())?)?;
+-        handlebars
+-            .register_template_string("toc_html", String::from_utf8(theme.toc_html.clone())?)?;
+-
+         debug!("Register handlebars helpers");
+         self.register_hbs_helpers(&mut handlebars, &html_config);
+ 
+@@ -588,18 +583,6 @@ impl Renderer for HtmlHandlebars {
+             debug!("Creating print.html ✓");
+         }
+ 
+-        debug!("Render toc");
+-        {
+-            let rendered_toc = handlebars.render("toc_js", &data)?;
+-            utils::fs::write_file(destination, "toc.js", rendered_toc.as_bytes())?;
+-            debug!("Creating toc.js ✓");
+-            data.insert("is_toc_html".to_owned(), json!(true));
+-            let rendered_toc = handlebars.render("toc_html", &data)?;
+-            utils::fs::write_file(destination, "toc.html", rendered_toc.as_bytes())?;
+-            debug!("Creating toc.html ✓");
+-            data.remove("is_toc_html");
+-        }
+-
+         debug!("Copy static files");
+         self.copy_static_files(destination, &theme, &html_config)
+             .with_context(|| "Unable to copy across static files")?;
+diff --git a/src/renderer/html_handlebars/helpers/toc.rs b/src/renderer/html_handlebars/helpers/toc.rs
+index d43c617f..aabea028 100644
+--- a/src/renderer/html_handlebars/helpers/toc.rs
++++ b/src/renderer/html_handlebars/helpers/toc.rs
+@@ -1,7 +1,8 @@
+ use std::path::Path;
+ use std::{cmp::Ordering, collections::BTreeMap};
+ 
+-use crate::utils::special_escape;
++use crate::utils;
++use crate::utils::bracket_escape;
+ 
+ use handlebars::{
+     Context, Handlebars, Helper, HelperDef, Output, RenderContext, RenderError, RenderErrorReason,
+@@ -31,6 +32,21 @@ impl HelperDef for RenderToc {
+                     RenderErrorReason::Other("Could not decode the JSON data".to_owned()).into()
+                 })
+         })?;
++        let current_path = rc
++            .evaluate(ctx, "@root/path")?
++            .as_json()
++            .as_str()
++            .ok_or_else(|| {
++                RenderErrorReason::Other("Type error for `path`, string expected".to_owned())
++            })?
++            .replace('\"', "");
++
++        let current_section = rc
++            .evaluate(ctx, "@root/section")?
++            .as_json()
++            .as_str()
++            .map(str::to_owned)
++            .unwrap_or_default();
+ 
+         let fold_enable = rc
+             .evaluate(ctx, "@root/fold_enable")?
+@@ -48,27 +64,31 @@ impl HelperDef for RenderToc {
+                 RenderErrorReason::Other("Type error for `fold_level`, u64 expected".to_owned())
+             })?;
+ 
+-        // If true, then this is the iframe and we need target="_parent"
+-        let is_toc_html = rc
+-            .evaluate(ctx, "@root/is_toc_html")?
+-            .as_json()
+-            .as_bool()
+-            .unwrap_or(false);
+-
+         out.write("<ol class=\"chapter\">")?;
+ 
+         let mut current_level = 1;
++        // The "index" page, which has this attribute set, is supposed to alias the first chapter in
++        // the book, i.e. the first link. There seems to be no easy way to determine which chapter
++        // the "index" is aliasing from within the renderer, so this is used instead to force the
++        // first link to be active. See further below.
++        let mut is_first_chapter = ctx.data().get("is_index").is_some();
+ 
+         for item in chapters {
+-            let (_section, level) = if let Some(s) = item.get("section") {
++            let (section, level) = if let Some(s) = item.get("section") {
+                 (s.as_str(), s.matches('.').count())
+             } else {
+                 ("", 1)
+             };
+ 
+-            // Expand if folding is disabled, or if levels that are larger than this would not
+-            // be folded.
+-            let is_expanded = !fold_enable || level - 1 < (fold_level as usize);
++            let is_expanded =
++                if !fold_enable || (!section.is_empty() && current_section.starts_with(section)) {
++                    // Expand if folding is disabled, or if the section is an
++                    // ancestor or the current section itself.
++                    true
++                } else {
++                    // Levels that are larger than this would be folded.
++                    level - 1 < fold_level as usize
++                };
+ 
+             match level.cmp(&current_level) {
+                 Ordering::Greater => {
+@@ -101,7 +121,7 @@ impl HelperDef for RenderToc {
+             // Part title
+             if let Some(title) = item.get("part") {
+                 out.write("<li class=\"part-title\">")?;
+-                out.write(&special_escape(title))?;
++                out.write(&bracket_escape(title))?;
+                 out.write("</li>")?;
+                 continue;
+             }
+@@ -119,12 +139,16 @@ impl HelperDef for RenderToc {
+                         .replace('\\', "/");
+ 
+                     // Add link
++                    out.write(&utils::fs::path_to_root(&current_path))?;
+                     out.write(&tmp)?;
+-                    out.write(if is_toc_html {
+-                        "\" target=\"_parent\">"
+-                    } else {
+-                        "\">"
+-                    })?;
++                    out.write("\"")?;
++
++                    if path == &current_path || is_first_chapter {
++                        is_first_chapter = false;
++                        out.write(" class=\"active\"")?;
++                    }
++
++                    out.write(">")?;
+                     path_exists = true;
+                 }
+                 _ => {
+@@ -143,7 +167,7 @@ impl HelperDef for RenderToc {
+             }
+ 
+             if let Some(name) = item.get("name") {
+-                out.write(&special_escape(name))?
++                out.write(&bracket_escape(name))?
+             }
+ 
+             if path_exists {
+diff --git a/src/theme/css/chrome.css b/src/theme/css/chrome.css
+index e62056b0..83b7969b 100644
+--- a/src/theme/css/chrome.css
++++ b/src/theme/css/chrome.css
+@@ -399,22 +399,6 @@ ul#searchresults span.teaser em {
+     background-color: var(--sidebar-bg);
+     color: var(--sidebar-fg);
+ }
+-.sidebar-iframe-inner {
+-    background-color: var(--sidebar-bg);
+-    color: var(--sidebar-fg);
+-    padding: 10px 10px;
+-    margin: 0;
+-    font-size: 1.4rem;
+-}
+-.sidebar-iframe-outer {
+-    border: none;
+-    height: 100%;
+-    position: absolute;
+-    top: 0;
+-    bottom: 0;
+-    left: 0;
+-    right: 0;
+-}
+ [dir=rtl] .sidebar { left: unset; right: 0; }
+ .sidebar-resizing {
+     -moz-user-select: none;
+diff --git a/src/theme/index.hbs b/src/theme/index.hbs
+index 97f59a13..080b7851 100644
+--- a/src/theme/index.hbs
++++ b/src/theme/index.hbs
+@@ -109,17 +109,35 @@
+         </script>
+ 
+         <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+-            <!-- populated by js -->
+-            <div class="sidebar-scrollbox"></div>
+-            <noscript>
+-                <iframe class="sidebar-iframe-outer" src="{{ path_to_root }}toc.html"></iframe>
+-            </noscript>
++            <div class="sidebar-scrollbox">
++                {{#toc}}{{/toc}}
++            </div>
+             <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                 <div class="sidebar-resize-indicator"></div>
+             </div>
+         </nav>
+ 
+-        <script async src="{{ path_to_root }}toc.js"></script>
++        <!-- Track and set sidebar scroll position -->
++        <script>
++            var sidebarScrollbox = document.querySelector('#sidebar .sidebar-scrollbox');
++            sidebarScrollbox.addEventListener('click', function(e) {
++                if (e.target.tagName === 'A') {
++                    sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
++                }
++            }, { passive: true });
++            var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
++            sessionStorage.removeItem('sidebar-scroll');
++            if (sidebarScrollTop) {
++                // preserve sidebar scroll position when navigating via links within sidebar
++                sidebarScrollbox.scrollTop = sidebarScrollTop;
++            } else {
++                // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
++                var activeSection = document.querySelector('#sidebar .active');
++                if (activeSection) {
++                    activeSection.scrollIntoView({ block: 'center' });
++                }
++            }
++        </script>
+ 
+         <div id="page-wrapper" class="page-wrapper">
+ 
+diff --git a/src/theme/mod.rs b/src/theme/mod.rs
+index b173bd4a..1c108d62 100644
+--- a/src/theme/mod.rs
++++ b/src/theme/mod.rs
+@@ -17,8 +17,6 @@ pub static INDEX: &[u8] = include_bytes!("index.hbs");
+ pub static HEAD: &[u8] = include_bytes!("head.hbs");
+ pub static REDIRECT: &[u8] = include_bytes!("redirect.hbs");
+ pub static HEADER: &[u8] = include_bytes!("header.hbs");
+-pub static TOC_JS: &[u8] = include_bytes!("toc.js.hbs");
+-pub static TOC_HTML: &[u8] = include_bytes!("toc.html.hbs");
+ pub static CHROME_CSS: &[u8] = include_bytes!("css/chrome.css");
+ pub static GENERAL_CSS: &[u8] = include_bytes!("css/general.css");
+ pub static PRINT_CSS: &[u8] = include_bytes!("css/print.css");
+@@ -52,8 +50,6 @@ pub struct Theme {
+     pub head: Vec<u8>,
+     pub redirect: Vec<u8>,
+     pub header: Vec<u8>,
+-    pub toc_js: Vec<u8>,
+-    pub toc_html: Vec<u8>,
+     pub chrome_css: Vec<u8>,
+     pub general_css: Vec<u8>,
+     pub print_css: Vec<u8>,
+@@ -89,8 +85,6 @@ impl Theme {
+                 (theme_dir.join("head.hbs"), &mut theme.head),
+                 (theme_dir.join("redirect.hbs"), &mut theme.redirect),
+                 (theme_dir.join("header.hbs"), &mut theme.header),
+-                (theme_dir.join("toc.js.hbs"), &mut theme.toc_js),
+-                (theme_dir.join("toc.html.hbs"), &mut theme.toc_html),
+                 (theme_dir.join("book.js"), &mut theme.js),
+                 (theme_dir.join("css/chrome.css"), &mut theme.chrome_css),
+                 (theme_dir.join("css/general.css"), &mut theme.general_css),
+@@ -180,8 +174,6 @@ impl Default for Theme {
+             head: HEAD.to_owned(),
+             redirect: REDIRECT.to_owned(),
+             header: HEADER.to_owned(),
+-            toc_js: TOC_JS.to_owned(),
+-            toc_html: TOC_HTML.to_owned(),
+             chrome_css: CHROME_CSS.to_owned(),
+             general_css: GENERAL_CSS.to_owned(),
+             print_css: PRINT_CSS.to_owned(),
+@@ -240,8 +232,6 @@ mod tests {
+             "head.hbs",
+             "redirect.hbs",
+             "header.hbs",
+-            "toc.js.hbs",
+-            "toc.html.hbs",
+             "favicon.png",
+             "favicon.svg",
+             "css/chrome.css",
+@@ -273,8 +263,6 @@ mod tests {
+             head: Vec::new(),
+             redirect: Vec::new(),
+             header: Vec::new(),
+-            toc_js: Vec::new(),
+-            toc_html: Vec::new(),
+             chrome_css: Vec::new(),
+             general_css: Vec::new(),
+             print_css: Vec::new(),
+diff --git a/src/theme/toc.html.hbs b/src/theme/toc.html.hbs
+deleted file mode 100644
+index f8fca873..00000000
+--- a/src/theme/toc.html.hbs
++++ /dev/null
+@@ -1,43 +0,0 @@
+-<!DOCTYPE HTML>
+-<html lang="{{ language }}" class="{{ default_theme }}" dir="{{ text_direction }}">
+-    <head>
+-        <!-- sidebar iframe generated using mdBook
+-
+-        This is a frame, and not included directly in the page, to control the total size of the
+-        book. The TOC contains an entry for each page, so if each page includes a copy of the TOC,
+-        the total size of the page becomes O(n**2).
+-
+-        The frame is only used as a fallback when JS is turned off. When it's on, the sidebar is
+-        instead added to the main page by `toc.js` instead. The JavaScript mode is better
+-        because, when running in a `file:///` URL, the iframed page would not be Same-Origin as
+-        the rest of the page, so the sidebar and the main page theme would fall out of sync.
+-        -->
+-        <meta charset="UTF-8">
+-        <meta name="robots" content="noindex">
+-        {{#if base_url}}
+-        <base href="{{ base_url }}">
+-        {{/if}}
+-        <!-- Custom HTML head -->
+-        {{> head}}
+-        <meta name="viewport" content="width=device-width, initial-scale=1">
+-        <meta name="theme-color" content="#ffffff">
+-        <link rel="stylesheet" href="{{ path_to_root }}css/variables.css">
+-        <link rel="stylesheet" href="{{ path_to_root }}css/general.css">
+-        <link rel="stylesheet" href="{{ path_to_root }}css/chrome.css">
+-        {{#if print_enable}}
+-        <link rel="stylesheet" href="{{ path_to_root }}css/print.css" media="print">
+-        {{/if}}
+-        <!-- Fonts -->
+-        <link rel="stylesheet" href="{{ path_to_root }}FontAwesome/css/font-awesome.css">
+-        {{#if copy_fonts}}
+-        <link rel="stylesheet" href="{{ path_to_root }}fonts/fonts.css">
+-        {{/if}}
+-        <!-- Custom theme stylesheets -->
+-        {{#each additional_css}}
+-        <link rel="stylesheet" href="{{ ../path_to_root }}{{ this }}">
+-        {{/each}}
+-    </head>
+-    <body class="sidebar-iframe-inner">
+-        {{#toc}}{{/toc}}
+-    </body>
+-</html>
+diff --git a/src/theme/toc.js.hbs b/src/theme/toc.js.hbs
+deleted file mode 100644
+index eb48c8ba..00000000
+--- a/src/theme/toc.js.hbs
++++ /dev/null
+@@ -1,54 +0,0 @@
+-// Populate the sidebar
+-//
+-// This is a script, and not included directly in the page, to control the total size of the book.
+-// The TOC contains an entry for each page, so if each page includes a copy of the TOC,
+-// the total size of the page becomes O(n**2).
+-var sidebarScrollbox = document.querySelector("#sidebar .sidebar-scrollbox");
+-sidebarScrollbox.innerHTML = '{{#toc}}{{/toc}}';
+-(function() {
+-    let current_page = document.location.href.toString();
+-    if (current_page.endsWith("/")) {
+-        current_page += "index.html";
+-    }
+-    var links = sidebarScrollbox.querySelectorAll("a");
+-    var l = links.length;
+-    for (var i = 0; i < l; ++i) {
+-        var link = links[i];
+-        var href = link.getAttribute("href");
+-        if (href && !href.startsWith("#") && !/^(?:[a-z+]+:)?\/\//.test(href)) {
+-            link.href = path_to_root + href;
+-        }
+-        // The "index" page is supposed to alias the first chapter in the book.
+-        if (link.href === current_page || (i === 0 && path_to_root === "" && current_page.endsWith("/index.html"))) {
+-            link.classList.add("active");
+-            var parent = link.parentElement;
+-            while (parent) {
+-                if (parent.tagName === "LI" && parent.previousElementSibling) {
+-                    if (parent.previousElementSibling.classList.contains("chapter-item")) {
+-                        parent.previousElementSibling.classList.add("expanded");
+-                    }
+-                }
+-                parent = parent.parentElement;
+-            }
+-        }
+-    }
+-})();
+-
+-// Track and set sidebar scroll position
+-sidebarScrollbox.addEventListener('click', function(e) {
+-    if (e.target.tagName === 'A') {
+-        sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
+-    }
+-}, { passive: true });
+-var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
+-sessionStorage.removeItem('sidebar-scroll');
+-if (sidebarScrollTop) {
+-    // preserve sidebar scroll position when navigating via links within sidebar
+-    sidebarScrollbox.scrollTop = sidebarScrollTop;
+-} else {
+-    // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
+-    var activeSection = document.querySelector('#sidebar .active');
+-    if (activeSection) {
+-        activeSection.scrollIntoView({ block: 'center' });
+-    }
+-}
+diff --git a/src/utils/mod.rs b/src/utils/mod.rs
+index f8215fed..2b17cc7d 100644
+--- a/src/utils/mod.rs
++++ b/src/utils/mod.rs
+@@ -265,25 +265,6 @@ pub fn log_backtrace(e: &Error) {
+     }
+ }
+ 
+-pub(crate) fn special_escape(mut s: &str) -> String {
+-    let mut escaped = String::with_capacity(s.len());
+-    let needs_escape: &[char] = &['<', '>', '\'', '\\', '&'];
+-    while let Some(next) = s.find(needs_escape) {
+-        escaped.push_str(&s[..next]);
+-        match s.as_bytes()[next] {
+-            b'<' => escaped.push_str("&lt;"),
+-            b'>' => escaped.push_str("&gt;"),
+-            b'\'' => escaped.push_str("&#39;"),
+-            b'\\' => escaped.push_str("&#92;"),
+-            b'&' => escaped.push_str("&amp;"),
+-            _ => unreachable!(),
+-        }
+-        s = &s[next + 1..];
+-    }
+-    escaped.push_str(s);
+-    escaped
+-}
+-
+ pub(crate) fn bracket_escape(mut s: &str) -> String {
+     let mut escaped = String::with_capacity(s.len());
+     let needs_escape: &[char] = &['<', '>'];
+@@ -302,7 +283,7 @@ pub(crate) fn bracket_escape(mut s: &str) -> String {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::{bracket_escape, special_escape};
++    use super::bracket_escape;
+ 
+     mod render_markdown {
+         use super::super::render_markdown;
+@@ -525,20 +506,5 @@ more text with spaces
+         assert_eq!(bracket_escape("<>"), "&lt;&gt;");
+         assert_eq!(bracket_escape("<test>"), "&lt;test&gt;");
+         assert_eq!(bracket_escape("a<test>b"), "a&lt;test&gt;b");
+-        assert_eq!(bracket_escape("'"), "'");
+-        assert_eq!(bracket_escape("\\"), "\\");
+-    }
+-
+-    #[test]
+-    fn escaped_special() {
+-        assert_eq!(special_escape(""), "");
+-        assert_eq!(special_escape("<"), "&lt;");
+-        assert_eq!(special_escape(">"), "&gt;");
+-        assert_eq!(special_escape("<>"), "&lt;&gt;");
+-        assert_eq!(special_escape("<test>"), "&lt;test&gt;");
+-        assert_eq!(special_escape("a<test>b"), "a&lt;test&gt;b");
+-        assert_eq!(special_escape("'"), "&#39;");
+-        assert_eq!(special_escape("\\"), "&#92;");
+-        assert_eq!(special_escape("&"), "&amp;");
+     }
+ }
+diff --git a/tests/rendered_output.rs b/tests/rendered_output.rs
+index f5078a70..a01ce5f4 100644
+--- a/tests/rendered_output.rs
++++ b/tests/rendered_output.rs
+@@ -9,7 +9,7 @@ use mdbook::utils::fs::write_file;
+ use mdbook::MDBook;
+ use pretty_assertions::assert_eq;
+ use select::document::Document;
+-use select::predicate::{Attr, Class, Name, Predicate};
++use select::predicate::{Class, Name, Predicate};
+ use std::collections::HashMap;
+ use std::ffi::OsStr;
+ use std::fs;
+@@ -61,6 +61,28 @@ fn by_default_mdbook_generates_rendered_content_in_the_book_directory() {
+     assert!(index_file.exists());
+ }
+ 
++#[test]
++fn make_sure_bottom_level_files_contain_links_to_chapters() {
++    let temp = DummyBook::new().build().unwrap();
++    let md = MDBook::load(temp.path()).unwrap();
++    md.build().unwrap();
++
++    let dest = temp.path().join("book");
++    let links = vec![
++        r#"href="intro.html""#,
++        r#"href="first/index.html""#,
++        r#"href="first/nested.html""#,
++        r#"href="second.html""#,
++        r#"href="conclusion.html""#,
++    ];
++
++    let files_in_bottom_dir = vec!["index.html", "intro.html", "second.html", "conclusion.html"];
++
++    for filename in files_in_bottom_dir {
++        assert_contains_strings(dest.join(filename), &links);
++    }
++}
++
+ #[test]
+ fn check_correct_cross_links_in_nested_dir() {
+     let temp = DummyBook::new().build().unwrap();
+@@ -68,6 +90,19 @@ fn check_correct_cross_links_in_nested_dir() {
+     md.build().unwrap();
+ 
+     let first = temp.path().join("book").join("first");
++    let links = vec![
++        r#"href="../intro.html""#,
++        r#"href="../first/index.html""#,
++        r#"href="../first/nested.html""#,
++        r#"href="../second.html""#,
++        r#"href="../conclusion.html""#,
++    ];
++
++    let files_in_nested_dir = vec!["index.html", "nested.html"];
++
++    for filename in files_in_nested_dir {
++        assert_contains_strings(first.join(filename), &links);
++    }
+ 
+     assert_contains_strings(
+         first.join("index.html"),
+@@ -230,9 +265,9 @@ fn entry_ends_with(entry: &DirEntry, ending: &str) -> bool {
+     entry.file_name().to_string_lossy().ends_with(ending)
+ }
+ 
+-/// Read the TOC (`book/toc.js`) nested HTML and expose it as a DOM which we
++/// Read the main page (`book/index.html`) and expose it as a DOM which we
+ /// can search with the `select` crate
+-fn toc_js_html() -> Result<Document> {
++fn root_index_html() -> Result<Document> {
+     let temp = DummyBook::new()
+         .build()
+         .with_context(|| "Couldn't create the dummy book")?;
+@@ -240,36 +275,15 @@ fn toc_js_html() -> Result<Document> {
+         .build()
+         .with_context(|| "Book building failed")?;
+ 
+-    let toc_path = temp.path().join("book").join("toc.js");
+-    let html = fs::read_to_string(toc_path).with_context(|| "Unable to read index.html")?;
+-    for line in html.lines() {
+-        if let Some(left) = line.strip_prefix("sidebarScrollbox.innerHTML = '") {
+-            if let Some(html) = left.strip_suffix("';") {
+-                return Ok(Document::from(html));
+-            }
+-        }
+-    }
+-    panic!("cannot find toc in file")
+-}
++    let index_page = temp.path().join("book").join("index.html");
++    let html = fs::read_to_string(index_page).with_context(|| "Unable to read index.html")?;
+ 
+-/// Read the TOC fallback (`book/toc.html`) HTML and expose it as a DOM which we
+-/// can search with the `select` crate
+-fn toc_fallback_html() -> Result<Document> {
+-    let temp = DummyBook::new()
+-        .build()
+-        .with_context(|| "Couldn't create the dummy book")?;
+-    MDBook::load(temp.path())?
+-        .build()
+-        .with_context(|| "Book building failed")?;
+-
+-    let toc_path = temp.path().join("book").join("toc.html");
+-    let html = fs::read_to_string(toc_path).with_context(|| "Unable to read index.html")?;
+     Ok(Document::from(html.as_str()))
+ }
+ 
+ #[test]
+ fn check_second_toc_level() {
+-    let doc = toc_js_html().unwrap();
++    let doc = root_index_html().unwrap();
+     let mut should_be = Vec::from(TOC_SECOND_LEVEL);
+     should_be.sort_unstable();
+ 
+@@ -291,7 +305,7 @@ fn check_second_toc_level() {
+ 
+ #[test]
+ fn check_first_toc_level() {
+-    let doc = toc_js_html().unwrap();
++    let doc = root_index_html().unwrap();
+     let mut should_be = Vec::from(TOC_TOP_LEVEL);
+ 
+     should_be.extend(TOC_SECOND_LEVEL);
+@@ -314,7 +328,7 @@ fn check_first_toc_level() {
+ 
+ #[test]
+ fn check_spacers() {
+-    let doc = toc_js_html().unwrap();
++    let doc = root_index_html().unwrap();
+     let should_be = 2;
+ 
+     let num_spacers = doc
+@@ -323,39 +337,6 @@ fn check_spacers() {
+     assert_eq!(num_spacers, should_be);
+ }
+ 
+-// don't use target="_parent" in JS
+-#[test]
+-fn check_link_target_js() {
+-    let doc = toc_js_html().unwrap();
+-
+-    let num_parent_links = doc
+-        .find(
+-            Class("chapter")
+-                .descendant(Name("li"))
+-                .descendant(Name("a").and(Attr("target", "_parent"))),
+-        )
+-        .count();
+-    assert_eq!(num_parent_links, 0);
+-}
+-
+-// don't use target="_parent" in IFRAME
+-#[test]
+-fn check_link_target_fallback() {
+-    let doc = toc_fallback_html().unwrap();
+-
+-    let num_parent_links = doc
+-        .find(
+-            Class("chapter")
+-                .descendant(Name("li"))
+-                .descendant(Name("a").and(Attr("target", "_parent"))),
+-        )
+-        .count();
+-    assert_eq!(
+-        num_parent_links,
+-        TOC_TOP_LEVEL.len() + TOC_SECOND_LEVEL.len()
+-    );
+-}
+-
+ /// Ensure building fails if `create-missing` is false and one of the files does
+ /// not exist.
+ #[test]
+@@ -468,15 +449,18 @@ fn by_default_mdbook_use_index_preprocessor_to_convert_readme_to_index() {
+     let md = MDBook::load_with_config(temp.path(), cfg).unwrap();
+     md.build().unwrap();
+ 
+-    let first_index = temp.path().join("book").join("toc.js");
++    let first_index = temp.path().join("book").join("first").join("index.html");
+     let expected_strings = vec![
+-        r#"href="first/index.html""#,
+-        r#"href="second/index.html""#,
+-        "1st README",
+-        "2nd README",
++        r#"href="../first/index.html""#,
++        r#"href="../second/index.html""#,
++        "First README",
+     ];
+     assert_contains_strings(&first_index, &expected_strings);
+-    assert_doesnt_contain_strings(&first_index, &["README.html", "Second README"]);
++    assert_doesnt_contain_strings(&first_index, &["README.html"]);
++
++    let second_index = temp.path().join("book").join("second").join("index.html");
++    let unexpected_strings = vec!["Second README"];
++    assert_doesnt_contain_strings(second_index, &unexpected_strings);
+ }
+ 
+ #[test]
+@@ -655,11 +639,11 @@ fn summary_with_markdown_formatting() {
+     let md = MDBook::load_with_config(temp.path(), cfg).unwrap();
+     md.build().unwrap();
+ 
+-    let rendered_path = temp.path().join("book/toc.js");
++    let rendered_path = temp.path().join("book/formatted-summary.html");
+     assert_contains_strings(
+         rendered_path,
+         &[
+-            r#"<a href="formatted-summary.html"><strong aria-hidden="true">1.</strong> Italic code *escape* `escape2`</a>"#,
++            r#"<a href="formatted-summary.html" class="active"><strong aria-hidden="true">1.</strong> Italic code *escape* `escape2`</a>"#,
+             r#"<a href="soft.html"><strong aria-hidden="true">2.</strong> Soft line break</a>"#,
+             r#"<a href="escaped-tag.html"><strong aria-hidden="true">3.</strong> &lt;escaped tag&gt;</a>"#,
+         ],

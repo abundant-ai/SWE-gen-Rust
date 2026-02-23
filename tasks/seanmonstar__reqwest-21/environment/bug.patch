@@ -1,0 +1,320 @@
+diff --git a/src/body.rs b/src/body.rs
+index 9bd9756..43fcfee 100644
+--- a/src/body.rs
++++ b/src/body.rs
+@@ -10,17 +10,6 @@ pub struct Body {
+ 
+ impl Body {
+     /// Instantiate a `Body` from a reader.
+-    ///
+-    /// # Note
+-    ///
+-    /// While allowing for many types to be used, these bodies do not have
+-    /// a way to reset to the beginning and be reused. This means that when
+-    /// encountering a 307 or 308 status code, instead of repeating the
+-    /// request at the new location, the `Response` will be returned with
+-    /// the redirect status code set.
+-    ///
+-    /// A `Body` constructed from a set of bytes, like `String` or `Vec<u8>`,
+-    /// are stored differently and can be reused.
+     pub fn new<R: Read + 'static>(reader: R) -> Body {
+         Body {
+             reader: Kind::Reader(Box::new(reader), None),
+@@ -126,10 +115,3 @@ pub fn as_hyper_body<'a>(body: &'a mut Body) -> ::hyper::client::Body<'a> {
+         }
+     }
+ }
+-
+-pub fn can_reset(body: &Body) -> bool {
+-    match body.reader {
+-        Kind::Bytes(_) => true,
+-        Kind::Reader(..) => false,
+-    }
+-}
+diff --git a/src/client.rs b/src/client.rs
+index a6a93f4..5fd0319 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -198,68 +198,57 @@ impl<'a> RequestBuilder<'a> {
+ 
+                 try!(req.send())
+             };
++            body.take();
+ 
+-            let should_redirect = match res.status {
++            match res.status {
+                 StatusCode::MovedPermanently |
+                 StatusCode::Found |
+                 StatusCode::SeeOther => {
+-                    body = None;
+-                    match method {
+-                        Method::Get | Method::Head => {},
+-                        _ => {
+-                            method = Method::Get;
+-                        }
+-                    }
+-                    true
+-                },
+-                StatusCode::TemporaryRedirect |
+-                StatusCode::PermanentRedirect => {
+-                    if let Some(ref body) = body {
+-                        body::can_reset(body)
+-                    } else {
+-                        true
+-                    }
+-                },
+-                _ => false,
+-            };
+ 
+-            if should_redirect {
+-                //TODO: turn this into self.redirect_policy.check()
+-                if redirect_count > 10 {
+-                    return Err(::Error::TooManyRedirects);
+-                }
+-                redirect_count += 1;
+-
+-                headers.set(Referer(url.to_string()));
+-
+-                let loc = {
+-                    let loc = res.headers.get::<Location>().map(|loc| url.join(loc));
+-                    if let Some(loc) = loc {
+-                        loc
+-                    } else {
+-                        return Ok(Response {
+-                            inner: res
+-                        });
++                    //TODO: turn this into self.redirect_policy.check()
++                    if redirect_count > 10 {
++                        return Err(::Error::TooManyRedirects);
+                     }
+-                };
+-
+-                url = match loc {
+-                    Ok(u) => u,
+-                    Err(e) => {
+-                        debug!("Location header had invalid URI: {:?}", e);
+-                        return Ok(Response {
+-                            inner: res
+-                        })
+-                    }
+-                };
++                    redirect_count += 1;
++
++                    method = match method {
++                        Method::Post | Method::Put => Method::Get,
++                        m => m
++                    };
++
++                    headers.set(Referer(url.to_string()));
++
++                    let loc = {
++                        let loc = res.headers.get::<Location>().map(|loc| url.join(loc));
++                        if let Some(loc) = loc {
++                            loc
++                        } else {
++                            return Ok(Response {
++                                inner: res
++                            });
++                        }
++                    };
++
++                    url = match loc {
++                        Ok(u) => u,
++                        Err(e) => {
++                            debug!("Location header had invalid URI: {:?}", e);
++                            return Ok(Response {
++                                inner: res
++                            })
++                        }
++                    };
+ 
+-                debug!("redirecting to {:?} '{}'", method, url);
++                    debug!("redirecting to '{}'", url);
+ 
+-                //TODO: removeSensitiveHeaders(&mut headers, &url);
+-            } else {
+-                return Ok(Response {
+-                    inner: res
+-                });
++                    //TODO: removeSensitiveHeaders(&mut headers, &url);
++
++                },
++                _ => {
++                    return Ok(Response {
++                        inner: res
++                    });
++                }
+             }
+         }
+     }
+diff --git a/tests/client.rs b/tests/client.rs
+index 39b8080..c6e8863 100644
+--- a/tests/client.rs
++++ b/tests/client.rs
+@@ -33,130 +33,45 @@ fn test_get() {
+ }
+ 
+ #[test]
+-fn test_redirect_301_and_302_and_303_changes_post_to_get() {
+-    let client = reqwest::Client::new().unwrap();
+-    let codes = [301, 302, 303];
+-
+-    for code in codes.iter() {
+-        let redirect = server! {
+-            request: format!("\
+-                POST /{} HTTP/1.1\r\n\
+-                Host: $HOST\r\n\
+-                User-Agent: $USERAGENT\r\n\
+-                Content-Length: 0\r\n\
+-                \r\n\
+-                ", code),
+-            response: format!("\
+-                HTTP/1.1 {} reason\r\n\
+-                Server: test-redirect\r\n\
+-                Content-Length: 0\r\n\
+-                Location: /dst\r\n\
+-                Connection: close\r\n\
+-                \r\n\
+-                ", code),
+-
+-            request: format!("\
+-                GET /dst HTTP/1.1\r\n\
+-                Host: $HOST\r\n\
+-                User-Agent: $USERAGENT\r\n\
+-                Referer: http://$HOST/{}\r\n\
+-                \r\n\
+-                ", code),
+-            response: b"\
+-                HTTP/1.1 200 OK\r\n\
+-                Server: test-dst\r\n\
+-                Content-Length: 0\r\n\
+-                \r\n\
+-                "
+-        };
+-
+-        let res = client.post(&format!("http://{}/{}", redirect.addr(), code))
+-            .send()
+-            .unwrap();
+-        assert_eq!(res.status(), &reqwest::StatusCode::Ok);
+-        assert_eq!(res.headers().get(), Some(&reqwest::header::Server("test-dst".to_string())));
+-    }
+-}
+-
+-#[test]
+-fn test_redirect_307_and_308_tries_to_post_again() {
+-    let client = reqwest::Client::new().unwrap();
+-    let codes = [307, 308];
+-    for code in codes.iter() {
+-        let redirect = server! {
+-            request: format!("\
+-                POST /{} HTTP/1.1\r\n\
+-                Host: $HOST\r\n\
+-                User-Agent: $USERAGENT\r\n\
+-                Content-Length: 5\r\n\
+-                \r\n\
+-                Hello\
+-                ", code),
+-            response: format!("\
+-                HTTP/1.1 {} reason\r\n\
+-                Server: test-redirect\r\n\
+-                Content-Length: 0\r\n\
+-                Location: /dst\r\n\
+-                Connection: close\r\n\
+-                \r\n\
+-                ", code),
++fn test_redirect_302_changes_post_to_get() {
+ 
+-            request: format!("\
+-                POST /dst HTTP/1.1\r\n\
+-                Host: $HOST\r\n\
+-                User-Agent: $USERAGENT\r\n\
+-                Referer: http://$HOST/{}\r\n\
+-                Content-Length: 5\r\n\
+-                \r\n\
+-                Hello\
+-                ", code),
+-            response: b"\
+-                HTTP/1.1 200 OK\r\n\
+-                Server: test-dst\r\n\
+-                Content-Length: 0\r\n\
+-                \r\n\
+-                "
+-        };
++    let redirect = server! {
++        request: b"\
++            POST /302 HTTP/1.1\r\n\
++            Host: $HOST\r\n\
++            User-Agent: $USERAGENT\r\n\
++            Content-Length: 0\r\n\
++            \r\n\
++            ",
++        response: b"\
++            HTTP/1.1 302 Found\r\n\
++            Server: test-redirect\r\n\
++            Content-Length: 0\r\n\
++            Location: /dst\r\n\
++            Connection: close\r\n\
++            \r\n\
++            ",
+ 
+-        let res = client.post(&format!("http://{}/{}", redirect.addr(), code))
+-            .body("Hello")
+-            .send()
+-            .unwrap();
+-        assert_eq!(res.status(), &reqwest::StatusCode::Ok);
+-        assert_eq!(res.headers().get(), Some(&reqwest::header::Server("test-dst".to_string())));
+-    }
+-}
++        request: b"\
++            GET /dst HTTP/1.1\r\n\
++            Host: $HOST\r\n\
++            User-Agent: $USERAGENT\r\n\
++            Referer: http://$HOST/302\r\n\
++            \r\n\
++            ",
++        response: b"\
++            HTTP/1.1 200 OK\r\n\
++            Server: test-dst\r\n\
++            Content-Length: 0\r\n\
++            \r\n\
++            "
++    };
+ 
+-#[test]
+-fn test_redirect_307_does_not_try_if_reader_cannot_reset() {
+     let client = reqwest::Client::new().unwrap();
+-    let codes = [307, 308];
+-    for &code in codes.iter() {
+-        let redirect = server! {
+-            request: format!("\
+-                POST /{} HTTP/1.1\r\n\
+-                Host: $HOST\r\n\
+-                User-Agent: $USERAGENT\r\n\
+-                Transfer-Encoding: chunked\r\n\
+-                \r\n\
+-                5\r\n\
+-                Hello\r\n\
+-                0\r\n\r\n\
+-                ", code),
+-            response: format!("\
+-                HTTP/1.1 {} reason\r\n\
+-                Server: test-redirect\r\n\
+-                Content-Length: 0\r\n\
+-                Location: /dst\r\n\
+-                Connection: close\r\n\
+-                \r\n\
+-                ", code)
+-        };
++    let res = client.post(&format!("http://{}/302", redirect.addr()))
++        .send()
++        .unwrap();
++    assert_eq!(res.status(), &reqwest::StatusCode::Ok);
++    assert_eq!(res.headers().get(), Some(&reqwest::header::Server("test-dst".to_string())));
+ 
+-        let res = client.post(&format!("http://{}/{}", redirect.addr(), code))
+-            .body(reqwest::Body::new(&b"Hello"[..]))
+-            .send()
+-            .unwrap();
+-        assert_eq!(res.status(), &reqwest::StatusCode::from_u16(code));
+-    }
+ }

@@ -34,5 +34,5 @@ harbor run --dataset swe-gen-rust \
 This command automatically downloads the tasks.
 
 <p align="center">
-  <img src="assets/pie_chart.png" style="height: 20em" alt="SWE-gen Rust pie chart" />
+  <img src="assets/pie_chart.jpg" style="height: 20em" alt="SWE-gen Rust pie chart" />
 </p>

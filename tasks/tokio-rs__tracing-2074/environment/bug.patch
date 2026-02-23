@@ -1,0 +1,597 @@
+diff --git a/tracing-core/src/field.rs b/tracing-core/src/field.rs
+index 068d5044..eeff65dd 100644
+--- a/tracing-core/src/field.rs
++++ b/tracing-core/src/field.rs
+@@ -588,21 +588,6 @@ impl<'a> Value for fmt::Arguments<'a> {
+     }
+ }
+ 
+-#[cfg(feature = "alloc")]
+-impl<T: ?Sized> crate::sealed::Sealed for alloc::boxed::Box<T> where T: Value {}
+-
+-#[cfg(feature = "alloc")]
+-#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+-impl<T: ?Sized> Value for alloc::boxed::Box<T>
+-where
+-    T: Value,
+-{
+-    #[inline]
+-    fn record(&self, key: &Field, visitor: &mut dyn Visit) {
+-        self.as_ref().record(key, visitor)
+-    }
+-}
+-
+ impl fmt::Debug for dyn Value {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         // We are only going to be recording the field value, so we don't
+@@ -1170,24 +1155,4 @@ mod test {
+         });
+         assert_eq!(result, "123".to_owned());
+     }
+-
+-    #[test]
+-    #[cfg(feature = "std")]
+-    fn record_error() {
+-        let fields = TEST_META_1.fields();
+-        let err: Box<dyn std::error::Error + Send + Sync + 'static> =
+-            std::io::Error::new(std::io::ErrorKind::Other, "lol").into();
+-        let values = &[
+-            (&fields.field("foo").unwrap(), Some(&err as &dyn Value)),
+-            (&fields.field("bar").unwrap(), Some(&Empty as &dyn Value)),
+-            (&fields.field("baz").unwrap(), Some(&Empty as &dyn Value)),
+-        ];
+-        let valueset = fields.value_set(values);
+-        let mut result = String::new();
+-        valueset.record(&mut |_: &Field, value: &dyn fmt::Debug| {
+-            use core::fmt::Write;
+-            write!(&mut result, "{:?}", value).unwrap();
+-        });
+-        assert_eq!(result, format!("{}", err));
+-    }
+ }
+diff --git a/tracing/src/lib.rs b/tracing/src/lib.rs
+index cd574bc7..880ac492 100644
+--- a/tracing/src/lib.rs
++++ b/tracing/src/lib.rs
+@@ -926,6 +926,10 @@
+ #[cfg(not(feature = "std"))]
+ extern crate alloc;
+ 
++#[cfg(feature = "log")]
++#[doc(hidden)]
++pub use log;
++
+ // Somehow this `use` statement is necessary for us to re-export the `core`
+ // macros on Rust 1.26.0. I'm not sure how this makes it work, but it does.
+ #[allow(unused_imports)]
+@@ -1065,31 +1069,6 @@ pub mod __macro_support {
+         pub fn disabled_span(&self) -> crate::Span {
+             crate::Span::none()
+         }
+-
+-        #[cfg(feature = "log")]
+-        pub fn log(
+-            &self,
+-            logger: &'static dyn log::Log,
+-            log_meta: log::Metadata<'_>,
+-            values: &tracing_core::field::ValueSet<'_>,
+-        ) {
+-            let meta = self.metadata();
+-            logger.log(
+-                &crate::log::Record::builder()
+-                    .file(meta.file())
+-                    .module_path(meta.module_path())
+-                    .line(meta.line())
+-                    .metadata(log_meta)
+-                    .args(format_args!(
+-                        "{}",
+-                        crate::log::LogValueSet {
+-                            values,
+-                            is_first: true
+-                        }
+-                    ))
+-                    .build(),
+-            );
+-        }
+     }
+ 
+     impl Callsite for MacroCallsite {
+@@ -1117,65 +1096,68 @@ pub mod __macro_support {
+                 .finish()
+         }
+     }
+-}
+ 
+-#[cfg(feature = "log")]
+-#[doc(hidden)]
+-pub mod log {
+-    use core::fmt;
+-    pub use log::*;
++    #[cfg(feature = "log")]
+     use tracing_core::field::{Field, ValueSet, Visit};
+ 
+-    /// Utility to format [`ValueSet`]s for logging.
+-    pub(crate) struct LogValueSet<'a> {
+-        pub(crate) values: &'a ValueSet<'a>,
+-        pub(crate) is_first: bool,
+-    }
++    /// Utility to format [`ValueSet`] for logging, used by macro-generated code.
++    ///
++    /// /!\ WARNING: This is *not* a stable API! /!\
++    /// This type, and all code contained in the `__macro_support` module, is
++    /// a *private* API of `tracing`. It is exposed publicly because it is used
++    /// by the `tracing` macros, but it is not part of the stable versioned API.
++    /// Breaking changes to this module may occur in small-numbered versions
++    /// without warning.
++    #[cfg(feature = "log")]
++    #[allow(missing_debug_implementations)]
++    pub struct LogValueSet<'a>(pub &'a ValueSet<'a>);
+ 
++    #[cfg(feature = "log")]
+     impl<'a> fmt::Display for LogValueSet<'a> {
+-        #[inline]
+         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-            struct LogVisitor<'a, 'b> {
+-                f: &'a mut fmt::Formatter<'b>,
+-                is_first: bool,
+-                result: fmt::Result,
+-            }
+-
+-            impl Visit for LogVisitor<'_, '_> {
+-                fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+-                    let res = if self.is_first {
+-                        self.is_first = false;
+-                        if field.name() == "message" {
+-                            write!(self.f, "{:?}", value)
+-                        } else {
+-                            write!(self.f, "{}={:?}", field.name(), value)
+-                        }
+-                    } else {
+-                        write!(self.f, " {}={:?}", field.name(), value)
+-                    };
+-                    if let Err(err) = res {
+-                        self.result = self.result.and(Err(err));
+-                    }
+-                }
+-
+-                fn record_str(&mut self, field: &Field, value: &str) {
+-                    if field.name() == "message" {
+-                        self.record_debug(field, &format_args!("{}", value))
+-                    } else {
+-                        self.record_debug(field, &value)
+-                    }
+-                }
+-            }
+-
+             let mut visit = LogVisitor {
+                 f,
+-                is_first: self.is_first,
++                is_first: true,
+                 result: Ok(()),
+             };
+-            self.values.record(&mut visit);
++            self.0.record(&mut visit);
+             visit.result
+         }
+     }
++
++    #[cfg(feature = "log")]
++    struct LogVisitor<'a, 'b> {
++        f: &'a mut fmt::Formatter<'b>,
++        is_first: bool,
++        result: fmt::Result,
++    }
++
++    #[cfg(feature = "log")]
++    impl Visit for LogVisitor<'_, '_> {
++        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
++            let res = if self.is_first {
++                self.is_first = false;
++                if field.name() == "message" {
++                    write!(self.f, "{:?}", value)
++                } else {
++                    write!(self.f, "{}={:?}", field.name(), value)
++                }
++            } else {
++                write!(self.f, " {}={:?}", field.name(), value)
++            };
++            if let Err(err) = res {
++                self.result = self.result.and(Err(err));
++            }
++        }
++
++        fn record_str(&mut self, field: &Field, value: &str) {
++            if field.name() == "message" {
++                self.record_debug(field, &format_args!("{}", value))
++            } else {
++                self.record_debug(field, &value)
++            }
++        }
++    }
+ }
+ 
+ mod sealed {
+diff --git a/tracing/src/macros.rs b/tracing/src/macros.rs
+index 825c0d86..bf7cf548 100644
+--- a/tracing/src/macros.rs
++++ b/tracing/src/macros.rs
+@@ -604,8 +604,8 @@ macro_rules! event {
+         if enabled {
+             (|value_set: $crate::field::ValueSet| {
+                 $crate::__tracing_log!(
++                    target: $target,
+                     $lvl,
+-                    CALLSITE,
+                     &value_set
+                 );
+                 let meta = CALLSITE.metadata();
+@@ -618,8 +618,8 @@ macro_rules! event {
+             })($crate::valueset!(CALLSITE.metadata().fields(), $($fields)*));
+         } else {
+             $crate::__tracing_log!(
++                target: $target,
+                 $lvl,
+-                CALLSITE,
+                 &$crate::valueset!(CALLSITE.metadata().fields(), $($fields)*)
+             );
+         }
+@@ -666,15 +666,15 @@ macro_rules! event {
+                     &value_set
+                 );
+                 $crate::__tracing_log!(
++                    target: $target,
+                     $lvl,
+-                    CALLSITE,
+                     &value_set
+                 );
+             })($crate::valueset!(CALLSITE.metadata().fields(), $($fields)*));
+         } else {
+             $crate::__tracing_log!(
++                target: $target,
+                 $lvl,
+-                CALLSITE,
+                 &$crate::valueset!(CALLSITE.metadata().fields(), $($fields)*)
+             );
+         }
+@@ -2416,25 +2416,31 @@ macro_rules! __tracing_stringify {
+ #[doc(hidden)]
+ #[macro_export]
+ macro_rules! __tracing_log {
+-    ($level:expr, $callsite:expr, $value_set:expr) => {};
++    (target: $target:expr, $level:expr, $value_set:expr ) => {};
+ }
+ 
+ #[cfg(feature = "log")]
+ #[doc(hidden)]
+ #[macro_export]
+ macro_rules! __tracing_log {
+-    ($level:expr, $callsite:expr, $value_set:expr) => {
++    (target: $target:expr, $level:expr, $value_set:expr ) => {
+         $crate::if_log_enabled! { $level, {
+             use $crate::log;
+             let level = $crate::level_to_log!($level);
+             if level <= log::max_level() {
+                 let log_meta = log::Metadata::builder()
+                     .level(level)
+-                    .target(CALLSITE.metadata().target())
++                    .target($target)
+                     .build();
+                 let logger = log::logger();
+                 if logger.enabled(&log_meta) {
+-                    $callsite.log(logger, log_meta, $value_set)
++                    logger.log(&log::Record::builder()
++                        .file(Some(file!()))
++                        .module_path(Some(module_path!()))
++                        .line(Some(line!()))
++                        .metadata(log_meta)
++                        .args(format_args!("{}", $crate::__macro_support::LogValueSet($value_set)))
++                        .build());
+                 }
+             }
+         }}
+diff --git a/tracing/src/span.rs b/tracing/src/span.rs
+index 7278e6d1..8379977f 100644
+--- a/tracing/src/span.rs
++++ b/tracing/src/span.rs
+@@ -580,12 +580,7 @@ impl Span {
+             } else {
+                 meta.target()
+             };
+-            let values = attrs.values();
+-            span.log(
+-                target,
+-                level_to_log!(*meta.level()),
+-                format_args!("++ {};{}", meta.name(), crate::log::LogValueSet { values, is_first: false }),
+-            );
++            span.log(target, level_to_log!(*meta.level()), format_args!("++ {}{}", meta.name(), FmtAttrs(attrs)));
+         }}
+ 
+         span
+@@ -1039,7 +1034,7 @@ impl Span {
+ 
+         if_log_enabled! { crate::Level::TRACE, {
+             if let Some(_meta) = self.meta {
+-                self.log(ACTIVITY_LOG_TARGET, log::Level::Trace, format_args!("-> {};", _meta.name()));
++                self.log(ACTIVITY_LOG_TARGET, log::Level::Trace, format_args!("-> {}", _meta.name()));
+             }
+         }}
+     }
+@@ -1056,7 +1051,7 @@ impl Span {
+ 
+         if_log_enabled! { crate::Level::TRACE, {
+             if let Some(_meta) = self.meta {
+-                self.log(ACTIVITY_LOG_TARGET, log::Level::Trace, format_args!("<- {};", _meta.name()));
++                self.log(ACTIVITY_LOG_TARGET, log::Level::Trace, format_args!("<- {}", _meta.name()));
+             }
+         }}
+     }
+@@ -1223,11 +1218,7 @@ impl Span {
+                 } else {
+                     _meta.target()
+                 };
+-                self.log(
+-                    target,
+-                    level_to_log!(*_meta.level()),
+-                    format_args!("{};{}", _meta.name(), crate::log::LogValueSet { values, is_first: false }),
+-                );
++                self.log(target, level_to_log!(*_meta.level()), format_args!("{}{}", _meta.name(), FmtValues(&record)));
+             }}
+         }
+ 
+@@ -1341,7 +1332,7 @@ impl Span {
+                                 .module_path(meta.module_path())
+                                 .file(meta.file())
+                                 .line(meta.line())
+-                                .args(format_args!("{} span={}", message, inner.id.into_u64()))
++                                .args(format_args!("{}; span={}", message, inner.id.into_u64()))
+                                 .build(),
+                         );
+                     } else {
+@@ -1468,7 +1459,7 @@ impl Drop for Span {
+                 self.log(
+                     LIFECYCLE_LOG_TARGET,
+                     log::Level::Trace,
+-                    format_args!("-- {};", meta.name()),
++                    format_args!("-- {}", meta.name()),
+                 );
+             }
+         }}
+@@ -1603,6 +1594,38 @@ const PhantomNotSend: PhantomNotSend = PhantomNotSend { ghost: PhantomData };
+ /// Trivially safe, as `PhantomNotSend` doesn't have any API.
+ unsafe impl Sync for PhantomNotSend {}
+ 
++#[cfg(feature = "log")]
++struct FmtValues<'a>(&'a Record<'a>);
++
++#[cfg(feature = "log")]
++impl<'a> fmt::Display for FmtValues<'a> {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let mut res = Ok(());
++        let mut is_first = true;
++        self.0.record(&mut |k: &field::Field, v: &dyn fmt::Debug| {
++            res = write!(f, "{} {}={:?}", if is_first { ";" } else { "" }, k, v);
++            is_first = false;
++        });
++        res
++    }
++}
++
++#[cfg(feature = "log")]
++struct FmtAttrs<'a>(&'a Attributes<'a>);
++
++#[cfg(feature = "log")]
++impl<'a> fmt::Display for FmtAttrs<'a> {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let mut res = Ok(());
++        let mut is_first = true;
++        self.0.record(&mut |k: &field::Field, v: &dyn fmt::Debug| {
++            res = write!(f, "{} {}={:?}", if is_first { ";" } else { "" }, k, v);
++            is_first = false;
++        });
++        res
++    }
++}
++
+ #[cfg(test)]
+ mod test {
+     use super::*;
+diff --git a/tracing/test-log-support/src/lib.rs b/tracing/test-log-support/src/lib.rs
+index de2cc945..e6325744 100644
+--- a/tracing/test-log-support/src/lib.rs
++++ b/tracing/test-log-support/src/lib.rs
+@@ -63,7 +63,6 @@ impl Test {
+         Test { state }
+     }
+ 
+-    #[track_caller]
+     pub fn assert_logged(&self, expected: &str) {
+         let last = match self.state.last_log.lock().unwrap().take() {
+             Some(last) => last,
+@@ -76,7 +75,6 @@ impl Test {
+         assert_eq!(last.as_str().trim(), expected);
+     }
+ 
+-    #[track_caller]
+     pub fn assert_not_logged(&self) {
+         if let Some(last) = self.state.last_log.lock().unwrap().take() {
+             panic!(
+diff --git a/tracing/test-log-support/tests/log_no_trace.rs b/tracing/test-log-support/tests/log_no_trace.rs
+index 4a5edbb3..206e9b57 100644
+--- a/tracing/test-log-support/tests/log_no_trace.rs
++++ b/tracing/test-log-support/tests/log_no_trace.rs
+@@ -20,18 +20,18 @@ fn test_always_log() {
+     test.assert_logged("hello world; thingy=42 other_thingy=666");
+ 
+     let foo = span!(Level::TRACE, "foo");
+-    test.assert_logged("foo;");
++    test.assert_logged("foo");
+ 
+     foo.in_scope(|| {
+-        test.assert_logged("-> foo;");
++        test.assert_logged("-> foo");
+ 
+         trace!({foo = 3, bar = 4}, "hello {};", "san francisco");
+         test.assert_logged("hello san francisco; foo=3 bar=4");
+     });
+-    test.assert_logged("<- foo;");
++    test.assert_logged("<- foo");
+ 
+     drop(foo);
+-    test.assert_logged("-- foo;");
++    test.assert_logged("-- foo");
+ 
+     trace!(foo = 1, bar = 2, "hello world");
+     test.assert_logged("hello world foo=1 bar=2");
+diff --git a/tracing/test-log-support/tests/log_with_trace.rs b/tracing/test-log-support/tests/log_with_trace.rs
+index b1c92107..c32cb79e 100644
+--- a/tracing/test-log-support/tests/log_with_trace.rs
++++ b/tracing/test-log-support/tests/log_with_trace.rs
+@@ -59,7 +59,7 @@ fn log_with_trace() {
+     test.assert_logged("-- foo; span=1");
+ 
+     let foo = span!(Level::TRACE, "foo", bar = 3, baz = false);
+-    test.assert_logged("++ foo; bar=3 baz=false span=2");
++    test.assert_logged("++ foo; bar=3 baz=false; span=2");
+ 
+     drop(foo);
+     test.assert_logged("-- foo; span=2");
+diff --git a/tracing/test-log-support/tests/span_activity_filtered_separately.rs b/tracing/test-log-support/tests/span_activity_filtered_separately.rs
+index 2086f97a..32bc00d9 100644
+--- a/tracing/test-log-support/tests/span_activity_filtered_separately.rs
++++ b/tracing/test-log-support/tests/span_activity_filtered_separately.rs
+@@ -21,7 +21,7 @@ fn span_activity_filtered_separately() {
+ 
+     let foo = span!(Level::TRACE, "foo");
+     // Creating a span goes to the `tracing::span` target.
+-    test.assert_logged("foo;");
++    test.assert_logged("foo");
+ 
+     foo.in_scope(|| {
+         // enter should not be logged
+@@ -35,7 +35,7 @@ fn span_activity_filtered_separately() {
+ 
+     drop(foo);
+     // drop should be logged
+-    test.assert_logged("-- foo;");
++    test.assert_logged("-- foo");
+ 
+     trace!(foo = 1, bar = 2, "hello world");
+     test.assert_logged("hello world foo=1 bar=2");
+@@ -57,7 +57,7 @@ fn span_activity_filtered_separately() {
+ 
+     let bar = span!(Level::INFO, "bar");
+     // lifecycles for INFO spans should be logged
+-    test.assert_logged("bar;");
++    test.assert_logged("bar");
+ 
+     bar.in_scope(|| {
+         // entering the INFO span should not be logged
+@@ -68,9 +68,9 @@ fn span_activity_filtered_separately() {
+ 
+     drop(foo);
+     // drop should be logged
+-    test.assert_logged("-- foo;");
++    test.assert_logged("-- foo");
+ 
+     drop(bar);
+     // dropping the INFO should be logged.
+-    test.assert_logged("-- bar;");
++    test.assert_logged("-- bar");
+ }
+diff --git a/tracing/test-log-support/tests/span_lifecycle_can_be_enabled.rs b/tracing/test-log-support/tests/span_lifecycle_can_be_enabled.rs
+index 38041fd4..8ff515f9 100644
+--- a/tracing/test-log-support/tests/span_lifecycle_can_be_enabled.rs
++++ b/tracing/test-log-support/tests/span_lifecycle_can_be_enabled.rs
+@@ -19,21 +19,21 @@ fn span_lifecycle_can_be_enabled() {
+     test.assert_logged("hello world; thingy=42 other_thingy=666");
+ 
+     let foo = span!(Level::TRACE, "foo");
+-    test.assert_logged("foo;");
++    test.assert_logged("foo");
+ 
+     foo.in_scope(|| {
+         // enter should be logged
+-        test.assert_logged("-> foo;");
++        test.assert_logged("-> foo");
+ 
+         trace!({foo = 3, bar = 4}, "hello {};", "san francisco");
+         test.assert_logged("hello san francisco; foo=3 bar=4");
+     });
+     // exit should be logged
+-    test.assert_logged("<- foo;");
++    test.assert_logged("<- foo");
+ 
+     drop(foo);
+     // drop should be logged
+-    test.assert_logged("-- foo;");
++    test.assert_logged("-- foo");
+ 
+     trace!(foo = 1, bar = 2, "hello world");
+     test.assert_logged("hello world foo=1 bar=2");
+@@ -44,10 +44,10 @@ fn span_lifecycle_can_be_enabled() {
+ 
+     foo.in_scope(|| {
+         // entering the span should be logged
+-        test.assert_logged("-> foo;");
++        test.assert_logged("-> foo");
+     });
+     // exiting the span should be logged
+-    test.assert_logged("<- foo;");
++    test.assert_logged("<- foo");
+ 
+     foo.record("baz", &true);
+     // recording a field should be logged
+@@ -55,20 +55,20 @@ fn span_lifecycle_can_be_enabled() {
+ 
+     let bar = span!(Level::INFO, "bar");
+     // lifecycles for INFO spans should be logged
+-    test.assert_logged("bar;");
++    test.assert_logged("bar");
+ 
+     bar.in_scope(|| {
+         // entering the INFO span should be logged
+-        test.assert_logged("-> bar;");
++        test.assert_logged("-> bar");
+     });
+     // exiting the INFO span should be logged
+-    test.assert_logged("<- bar;");
++    test.assert_logged("<- bar");
+ 
+     drop(foo);
+     // drop should be logged.
+-    test.assert_logged("-- foo;");
++    test.assert_logged("-- foo");
+ 
+     drop(bar);
+     // dropping the INFO should be logged.
+-    test.assert_logged("-- bar;");
++    test.assert_logged("-- bar");
+ }
+diff --git a/tracing/tests/future_send.rs b/tracing/tests/future_send.rs
+deleted file mode 100644
+index 5e5f9f18..00000000
+--- a/tracing/tests/future_send.rs
++++ /dev/null
+@@ -1,22 +0,0 @@
+-// These tests reproduce the following issues:
+-// - https://github.com/tokio-rs/tracing/issues/1487
+-// - https://github.com/tokio-rs/tracing/issues/1793
+-
+-use core::future::{self, Future};
+-#[test]
+-fn async_fn_is_send() {
+-    async fn some_async_fn() {
+-        tracing::info!("{}", future::ready("test").await);
+-    }
+-
+-    assert_send(some_async_fn())
+-}
+-
+-#[test]
+-fn async_block_is_send() {
+-    assert_send(async {
+-        tracing::info!("{}", future::ready("test").await);
+-    })
+-}
+-
+-fn assert_send<F: Future + Send>(_f: F) {}

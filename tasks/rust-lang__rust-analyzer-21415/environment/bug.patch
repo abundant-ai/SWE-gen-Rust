@@ -1,0 +1,2020 @@
+diff --git a/crates/hir/src/symbols.rs b/crates/hir/src/symbols.rs
+index f9002f31fd..073142670d 100644
+--- a/crates/hir/src/symbols.rs
++++ b/crates/hir/src/symbols.rs
+@@ -9,7 +9,6 @@ use hir_def::{
+     ModuleDefId, ModuleId, TraitId,
+     db::DefDatabase,
+     item_scope::{ImportId, ImportOrExternCrate, ImportOrGlob},
+-    nameres::crate_def_map,
+     per_ns::Item,
+     src::{HasChildSource, HasSource},
+     visibility::{Visibility, VisibilityExplicitness},
+@@ -41,14 +40,14 @@ pub struct FileSymbol<'db> {
+     _marker: PhantomData<&'db ()>,
+ }
+ 
+-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
++#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+ pub struct DeclarationLocation {
+     /// The file id for both the `ptr` and `name_ptr`.
+     pub hir_file_id: HirFileId,
+     /// This points to the whole syntax node of the declaration.
+     pub ptr: SyntaxNodePtr,
+     /// This points to the [`syntax::ast::Name`] identifier of the declaration.
+-    pub name_ptr: Option<AstPtr<Either<syntax::ast::Name, syntax::ast::NameRef>>>,
++    pub name_ptr: AstPtr<Either<syntax::ast::Name, syntax::ast::NameRef>>,
+ }
+ 
+ impl DeclarationLocation {
+@@ -100,11 +99,6 @@ impl<'a> SymbolCollector<'a> {
+         let _p = tracing::info_span!("SymbolCollector::collect", ?module).entered();
+         tracing::info!(?module, "SymbolCollector::collect");
+ 
+-        // If this is a crate root module, add a symbol for the crate itself
+-        if module.is_crate_root(self.db) {
+-            self.push_crate_root(module);
+-        }
+-
+         // The initial work is the root module we're collecting, additional work will
+         // be populated as we traverse the module's definitions.
+         self.work.push(SymbolCollectorWork { module_id: module.into(), parent: None });
+@@ -114,51 +108,6 @@ impl<'a> SymbolCollector<'a> {
+         }
+     }
+ 
+-    /// Push a symbol for a crate's root module.
+-    /// This allows crate roots to appear in the symbol index for queries like `::` or `::foo`.
+-    fn push_crate_root(&mut self, module: Module) {
+-        let krate = module.krate(self.db);
+-        let Some(display_name) = krate.display_name(self.db) else { return };
+-        let crate_name = display_name.crate_name();
+-        let canonical_name = display_name.canonical_name();
+-
+-        let def_map = crate_def_map(self.db, krate.into());
+-        let module_data = &def_map[def_map.crate_root(self.db)];
+-
+-        let definition = module_data.origin.definition_source(self.db);
+-        let hir_file_id = definition.file_id;
+-        let syntax_node = definition.value.node();
+-        let ptr = SyntaxNodePtr::new(&syntax_node);
+-
+-        let loc = DeclarationLocation { hir_file_id, ptr, name_ptr: None };
+-
+-        self.symbols.insert(FileSymbol {
+-            name: crate_name.symbol().clone(),
+-            def: ModuleDef::Module(module),
+-            loc,
+-            container_name: None,
+-            is_alias: false,
+-            is_assoc: false,
+-            is_import: false,
+-            do_not_complete: Complete::Yes,
+-            _marker: PhantomData,
+-        });
+-
+-        if canonical_name != crate_name.symbol() {
+-            self.symbols.insert(FileSymbol {
+-                name: canonical_name.clone(),
+-                def: ModuleDef::Module(module),
+-                loc,
+-                container_name: None,
+-                is_alias: false,
+-                is_assoc: false,
+-                is_import: false,
+-                do_not_complete: Complete::Yes,
+-                _marker: PhantomData,
+-            });
+-        }
+-    }
+-
+     pub fn finish(self) -> Box<[FileSymbol<'a>]> {
+         self.symbols.into_iter().collect()
+     }
+@@ -260,7 +209,7 @@ impl<'a> SymbolCollector<'a> {
+             let dec_loc = DeclarationLocation {
+                 hir_file_id: source.file_id,
+                 ptr: SyntaxNodePtr::new(use_tree_src.syntax()),
+-                name_ptr: Some(AstPtr::new(&name_syntax)),
++                name_ptr: AstPtr::new(&name_syntax),
+             };
+             this.symbols.insert(FileSymbol {
+                 name: name.symbol().clone(),
+@@ -295,7 +244,7 @@ impl<'a> SymbolCollector<'a> {
+                 let dec_loc = DeclarationLocation {
+                     hir_file_id: source.file_id,
+                     ptr: SyntaxNodePtr::new(source.value.syntax()),
+-                    name_ptr: Some(AstPtr::new(&name_syntax)),
++                    name_ptr: AstPtr::new(&name_syntax),
+                 };
+                 this.symbols.insert(FileSymbol {
+                     name: name.symbol().clone(),
+@@ -460,10 +409,10 @@ impl<'a> SymbolCollector<'a> {
+         let source = loc.source(self.db);
+         let Some(name_node) = source.value.name() else { return Complete::Yes };
+         let def = ModuleDef::from(id.into());
+-        let loc = DeclarationLocation {
++        let dec_loc = DeclarationLocation {
+             hir_file_id: source.file_id,
+             ptr: SyntaxNodePtr::new(source.value.syntax()),
+-            name_ptr: Some(AstPtr::new(&name_node).wrap_left()),
++            name_ptr: AstPtr::new(&name_node).wrap_left(),
+         };
+ 
+         let mut do_not_complete = Complete::Yes;
+@@ -478,7 +427,7 @@ impl<'a> SymbolCollector<'a> {
+                 self.symbols.insert(FileSymbol {
+                     name: alias.clone(),
+                     def,
+-                    loc,
++                    loc: dec_loc.clone(),
+                     container_name: self.current_container_name.clone(),
+                     is_alias: true,
+                     is_assoc,
+@@ -493,7 +442,7 @@ impl<'a> SymbolCollector<'a> {
+             name: name.symbol().clone(),
+             def,
+             container_name: self.current_container_name.clone(),
+-            loc,
++            loc: dec_loc,
+             is_alias: false,
+             is_assoc,
+             is_import: false,
+@@ -510,10 +459,10 @@ impl<'a> SymbolCollector<'a> {
+         let Some(declaration) = module_data.origin.declaration() else { return };
+         let module = declaration.to_node(self.db);
+         let Some(name_node) = module.name() else { return };
+-        let loc = DeclarationLocation {
++        let dec_loc = DeclarationLocation {
+             hir_file_id: declaration.file_id,
+             ptr: SyntaxNodePtr::new(module.syntax()),
+-            name_ptr: Some(AstPtr::new(&name_node).wrap_left()),
++            name_ptr: AstPtr::new(&name_node).wrap_left(),
+         };
+ 
+         let def = ModuleDef::Module(module_id.into());
+@@ -526,7 +475,7 @@ impl<'a> SymbolCollector<'a> {
+                 self.symbols.insert(FileSymbol {
+                     name: alias.clone(),
+                     def,
+-                    loc,
++                    loc: dec_loc.clone(),
+                     container_name: self.current_container_name.clone(),
+                     is_alias: true,
+                     is_assoc: false,
+@@ -541,7 +490,7 @@ impl<'a> SymbolCollector<'a> {
+             name: name.symbol().clone(),
+             def: ModuleDef::Module(module_id.into()),
+             container_name: self.current_container_name.clone(),
+-            loc,
++            loc: dec_loc,
+             is_alias: false,
+             is_assoc: false,
+             is_import: false,
+diff --git a/crates/ide-db/src/symbol_index.rs b/crates/ide-db/src/symbol_index.rs
+index 05c3f360fa..eb0529d6b5 100644
+--- a/crates/ide-db/src/symbol_index.rs
++++ b/crates/ide-db/src/symbol_index.rs
+@@ -40,78 +40,24 @@ use salsa::Update;
+ 
+ use crate::RootDatabase;
+ 
+-/// A query for searching symbols in the workspace or dependencies.
+-///
+-/// This struct configures how symbol search is performed, including the search text,
+-/// matching strategy, and filtering options. It is used by [`world_symbols`] to find
+-/// symbols across the codebase.
+-///
+-/// # Example
+-/// ```ignore
+-/// let mut query = Query::new("MyStruct".to_string());
+-/// query.only_types();  // Only search for type definitions
+-/// query.libs();        // Include library dependencies
+-/// query.exact();       // Use exact matching instead of fuzzy
+-/// ```
+ #[derive(Debug, Clone)]
+ pub struct Query {
+-    /// The item name to search for (last segment of the path, or full query if no path).
+-    /// When empty with a non-empty `path_filter`, returns all items in that module.
+     query: String,
+-    /// Lowercase version of [`Self::query`], pre-computed for efficiency.
+-    /// Used to build FST automata for case-insensitive index lookups.
+     lowercased: String,
+-    /// Path segments to filter by (all segments except the last).
+-    /// Empty if no `::` in the original query.
+-    path_filter: Vec<String>,
+-    /// If true, the first path segment must be a crate name (query started with `::`).
+-    anchor_to_crate: bool,
+-    /// The search strategy to use when matching symbols.
+-    /// - [`SearchMode::Exact`]: Symbol name must exactly match the query.
+-    /// - [`SearchMode::Fuzzy`]: Symbol name must contain all query characters in order (subsequence match).
+-    /// - [`SearchMode::Prefix`]: Symbol name must start with the query string.
+-    ///
+-    /// Defaults to [`SearchMode::Fuzzy`].
+     mode: SearchMode,
+-    /// Controls filtering of trait-associated items (methods, constants, types).
+-    /// - [`AssocSearchMode::Include`]: Include both associated and non-associated items.
+-    /// - [`AssocSearchMode::Exclude`]: Exclude trait-associated items from results.
+-    /// - [`AssocSearchMode::AssocItemsOnly`]: Only return trait-associated items.
+-    ///
+-    /// Defaults to [`AssocSearchMode::Include`].
+     assoc_mode: AssocSearchMode,
+-    /// Whether the final symbol name comparison should be case-sensitive.
+-    /// When `false`, matching is case-insensitive (e.g., "foo" matches "Foo").
+-    ///
+-    /// Defaults to `false`.
+     case_sensitive: bool,
+-    /// When `true`, only return type definitions: structs, enums, unions,
+-    /// type aliases, built-in types, and traits. Functions, constants, statics,
+-    /// and modules are excluded.
+-    ///
+-    /// Defaults to `false`.
+     only_types: bool,
+-    /// When `true`, search library dependency roots instead of local workspace crates.
+-    /// This enables finding symbols in external dependencies including the standard library.
+-    ///
+-    /// Defaults to `false` (search local workspace only).
+     libs: bool,
+-    /// When `true`, exclude re-exported/imported symbols from results,
+-    /// showing only the original definitions.
+-    ///
+-    /// Defaults to `false`.
+     exclude_imports: bool,
+ }
+ 
+ impl Query {
+     pub fn new(query: String) -> Query {
+-        let (path_filter, item_query, anchor_to_crate) = Self::parse_path_query(&query);
+-        let lowercased = item_query.to_lowercase();
++        let lowercased = query.to_lowercase();
+         Query {
+-            query: item_query,
++            query,
+             lowercased,
+-            path_filter,
+-            anchor_to_crate,
+             only_types: false,
+             libs: false,
+             mode: SearchMode::Fuzzy,
+@@ -121,35 +67,6 @@ impl Query {
+         }
+     }
+ 
+-    /// Parse a query string that may contain path segments.
+-    ///
+-    /// Returns (path_filter, item_query, anchor_to_crate) where:
+-    /// - `path_filter`: Path segments to match (all but the last segment)
+-    /// - `item_query`: The item name to search for (last segment)
+-    /// - `anchor_to_crate`: Whether the first segment must be a crate name
+-    fn parse_path_query(query: &str) -> (Vec<String>, String, bool) {
+-        // Check for leading :: (absolute path / crate search)
+-        let (query, anchor_to_crate) = match query.strip_prefix("::") {
+-            Some(q) => (q, true),
+-            None => (query, false),
+-        };
+-
+-        let Some((prefix, query)) = query.rsplit_once("::") else {
+-            return (vec![], query.to_owned(), anchor_to_crate);
+-        };
+-
+-        let prefix: Vec<_> =
+-            prefix.split("::").filter(|s| !s.is_empty()).map(ToOwned::to_owned).collect();
+-
+-        (prefix, query.to_owned(), anchor_to_crate)
+-    }
+-
+-    /// Returns true if this query is searching for crates
+-    /// (i.e., the query was "::" alone or "::foo" for fuzzy crate search)
+-    fn is_crate_search(&self) -> bool {
+-        self.anchor_to_crate && self.path_filter.is_empty()
+-    }
+-
+     pub fn only_types(&mut self) {
+         self.only_types = true;
+     }
+@@ -206,14 +123,11 @@ pub fn crate_symbols(db: &dyn HirDatabase, krate: Crate) -> Box<[&SymbolIndex<'_
+ // That is, `#` switches from "types" to all symbols, `*` switches from the current
+ // workspace to dependencies.
+ //
+-// This also supports general Rust path syntax with the usual rules.
+-//
+-// Note that paths do not currently work in VSCode due to the editor never
+-// sending the special symbols to the language server. Some other editors might not support the # or
+-// * search either, instead, you can configure the filtering via the
+-// `rust-analyzer.workspace.symbol.search.scope` and `rust-analyzer.workspace.symbol.search.kind`
+-// settings. Symbols prefixed with `__` are hidden from the search results unless configured
+-// otherwise.
++// Note that filtering does not currently work in VSCode due to the editor never
++// sending the special symbols to the language server. Instead, you can configure
++// the filtering via the `rust-analyzer.workspace.symbol.search.scope` and
++// `rust-analyzer.workspace.symbol.search.kind` settings. Symbols prefixed
++// with `__` are hidden from the search results unless configured otherwise.
+ //
+ // | Editor  | Shortcut |
+ // |---------|-----------|
+@@ -221,25 +135,7 @@ pub fn crate_symbols(db: &dyn HirDatabase, krate: Crate) -> Box<[&SymbolIndex<'_
+ pub fn world_symbols(db: &RootDatabase, query: Query) -> Vec<FileSymbol<'_>> {
+     let _p = tracing::info_span!("world_symbols", query = ?query.query).entered();
+ 
+-    if query.is_crate_search() {
+-        return search_crates(db, &query);
+-    }
+-
+-    // If we have a path filter, resolve it to target modules
+-    let indices: Vec<_> = if !query.path_filter.is_empty() {
+-        let target_modules = resolve_path_to_modules(
+-            db,
+-            &query.path_filter,
+-            query.anchor_to_crate,
+-            query.case_sensitive,
+-        );
+-
+-        if target_modules.is_empty() {
+-            return vec![];
+-        }
+-
+-        target_modules.iter().map(|&module| SymbolIndex::module_symbols(db, module)).collect()
+-    } else if query.libs {
++    let indices: Vec<_> = if query.libs {
+         LibraryRoots::get(db)
+             .roots(db)
+             .par_iter()
+@@ -262,125 +158,13 @@ pub fn world_symbols(db: &RootDatabase, query: Query) -> Vec<FileSymbol<'_>> {
+     };
+ 
+     let mut res = vec![];
+-
+-    // Normal search: use FST to match item name
+     query.search::<()>(&indices, |f| {
+         res.push(f.clone());
+         ControlFlow::Continue(())
+     });
+-
+     res
+ }
+ 
+-/// Search for crates by name (handles "::" and "::foo" queries)
+-fn search_crates<'db>(db: &'db RootDatabase, query: &Query) -> Vec<FileSymbol<'db>> {
+-    let mut res = vec![];
+-
+-    for krate in Crate::all(db) {
+-        let Some(display_name) = krate.display_name(db) else { continue };
+-        let crate_name = display_name.crate_name().as_str();
+-
+-        // If query is empty (sole "::"), return all crates
+-        // Otherwise, fuzzy match the crate name
+-        let matches = if query.query.is_empty() {
+-            true
+-        } else {
+-            query.mode.check(&query.query, query.case_sensitive, crate_name)
+-        };
+-
+-        if matches {
+-            // Get the crate root module's symbol index and find the root module symbol
+-            let root_module = krate.root_module(db);
+-            let index = SymbolIndex::module_symbols(db, root_module);
+-            // Find the module symbol itself (representing the crate)
+-            for symbol in index.symbols.iter() {
+-                if matches!(symbol.def, hir::ModuleDef::Module(m) if m == root_module) {
+-                    res.push(symbol.clone());
+-                    break;
+-                }
+-            }
+-        }
+-    }
+-
+-    res
+-}
+-
+-/// Resolve a path filter to the target module(s) it points to.
+-/// Returns the modules whose symbol indices should be searched.
+-///
+-/// The path_filter contains segments like ["std", "vec"] for a query like "std::vec::Vec".
+-/// We resolve this by:
+-/// 1. Finding crates matching the first segment
+-/// 2. Walking down the module tree following subsequent segments
+-fn resolve_path_to_modules(
+-    db: &dyn HirDatabase,
+-    path_filter: &[String],
+-    anchor_to_crate: bool,
+-    case_sensitive: bool,
+-) -> Vec<Module> {
+-    let [first_segment, rest_segments @ ..] = path_filter else {
+-        return vec![];
+-    };
+-
+-    // Helper for name comparison
+-    let names_match = |actual: &str, expected: &str| -> bool {
+-        if case_sensitive { actual == expected } else { actual.eq_ignore_ascii_case(expected) }
+-    };
+-
+-    // Find crates matching the first segment
+-    let matching_crates: Vec<Crate> = Crate::all(db)
+-        .into_iter()
+-        .filter(|krate| {
+-            krate
+-                .display_name(db)
+-                .is_some_and(|name| names_match(name.crate_name().as_str(), first_segment))
+-        })
+-        .collect();
+-
+-    // If anchor_to_crate is true, first segment MUST be a crate name
+-    // If anchor_to_crate is false, first segment could be a crate OR a module in local crates
+-    let mut candidate_modules: Vec<Module> = vec![];
+-
+-    // Add crate root modules for matching crates
+-    for krate in matching_crates {
+-        candidate_modules.push(krate.root_module(db));
+-    }
+-
+-    // If not anchored to crate, also search for modules matching first segment in local crates
+-    if !anchor_to_crate {
+-        for &root in LocalRoots::get(db).roots(db).iter() {
+-            for &krate in db.source_root_crates(root).iter() {
+-                let root_module = Crate::from(krate).root_module(db);
+-                for child in root_module.children(db) {
+-                    if let Some(name) = child.name(db)
+-                        && names_match(name.as_str(), first_segment)
+-                    {
+-                        candidate_modules.push(child);
+-                    }
+-                }
+-            }
+-        }
+-    }
+-
+-    // Walk down the module tree for remaining path segments
+-    for segment in rest_segments {
+-        candidate_modules = candidate_modules
+-            .into_iter()
+-            .flat_map(|module| {
+-                module.children(db).filter(|child| {
+-                    child.name(db).is_some_and(|name| names_match(name.as_str(), segment))
+-                })
+-            })
+-            .collect();
+-
+-        if candidate_modules.is_empty() {
+-            break;
+-        }
+-    }
+-
+-    candidate_modules
+-}
+-
+ #[derive(Default)]
+ pub struct SymbolIndex<'db> {
+     symbols: Box<[FileSymbol<'db>]>,
+@@ -552,14 +336,12 @@ impl<'db> SymbolIndex<'db> {
+ }
+ 
+ impl Query {
+-    /// Search symbols in the given indices.
+     pub(crate) fn search<'db, T>(
+-        &self,
++        self,
+         indices: &[&'db SymbolIndex<'db>],
+         cb: impl FnMut(&'db FileSymbol<'db>) -> ControlFlow<T>,
+     ) -> Option<T> {
+         let _p = tracing::info_span!("symbol_index::Query::search").entered();
+-
+         let mut op = fst::map::OpBuilder::new();
+         match self.mode {
+             SearchMode::Exact => {
+@@ -794,367 +576,4 @@ pub struct Foo;
+         let symbols = world_symbols(&db, query);
+         expect_file!["./test_data/test_symbols_exclude_imports.txt"].assert_debug_eq(&symbols);
+     }
+-
+-    #[test]
+-    fn test_parse_path_query() {
+-        // Plain query - no path
+-        let (path, item, anchor) = Query::parse_path_query("Item");
+-        assert_eq!(path, Vec::<String>::new());
+-        assert_eq!(item, "Item");
+-        assert!(!anchor);
+-
+-        // Path with item
+-        let (path, item, anchor) = Query::parse_path_query("foo::Item");
+-        assert_eq!(path, vec!["foo"]);
+-        assert_eq!(item, "Item");
+-        assert!(!anchor);
+-
+-        // Multi-segment path
+-        let (path, item, anchor) = Query::parse_path_query("foo::bar::Item");
+-        assert_eq!(path, vec!["foo", "bar"]);
+-        assert_eq!(item, "Item");
+-        assert!(!anchor);
+-
+-        // Leading :: (anchor to crate)
+-        let (path, item, anchor) = Query::parse_path_query("::std::vec::Vec");
+-        assert_eq!(path, vec!["std", "vec"]);
+-        assert_eq!(item, "Vec");
+-        assert!(anchor);
+-
+-        // Just "::" - return all crates
+-        let (path, item, anchor) = Query::parse_path_query("::");
+-        assert_eq!(path, Vec::<String>::new());
+-        assert_eq!(item, "");
+-        assert!(anchor);
+-
+-        // "::foo" - fuzzy search crate names
+-        let (path, item, anchor) = Query::parse_path_query("::foo");
+-        assert_eq!(path, Vec::<String>::new());
+-        assert_eq!(item, "foo");
+-        assert!(anchor);
+-
+-        // Trailing :: (module browsing)
+-        let (path, item, anchor) = Query::parse_path_query("foo::");
+-        assert_eq!(path, vec!["foo"]);
+-        assert_eq!(item, "");
+-        assert!(!anchor);
+-
+-        // Full path with trailing ::
+-        let (path, item, anchor) = Query::parse_path_query("foo::bar::");
+-        assert_eq!(path, vec!["foo", "bar"]);
+-        assert_eq!(item, "");
+-        assert!(!anchor);
+-
+-        // Absolute path with trailing ::
+-        let (path, item, anchor) = Query::parse_path_query("::std::vec::");
+-        assert_eq!(path, vec!["std", "vec"]);
+-        assert_eq!(item, "");
+-        assert!(anchor);
+-
+-        // Empty segments should be filtered
+-        let (path, item, anchor) = Query::parse_path_query("foo::::bar");
+-        assert_eq!(path, vec!["foo"]);
+-        assert_eq!(item, "bar");
+-        assert!(!anchor);
+-    }
+-
+-    #[test]
+-    fn test_path_search() {
+-        let (mut db, _) = RootDatabase::with_many_files(
+-            r#"
+-//- /lib.rs crate:main
+-mod inner;
+-pub struct RootStruct;
+-
+-//- /inner.rs
+-pub struct InnerStruct;
+-pub mod nested {
+-    pub struct NestedStruct;
+-}
+-"#,
+-        );
+-
+-        let mut local_roots = FxHashSet::default();
+-        local_roots.insert(WORKSPACE);
+-        LocalRoots::get(&db).set_roots(&mut db).to(local_roots);
+-
+-        // Search for item in specific module
+-        let query = Query::new("inner::InnerStruct".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        let names: Vec<_> = symbols.iter().map(|s| s.name.as_str()).collect();
+-        assert!(names.contains(&"InnerStruct"), "Expected InnerStruct in {:?}", names);
+-
+-        // Search for item in nested module
+-        let query = Query::new("inner::nested::NestedStruct".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        let names: Vec<_> = symbols.iter().map(|s| s.name.as_str()).collect();
+-        assert!(names.contains(&"NestedStruct"), "Expected NestedStruct in {:?}", names);
+-
+-        // Search with crate prefix
+-        let query = Query::new("main::inner::InnerStruct".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        let names: Vec<_> = symbols.iter().map(|s| s.name.as_str()).collect();
+-        assert!(names.contains(&"InnerStruct"), "Expected InnerStruct in {:?}", names);
+-
+-        // Wrong path should return empty
+-        let query = Query::new("wrong::InnerStruct".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        assert!(symbols.is_empty(), "Expected empty results for wrong path");
+-    }
+-
+-    #[test]
+-    fn test_module_browsing() {
+-        let (mut db, _) = RootDatabase::with_many_files(
+-            r#"
+-//- /lib.rs crate:main
+-mod mymod;
+-
+-//- /mymod.rs
+-pub struct MyStruct;
+-pub fn my_func() {}
+-pub const MY_CONST: u32 = 1;
+-"#,
+-        );
+-
+-        let mut local_roots = FxHashSet::default();
+-        local_roots.insert(WORKSPACE);
+-        LocalRoots::get(&db).set_roots(&mut db).to(local_roots);
+-
+-        // Browse all items in module
+-        let query = Query::new("main::mymod::".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        let names: Vec<_> = symbols.iter().map(|s| s.name.as_str()).collect();
+-
+-        assert!(names.contains(&"MyStruct"), "Expected MyStruct in {:?}", names);
+-        assert!(names.contains(&"my_func"), "Expected my_func in {:?}", names);
+-        assert!(names.contains(&"MY_CONST"), "Expected MY_CONST in {:?}", names);
+-    }
+-
+-    #[test]
+-    fn test_fuzzy_item_with_path() {
+-        let (mut db, _) = RootDatabase::with_many_files(
+-            r#"
+-//- /lib.rs crate:main
+-mod mymod;
+-
+-//- /mymod.rs
+-pub struct MyLongStructName;
+-"#,
+-        );
+-
+-        let mut local_roots = FxHashSet::default();
+-        local_roots.insert(WORKSPACE);
+-        LocalRoots::get(&db).set_roots(&mut db).to(local_roots);
+-
+-        // Fuzzy match on item name with exact path
+-        let query = Query::new("main::mymod::MyLong".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        let names: Vec<_> = symbols.iter().map(|s| s.name.as_str()).collect();
+-        assert!(
+-            names.contains(&"MyLongStructName"),
+-            "Expected fuzzy match for MyLongStructName in {:?}",
+-            names
+-        );
+-    }
+-
+-    #[test]
+-    fn test_case_insensitive_path() {
+-        let (mut db, _) = RootDatabase::with_many_files(
+-            r#"
+-//- /lib.rs crate:main
+-mod MyMod;
+-
+-//- /MyMod.rs
+-pub struct MyStruct;
+-"#,
+-        );
+-
+-        let mut local_roots = FxHashSet::default();
+-        local_roots.insert(WORKSPACE);
+-        LocalRoots::get(&db).set_roots(&mut db).to(local_roots);
+-
+-        // Case insensitive path matching (default)
+-        let query = Query::new("main::mymod::MyStruct".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        let names: Vec<_> = symbols.iter().map(|s| s.name.as_str()).collect();
+-        assert!(names.contains(&"MyStruct"), "Expected case-insensitive match in {:?}", names);
+-    }
+-
+-    #[test]
+-    fn test_absolute_path_search() {
+-        let (mut db, _) = RootDatabase::with_many_files(
+-            r#"
+-//- /lib.rs crate:mycrate
+-mod inner;
+-pub struct CrateRoot;
+-
+-//- /inner.rs
+-pub struct InnerItem;
+-"#,
+-        );
+-
+-        let mut local_roots = FxHashSet::default();
+-        local_roots.insert(WORKSPACE);
+-        LocalRoots::get(&db).set_roots(&mut db).to(local_roots);
+-
+-        // Absolute path with leading ::
+-        let query = Query::new("::mycrate::inner::InnerItem".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        let names: Vec<_> = symbols.iter().map(|s| s.name.as_str()).collect();
+-        assert!(
+-            names.contains(&"InnerItem"),
+-            "Expected InnerItem with absolute path in {:?}",
+-            names
+-        );
+-
+-        // Absolute path should NOT match if crate name is wrong
+-        let query = Query::new("::wrongcrate::inner::InnerItem".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        assert!(symbols.is_empty(), "Expected empty results for wrong crate name");
+-    }
+-
+-    #[test]
+-    fn test_wrong_path_returns_empty() {
+-        let (mut db, _) = RootDatabase::with_many_files(
+-            r#"
+-//- /lib.rs crate:main
+-mod existing;
+-
+-//- /existing.rs
+-pub struct MyStruct;
+-"#,
+-        );
+-
+-        let mut local_roots = FxHashSet::default();
+-        local_roots.insert(WORKSPACE);
+-        LocalRoots::get(&db).set_roots(&mut db).to(local_roots);
+-
+-        // Non-existent module path
+-        let query = Query::new("nonexistent::MyStruct".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        assert!(symbols.is_empty(), "Expected empty results for non-existent path");
+-
+-        // Correct item, wrong module
+-        let query = Query::new("wrongmod::MyStruct".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        assert!(symbols.is_empty(), "Expected empty results for wrong module");
+-    }
+-
+-    #[test]
+-    fn test_root_module_items() {
+-        let (mut db, _) = RootDatabase::with_many_files(
+-            r#"
+-//- /lib.rs crate:mylib
+-pub struct RootItem;
+-pub fn root_fn() {}
+-"#,
+-        );
+-
+-        let mut local_roots = FxHashSet::default();
+-        local_roots.insert(WORKSPACE);
+-        LocalRoots::get(&db).set_roots(&mut db).to(local_roots);
+-
+-        // Items at crate root - path is just the crate name
+-        let query = Query::new("mylib::RootItem".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        let names: Vec<_> = symbols.iter().map(|s| s.name.as_str()).collect();
+-        assert!(names.contains(&"RootItem"), "Expected RootItem at crate root in {:?}", names);
+-
+-        // Browse crate root
+-        let query = Query::new("mylib::".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        let names: Vec<_> = symbols.iter().map(|s| s.name.as_str()).collect();
+-        assert!(
+-            names.contains(&"RootItem"),
+-            "Expected RootItem when browsing crate root in {:?}",
+-            names
+-        );
+-        assert!(
+-            names.contains(&"root_fn"),
+-            "Expected root_fn when browsing crate root in {:?}",
+-            names
+-        );
+-    }
+-
+-    #[test]
+-    fn test_crate_search_all() {
+-        // Test that sole "::" returns all crates
+-        let (mut db, _) = RootDatabase::with_many_files(
+-            r#"
+-//- /lib.rs crate:alpha
+-pub struct AlphaStruct;
+-
+-//- /beta.rs crate:beta
+-pub struct BetaStruct;
+-
+-//- /gamma.rs crate:gamma
+-pub struct GammaStruct;
+-"#,
+-        );
+-
+-        let mut local_roots = FxHashSet::default();
+-        local_roots.insert(WORKSPACE);
+-        LocalRoots::get(&db).set_roots(&mut db).to(local_roots);
+-
+-        // Sole "::" should return all crates (as module symbols)
+-        let query = Query::new("::".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        let names: Vec<_> = symbols.iter().map(|s| s.name.as_str()).collect();
+-
+-        assert!(names.contains(&"alpha"), "Expected alpha crate in {:?}", names);
+-        assert!(names.contains(&"beta"), "Expected beta crate in {:?}", names);
+-        assert!(names.contains(&"gamma"), "Expected gamma crate in {:?}", names);
+-        assert_eq!(symbols.len(), 3, "Expected exactly 3 crates, got {:?}", names);
+-    }
+-
+-    #[test]
+-    fn test_crate_search_fuzzy() {
+-        // Test that "::foo" fuzzy-matches crate names
+-        let (mut db, _) = RootDatabase::with_many_files(
+-            r#"
+-//- /lib.rs crate:my_awesome_lib
+-pub struct AwesomeStruct;
+-
+-//- /other.rs crate:another_lib
+-pub struct OtherStruct;
+-
+-//- /foo.rs crate:foobar
+-pub struct FooStruct;
+-"#,
+-        );
+-
+-        let mut local_roots = FxHashSet::default();
+-        local_roots.insert(WORKSPACE);
+-        LocalRoots::get(&db).set_roots(&mut db).to(local_roots);
+-
+-        // "::foo" should fuzzy-match crate names containing "foo"
+-        let query = Query::new("::foo".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        let names: Vec<_> = symbols.iter().map(|s| s.name.as_str()).collect();
+-
+-        assert!(names.contains(&"foobar"), "Expected foobar crate in {:?}", names);
+-        assert_eq!(symbols.len(), 1, "Expected only foobar crate, got {:?}", names);
+-
+-        // "::awesome" should match my_awesome_lib
+-        let query = Query::new("::awesome".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        let names: Vec<_> = symbols.iter().map(|s| s.name.as_str()).collect();
+-
+-        assert!(names.contains(&"my_awesome_lib"), "Expected my_awesome_lib crate in {:?}", names);
+-        assert_eq!(symbols.len(), 1, "Expected only my_awesome_lib crate, got {:?}", names);
+-
+-        // "::lib" should match multiple crates
+-        let query = Query::new("::lib".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        let names: Vec<_> = symbols.iter().map(|s| s.name.as_str()).collect();
+-
+-        assert!(names.contains(&"my_awesome_lib"), "Expected my_awesome_lib in {:?}", names);
+-        assert!(names.contains(&"another_lib"), "Expected another_lib in {:?}", names);
+-        assert_eq!(symbols.len(), 2, "Expected 2 crates matching 'lib', got {:?}", names);
+-
+-        // "::nonexistent" should return empty
+-        let query = Query::new("::nonexistent".to_owned());
+-        let symbols = world_symbols(&db, query);
+-        assert!(symbols.is_empty(), "Expected empty results for non-matching crate pattern");
+-    }
+ }
+diff --git a/crates/ide-db/src/test_data/test_doc_alias.txt b/crates/ide-db/src/test_data/test_doc_alias.txt
+index 71680699b7..5783d97564 100644
+--- a/crates/ide-db/src/test_data/test_doc_alias.txt
++++ b/crates/ide-db/src/test_data/test_doc_alias.txt
+@@ -27,13 +27,11 @@
+                         kind: STRUCT,
+                         range: 83..119,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 109..118,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 109..118,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -64,13 +62,11 @@
+                         kind: STRUCT,
+                         range: 0..81,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 74..80,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 74..80,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -101,13 +97,11 @@
+                         kind: STRUCT,
+                         range: 0..81,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 74..80,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 74..80,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -138,45 +132,15 @@
+                         kind: STRUCT,
+                         range: 0..81,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 74..80,
+-                            },
+-                        ),
+-                    ),
+-                },
+-                container_name: None,
+-                is_alias: true,
+-                is_assoc: false,
+-                is_import: false,
+-                do_not_complete: Yes,
+-                _marker: PhantomData<&()>,
+-            },
+-            FileSymbol {
+-                name: "ra_test_fixture",
+-                def: Module(
+-                    Module {
+-                        id: ModuleIdLt {
+-                            [salsa id]: Id(3800),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 74..80,
+                         },
+-                    },
+-                ),
+-                loc: DeclarationLocation {
+-                    hir_file_id: FileId(
+-                        EditionedFileId(
+-                            Id(3000),
+-                        ),
+                     ),
+-                    ptr: SyntaxNodePtr {
+-                        kind: SOURCE_FILE,
+-                        range: 0..128,
+-                    },
+-                    name_ptr: None,
+                 },
+                 container_name: None,
+-                is_alias: false,
++                is_alias: true,
+                 is_assoc: false,
+                 is_import: false,
+                 do_not_complete: Yes,
+@@ -203,13 +167,11 @@
+                         kind: STRUCT,
+                         range: 0..81,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 74..80,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 74..80,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -240,13 +202,11 @@
+                         kind: STRUCT,
+                         range: 83..119,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 109..118,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 109..118,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -277,13 +237,11 @@
+                         kind: STRUCT,
+                         range: 0..81,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 74..80,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 74..80,
++                        },
+                     ),
+                 },
+                 container_name: None,
+diff --git a/crates/ide-db/src/test_data/test_symbol_index_collection.txt b/crates/ide-db/src/test_data/test_symbol_index_collection.txt
+index 2d62a56fe2..7692a7d61a 100644
+--- a/crates/ide-db/src/test_data/test_symbol_index_collection.txt
++++ b/crates/ide-db/src/test_data/test_symbol_index_collection.txt
+@@ -25,13 +25,11 @@
+                         kind: VARIANT,
+                         range: 201..202,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 201..202,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 201..202,
++                        },
+                     ),
+                 },
+                 container_name: Some(
+@@ -62,13 +60,11 @@
+                         kind: TYPE_ALIAS,
+                         range: 470..490,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 475..480,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 475..480,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -97,13 +93,11 @@
+                         kind: VARIANT,
+                         range: 204..205,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 204..205,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 204..205,
++                        },
+                     ),
+                 },
+                 container_name: Some(
+@@ -134,13 +128,11 @@
+                         kind: CONST,
+                         range: 413..434,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 419..424,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 419..424,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -169,13 +161,11 @@
+                         kind: CONST,
+                         range: 593..665,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 599..615,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 599..615,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -206,13 +196,11 @@
+                         kind: ENUM,
+                         range: 185..207,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 190..194,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 190..194,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -243,13 +231,11 @@
+                         kind: USE_TREE,
+                         range: 727..749,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 736..749,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 736..749,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -280,13 +266,11 @@
+                         kind: MACRO_DEF,
+                         range: 153..168,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 159..164,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 159..164,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -315,13 +299,11 @@
+                         kind: STATIC,
+                         range: 435..469,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 442..448,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 442..448,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -352,13 +334,11 @@
+                         kind: STRUCT,
+                         range: 170..184,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 177..183,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 177..183,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -389,13 +369,11 @@
+                         kind: STRUCT,
+                         range: 0..22,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 6..21,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 6..21,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -426,13 +404,11 @@
+                         kind: STRUCT,
+                         range: 391..409,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 398..408,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 398..408,
++                        },
+                     ),
+                 },
+                 container_name: Some(
+@@ -465,13 +441,11 @@
+                         kind: STRUCT,
+                         range: 628..654,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 635..653,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 635..653,
++                        },
+                     ),
+                 },
+                 container_name: Some(
+@@ -504,13 +478,11 @@
+                         kind: STRUCT,
+                         range: 552..580,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 559..579,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 559..579,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -541,13 +513,11 @@
+                         kind: STRUCT,
+                         range: 261..279,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 268..275,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 268..275,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -576,13 +546,11 @@
+                         kind: TRAIT,
+                         range: 334..373,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 340..345,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 340..345,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -613,13 +581,11 @@
+                         kind: USE_TREE,
+                         range: 755..769,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 764..769,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 764..769,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -650,13 +616,11 @@
+                         kind: UNION,
+                         range: 208..222,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 214..219,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 214..219,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -685,13 +649,11 @@
+                         kind: MODULE,
+                         range: 492..530,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 496..501,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 496..501,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -720,13 +682,11 @@
+                         kind: MODULE,
+                         range: 667..677,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 671..676,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 671..676,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -757,13 +717,11 @@
+                         kind: MACRO_RULES,
+                         range: 51..131,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 64..77,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 64..77,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -792,13 +750,11 @@
+                         kind: FN,
+                         range: 307..330,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 310..325,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 310..325,
++                        },
+                     ),
+                 },
+                 container_name: Some(
+@@ -829,13 +785,11 @@
+                         kind: FN,
+                         range: 242..257,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 245..252,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 245..252,
++                        },
+                     ),
+                 },
+                 container_name: Some(
+@@ -868,13 +822,11 @@
+                         kind: MACRO_RULES,
+                         range: 1..48,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 14..31,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 14..31,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -903,42 +855,12 @@
+                         kind: FN,
+                         range: 375..411,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 378..382,
+-                            },
+-                        ),
+-                    ),
+-                },
+-                container_name: None,
+-                is_alias: false,
+-                is_assoc: false,
+-                is_import: false,
+-                do_not_complete: Yes,
+-                _marker: PhantomData<&()>,
+-            },
+-            FileSymbol {
+-                name: "ra_test_fixture",
+-                def: Module(
+-                    Module {
+-                        id: ModuleIdLt {
+-                            [salsa id]: Id(3800),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 378..382,
+                         },
+-                    },
+-                ),
+-                loc: DeclarationLocation {
+-                    hir_file_id: FileId(
+-                        EditionedFileId(
+-                            Id(3000),
+-                        ),
+                     ),
+-                    ptr: SyntaxNodePtr {
+-                        kind: SOURCE_FILE,
+-                        range: 0..793,
+-                    },
+-                    name_ptr: None,
+                 },
+                 container_name: None,
+                 is_alias: false,
+@@ -968,13 +890,11 @@
+                         kind: USE_TREE,
+                         range: 684..721,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 701..721,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 701..721,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -1003,13 +923,11 @@
+                         kind: FN,
+                         range: 352..371,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 355..363,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 355..363,
++                        },
+                     ),
+                 },
+                 container_name: Some(
+@@ -1051,13 +969,11 @@
+                         kind: STRUCT,
+                         range: 508..528,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 515..527,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 515..527,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -1095,13 +1011,11 @@
+                         kind: USE_TREE,
+                         range: 141..173,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 157..173,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 157..173,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -1132,13 +1046,11 @@
+                         kind: USE_TREE,
+                         range: 141..173,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 157..173,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 157..173,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -1169,13 +1081,11 @@
+                         kind: STRUCT,
+                         range: 0..20,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 7..19,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 7..19,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -1206,13 +1116,11 @@
+                         kind: USE_TREE,
+                         range: 35..69,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 51..69,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 51..69,
++                        },
+                     ),
+                 },
+                 container_name: None,
+@@ -1243,13 +1151,11 @@
+                         kind: USE_TREE,
+                         range: 85..125,
+                     },
+-                    name_ptr: Some(
+-                        AstPtr(
+-                            SyntaxNodePtr {
+-                                kind: NAME,
+-                                range: 115..125,
+-                            },
+-                        ),
++                    name_ptr: AstPtr(
++                        SyntaxNodePtr {
++                            kind: NAME,
++                            range: 115..125,
++                        },
+                     ),
+                 },
+                 container_name: None,
+diff --git a/crates/ide-db/src/test_data/test_symbols_exclude_imports.txt b/crates/ide-db/src/test_data/test_symbols_exclude_imports.txt
+index 87f0c7d9a8..6f5f8f889c 100644
+--- a/crates/ide-db/src/test_data/test_symbols_exclude_imports.txt
++++ b/crates/ide-db/src/test_data/test_symbols_exclude_imports.txt
+@@ -20,13 +20,11 @@
+                 kind: STRUCT,
+                 range: 0..15,
+             },
+-            name_ptr: Some(
+-                AstPtr(
+-                    SyntaxNodePtr {
+-                        kind: NAME,
+-                        range: 11..14,
+-                    },
+-                ),
++            name_ptr: AstPtr(
++                SyntaxNodePtr {
++                    kind: NAME,
++                    range: 11..14,
++                },
+             ),
+         },
+         container_name: None,
+diff --git a/crates/ide-db/src/test_data/test_symbols_with_imports.txt b/crates/ide-db/src/test_data/test_symbols_with_imports.txt
+index e96aa889ba..5d3fe4d265 100644
+--- a/crates/ide-db/src/test_data/test_symbols_with_imports.txt
++++ b/crates/ide-db/src/test_data/test_symbols_with_imports.txt
+@@ -20,13 +20,11 @@
+                 kind: STRUCT,
+                 range: 0..15,
+             },
+-            name_ptr: Some(
+-                AstPtr(
+-                    SyntaxNodePtr {
+-                        kind: NAME,
+-                        range: 11..14,
+-                    },
+-                ),
++            name_ptr: AstPtr(
++                SyntaxNodePtr {
++                    kind: NAME,
++                    range: 11..14,
++                },
+             ),
+         },
+         container_name: None,
+@@ -57,13 +55,11 @@
+                 kind: USE_TREE,
+                 range: 17..25,
+             },
+-            name_ptr: Some(
+-                AstPtr(
+-                    SyntaxNodePtr {
+-                        kind: NAME_REF,
+-                        range: 22..25,
+-                    },
+-                ),
++            name_ptr: AstPtr(
++                SyntaxNodePtr {
++                    kind: NAME_REF,
++                    range: 22..25,
++                },
+             ),
+         },
+         container_name: None,
+diff --git a/crates/ide/src/navigation_target.rs b/crates/ide/src/navigation_target.rs
+index 047df309ec..a271cac6fc 100644
+--- a/crates/ide/src/navigation_target.rs
++++ b/crates/ide/src/navigation_target.rs
+@@ -19,7 +19,7 @@ use ide_db::{
+ };
+ use stdx::never;
+ use syntax::{
+-    AstNode, AstPtr, SyntaxNode, TextRange,
++    AstNode, SyntaxNode, TextRange,
+     ast::{self, HasName},
+ };
+ 
+@@ -253,7 +253,7 @@ impl<'db> TryToNav for FileSymbol<'db> {
+                 db,
+                 self.loc.hir_file_id,
+                 self.loc.ptr.text_range(),
+-                self.loc.name_ptr.map(AstPtr::text_range),
++                Some(self.loc.name_ptr.text_range()),
+             )
+             .map(|(FileRange { file_id, range: full_range }, focus_range)| {
+                 NavigationTarget {
+diff --git a/crates/mbe/src/expander/matcher.rs b/crates/mbe/src/expander/matcher.rs
+index fe01fb1f10..8f6627a60f 100644
+--- a/crates/mbe/src/expander/matcher.rs
++++ b/crates/mbe/src/expander/matcher.rs
+@@ -414,9 +414,8 @@ fn match_loop_inner<'t>(
+                     }
+ 
+                     // Check if we need a separator.
+-                    if let Some(sep) = &item.sep
+-                        && !item.sep_matched
+-                    {
++                    if item.sep.is_some() && !item.sep_matched {
++                        let sep = item.sep.as_ref().unwrap();
+                         let mut fork = src.clone();
+                         if expect_separator(&mut fork, sep) {
+                             // HACK: here we use `meta_result` to pass `TtIter` back to caller because
+diff --git a/crates/rust-analyzer/tests/slow-tests/main.rs b/crates/rust-analyzer/tests/slow-tests/main.rs
+index 9f3c6742d6..eb1b8c5dd0 100644
+--- a/crates/rust-analyzer/tests/slow-tests/main.rs
++++ b/crates/rust-analyzer/tests/slow-tests/main.rs
+@@ -1447,27 +1447,7 @@ foo = { path = "../foo" }
+     .server()
+     .wait_until_workspace_is_loaded();
+ 
+-    server.request::<WorkspaceSymbolRequest>(
+-        Default::default(),
+-        json!([
+-        {
+-          "name": "bar",
+-          "kind": 2,
+-          "location": {
+-            "uri": "file:///[..]bar/src/lib.rs",
+-            "range": {
+-              "start": {
+-                "line": 0,
+-                "character": 0
+-              },
+-              "end": {
+-                "line": 0,
+-                "character": 0
+-              }
+-            }
+-          }
+-        }]),
+-    );
++    server.request::<WorkspaceSymbolRequest>(Default::default(), json!([]));
+ 
+     let server = Project::with_fixture(
+         r#"
+@@ -1506,27 +1486,7 @@ version = "0.0.0"
+     .server()
+     .wait_until_workspace_is_loaded();
+ 
+-    server.request::<WorkspaceSymbolRequest>(
+-        Default::default(),
+-        json!([
+-        {
+-          "name": "baz",
+-          "kind": 2,
+-          "location": {
+-            "uri": "file:///[..]baz/src/lib.rs",
+-            "range": {
+-              "start": {
+-                "line": 0,
+-                "character": 0
+-              },
+-              "end": {
+-                "line": 0,
+-                "character": 0
+-              }
+-            }
+-          }
+-        }]),
+-    );
++    server.request::<WorkspaceSymbolRequest>(Default::default(), json!([]));
+ }
+ 
+ #[test]
+diff --git a/crates/syntax/src/ptr.rs b/crates/syntax/src/ptr.rs
+index c4979b8e3a..34c07598d2 100644
+--- a/crates/syntax/src/ptr.rs
++++ b/crates/syntax/src/ptr.rs
+@@ -68,7 +68,7 @@ impl<N: AstNode> AstPtr<N> {
+         self.raw
+     }
+ 
+-    pub fn text_range(self) -> TextRange {
++    pub fn text_range(&self) -> TextRange {
+         self.raw.text_range()
+     }
+ 
+diff --git a/crates/test-fixture/src/lib.rs b/crates/test-fixture/src/lib.rs
+index ca68edd88c..d81f27d7c3 100644
+--- a/crates/test-fixture/src/lib.rs
++++ b/crates/test-fixture/src/lib.rs
+@@ -37,110 +37,7 @@ use triomphe::Arc;
+ 
+ pub const WORKSPACE: base_db::SourceRootId = base_db::SourceRootId(0);
+ 
+-/// A trait for setting up test databases from fixture strings.
+-///
+-/// Fixtures are strings containing Rust source code with optional metadata that describe
+-/// a project setup. This is the primary way to write tests for rust-analyzer without
+-/// having to depend on the entire sysroot.
+-///
+-/// # Fixture Syntax
+-///
+-/// ## Basic Structure
+-///
+-/// A fixture without metadata is parsed into a single source file (`/main.rs`).
+-/// Metadata is added after a `//-` comment prefix.
+-///
+-/// ```text
+-/// //- /main.rs
+-/// fn main() {
+-///     println!("Hello");
+-/// }
+-/// ```
+-///
+-/// Note that the fixture syntax is optional and can be omitted if the test only requires
+-/// a simple single file.
+-///
+-/// ## File Metadata
+-///
+-/// Each file can have the following metadata after `//-`:
+-///
+-/// - **Path** (required): Must start with `/`, e.g., `/main.rs`, `/lib.rs`, `/foo/bar.rs`
+-/// - **`crate:<name>`**: Defines a new crate with this file as its root
+-///   - Optional version: `crate:foo@0.1.0,https://example.com/repo.git`
+-/// - **`deps:<crate1>,<crate2>`**: Dependencies (requires `crate:`)
+-/// - **`extern-prelude:<crate1>,<crate2>`**: Limits extern prelude to specified crates
+-/// - **`edition:<year>`**: Rust edition (2015, 2018, 2021, 2024). Defaults to current.
+-/// - **`cfg:<key>=<value>,<flag>`**: Configuration options, e.g., `cfg:test,feature="foo"`
+-/// - **`env:<KEY>=<value>`**: Environment variables
+-/// - **`crate-attr:<attr>`**: Crate-level attributes, e.g., `crate-attr:no_std`
+-/// - **`new_source_root:local|library`**: Starts a new source root
+-/// - **`library`**: Marks crate as external library (not workspace member)
+-///
+-/// ## Global Meta (must appear at the top, in order)
+-///
+-/// - **`//- toolchain: nightly|stable`**: Sets the Rust toolchain (default: stable)
+-/// - **`//- target_data_layout: <layout>`**: LLVM data layout string
+-/// - **`//- target_arch: <arch>`**: Target architecture (default: x86_64)
+-/// - **`//- proc_macros: <name1>,<name2>`**: Enables predefined test proc macros
+-/// - **`//- minicore: <flag1>, <flag2>`**: Includes subset of libcore
+-///
+-/// ## Cursor Markers
+-///
+-/// Use `$0` to mark cursor position(s) in the fixture:
+-/// - Single `$0`: marks a position (use with [`with_position`](Self::with_position))
+-/// - Two `$0` markers: marks a range (use with [`with_range`](Self::with_range))
+-/// - Escape as `\$0` if you need a literal `$0`
+-///
+-/// # Examples
+-///
+-/// ## Single file with cursor position
+-/// ```text
+-/// r#"
+-/// fn main() {
+-///     let x$0 = 42;
+-/// }
+-/// "#
+-/// ```
+-///
+-/// ## Multiple crates with dependencies
+-/// ```text
+-/// r#"
+-/// //- /main.rs crate:main deps:helper
+-/// use helper::greet;
+-/// fn main() { greet(); }
+-///
+-/// //- /lib.rs crate:helper
+-/// pub fn greet() {}
+-/// "#
+-/// ```
+-///
+-/// ## Using minicore for lang items
+-/// ```text
+-/// r#"
+-/// //- minicore: option, result, iterator
+-/// //- /main.rs
+-/// fn foo() -> Option<i32> { Some(42) }
+-/// "#
+-/// ```
+-///
+-/// The available minicore flags are listed at the top of crates\test-utils\src\minicore.rs.
+-///
+-/// ## Using test proc macros
+-/// ```text
+-/// r#"
+-/// //- proc_macros: identity, mirror
+-/// //- /main.rs crate:main deps:proc_macros
+-/// use proc_macros::identity;
+-///
+-/// #[identity]
+-/// fn foo() {}
+-/// "#
+-/// ```
+-///
+-/// Available proc macros: `identity` (attr), `DeriveIdentity` (derive), `input_replace` (attr),
+-/// `mirror` (bang), `shorten` (bang)
+ pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
+-    /// See the trait documentation for more information on fixtures.
+     #[track_caller]
+     fn with_single_file(
+         #[rust_analyzer::rust_fixture] ra_fixture: &str,
+@@ -153,7 +50,6 @@ pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
+         (db, file)
+     }
+ 
+-    /// See the trait documentation for more information on fixtures.
+     #[track_caller]
+     fn with_many_files(
+         #[rust_analyzer::rust_fixture] ra_fixture: &str,
+@@ -170,7 +66,6 @@ pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
+         (db, files)
+     }
+ 
+-    /// See the trait documentation for more information on fixtures.
+     #[track_caller]
+     fn with_files(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> Self {
+         let mut db = Self::default();
+@@ -180,7 +75,6 @@ pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
+         db
+     }
+ 
+-    /// See the trait documentation for more information on fixtures.
+     #[track_caller]
+     fn with_files_extra_proc_macros(
+         #[rust_analyzer::rust_fixture] ra_fixture: &str,
+@@ -194,7 +88,6 @@ pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
+         db
+     }
+ 
+-    /// See the trait documentation for more information on fixtures.
+     #[track_caller]
+     fn with_position(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (Self, FilePosition) {
+         let (db, file_id, range_or_offset) = Self::with_range_or_offset(ra_fixture);
+@@ -202,7 +95,6 @@ pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
+         (db, FilePosition { file_id, offset })
+     }
+ 
+-    /// See the trait documentation for more information on fixtures.
+     #[track_caller]
+     fn with_range(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (Self, FileRange) {
+         let (db, file_id, range_or_offset) = Self::with_range_or_offset(ra_fixture);
+@@ -210,7 +102,6 @@ pub trait WithFixture: Default + ExpandDatabase + SourceDatabase + 'static {
+         (db, FileRange { file_id, range })
+     }
+ 
+-    /// See the trait documentation for more information on fixtures.
+     #[track_caller]
+     fn with_range_or_offset(
+         #[rust_analyzer::rust_fixture] ra_fixture: &str,

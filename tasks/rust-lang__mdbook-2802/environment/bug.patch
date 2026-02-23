@@ -1,0 +1,321 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 2b1daada..fe63883f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1335,7 +1335,6 @@ name = "mdbook-driver"
+ version = "0.5.0-alpha.1"
+ dependencies = [
+  "anyhow",
+- "indexmap",
+  "log",
+  "mdbook-core",
+  "mdbook-html",
+diff --git a/Cargo.toml b/Cargo.toml
+index dbdfb442..c085d699 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -37,7 +37,6 @@ font-awesome-as-a-crate = "0.3.0"
+ futures-util = "0.3.31"
+ handlebars = "6.3.2"
+ hex = "0.4.3"
+-indexmap = "2.10.0"
+ ignore = "0.4.23"
+ log = "0.4.27"
+ mdbook-core = { path = "crates/mdbook-core" }
+diff --git a/crates/mdbook-driver/Cargo.toml b/crates/mdbook-driver/Cargo.toml
+index 9f7936a4..f7edc053 100644
+--- a/crates/mdbook-driver/Cargo.toml
++++ b/crates/mdbook-driver/Cargo.toml
+@@ -9,7 +9,6 @@ rust-version.workspace = true
+ 
+ [dependencies]
+ anyhow.workspace = true
+-indexmap.workspace = true
+ log.workspace = true
+ mdbook-core.workspace = true
+ mdbook-html.workspace = true
+diff --git a/crates/mdbook-driver/src/mdbook.rs b/crates/mdbook-driver/src/mdbook.rs
+index d173502b..4edc27c6 100644
+--- a/crates/mdbook-driver/src/mdbook.rs
++++ b/crates/mdbook-driver/src/mdbook.rs
+@@ -5,7 +5,6 @@ use crate::builtin_renderers::{CmdRenderer, MarkdownRenderer};
+ use crate::init::BookBuilder;
+ use crate::load::{load_book, load_book_from_disk};
+ use anyhow::{Context, Error, Result, bail};
+-use indexmap::IndexMap;
+ use log::{debug, error, info, log_enabled, trace, warn};
+ use mdbook_core::book::{Book, BookItem, BookItems};
+ use mdbook_core::config::{Config, RustEdition};
+@@ -29,18 +28,14 @@ mod tests;
+ pub struct MDBook {
+     /// The book's root directory.
+     pub root: PathBuf,
+-
+     /// The configuration used to tweak now a book is built.
+     pub config: Config,
+-
+     /// A representation of the book's contents in memory.
+     pub book: Book,
++    renderers: Vec<Box<dyn Renderer>>,
+ 
+-    /// Renderers to execute.
+-    renderers: IndexMap<String, Box<dyn Renderer>>,
+-
+-    /// Pre-processors to be run on the book.
+-    preprocessors: IndexMap<String, Box<dyn Preprocessor>>,
++    /// List of pre-processors to be run on the book.
++    preprocessors: Vec<Box<dyn Preprocessor>>,
+ }
+ 
+ impl MDBook {
+@@ -161,7 +156,7 @@ impl MDBook {
+     pub fn build(&self) -> Result<()> {
+         info!("Book building has started");
+ 
+-        for renderer in self.renderers.values() {
++        for renderer in &self.renderers {
+             self.execute_build_process(&**renderer)?;
+         }
+ 
+@@ -176,7 +171,7 @@ impl MDBook {
+             renderer.name().to_string(),
+         );
+         let mut preprocessed_book = self.book.clone();
+-        for preprocessor in self.preprocessors.values() {
++        for preprocessor in &self.preprocessors {
+             if preprocessor_should_run(&**preprocessor, renderer, &self.config)? {
+                 debug!("Running the {} preprocessor.", preprocessor.name());
+                 preprocessed_book = preprocessor.run(&preprocess_ctx, preprocessed_book)?;
+@@ -212,15 +207,13 @@ impl MDBook {
+     /// The only requirement is that your renderer implement the [`Renderer`]
+     /// trait.
+     pub fn with_renderer<R: Renderer + 'static>(&mut self, renderer: R) -> &mut Self {
+-        self.renderers
+-            .insert(renderer.name().to_string(), Box::new(renderer));
++        self.renderers.push(Box::new(renderer));
+         self
+     }
+ 
+     /// Register a [`Preprocessor`] to be used when rendering the book.
+     pub fn with_preprocessor<P: Preprocessor + 'static>(&mut self, preprocessor: P) -> &mut Self {
+-        self.preprocessors
+-            .insert(preprocessor.name().to_string(), Box::new(preprocessor));
++        self.preprocessors.push(Box::new(preprocessor));
+         self
+     }
+ 
+@@ -265,9 +258,10 @@ impl MDBook {
+ 
+         // Index Preprocessor is disabled so that chapter paths
+         // continue to point to the actual markdown files.
+-        self.preprocessors = determine_preprocessors(&self.config, &self.root)?;
+-        self.preprocessors
+-            .shift_remove_entry(IndexPreprocessor::NAME);
++        self.preprocessors = determine_preprocessors(&self.config, &self.root)?
++            .into_iter()
++            .filter(|pre| pre.name() != IndexPreprocessor::NAME)
++            .collect();
+         let (book, _) = self.preprocess_book(&TestRenderer)?;
+ 
+         let color_output = std::io::stderr().is_terminal();
+@@ -405,25 +399,24 @@ struct OutputConfig {
+ }
+ 
+ /// Look at the `Config` and try to figure out what renderers to use.
+-fn determine_renderers(config: &Config) -> Result<IndexMap<String, Box<dyn Renderer>>> {
+-    let mut renderers = IndexMap::new();
++fn determine_renderers(config: &Config) -> Result<Vec<Box<dyn Renderer>>> {
++    let mut renderers = Vec::new();
+ 
+     let outputs = config.outputs::<OutputConfig>()?;
+     renderers.extend(outputs.into_iter().map(|(key, table)| {
+-        let renderer = if key == "html" {
++        if key == "html" {
+             Box::new(HtmlHandlebars::new()) as Box<dyn Renderer>
+         } else if key == "markdown" {
+             Box::new(MarkdownRenderer::new()) as Box<dyn Renderer>
+         } else {
+             let command = table.command.unwrap_or_else(|| format!("mdbook-{key}"));
+-            Box::new(CmdRenderer::new(key.clone(), command))
+-        };
+-        (key, renderer)
++            Box::new(CmdRenderer::new(key, command))
++        }
+     }));
+ 
+     // if we couldn't find anything, add the HTML renderer as a default
+     if renderers.is_empty() {
+-        renderers.insert("html".to_string(), Box::new(HtmlHandlebars::new()));
++        renderers.push(Box::new(HtmlHandlebars::new()));
+     }
+ 
+     Ok(renderers)
+@@ -449,10 +442,7 @@ struct PreprocessorConfig {
+ }
+ 
+ /// Look at the `MDBook` and try to figure out what preprocessors to run.
+-fn determine_preprocessors(
+-    config: &Config,
+-    root: &Path,
+-) -> Result<IndexMap<String, Box<dyn Preprocessor>>> {
++fn determine_preprocessors(config: &Config, root: &Path) -> Result<Vec<Box<dyn Preprocessor>>> {
+     // Collect the names of all preprocessors intended to be run, and the order
+     // in which they should be run.
+     let mut preprocessor_names = TopologicalSort::<String>::new();
+@@ -500,7 +490,7 @@ fn determine_preprocessors(
+     }
+ 
+     // Now that all links have been established, queue preprocessors in a suitable order
+-    let mut preprocessors = IndexMap::with_capacity(preprocessor_names.len());
++    let mut preprocessors = Vec::with_capacity(preprocessor_names.len());
+     // `pop_all()` returns an empty vector when no more items are not being depended upon
+     for mut names in std::iter::repeat_with(|| preprocessor_names.pop_all())
+         .take_while(|names| !names.is_empty())
+@@ -526,14 +516,14 @@ fn determine_preprocessors(
+                         .to_owned()
+                         .unwrap_or_else(|| format!("mdbook-{name}"));
+                     Box::new(CmdPreprocessor::new(
+-                        name.clone(),
++                        name,
+                         command,
+                         root.to_owned(),
+                         table.optional,
+                     ))
+                 }
+             };
+-            preprocessors.insert(name, preprocessor);
++            preprocessors.push(preprocessor);
+         }
+     }
+ 
+diff --git a/crates/mdbook-driver/src/mdbook/tests.rs b/crates/mdbook-driver/src/mdbook/tests.rs
+index 2914324c..b7399133 100644
+--- a/crates/mdbook-driver/src/mdbook/tests.rs
++++ b/crates/mdbook-driver/src/mdbook/tests.rs
+@@ -85,7 +85,7 @@ fn can_determine_third_party_preprocessors() {
+ 
+     let got = determine_preprocessors(&cfg, Path::new("")).unwrap();
+ 
+-    assert!(got.contains_key("random"));
++    assert!(got.into_iter().any(|p| p.name() == "random"));
+ }
+ 
+ #[test]
+@@ -143,12 +143,19 @@ fn preprocessor_order_is_honored() {
+     let cfg = Config::from_str(cfg_str).unwrap();
+ 
+     let preprocessors = determine_preprocessors(&cfg, Path::new("")).unwrap();
+-    let index = |name| preprocessors.get_index_of(name).unwrap();
++    let index = |name| {
++        preprocessors
++            .iter()
++            .enumerate()
++            .find(|(_, preprocessor)| preprocessor.name() == name)
++            .unwrap()
++            .0
++    };
+     let assert_before = |before, after| {
+         if index(before) >= index(after) {
+             eprintln!("Preprocessor order:");
+-            for preprocessor in preprocessors.keys() {
+-                eprintln!("  {}", preprocessor);
++            for preprocessor in &preprocessors {
++                eprintln!("  {}", preprocessor.name());
+             }
+             panic!("{before} should come before {after}");
+         }
+@@ -186,8 +193,11 @@ fn dependencies_dont_register_undefined_preprocessors() {
+ 
+     let preprocessors = determine_preprocessors(&cfg, Path::new("")).unwrap();
+ 
+-    // Does not contain "random"
+-    assert_eq!(preprocessors.keys().collect::<Vec<_>>(), ["index", "links"]);
++    assert!(
++        !preprocessors
++            .iter()
++            .any(|preprocessor| preprocessor.name() == "random")
++    );
+ }
+ 
+ #[test]
+@@ -204,8 +214,11 @@ fn dependencies_dont_register_builtin_preprocessors_if_disabled() {
+ 
+     let preprocessors = determine_preprocessors(&cfg, Path::new("")).unwrap();
+ 
+-    // Does not contain "links"
+-    assert_eq!(preprocessors.keys().collect::<Vec<_>>(), ["random"]);
++    assert!(
++        !preprocessors
++            .iter()
++            .any(|preprocessor| preprocessor.name() == "links")
++    );
+ }
+ 
+ #[test]
+diff --git a/tests/testsuite/book_test.rs b/tests/testsuite/book_test.rs
+index 3cf6b0a4..2f5e9d63 100644
+--- a/tests/testsuite/book_test.rs
++++ b/tests/testsuite/book_test.rs
+@@ -22,8 +22,7 @@ enum StatusCode {
+ pub struct BookTest {
+     /// The temp directory where the test should perform its work.
+     pub dir: PathBuf,
+-    /// Snapshot assertion support.
+-    pub assert: snapbox::Assert,
++    assert: snapbox::Assert,
+     /// This indicates whether or not the book has been built.
+     built: bool,
+ }
+diff --git a/tests/testsuite/preprocessor.rs b/tests/testsuite/preprocessor.rs
+index de3e5efe..9fa1df1c 100644
+--- a/tests/testsuite/preprocessor.rs
++++ b/tests/testsuite/preprocessor.rs
+@@ -180,22 +180,3 @@ fn missing_optional_not_fatal() {
+ "#]]);
+     });
+ }
+-
+-// with_preprocessor of an existing name.
+-#[test]
+-fn with_preprocessor_same_name() {
+-    let mut test = BookTest::init(|_| {});
+-    test.change_file(
+-        "book.toml",
+-        "[preprocessor.dummy]\n\
+-         command = 'mdbook-preprocessor-does-not-exist'\n",
+-    );
+-    let spy: Arc<Mutex<Inner>> = Default::default();
+-    let mut book = test.load_book();
+-    book.with_preprocessor(Spy(Arc::clone(&spy)));
+-    // Unfortunately this is unable to capture the output when using the API.
+-    book.build().unwrap();
+-    let inner = spy.lock().unwrap();
+-    assert_eq!(inner.run_count, 1);
+-    assert_eq!(inner.rendered_with, ["html"]);
+-}
+diff --git a/tests/testsuite/renderer.rs b/tests/testsuite/renderer.rs
+index 456fcd7e..a04ff0e3 100644
+--- a/tests/testsuite/renderer.rs
++++ b/tests/testsuite/renderer.rs
+@@ -241,21 +241,3 @@ fn relative_command_path() {
+     })
+     .check_file("book/output", "test");
+ }
+-
+-// with_renderer of an existing name.
+-#[test]
+-fn with_renderer_same_name() {
+-    let mut test = BookTest::init(|_| {});
+-    test.change_file(
+-        "book.toml",
+-        "[output.dummy]\n\
+-         command = 'mdbook-renderer-does-not-exist'\n",
+-    );
+-    let spy: Arc<Mutex<Inner>> = Default::default();
+-    let mut book = test.load_book();
+-    book.with_renderer(Spy(Arc::clone(&spy)));
+-    // Unfortunately this is unable to capture the output when using the API.
+-    book.build().unwrap();
+-    let inner = spy.lock().unwrap();
+-    assert_eq!(inner.run_count, 1);
+-}

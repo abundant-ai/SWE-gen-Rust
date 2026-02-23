@@ -1,0 +1,153 @@
+diff --git a/guide/src/format/markdown.md b/guide/src/format/markdown.md
+index 963a1538..8a92870b 100644
+--- a/guide/src/format/markdown.md
++++ b/guide/src/format/markdown.md
+@@ -220,3 +220,16 @@ To enable it, see the [`output.html.curly-quotes`] config option.
+ [tables]: https://github.github.com/gfm/#tables-extension-
+ [task list extension]: https://github.github.com/gfm/#task-list-items-extension-
+ [`output.html.curly-quotes`]: configuration/renderers.md#html-renderer-options
++
++### Heading attributes
++
++Headings can have a custom HTML ID and classes. This let's you maintain the same ID even if you change the heading's text, it also let's you add multiple classes in the heading.
++
++Example:
++```md
++# Example heading { #first .class1 .class2 }
++```
++
++This makes the level 1 heading with the content `Example heading`, ID `first`, and classes `class1` and `class2`. Note that the attributes should be space-separated.
++
++More information can be found in the [heading attrs spec page](https://github.com/raphlinus/pulldown-cmark/blob/master/specs/heading_attrs.txt).
+diff --git a/src/renderer/html_handlebars/hbs_renderer.rs b/src/renderer/html_handlebars/hbs_renderer.rs
+index ee27fd13..e753dc2e 100644
+--- a/src/renderer/html_handlebars/hbs_renderer.rs
++++ b/src/renderer/html_handlebars/hbs_renderer.rs
+@@ -789,8 +789,10 @@ fn make_data(
+ /// Goes through the rendered HTML, making sure all header tags have
+ /// an anchor respectively so people can link to sections directly.
+ fn build_header_links(html: &str) -> String {
+-    static BUILD_HEADER_LINKS: Lazy<Regex> =
+-        Lazy::new(|| Regex::new(r"<h(\d)>(.*?)</h\d>").unwrap());
++    static BUILD_HEADER_LINKS: Lazy<Regex> = Lazy::new(|| {
++        Regex::new(r#"<h(\d)(?: id="([^"]+)")?(?: class="([^"]+)")?>(.*?)</h\d>"#).unwrap()
++    });
++    static IGNORE_CLASS: &[&str] = &["menu-title"];
+ 
+     let mut id_counter = HashMap::new();
+ 
+@@ -800,7 +802,22 @@ fn build_header_links(html: &str) -> String {
+                 .parse()
+                 .expect("Regex should ensure we only ever get numbers here");
+ 
+-            insert_link_into_header(level, &caps[2], &mut id_counter)
++            // Ignore .menu-title because now it's getting detected by the regex.
++            if let Some(classes) = caps.get(3) {
++                for class in classes.as_str().split(" ") {
++                    if IGNORE_CLASS.contains(&class) {
++                        return caps[0].to_string();
++                    }
++                }
++            }
++
++            insert_link_into_header(
++                level,
++                &caps[4],
++                caps.get(2).map(|x| x.as_str().to_string()),
++                caps.get(3).map(|x| x.as_str().to_string()),
++                &mut id_counter,
++            )
+         })
+         .into_owned()
+ }
+@@ -810,15 +827,21 @@ fn build_header_links(html: &str) -> String {
+ fn insert_link_into_header(
+     level: usize,
+     content: &str,
++    id: Option<String>,
++    classes: Option<String>,
+     id_counter: &mut HashMap<String, usize>,
+ ) -> String {
+-    let id = utils::unique_id_from_content(content, id_counter);
++    let id = id.unwrap_or_else(|| utils::unique_id_from_content(content, id_counter));
++    let classes = classes
++        .map(|s| format!(" class=\"{s}\""))
++        .unwrap_or_default();
+ 
+     format!(
+-        r##"<h{level} id="{id}"><a class="header" href="#{id}">{text}</a></h{level}>"##,
++        r##"<h{level} id="{id}"{classes}><a class="header" href="#{id}">{text}</a></h{level}>"##,
+         level = level,
+         id = id,
+-        text = content
++        text = content,
++        classes = classes
+     )
+ }
+ 
+@@ -1015,6 +1038,21 @@ mod tests {
+                 "<h1>Foo</h1><h3>Foo</h3>",
+                 r##"<h1 id="foo"><a class="header" href="#foo">Foo</a></h1><h3 id="foo-1"><a class="header" href="#foo-1">Foo</a></h3>"##,
+             ),
++            // id only
++            (
++                r##"<h1 id="foobar">Foo</h1>"##,
++                r##"<h1 id="foobar"><a class="header" href="#foobar">Foo</a></h1>"##,
++            ),
++            // class only
++            (
++                r##"<h1 class="class1 class2">Foo</h1>"##,
++                r##"<h1 id="foo" class="class1 class2"><a class="header" href="#foo">Foo</a></h1>"##,
++            ),
++            // both id and class
++            (
++                r##"<h1 id="foobar" class="class1 class2">Foo</h1>"##,
++                r##"<h1 id="foobar" class="class1 class2"><a class="header" href="#foobar">Foo</a></h1>"##,
++            ),
+         ];
+ 
+         for (src, should_be) in inputs {
+diff --git a/src/renderer/html_handlebars/search.rs b/src/renderer/html_handlebars/search.rs
+index a9e2f5ca..24d62fda 100644
+--- a/src/renderer/html_handlebars/search.rs
++++ b/src/renderer/html_handlebars/search.rs
+@@ -138,9 +138,11 @@ fn render_item(
+ 
+                 in_heading = true;
+             }
+-            Event::End(Tag::Heading(i, ..)) if i as u32 <= max_section_depth => {
++            Event::End(Tag::Heading(i, id, _classes)) if i as u32 <= max_section_depth => {
+                 in_heading = false;
+-                section_id = Some(utils::unique_id_from_content(&heading, &mut id_counter));
++                section_id = id
++                    .map(|id| id.to_string())
++                    .or_else(|| Some(utils::unique_id_from_content(&heading, &mut id_counter)));
+                 breadcrumbs.push(heading.clone());
+             }
+             Event::Start(Tag::FootnoteDefinition(name)) => {
+diff --git a/src/utils/mod.rs b/src/utils/mod.rs
+index 9f67deda..9156916e 100644
+--- a/src/utils/mod.rs
++++ b/src/utils/mod.rs
+@@ -183,6 +183,7 @@ pub fn new_cmark_parser(text: &str, curly_quotes: bool) -> Parser<'_, '_> {
+     opts.insert(Options::ENABLE_FOOTNOTES);
+     opts.insert(Options::ENABLE_STRIKETHROUGH);
+     opts.insert(Options::ENABLE_TASKLISTS);
++    opts.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+     if curly_quotes {
+         opts.insert(Options::ENABLE_SMART_PUNCTUATION);
+     }
+diff --git a/test_book/src/individual/heading.md b/test_book/src/individual/heading.md
+index df96d74c..f9f4d5b2 100644
+--- a/test_book/src/individual/heading.md
++++ b/test_book/src/individual/heading.md
+@@ -13,3 +13,9 @@
+ ##### Really Small Heading
+ 
+ ###### Is it even a heading anymore - heading
++
++## Custom id {#example-id}
++
++## Custom class {.class1 .class2}
++
++## Both id and class {#example-id2 .class1 .class2}

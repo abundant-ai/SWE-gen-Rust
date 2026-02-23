@@ -1,0 +1,369 @@
+diff --git a/guide/src/format/configuration/renderers.md b/guide/src/format/configuration/renderers.md
+index 16a42516..b9c30861 100644
+--- a/guide/src/format/configuration/renderers.md
++++ b/guide/src/format/configuration/renderers.md
+@@ -126,10 +126,7 @@ The following configuration options are available:
+   that occur in code blocks and code spans. Defaults to `false`.
+ - **mathjax-support:** Adds support for [MathJax](../mathjax.md). Defaults to
+   `false`.
+-- **copy-fonts:** (**Deprecated**) If `true` (the default), mdBook uses its built-in fonts which are copied to the output directory.
+-  If `false`, the built-in fonts will not be used.
+-  This option is deprecated. If you want to define your own custom fonts,
+-  create a `theme/fonts/fonts.css` file and store the fonts in the `theme/fonts/` directory.
++- **copy-fonts:** Copies fonts.css and respective font files to the output directory and use them in the default theme. Defaults to `true`.
+ - **google-analytics:** This field has been deprecated and will be removed in a future release.
+   Use the `theme/head.hbs` file to add the appropriate Google Analytics code instead.
+ - **additional-css:** If you need to slightly change the appearance of your book
+diff --git a/guide/src/format/theme/README.md b/guide/src/format/theme/README.md
+index 1aeb6dc7..4a776e60 100644
+--- a/guide/src/format/theme/README.md
++++ b/guide/src/format/theme/README.md
+@@ -26,8 +26,6 @@ Here are the files you can override:
+ - **_highlight.css_** is the theme used for the code highlighting.
+ - **_favicon.svg_** and **_favicon.png_** the favicon that will be used. The SVG
+   version is used by [newer browsers].
+-- **fonts/fonts.css** contains the definition of which fonts to load.
+-  Custom fonts can be included in the `fonts` directory.
+ 
+ Generally, when you want to tweak the theme, you don't need to override all the
+ files. If you only need changes in the stylesheet, there is no point in
+diff --git a/src/book/init.rs b/src/book/init.rs
+index ebcdd934..dd3fa8b0 100644
+--- a/src/book/init.rs
++++ b/src/book/init.rs
+@@ -6,7 +6,6 @@ use super::MDBook;
+ use crate::config::Config;
+ use crate::errors::*;
+ use crate::theme;
+-use crate::utils::fs::write_file;
+ use log::{debug, error, info, trace};
+ 
+ /// A helper for setting up a new book and its directory structure.
+@@ -159,19 +158,6 @@ impl BookBuilder {
+         let mut highlight_js = File::create(themedir.join("highlight.js"))?;
+         highlight_js.write_all(theme::HIGHLIGHT_JS)?;
+ 
+-        write_file(&themedir.join("fonts"), "fonts.css", theme::fonts::CSS)?;
+-        for (file_name, contents) in theme::fonts::LICENSES {
+-            write_file(&themedir, file_name, contents)?;
+-        }
+-        for (file_name, contents) in theme::fonts::OPEN_SANS.iter() {
+-            write_file(&themedir, file_name, contents)?;
+-        }
+-        write_file(
+-            &themedir,
+-            theme::fonts::SOURCE_CODE_PRO.0,
+-            theme::fonts::SOURCE_CODE_PRO.1,
+-        )?;
+-
+         Ok(())
+     }
+ 
+diff --git a/src/renderer/html_handlebars/hbs_renderer.rs b/src/renderer/html_handlebars/hbs_renderer.rs
+index e170e2fc..1b648dac 100644
+--- a/src/renderer/html_handlebars/hbs_renderer.rs
++++ b/src/renderer/html_handlebars/hbs_renderer.rs
+@@ -289,31 +289,6 @@ impl HtmlHandlebars {
+                 theme::fonts::SOURCE_CODE_PRO.1,
+             )?;
+         }
+-        if let Some(fonts_css) = &theme.fonts_css {
+-            if !fonts_css.is_empty() {
+-                if html_config.copy_fonts {
+-                    warn!(
+-                        "output.html.copy_fonts is deprecated.\n\
+-                        Set copy_fonts=false and ensure the fonts you want are in \
+-                        the `theme/fonts/` directory."
+-                    );
+-                }
+-                write_file(destination, "fonts/fonts.css", &fonts_css)?;
+-            }
+-        }
+-        if !html_config.copy_fonts && theme.fonts_css.is_none() {
+-            warn!(
+-                "output.html.copy_fonts is deprecated.\n\
+-                This book appears to have copy_fonts=false without a fonts.css file.\n\
+-                Add an empty `theme/fonts/fonts.css` file to squelch this warning."
+-            );
+-        }
+-        for font_file in &theme.font_files {
+-            let contents = fs::read(font_file)?;
+-            let filename = font_file.file_name().unwrap();
+-            let filename = Path::new("fonts").join(filename);
+-            write_file(destination, filename, &contents)?;
+-        }
+ 
+         let playground_config = &html_config.playground;
+ 
+@@ -681,8 +656,7 @@ fn make_data(
+         data.insert("mathjax_support".to_owned(), json!(true));
+     }
+ 
+-    // This `matches!` checks for a non-empty file.
+-    if html_config.copy_fonts || matches!(theme.fonts_css.as_deref(), Some([_, ..])) {
++    if html_config.copy_fonts {
+         data.insert("copy_fonts".to_owned(), json!(true));
+     }
+ 
+diff --git a/src/theme/mod.rs b/src/theme/mod.rs
+index 6e6b509d..7af5e2b7 100644
+--- a/src/theme/mod.rs
++++ b/src/theme/mod.rs
+@@ -9,7 +9,7 @@ pub mod searcher;
+ 
+ use std::fs::File;
+ use std::io::Read;
+-use std::path::{Path, PathBuf};
++use std::path::Path;
+ 
+ use crate::errors::*;
+ use log::warn;
+@@ -54,8 +54,6 @@ pub struct Theme {
+     pub general_css: Vec<u8>,
+     pub print_css: Vec<u8>,
+     pub variables_css: Vec<u8>,
+-    pub fonts_css: Option<Vec<u8>>,
+-    pub font_files: Vec<PathBuf>,
+     pub favicon_png: Option<Vec<u8>>,
+     pub favicon_svg: Option<Vec<u8>>,
+     pub js: Vec<u8>,
+@@ -106,7 +104,7 @@ impl Theme {
+                 ),
+             ];
+ 
+-            let load_with_warn = |filename: &Path, dest: &mut Vec<u8>| {
++            let load_with_warn = |filename: &Path, dest| {
+                 if !filename.exists() {
+                     // Don't warn if the file doesn't exist.
+                     return false;
+@@ -123,29 +121,6 @@ impl Theme {
+                 load_with_warn(&filename, dest);
+             }
+ 
+-            let fonts_dir = theme_dir.join("fonts");
+-            if fonts_dir.exists() {
+-                let mut fonts_css = Vec::new();
+-                if load_with_warn(&fonts_dir.join("fonts.css"), &mut fonts_css) {
+-                    theme.fonts_css.replace(fonts_css);
+-                }
+-                if let Ok(entries) = fonts_dir.read_dir() {
+-                    theme.font_files = entries
+-                        .filter_map(|entry| {
+-                            let entry = entry.ok()?;
+-                            if entry.file_name() == "fonts.css" {
+-                                None
+-                            } else if entry.file_type().ok()?.is_dir() {
+-                                log::info!("skipping font directory {:?}", entry.path());
+-                                None
+-                            } else {
+-                                Some(entry.path())
+-                            }
+-                        })
+-                        .collect();
+-                }
+-            }
+-
+             // If the user overrides one favicon, but not the other, do not
+             // copy the default for the other.
+             let favicon_png = &mut theme.favicon_png.as_mut().unwrap();
+@@ -178,8 +153,6 @@ impl Default for Theme {
+             general_css: GENERAL_CSS.to_owned(),
+             print_css: PRINT_CSS.to_owned(),
+             variables_css: VARIABLES_CSS.to_owned(),
+-            fonts_css: None,
+-            font_files: Vec::new(),
+             favicon_png: Some(FAVICON_PNG.to_owned()),
+             favicon_svg: Some(FAVICON_SVG.to_owned()),
+             js: JS.to_owned(),
+@@ -236,10 +209,10 @@ mod tests {
+             "favicon.png",
+             "favicon.svg",
+             "css/chrome.css",
++            "css/fonts.css",
+             "css/general.css",
+             "css/print.css",
+             "css/variables.css",
+-            "fonts/fonts.css",
+             "book.js",
+             "highlight.js",
+             "tomorrow-night.css",
+@@ -250,7 +223,6 @@ mod tests {
+ 
+         let temp = TempFileBuilder::new().prefix("mdbook-").tempdir().unwrap();
+         fs::create_dir(temp.path().join("css")).unwrap();
+-        fs::create_dir(temp.path().join("fonts")).unwrap();
+ 
+         // "touch" all of the special files so we have empty copies
+         for file in &files {
+@@ -268,8 +240,6 @@ mod tests {
+             general_css: Vec::new(),
+             print_css: Vec::new(),
+             variables_css: Vec::new(),
+-            fonts_css: Some(Vec::new()),
+-            font_files: Vec::new(),
+             favicon_png: Some(Vec::new()),
+             favicon_svg: Some(Vec::new()),
+             js: Vec::new(),
+diff --git a/tests/init.rs b/tests/init.rs
+index 2b6ad507..1c3b962b 100644
+--- a/tests/init.rs
++++ b/tests/init.rs
+@@ -1,6 +1,5 @@
+ use mdbook::config::Config;
+ use mdbook::MDBook;
+-use pretty_assertions::assert_eq;
+ use std::fs;
+ use std::fs::File;
+ use std::io::prelude::*;
+@@ -122,20 +121,6 @@ fn copy_theme() {
+         "css/variables.css",
+         "favicon.png",
+         "favicon.svg",
+-        "fonts/OPEN-SANS-LICENSE.txt",
+-        "fonts/SOURCE-CODE-PRO-LICENSE.txt",
+-        "fonts/fonts.css",
+-        "fonts/open-sans-v17-all-charsets-300.woff2",
+-        "fonts/open-sans-v17-all-charsets-300italic.woff2",
+-        "fonts/open-sans-v17-all-charsets-600.woff2",
+-        "fonts/open-sans-v17-all-charsets-600italic.woff2",
+-        "fonts/open-sans-v17-all-charsets-700.woff2",
+-        "fonts/open-sans-v17-all-charsets-700italic.woff2",
+-        "fonts/open-sans-v17-all-charsets-800.woff2",
+-        "fonts/open-sans-v17-all-charsets-800italic.woff2",
+-        "fonts/open-sans-v17-all-charsets-italic.woff2",
+-        "fonts/open-sans-v17-all-charsets-regular.woff2",
+-        "fonts/source-code-pro-v11-all-charsets-500.woff2",
+         "highlight.css",
+         "highlight.js",
+         "index.hbs",
+diff --git a/tests/rendered_output.rs b/tests/rendered_output.rs
+index a279c4f8..9750a35e 100644
+--- a/tests/rendered_output.rs
++++ b/tests/rendered_output.rs
+@@ -1,3 +1,6 @@
++#[macro_use]
++extern crate pretty_assertions;
++
+ mod dummy_book;
+ 
+ use crate::dummy_book::{assert_contains_strings, assert_doesnt_contain_strings, DummyBook};
+@@ -7,7 +10,6 @@ use mdbook::config::Config;
+ use mdbook::errors::*;
+ use mdbook::utils::fs::write_file;
+ use mdbook::MDBook;
+-use pretty_assertions::assert_eq;
+ use select::document::Document;
+ use select::predicate::{Class, Name, Predicate};
+ use std::collections::HashMap;
+@@ -840,111 +842,3 @@ mod search {
+         }
+     }
+ }
+-
+-#[test]
+-fn custom_fonts() {
+-    // Tests to ensure custom fonts are copied as expected.
+-    let builtin_fonts = [
+-        "OPEN-SANS-LICENSE.txt",
+-        "SOURCE-CODE-PRO-LICENSE.txt",
+-        "fonts.css",
+-        "open-sans-v17-all-charsets-300.woff2",
+-        "open-sans-v17-all-charsets-300italic.woff2",
+-        "open-sans-v17-all-charsets-600.woff2",
+-        "open-sans-v17-all-charsets-600italic.woff2",
+-        "open-sans-v17-all-charsets-700.woff2",
+-        "open-sans-v17-all-charsets-700italic.woff2",
+-        "open-sans-v17-all-charsets-800.woff2",
+-        "open-sans-v17-all-charsets-800italic.woff2",
+-        "open-sans-v17-all-charsets-italic.woff2",
+-        "open-sans-v17-all-charsets-regular.woff2",
+-        "source-code-pro-v11-all-charsets-500.woff2",
+-    ];
+-    let actual_files = |path: &Path| -> Vec<String> {
+-        let mut actual: Vec<_> = path
+-            .read_dir()
+-            .unwrap()
+-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+-            .collect();
+-        actual.sort();
+-        actual
+-    };
+-    let has_fonts_css = |path: &Path| -> bool {
+-        let contents = fs::read_to_string(path.join("book/index.html")).unwrap();
+-        contents.contains("fonts/fonts.css")
+-    };
+-
+-    // No theme:
+-    let temp = TempFileBuilder::new().prefix("mdbook").tempdir().unwrap();
+-    let p = temp.path();
+-    MDBook::init(p).build().unwrap();
+-    MDBook::load(p).unwrap().build().unwrap();
+-    assert_eq!(actual_files(&p.join("book/fonts")), &builtin_fonts);
+-    assert!(has_fonts_css(p));
+-
+-    // Full theme.
+-    let temp = TempFileBuilder::new().prefix("mdbook").tempdir().unwrap();
+-    let p = temp.path();
+-    MDBook::init(p).copy_theme(true).build().unwrap();
+-    assert_eq!(actual_files(&p.join("theme/fonts")), &builtin_fonts);
+-    MDBook::load(p).unwrap().build().unwrap();
+-    assert_eq!(actual_files(&p.join("book/fonts")), &builtin_fonts);
+-    assert!(has_fonts_css(p));
+-
+-    // Mixed with copy_fonts=true
+-    // This should generate a deprecation warning.
+-    let temp = TempFileBuilder::new().prefix("mdbook").tempdir().unwrap();
+-    let p = temp.path();
+-    MDBook::init(p).build().unwrap();
+-    write_file(&p.join("theme/fonts"), "fonts.css", b"/*custom*/").unwrap();
+-    write_file(&p.join("theme/fonts"), "myfont.woff", b"").unwrap();
+-    MDBook::load(p).unwrap().build().unwrap();
+-    assert!(has_fonts_css(p));
+-    let mut expected = Vec::from(builtin_fonts);
+-    expected.push("myfont.woff");
+-    expected.sort();
+-    assert_eq!(actual_files(&p.join("book/fonts")), expected.as_slice());
+-
+-    // copy-fonts=false, no theme
+-    // This should generate a deprecation warning.
+-    let temp = TempFileBuilder::new().prefix("mdbook").tempdir().unwrap();
+-    let p = temp.path();
+-    MDBook::init(p).build().unwrap();
+-    let config = Config::from_str("output.html.copy-fonts = false").unwrap();
+-    MDBook::load_with_config(p, config)
+-        .unwrap()
+-        .build()
+-        .unwrap();
+-    assert!(!has_fonts_css(p));
+-    assert!(!p.join("book/fonts").exists());
+-
+-    // copy-fonts=false with empty fonts.css
+-    let temp = TempFileBuilder::new().prefix("mdbook").tempdir().unwrap();
+-    let p = temp.path();
+-    MDBook::init(p).build().unwrap();
+-    write_file(&p.join("theme/fonts"), "fonts.css", b"").unwrap();
+-    let config = Config::from_str("output.html.copy-fonts = false").unwrap();
+-    MDBook::load_with_config(p, config)
+-        .unwrap()
+-        .build()
+-        .unwrap();
+-    assert!(!has_fonts_css(p));
+-    assert!(!p.join("book/fonts").exists());
+-
+-    // copy-fonts=false with fonts theme
+-    let temp = TempFileBuilder::new().prefix("mdbook").tempdir().unwrap();
+-    let p = temp.path();
+-    MDBook::init(p).build().unwrap();
+-    write_file(&p.join("theme/fonts"), "fonts.css", b"/*custom*/").unwrap();
+-    write_file(&p.join("theme/fonts"), "myfont.woff", b"").unwrap();
+-    let config = Config::from_str("output.html.copy-fonts = false").unwrap();
+-    MDBook::load_with_config(p, config)
+-        .unwrap()
+-        .build()
+-        .unwrap();
+-    assert!(has_fonts_css(p));
+-    assert_eq!(
+-        actual_files(&p.join("book/fonts")),
+-        &["fonts.css", "myfont.woff"]
+-    );
+-}

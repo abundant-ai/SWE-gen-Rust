@@ -1,0 +1,508 @@
+diff --git a/crates/mdbook-driver/src/builtin_preprocessors/cmd.rs b/crates/mdbook-driver/src/builtin_preprocessors/cmd.rs
+index 498b055d..0241a081 100644
+--- a/crates/mdbook-driver/src/builtin_preprocessors/cmd.rs
++++ b/crates/mdbook-driver/src/builtin_preprocessors/cmd.rs
+@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
+ use log::{debug, trace, warn};
+ use mdbook_core::book::Book;
+ use mdbook_preprocessor::{Preprocessor, PreprocessorContext};
+-use std::io::Write;
++use std::io::{self, Write};
+ use std::path::PathBuf;
+ use std::process::{Child, Stdio};
+ 
+@@ -34,18 +34,12 @@ pub struct CmdPreprocessor {
+     name: String,
+     cmd: String,
+     root: PathBuf,
+-    optional: bool,
+ }
+ 
+ impl CmdPreprocessor {
+     /// Create a new `CmdPreprocessor`.
+-    pub fn new(name: String, cmd: String, root: PathBuf, optional: bool) -> CmdPreprocessor {
+-        CmdPreprocessor {
+-            name,
+-            cmd,
+-            root,
+-            optional,
+-        }
++    pub fn new(name: String, cmd: String, root: PathBuf) -> CmdPreprocessor {
++        CmdPreprocessor { name, cmd, root }
+     }
+ 
+     fn write_input_to_child(&self, child: &mut Child, book: &Book, ctx: &PreprocessorContext) {
+@@ -81,29 +75,18 @@ impl Preprocessor for CmdPreprocessor {
+     fn run(&self, ctx: &PreprocessorContext, book: Book) -> Result<Book> {
+         let mut cmd = crate::compose_command(&self.cmd, &ctx.root)?;
+ 
+-        let mut child = match cmd
++        let mut child = cmd
+             .stdin(Stdio::piped())
+             .stdout(Stdio::piped())
+             .stderr(Stdio::inherit())
+             .current_dir(&self.root)
+             .spawn()
+-        {
+-            Ok(c) => c,
+-            Err(e) => {
+-                crate::handle_command_error(
+-                    e,
+-                    self.optional,
+-                    "preprocessor",
+-                    "preprocessor",
+-                    &self.name,
+-                    &self.cmd,
+-                )?;
+-                // This should normally not be reached, since the validation
+-                // for NotFound should have already happened when running the
+-                // "supports" command.
+-                return Ok(book);
+-            }
+-        };
++            .with_context(|| {
++                format!(
++                    "Unable to start the \"{}\" preprocessor. Is it installed?",
++                    self.name()
++                )
++            })?;
+ 
+         self.write_input_to_child(&mut child, &book, ctx);
+ 
+@@ -131,16 +114,26 @@ impl Preprocessor for CmdPreprocessor {
+         })
+     }
+ 
+-    fn supports_renderer(&self, renderer: &str) -> Result<bool> {
++    fn supports_renderer(&self, renderer: &str) -> bool {
+         debug!(
+             "Checking if the \"{}\" preprocessor supports \"{}\"",
+             self.name(),
+             renderer
+         );
+ 
+-        let mut cmd = crate::compose_command(&self.cmd, &self.root)?;
++        let mut cmd = match crate::compose_command(&self.cmd, &self.root) {
++            Ok(c) => c,
++            Err(e) => {
++                warn!(
++                    "Unable to create the command for the \"{}\" preprocessor, {}",
++                    self.name(),
++                    e
++                );
++                return false;
++            }
++        };
+ 
+-        match cmd
++        let outcome = cmd
+             .arg("supports")
+             .arg(renderer)
+             .stdin(Stdio::null())
+@@ -148,20 +141,19 @@ impl Preprocessor for CmdPreprocessor {
+             .stderr(Stdio::inherit())
+             .current_dir(&self.root)
+             .status()
+-        {
+-            Ok(status) => Ok(status.code() == Some(0)),
+-            Err(e) => {
+-                crate::handle_command_error(
+-                    e,
+-                    self.optional,
+-                    "preprocessor",
+-                    "preprocessor",
+-                    &self.name,
+-                    &self.cmd,
+-                )?;
+-                Ok(false)
++            .map(|status| status.code() == Some(0));
++
++        if let Err(ref e) = outcome {
++            if e.kind() == io::ErrorKind::NotFound {
++                warn!(
++                    "The command wasn't found, is the \"{}\" preprocessor installed?",
++                    self.name
++                );
++                warn!("\tCommand: {}", self.cmd);
+             }
+         }
++
++        outcome.unwrap_or(false)
+     }
+ }
+ 
+@@ -179,12 +171,7 @@ mod tests {
+     #[test]
+     fn round_trip_write_and_parse_input() {
+         let md = guide();
+-        let cmd = CmdPreprocessor::new(
+-            "test".to_string(),
+-            "test".to_string(),
+-            md.root.clone(),
+-            false,
+-        );
++        let cmd = CmdPreprocessor::new("test".to_string(), "test".to_string(), md.root.clone());
+         let ctx = PreprocessorContext::new(
+             md.root.clone(),
+             md.config.clone(),
+diff --git a/crates/mdbook-driver/src/builtin_renderers/mod.rs b/crates/mdbook-driver/src/builtin_renderers/mod.rs
+index b319ff1f..615dedde 100644
+--- a/crates/mdbook-driver/src/builtin_renderers/mod.rs
++++ b/crates/mdbook-driver/src/builtin_renderers/mod.rs
+@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
+ use log::{error, info, trace, warn};
+ use mdbook_renderer::{RenderContext, Renderer};
+ use std::fs;
++use std::io::{self, ErrorKind};
+ use std::process::Stdio;
+ 
+ pub use self::markdown_renderer::MarkdownRenderer;
+@@ -48,6 +49,41 @@ impl CmdRenderer {
+     }
+ }
+ 
++impl CmdRenderer {
++    fn handle_render_command_error(&self, ctx: &RenderContext, error: io::Error) -> Result<()> {
++        if let ErrorKind::NotFound = error.kind() {
++            // Look for "output.{self.name}.optional".
++            // If it exists and is true, treat this as a warning.
++            // Otherwise, fail the build.
++
++            let optional_key = format!("output.{}.optional", self.name);
++
++            let is_optional = match ctx.config.get(&optional_key) {
++                Ok(Some(value)) => value,
++                Err(e) => bail!("expected bool for `{optional_key}`: {e}"),
++                Ok(None) => false,
++            };
++
++            if is_optional {
++                warn!(
++                    "The command `{}` for backend `{}` was not found, \
++                    but was marked as optional.",
++                    self.cmd, self.name
++                );
++                return Ok(());
++            } else {
++                error!(
++                    "The command `{0}` wasn't found, is the \"{1}\" backend installed? \
++                    If you want to ignore this error when the \"{1}\" backend is not installed, \
++                    set `optional = true` in the `[output.{1}]` section of the book.toml configuration file.",
++                    self.cmd, self.name
++                );
++            }
++        }
++        Err(error).with_context(|| "Unable to start the backend")?
++    }
++}
++
+ impl Renderer for CmdRenderer {
+     fn name(&self) -> &str {
+         &self.name
+@@ -56,13 +92,6 @@ impl Renderer for CmdRenderer {
+     fn render(&self, ctx: &RenderContext) -> Result<()> {
+         info!("Invoking the \"{}\" renderer", self.name);
+ 
+-        let optional_key = format!("output.{}.optional", self.name);
+-        let optional = match ctx.config.get(&optional_key) {
+-            Ok(Some(value)) => value,
+-            Err(e) => bail!("expected bool for `{optional_key}`: {e}"),
+-            Ok(None) => false,
+-        };
+-
+         let _ = fs::create_dir_all(&ctx.destination);
+ 
+         let mut cmd = crate::compose_command(&self.cmd, &ctx.root)?;
+@@ -74,11 +103,7 @@ impl Renderer for CmdRenderer {
+             .spawn()
+         {
+             Ok(c) => c,
+-            Err(e) => {
+-                return crate::handle_command_error(
+-                    e, optional, "output", "backend", &self.name, &self.cmd,
+-                );
+-            }
++            Err(e) => return self.handle_render_command_error(ctx, e),
+         };
+ 
+         let mut stdin = child.stdin.take().expect("Child has stdin");
+diff --git a/crates/mdbook-driver/src/lib.rs b/crates/mdbook-driver/src/lib.rs
+index c2b3123f..8eb85c8b 100644
+--- a/crates/mdbook-driver/src/lib.rs
++++ b/crates/mdbook-driver/src/lib.rs
+@@ -64,8 +64,7 @@ pub mod init;
+ mod load;
+ mod mdbook;
+ 
+-use anyhow::{Context, Result, bail};
+-use log::{error, warn};
++use anyhow::{Result, bail};
+ pub use mdbook::MDBook;
+ pub use mdbook_core::{book, config, errors};
+ use shlex::Shlex;
+@@ -96,30 +95,3 @@ fn compose_command(cmd: &str, root: &Path) -> Result<Command> {
+ 
+     Ok(cmd)
+ }
+-
+-/// Handles a failure for a preprocessor or renderer.
+-fn handle_command_error(
+-    error: std::io::Error,
+-    optional: bool,
+-    key: &str,
+-    what: &str,
+-    name: &str,
+-    cmd: &str,
+-) -> Result<()> {
+-    if let std::io::ErrorKind::NotFound = error.kind() {
+-        if optional {
+-            warn!(
+-                "The command `{cmd}` for {what} `{name}` was not found, \
+-                 but is marked as optional.",
+-            );
+-            return Ok(());
+-        } else {
+-            error!(
+-                "The command `{cmd}` wasn't found, is the `{name}` {what} installed? \
+-                If you want to ignore this error when the `{name}` {what} is not installed, \
+-                set `optional = true` in the `[{key}.{name}]` section of the book.toml configuration file.",
+-            );
+-        }
+-    }
+-    Err(error).with_context(|| format!("Unable to run the {what} `{name}`"))?
+-}
+diff --git a/crates/mdbook-driver/src/mdbook.rs b/crates/mdbook-driver/src/mdbook.rs
+index 4edc27c6..54728bae 100644
+--- a/crates/mdbook-driver/src/mdbook.rs
++++ b/crates/mdbook-driver/src/mdbook.rs
+@@ -437,8 +437,6 @@ struct PreprocessorConfig {
+     before: Vec<String>,
+     #[serde(default)]
+     after: Vec<String>,
+-    #[serde(default)]
+-    optional: bool,
+ }
+ 
+ /// Look at the `MDBook` and try to figure out what preprocessors to run.
+@@ -515,12 +513,7 @@ fn determine_preprocessors(config: &Config, root: &Path) -> Result<Vec<Box<dyn P
+                         .command
+                         .to_owned()
+                         .unwrap_or_else(|| format!("mdbook-{name}"));
+-                    Box::new(CmdPreprocessor::new(
+-                        name,
+-                        command,
+-                        root.to_owned(),
+-                        table.optional,
+-                    ))
++                    Box::new(CmdPreprocessor::new(name, command, root.to_owned()))
+                 }
+             };
+             preprocessors.push(preprocessor);
+@@ -549,7 +542,7 @@ fn preprocessor_should_run(
+ ) -> Result<bool> {
+     // default preprocessors should be run by default (if supported)
+     if cfg.build.use_default_preprocessors && is_default_preprocessor(preprocessor) {
+-        return preprocessor.supports_renderer(renderer.name());
++        return Ok(preprocessor.supports_renderer(renderer.name()));
+     }
+ 
+     let key = format!("preprocessor.{}.renderers", preprocessor.name());
+@@ -559,7 +552,7 @@ fn preprocessor_should_run(
+         Ok(Some(explicit_renderers)) => {
+             Ok(explicit_renderers.iter().any(|name| name == renderer_name))
+         }
+-        Ok(None) => preprocessor.supports_renderer(renderer_name),
++        Ok(None) => Ok(preprocessor.supports_renderer(renderer_name)),
+         Err(e) => bail!("failed to get `{key}`: {e}"),
+     }
+ }
+diff --git a/crates/mdbook-driver/src/mdbook/tests.rs b/crates/mdbook-driver/src/mdbook/tests.rs
+index b7399133..675bfc25 100644
+--- a/crates/mdbook-driver/src/mdbook/tests.rs
++++ b/crates/mdbook-driver/src/mdbook/tests.rs
+@@ -247,8 +247,8 @@ impl Preprocessor for BoolPreprocessor {
+         unimplemented!()
+     }
+ 
+-    fn supports_renderer(&self, _renderer: &str) -> Result<bool> {
+-        Ok(self.0)
++    fn supports_renderer(&self, _renderer: &str) -> bool {
++        self.0
+     }
+ }
+ 
+diff --git a/crates/mdbook-preprocessor/src/lib.rs b/crates/mdbook-preprocessor/src/lib.rs
+index 64100500..c1aa35ea 100644
+--- a/crates/mdbook-preprocessor/src/lib.rs
++++ b/crates/mdbook-preprocessor/src/lib.rs
+@@ -39,8 +39,8 @@ pub trait Preprocessor {
+     /// particular renderer.
+     ///
+     /// By default, always returns `true`.
+-    fn supports_renderer(&self, _renderer: &str) -> Result<bool> {
+-        Ok(true)
++    fn supports_renderer(&self, _renderer: &str) -> bool {
++        true
+     }
+ }
+ 
+diff --git a/examples/nop-preprocessor.rs b/examples/nop-preprocessor.rs
+index 488271dc..3423b481 100644
+--- a/examples/nop-preprocessor.rs
++++ b/examples/nop-preprocessor.rs
+@@ -59,7 +59,7 @@ fn handle_supports(pre: &dyn Preprocessor, sub_args: &ArgMatches) -> ! {
+     let renderer = sub_args
+         .get_one::<String>("renderer")
+         .expect("Required argument");
+-    let supported = pre.supports_renderer(renderer).unwrap();
++    let supported = pre.supports_renderer(renderer);
+ 
+     // Signal whether the renderer is supported by exiting with 1 or 0.
+     if supported {
+@@ -105,8 +105,8 @@ mod nop_lib {
+             Ok(book)
+         }
+ 
+-        fn supports_renderer(&self, renderer: &str) -> Result<bool> {
+-            Ok(renderer != "not-supported")
++        fn supports_renderer(&self, renderer: &str) -> bool {
++            renderer != "not-supported"
+         }
+     }
+ 
+diff --git a/guide/src/format/configuration/preprocessors.md b/guide/src/format/configuration/preprocessors.md
+index 24745d35..26a786b2 100644
+--- a/guide/src/format/configuration/preprocessors.md
++++ b/guide/src/format/configuration/preprocessors.md
+@@ -64,18 +64,6 @@ be overridden by adding a `command` field.
+ command = "python random.py"
+ ```
+ 
+-### Optional preprocessors
+-
+-If you enable a preprocessor that isn't installed, the default behavior is to throw an error.
+-This behavior can be changed by marking the preprocessor as optional:
+-
+-```toml
+-[preprocessor.example]
+-optional = true
+-```
+-
+-This demotes the error to a warning.
+-
+ ## Require A Certain Order
+ 
+ The order in which preprocessors are run can be controlled with the `before` and `after` fields.
+diff --git a/tests/testsuite/preprocessor.rs b/tests/testsuite/preprocessor.rs
+index 9fa1df1c..17f20876 100644
+--- a/tests/testsuite/preprocessor.rs
++++ b/tests/testsuite/preprocessor.rs
+@@ -76,7 +76,6 @@ fn example() -> CmdPreprocessor {
+         "nop-preprocessor".to_string(),
+         "cargo run --quiet --example nop-preprocessor --".to_string(),
+         std::env::current_dir().unwrap(),
+-        false,
+     )
+ }
+ 
+@@ -84,7 +83,7 @@ fn example() -> CmdPreprocessor {
+ fn example_supports_whatever() {
+     let cmd = example();
+ 
+-    let got = cmd.supports_renderer("whatever").unwrap();
++    let got = cmd.supports_renderer("whatever");
+ 
+     assert_eq!(got, true);
+ }
+@@ -93,7 +92,7 @@ fn example_supports_whatever() {
+ fn example_doesnt_support_not_supported() {
+     let cmd = example();
+ 
+-    let got = cmd.supports_renderer("not-supported").unwrap();
++    let got = cmd.supports_renderer("not-supported");
+ 
+     assert_eq!(got, false);
+ }
+@@ -150,33 +149,3 @@ fn relative_command_path() {
+     .check_file("support-check", "html")
+     .check_file("preprocessor-ran", "test");
+ }
+-
+-// Preprocessor command is missing.
+-#[test]
+-fn missing_preprocessor() {
+-    BookTest::from_dir("preprocessor/missing_preprocessor").run("build", |cmd| {
+-        cmd.expect_failure()
+-            .expect_stdout(str![[""]])
+-            .expect_stderr(str![[r#"
+-[TIMESTAMP] [INFO] (mdbook_driver::mdbook): Book building has started
+-[TIMESTAMP] [ERROR] (mdbook_driver): The command `trduyvbhijnorgevfuhn` wasn't found, is the `missing` preprocessor installed? If you want to ignore this error when the `missing` preprocessor is not installed, set `optional = true` in the `[preprocessor.missing]` section of the book.toml configuration file.
+-[TIMESTAMP] [ERROR] (mdbook_core::utils): Error: Unable to run the preprocessor `missing`
+-[TIMESTAMP] [ERROR] (mdbook_core::utils): [TAB]Caused By: [NOT_FOUND]
+-
+-"#]]);
+-    });
+-}
+-
+-// Optional missing is not an error.
+-#[test]
+-fn missing_optional_not_fatal() {
+-    BookTest::from_dir("preprocessor/missing_optional_not_fatal").run("build", |cmd| {
+-        cmd.expect_stdout(str![[""]]).expect_stderr(str![[r#"
+-[TIMESTAMP] [INFO] (mdbook_driver::mdbook): Book building has started
+-[TIMESTAMP] [WARN] (mdbook_driver): The command `trduyvbhijnorgevfuhn` for preprocessor `missing` was not found, but is marked as optional.
+-[TIMESTAMP] [INFO] (mdbook_driver::mdbook): Running the html backend
+-[TIMESTAMP] [INFO] (mdbook_html::html_handlebars::hbs_renderer): HTML book written to `[ROOT]/book`
+-
+-"#]]);
+-    });
+-}
+diff --git a/tests/testsuite/preprocessor/missing_optional_not_fatal/book.toml b/tests/testsuite/preprocessor/missing_optional_not_fatal/book.toml
+deleted file mode 100644
+index 59bc75cd..00000000
+--- a/tests/testsuite/preprocessor/missing_optional_not_fatal/book.toml
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[preprocessor.missing]
+-command = "trduyvbhijnorgevfuhn"
+-optional = true
+diff --git a/tests/testsuite/preprocessor/missing_optional_not_fatal/src/SUMMARY.md b/tests/testsuite/preprocessor/missing_optional_not_fatal/src/SUMMARY.md
+deleted file mode 100644
+index e69de29b..00000000
+diff --git a/tests/testsuite/preprocessor/missing_preprocessor/book.toml b/tests/testsuite/preprocessor/missing_preprocessor/book.toml
+deleted file mode 100644
+index 6a5241f3..00000000
+--- a/tests/testsuite/preprocessor/missing_preprocessor/book.toml
++++ /dev/null
+@@ -1,3 +0,0 @@
+-[preprocessor.missing]
+-command = "trduyvbhijnorgevfuhn"
+-
+diff --git a/tests/testsuite/preprocessor/missing_preprocessor/src/SUMMARY.md b/tests/testsuite/preprocessor/missing_preprocessor/src/SUMMARY.md
+deleted file mode 100644
+index e69de29b..00000000
+diff --git a/tests/testsuite/renderer.rs b/tests/testsuite/renderer.rs
+index 9f2ee010..28ff25be 100644
+--- a/tests/testsuite/renderer.rs
++++ b/tests/testsuite/renderer.rs
+@@ -85,9 +85,9 @@ fn missing_renderer() {
+ [TIMESTAMP] [INFO] (mdbook_driver::mdbook): Book building has started
+ [TIMESTAMP] [INFO] (mdbook_driver::mdbook): Running the missing backend
+ [TIMESTAMP] [INFO] (mdbook_driver::builtin_renderers): Invoking the "missing" renderer
+-[TIMESTAMP] [ERROR] (mdbook_driver): The command `trduyvbhijnorgevfuhn` wasn't found, is the `missing` backend installed? If you want to ignore this error when the `missing` backend is not installed, set `optional = true` in the `[output.missing]` section of the book.toml configuration file.
++[TIMESTAMP] [ERROR] (mdbook_driver::builtin_renderers): The command `trduyvbhijnorgevfuhn` wasn't found, is the "missing" backend installed? If you want to ignore this error when the "missing" backend is not installed, set `optional = true` in the `[output.missing]` section of the book.toml configuration file.
+ [TIMESTAMP] [ERROR] (mdbook_core::utils): Error: Rendering failed
+-[TIMESTAMP] [ERROR] (mdbook_core::utils): [TAB]Caused By: Unable to run the backend `missing`
++[TIMESTAMP] [ERROR] (mdbook_core::utils): [TAB]Caused By: Unable to start the backend
+ [TIMESTAMP] [ERROR] (mdbook_core::utils): [TAB]Caused By: [NOT_FOUND]
+ 
+ "#]]);
+@@ -102,7 +102,7 @@ fn missing_optional_not_fatal() {
+ [TIMESTAMP] [INFO] (mdbook_driver::mdbook): Book building has started
+ [TIMESTAMP] [INFO] (mdbook_driver::mdbook): Running the missing backend
+ [TIMESTAMP] [INFO] (mdbook_driver::builtin_renderers): Invoking the "missing" renderer
+-[TIMESTAMP] [WARN] (mdbook_driver): The command `trduyvbhijnorgevfuhn` for backend `missing` was not found, but is marked as optional.
++[TIMESTAMP] [WARN] (mdbook_driver::builtin_renderers): The command `trduyvbhijnorgevfuhn` for backend `missing` was not found, but was marked as optional.
+ 
+ "#]]);
+     });

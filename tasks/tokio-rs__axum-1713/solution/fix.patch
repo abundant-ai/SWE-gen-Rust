@@ -1,0 +1,232 @@
+diff --git a/axum/CHANGELOG.md b/axum/CHANGELOG.md
+index d956b3af..f312e3b7 100644
+--- a/axum/CHANGELOG.md
++++ b/axum/CHANGELOG.md
+@@ -9,12 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ - **added:** Implement `IntoResponse` for `&'static [u8; N]` and `[u8; N]` ([#1690])
+ - **fixed:** Make `Path` support types uses `serde::Deserializer::deserialize_any` ([#1693])
++- **added:** Add `RawPathParams` ([#1713])
+ - **added:** Implement `Clone` and `Service` for `axum::middleware::Next` ([#1712])
+ - **fixed:** Document required tokio features to run "Hello, World!" example ([#1715])
+ 
+ [#1690]: https://github.com/tokio-rs/axum/pull/1690
+ [#1693]: https://github.com/tokio-rs/axum/pull/1693
+ [#1712]: https://github.com/tokio-rs/axum/pull/1712
++[#1713]: https://github.com/tokio-rs/axum/pull/1713
+ [#1715]: https://github.com/tokio-rs/axum/pull/1715
+ 
+ # 0.6.2 (9. January, 2023)
+diff --git a/axum/src/extract/mod.rs b/axum/src/extract/mod.rs
+index ed4e227b..cb4ebcd9 100644
+--- a/axum/src/extract/mod.rs
++++ b/axum/src/extract/mod.rs
+@@ -26,7 +26,7 @@ pub use axum_macros::{FromRef, FromRequest, FromRequestParts};
+ #[allow(deprecated)]
+ pub use self::{
+     host::Host,
+-    path::Path,
++    path::{Path, RawPathParams},
+     raw_form::RawForm,
+     raw_query::RawQuery,
+     request_parts::{BodyStream, RawBody},
+diff --git a/axum/src/extract/path/mod.rs b/axum/src/extract/path/mod.rs
+index 44c9bc04..088ed068 100644
+--- a/axum/src/extract/path/mod.rs
++++ b/axum/src/extract/path/mod.rs
+@@ -6,6 +6,7 @@ mod de;
+ use crate::{
+     extract::{rejection::*, FromRequestParts},
+     routing::url_params::UrlParams,
++    util::PercentDecodedStr,
+ };
+ use async_trait::async_trait;
+ use axum_core::response::{IntoResponse, Response};
+@@ -14,6 +15,7 @@ use serde::de::DeserializeOwned;
+ use std::{
+     fmt,
+     ops::{Deref, DerefMut},
++    sync::Arc,
+ };
+ 
+ /// Extractor that will get captures from the URL and parse them using
+@@ -426,6 +428,125 @@ impl fmt::Display for FailedToDeserializePathParams {
+ 
+ impl std::error::Error for FailedToDeserializePathParams {}
+ 
++/// Extractor that will get captures from the URL without deserializing them.
++///
++/// In general you should prefer to use [`Path`] as it is higher level, however `RawPathParams` is
++/// suitable if just want the raw params without deserializing them and thus saving some
++/// allocations.
++///
++/// Any percent encoded parameters will be automatically decoded. The decoded parameters must be
++/// valid UTF-8, otherwise `RawPathParams` will fail and return a `400 Bad Request` response.
++///
++/// # Example
++///
++/// ```rust,no_run
++/// use axum::{
++///     extract::RawPathParams,
++///     routing::get,
++///     Router,
++/// };
++///
++/// async fn users_teams_show(params: RawPathParams) {
++///     for (key, value) in &params {
++///         println!("{key:?} = {value:?}");
++///     }
++/// }
++///
++/// let app = Router::new().route("/users/:user_id/team/:team_id", get(users_teams_show));
++/// # let _: Router = app;
++/// ```
++#[derive(Debug)]
++pub struct RawPathParams(Vec<(Arc<str>, PercentDecodedStr)>);
++
++#[async_trait]
++impl<S> FromRequestParts<S> for RawPathParams
++where
++    S: Send + Sync,
++{
++    type Rejection = RawPathParamsRejection;
++
++    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
++        let params = match parts.extensions.get::<UrlParams>() {
++            Some(UrlParams::Params(params)) => params,
++            Some(UrlParams::InvalidUtf8InPathParam { key }) => {
++                return Err(InvalidUtf8InPathParam {
++                    key: Arc::clone(key),
++                }
++                .into());
++            }
++            None => {
++                return Err(MissingPathParams.into());
++            }
++        };
++
++        Ok(Self(params.clone()))
++    }
++}
++
++impl RawPathParams {
++    /// Get an iterator over the path parameters.
++    pub fn iter(&self) -> RawPathParamsIter<'_> {
++        self.into_iter()
++    }
++}
++
++impl<'a> IntoIterator for &'a RawPathParams {
++    type Item = (&'a str, &'a str);
++    type IntoIter = RawPathParamsIter<'a>;
++
++    fn into_iter(self) -> Self::IntoIter {
++        RawPathParamsIter(self.0.iter())
++    }
++}
++
++/// An iterator over raw path parameters.
++///
++/// Created with [`RawPathParams::iter`].
++#[derive(Debug)]
++pub struct RawPathParamsIter<'a>(std::slice::Iter<'a, (Arc<str>, PercentDecodedStr)>);
++
++impl<'a> Iterator for RawPathParamsIter<'a> {
++    type Item = (&'a str, &'a str);
++
++    fn next(&mut self) -> Option<Self::Item> {
++        let (key, value) = self.0.next()?;
++        Some((&**key, value.as_str()))
++    }
++}
++
++/// Rejection used by [`RawPathParams`] if a parameter contained text that, once percent decoded,
++/// wasn't valid UTF-8.
++#[derive(Debug)]
++pub struct InvalidUtf8InPathParam {
++    key: Arc<str>,
++}
++
++impl InvalidUtf8InPathParam {
++    /// Get the response body text used for this rejection.
++    pub fn body_text(&self) -> String {
++        self.to_string()
++    }
++
++    /// Get the status code used for this rejection.
++    pub fn status(&self) -> StatusCode {
++        StatusCode::BAD_REQUEST
++    }
++}
++
++impl fmt::Display for InvalidUtf8InPathParam {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "Invalid UTF-8 in `{}`", self.key)
++    }
++}
++
++impl std::error::Error for InvalidUtf8InPathParam {}
++
++impl IntoResponse for InvalidUtf8InPathParam {
++    fn into_response(self) -> Response {
++        (self.status(), self.body_text()).into_response()
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -710,4 +831,23 @@ mod tests {
+             .await
+             .starts_with("Wrong number of path arguments for `Path`. Expected 1 but got 2"));
+     }
++
++    #[crate::test]
++    async fn raw_path_params() {
++        let app = Router::new().route(
++            "/:a/:b/:c",
++            get(|params: RawPathParams| async move {
++                params
++                    .into_iter()
++                    .map(|(key, value)| format!("{key}={value}"))
++                    .collect::<Vec<_>>()
++                    .join(" ")
++            }),
++        );
++
++        let client = TestClient::new(app);
++        let res = client.get("/foo/bar/baz").send().await;
++        let body = res.text().await;
++        assert_eq!(body, "a=foo b=bar c=baz");
++    }
+ }
+diff --git a/axum/src/extract/rejection.rs b/axum/src/extract/rejection.rs
+index 0b382936..0bb2df04 100644
+--- a/axum/src/extract/rejection.rs
++++ b/axum/src/extract/rejection.rs
+@@ -1,6 +1,6 @@
+ //! Rejection response types.
+ 
+-pub use crate::extract::path::FailedToDeserializePathParams;
++pub use crate::extract::path::{FailedToDeserializePathParams, InvalidUtf8InPathParam};
+ pub use axum_core::extract::rejection::*;
+ 
+ #[cfg(feature = "json")]
+@@ -155,6 +155,17 @@ composite_rejection! {
+     }
+ }
+ 
++composite_rejection! {
++    /// Rejection used for [`RawPathParams`](super::RawPathParams).
++    ///
++    /// Contains one variant for each way the [`RawPathParams`](super::RawPathParams) extractor
++    /// can fail.
++    pub enum RawPathParamsRejection {
++        InvalidUtf8InPathParam,
++        MissingPathParams,
++    }
++}
++
+ composite_rejection! {
+     /// Rejection used for [`Host`](super::Host).
+     ///

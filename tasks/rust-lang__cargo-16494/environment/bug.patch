@@ -1,0 +1,133 @@
+diff --git a/src/cargo/core/compiler/custom_build.rs b/src/cargo/core/compiler/custom_build.rs
+index 369b048df..d7e6aadc3 100644
+--- a/src/cargo/core/compiler/custom_build.rs
++++ b/src/cargo/core/compiler/custom_build.rs
+@@ -469,10 +469,20 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
+             if dep.unit.mode.is_run_custom_build() {
+                 let dep_metadata = build_runner.get_run_build_script_metadata(&dep.unit);
+ 
+-                let dep_name = dep.dep_name.unwrap_or(dep.unit.pkg.name());
++                let Some(dependency) = unit.pkg.dependencies().iter().find(|d| {
++                    d.package_name() == dep.unit.pkg.name()
++                        && d.source_id() == dep.unit.pkg.package_id().source_id()
++                        && d.version_req().matches(dep.unit.pkg.version())
++                }) else {
++                    panic!(
++                        "Dependency `{}` not found in `{}`s dependencies",
++                        dep.unit.pkg.name(),
++                        unit.pkg.name()
++                    )
++                };
+ 
+                 Some((
+-                    dep_name,
++                    dependency.name_in_toml(),
+                     dep.unit
+                         .pkg
+                         .manifest()
+diff --git a/src/cargo/core/compiler/unit_dependencies.rs b/src/cargo/core/compiler/unit_dependencies.rs
+index 113a3d1f2..7b9e6426a 100644
+--- a/src/cargo/core/compiler/unit_dependencies.rs
++++ b/src/cargo/core/compiler/unit_dependencies.rs
+@@ -1005,16 +1005,7 @@ fn connect_run_custom_build_deps(state: &mut State<'_, '_>) {
+                     state.unit_dependencies[&other.unit]
+                         .iter()
+                         .find(|other_dep| other_dep.unit.mode == CompileMode::RunCustomBuild)
+-                        .map(|other_dep| {
+-                            let mut dep = other_dep.clone();
+-                            let dep_name = other.dep_name.unwrap_or(other.unit.pkg.name());
+-                            // Propagate the manifest dep name from the sibling edge.
+-                            // The RunCustomBuild-RustCustomBuild edge is synthetic
+-                            // and doesn't carry a usable dep name, but build script
+-                            // metadata needs one for `CARGO_DEP_<dep_name>_*` env var
+-                            dep.dep_name = Some(dep_name);
+-                            dep
+-                        })
++                        .cloned()
+                 })
+                 .collect::<HashSet<_>>();
+ 
+diff --git a/src/cargo/core/compiler/unit_graph.rs b/src/cargo/core/compiler/unit_graph.rs
+index 40e2d660e..fa1fae480 100644
+--- a/src/cargo/core/compiler/unit_graph.rs
++++ b/src/cargo/core/compiler/unit_graph.rs
+@@ -26,15 +26,11 @@ pub struct UnitDep {
+     pub unit_for: UnitFor,
+     /// The name the parent uses to refer to this dependency.
+     pub extern_crate_name: InternedString,
+-    /// The dependency name as written in the manifest (including a rename).
+-    ///
+-    /// `None` means this edge does not carry a manifest dep name. For example,
+-    /// std edges in build-std or synthetic edges for build script executions.
+-    /// When `None`, the package name is typically used by callers as a fallback.
+-    ///
+-    /// This is mainly for Cargo-synthesized outputs
+-    /// (artifact env vars and `CARGO_DEP_*` metadata env)
+-    /// and is distinct from `extern_crate_name`.
++    /// If `Some`, the name of the dependency if renamed in toml.
++    /// It's particularly interesting to artifact dependencies which rely on it
++    /// for naming their environment variables. Note that the `extern_crate_name`
++    /// cannot be used for this as it also may be the build target itself,
++    /// which isn't always the renamed dependency name.
+     pub dep_name: Option<InternedString>,
+     /// Whether or not this is a public dependency.
+     pub public: bool,
+diff --git a/tests/testsuite/build_script.rs b/tests/testsuite/build_script.rs
+index a185384fe..190158a30 100644
+--- a/tests/testsuite/build_script.rs
++++ b/tests/testsuite/build_script.rs
+@@ -1722,54 +1722,6 @@ fn non_links_can_pass_env_vars_direct_deps_only() {
+         .run();
+ }
+ 
+-/// Regression test for https://github.com/rust-lang/cargo/issues/16493
+-#[cargo_test]
+-fn with_patch() {
+-    Package::new("cxx", "1.0.0").publish();
+-
+-    let p = project()
+-        .file(
+-            "Cargo.toml",
+-            r#"
+-            [package]
+-            name = "foo"
+-            edition = "2021"
+-
+-            [dependencies]
+-            cxx = "1.0.0"
+-
+-            [patch.crates-io]
+-            cxx = { path = "cxx" }
+-            "#,
+-        )
+-        .file("src/lib.rs", "")
+-        .file("build.rs", "fn main() {}")
+-        .file(
+-            "cxx/Cargo.toml",
+-            r#"
+-            [package]
+-            name = "cxx"
+-            version = "1.0.0"
+-            edition = "2021"
+-            links = "cxx"
+-            "#,
+-        )
+-        .file("cxx/src/lib.rs", "")
+-        .file("cxx/build.rs", "fn main() {}")
+-        .build();
+-
+-    p.cargo("check")
+-        .with_stderr_data(str![[r#"
+-[UPDATING] `dummy-registry` index
+-[LOCKING] 1 package to latest compatible version
+-[COMPILING] cxx v1.0.0 ([ROOT]/foo/cxx)
+-[COMPILING] foo v0.0.0 ([ROOT]/foo)
+-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+-
+-"#]])
+-        .run();
+-}
+-
+ #[cargo_test]
+ fn only_rerun_build_script() {
+     let p = project()

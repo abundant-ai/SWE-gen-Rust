@@ -1,0 +1,872 @@
+diff --git a/crates/mdbook-core/src/config.rs b/crates/mdbook-core/src/config.rs
+index 365980c6..c5f24b60 100644
+--- a/crates/mdbook-core/src/config.rs
++++ b/crates/mdbook-core/src/config.rs
+@@ -13,6 +13,7 @@
+ //! use std::path::PathBuf;
+ //! use std::str::FromStr;
+ //! use mdbook_core::config::Config;
++//! use toml::Value;
+ //!
+ //! # fn run() -> Result<()> {
+ //! let src = r#"
+@@ -20,6 +21,9 @@
+ //! title = "My Book"
+ //! authors = ["Michael-F-Bryan"]
+ //!
++//! [build]
++//! src = "out"
++//!
+ //! [preprocessor.my-preprocessor]
+ //! bar = 123
+ //! "#;
+@@ -32,7 +36,7 @@
+ //! assert_eq!(bar, Some(123));
+ //!
+ //! // Set the `output.html.theme` directory
+-//! assert!(cfg.get::<toml::Value>("output.html")?.is_none());
++//! assert!(cfg.get::<Value>("output.html")?.is_none());
+ //! cfg.set("output.html.theme", "./themes");
+ //!
+ //! // then load it again, automatically deserializing to a `PathBuf`.
+@@ -45,9 +49,9 @@
+ 
+ use crate::utils::TomlExt;
+ use crate::utils::log_backtrace;
+-use anyhow::{Context, Error, Result, bail};
+-use log::{debug, trace};
+-use serde::{Deserialize, Serialize};
++use anyhow::{Context, Error, Result};
++use log::{debug, trace, warn};
++use serde::{Deserialize, Deserializer, Serialize, Serializer};
+ use std::collections::HashMap;
+ use std::env;
+ use std::fs::File;
+@@ -59,34 +63,16 @@ use toml::value::Table;
+ 
+ /// The overall configuration object for MDBook, essentially an in-memory
+ /// representation of `book.toml`.
+-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+-#[serde(default, deny_unknown_fields)]
++#[derive(Debug, Clone, PartialEq)]
+ #[non_exhaustive]
+ pub struct Config {
+     /// Metadata about the book.
+     pub book: BookConfig,
+     /// Information about the build environment.
+-    #[serde(skip_serializing_if = "is_default")]
+     pub build: BuildConfig,
+     /// Information about Rust language support.
+-    #[serde(skip_serializing_if = "is_default")]
+     pub rust: RustConfig,
+-    /// The renderer configurations.
+-    #[serde(skip_serializing_if = "toml_is_empty")]
+-    output: Value,
+-    /// The preprocessor configurations.
+-    #[serde(skip_serializing_if = "toml_is_empty")]
+-    preprocessor: Value,
+-}
+-
+-/// Helper for serde serialization.
+-fn is_default<T: Default + PartialEq>(t: &T) -> bool {
+-    t == &T::default()
+-}
+-
+-/// Helper for serde serialization.
+-fn toml_is_empty(table: &Value) -> bool {
+-    table.as_table().unwrap().is_empty()
++    rest: Value,
+ }
+ 
+ impl FromStr for Config {
+@@ -98,18 +84,6 @@ impl FromStr for Config {
+     }
+ }
+ 
+-impl Default for Config {
+-    fn default() -> Config {
+-        Config {
+-            book: BookConfig::default(),
+-            build: BuildConfig::default(),
+-            rust: RustConfig::default(),
+-            output: Value::Table(Table::default()),
+-            preprocessor: Value::Table(Table::default()),
+-        }
+-    }
+-}
+-
+ impl Config {
+     /// Load the configuration file from disk.
+     pub fn from_disk<P: AsRef<Path>>(config_file: P) -> Result<Config> {
+@@ -187,48 +161,24 @@ impl Config {
+     /// dotted indices to access nested items (e.g. `output.html.playground`
+     /// will fetch the "playground" out of the html output table).
+     ///
+-    /// This can only access the `output` and `preprocessor` tables.
++    /// This does not have access to the [`Config::book`], [`Config::build`],
++    /// or [`Config::rust`] fields.
+     ///
+     /// Returns `Ok(None)` if the field is not set.
+     ///
+     /// Returns `Err` if it fails to deserialize.
+     pub fn get<'de, T: Deserialize<'de>>(&self, name: &str) -> Result<Option<T>> {
+-        let (key, table) = if let Some(key) = name.strip_prefix("output.") {
+-            (key, &self.output)
+-        } else if let Some(key) = name.strip_prefix("preprocessor.") {
+-            (key, &self.preprocessor)
+-        } else {
+-            bail!(
+-                "unable to get `{name}`, only `output` and `preprocessor` table entries are allowed"
+-            );
+-        };
+-        table
+-            .read(key)
++        self.rest
++            .read(name)
+             .map(|value| {
+                 value
+                     .clone()
+                     .try_into()
+-                    .with_context(|| "Failed to deserialize `{name}`")
++                    .with_context(|| "Couldn't deserialize the value")
+             })
+             .transpose()
+     }
+ 
+-    /// Returns the configuration for all preprocessors.
+-    pub fn preprocessors<'de, T: Deserialize<'de>>(&self) -> Result<HashMap<String, T>> {
+-        self.preprocessor
+-            .clone()
+-            .try_into()
+-            .with_context(|| "Failed to read preprocessors")
+-    }
+-
+-    /// Returns the configuration for all renderers.
+-    pub fn outputs<'de, T: Deserialize<'de>>(&self) -> Result<HashMap<String, T>> {
+-        self.output
+-            .clone()
+-            .try_into()
+-            .with_context(|| "Failed to read renderers")
+-    }
+-
+     /// Convenience method for getting the html renderer's configuration.
+     ///
+     /// # Note
+@@ -237,7 +187,10 @@ impl Config {
+     /// HTML renderer is refactored to be less coupled to `mdbook` internals.
+     #[doc(hidden)]
+     pub fn html_config(&self) -> Option<HtmlConfig> {
+-        match self.get("output.html") {
++        match self
++            .get("output.html")
++            .with_context(|| "Parsing configuration [output.html]")
++        {
+             Ok(Some(config)) => Some(config),
+             Ok(None) => None,
+             Err(e) => {
+@@ -267,27 +220,110 @@ impl Config {
+             self.build.update_value(key, value);
+         } else if let Some(key) = index.strip_prefix("rust.") {
+             self.rust.update_value(key, value);
+-        } else if let Some(key) = index.strip_prefix("output.") {
+-            self.output.update_value(key, value);
+-        } else if let Some(key) = index.strip_prefix("preprocessor.") {
+-            self.preprocessor.update_value(key, value);
+         } else {
+-            bail!("invalid key `{index}`");
++            self.rest.insert(index, value);
+         }
+ 
+         Ok(())
+     }
+ }
+ 
++impl Default for Config {
++    fn default() -> Config {
++        Config {
++            book: BookConfig::default(),
++            build: BuildConfig::default(),
++            rust: RustConfig::default(),
++            rest: Value::Table(Table::default()),
++        }
++    }
++}
++
++impl<'de> serde::Deserialize<'de> for Config {
++    fn deserialize<D: Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
++        let raw = Value::deserialize(de)?;
++
++        warn_on_invalid_fields(&raw);
++
++        use serde::de::Error;
++        let mut table = match raw {
++            Value::Table(t) => t,
++            _ => {
++                return Err(D::Error::custom(
++                    "A config file should always be a toml table",
++                ));
++            }
++        };
++
++        let book: BookConfig = table
++            .remove("book")
++            .map(|book| book.try_into().map_err(D::Error::custom))
++            .transpose()?
++            .unwrap_or_default();
++
++        let build: BuildConfig = table
++            .remove("build")
++            .map(|build| build.try_into().map_err(D::Error::custom))
++            .transpose()?
++            .unwrap_or_default();
++
++        let rust: RustConfig = table
++            .remove("rust")
++            .map(|rust| rust.try_into().map_err(D::Error::custom))
++            .transpose()?
++            .unwrap_or_default();
++
++        Ok(Config {
++            book,
++            build,
++            rust,
++            rest: Value::Table(table),
++        })
++    }
++}
++
++impl Serialize for Config {
++    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
++        // TODO: This should probably be removed and use a derive instead.
++        let mut table = self.rest.clone();
++
++        let book_config = Value::try_from(&self.book).expect("should always be serializable");
++        table.insert("book", book_config);
++
++        if self.build != BuildConfig::default() {
++            let build_config = Value::try_from(&self.build).expect("should always be serializable");
++            table.insert("build", build_config);
++        }
++
++        if self.rust != RustConfig::default() {
++            let rust_config = Value::try_from(&self.rust).expect("should always be serializable");
++            table.insert("rust", rust_config);
++        }
++
++        table.serialize(s)
++    }
++}
++
+ fn parse_env(key: &str) -> Option<String> {
+     key.strip_prefix("MDBOOK_")
+         .map(|key| key.to_lowercase().replace("__", ".").replace('_', "-"))
+ }
+ 
++fn warn_on_invalid_fields(table: &Value) {
++    let valid_items = ["book", "build", "rust", "output", "preprocessor"];
++
++    let table = table.as_table().expect("root must be a table");
++    for item in table.keys() {
++        if !valid_items.contains(&item.as_str()) {
++            warn!("Invalid field {:?} in book.toml", &item);
++        }
++    }
++}
++
+ /// Configuration options which are specific to the book and required for
+ /// loading it from disk.
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+-#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
++#[serde(default, rename_all = "kebab-case")]
+ #[non_exhaustive]
+ pub struct BookConfig {
+     /// The book's title.
+@@ -357,7 +393,7 @@ impl TextDirection {
+ 
+ /// Configuration for the build procedure.
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+-#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
++#[serde(default, rename_all = "kebab-case")]
+ #[non_exhaustive]
+ pub struct BuildConfig {
+     /// Where to put built artefacts relative to the book's root directory.
+@@ -385,7 +421,7 @@ impl Default for BuildConfig {
+ 
+ /// Configuration for the Rust compiler(e.g., for playground)
+ #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+-#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
++#[serde(default, rename_all = "kebab-case")]
+ #[non_exhaustive]
+ pub struct RustConfig {
+     /// Rust edition used in playground
+@@ -412,7 +448,7 @@ pub enum RustEdition {
+ 
+ /// Configuration for the HTML renderer.
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+-#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
++#[serde(default, rename_all = "kebab-case")]
+ #[non_exhaustive]
+ pub struct HtmlConfig {
+     /// The theme directory, if specified.
+@@ -532,7 +568,7 @@ impl HtmlConfig {
+ 
+ /// Configuration for how to render the print icon, print.html, and print.css.
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+-#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
++#[serde(default, rename_all = "kebab-case")]
+ #[non_exhaustive]
+ pub struct Print {
+     /// Whether print support is enabled.
+@@ -552,7 +588,7 @@ impl Default for Print {
+ 
+ /// Configuration for how to fold chapters of sidebar.
+ #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+-#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
++#[serde(default, rename_all = "kebab-case")]
+ #[non_exhaustive]
+ pub struct Fold {
+     /// When off, all folds are open. Default: `false`.
+@@ -565,7 +601,7 @@ pub struct Fold {
+ 
+ /// Configuration for tweaking how the HTML renderer handles the playground.
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+-#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
++#[serde(default, rename_all = "kebab-case")]
+ #[non_exhaustive]
+ pub struct Playground {
+     /// Should playground snippets be editable? Default: `false`.
+@@ -595,7 +631,7 @@ impl Default for Playground {
+ 
+ /// Configuration for tweaking how the HTML renderer handles code blocks.
+ #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+-#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
++#[serde(default, rename_all = "kebab-case")]
+ #[non_exhaustive]
+ pub struct Code {
+     /// A prefix string to hide lines per language (one or more chars).
+@@ -604,7 +640,7 @@ pub struct Code {
+ 
+ /// Configuration of the search functionality of the HTML renderer.
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+-#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
++#[serde(default, rename_all = "kebab-case")]
+ #[non_exhaustive]
+ pub struct Search {
+     /// Enable the search feature. Default: `true`.
+@@ -662,7 +698,7 @@ impl Default for Search {
+ 
+ /// Search options for chapters (or paths).
+ #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+-#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
++#[serde(default, rename_all = "kebab-case")]
+ #[non_exhaustive]
+ pub struct SearchChapterSettings {
+     /// Whether or not indexing is enabled, default `true`.
+@@ -696,6 +732,7 @@ impl<'de, T> Updateable<'de> for T where T: Serialize + Deserialize<'de> {}
+ mod tests {
+     use super::*;
+     use crate::utils::fs::get_404_output_file;
++    use serde_json::json;
+ 
+     const COMPLEX_CONFIG: &str = r#"
+         [book]
+@@ -720,6 +757,7 @@ mod tests {
+ 
+         [output.html.playground]
+         editable = true
++        editor = "ace"
+ 
+         [output.html.redirect]
+         "index.html" = "overview.html"
+@@ -905,6 +943,19 @@ mod tests {
+         assert_eq!(got_baz, baz_should_be);
+     }
+ 
++    #[test]
++    fn set_a_config_item() {
++        let mut cfg = Config::default();
++        let key = "foo.bar.baz";
++        let value = "Something Interesting";
++
++        assert!(cfg.get::<i32>(key).unwrap().is_none());
++        cfg.set(key, value).unwrap();
++
++        let got: String = cfg.get(key).unwrap().unwrap();
++        assert_eq!(got, value);
++    }
++
+     #[test]
+     fn set_special_tables() {
+         let mut cfg = Config::default();
+@@ -919,21 +970,6 @@ mod tests {
+         assert_eq!(cfg.rust.edition, None);
+         cfg.set("rust.edition", "2024").unwrap();
+         assert_eq!(cfg.rust.edition, Some(RustEdition::E2024));
+-
+-        cfg.set("output.foo.value", "123").unwrap();
+-        let got: String = cfg.get("output.foo.value").unwrap().unwrap();
+-        assert_eq!(got, "123");
+-
+-        cfg.set("preprocessor.bar.value", "456").unwrap();
+-        let got: String = cfg.get("preprocessor.bar.value").unwrap().unwrap();
+-        assert_eq!(got, "456");
+-    }
+-
+-    #[test]
+-    fn set_invalid_keys() {
+-        let mut cfg = Config::default();
+-        let err = cfg.set("foo", "test").unwrap_err();
+-        assert!(err.to_string().contains("invalid key `foo`"));
+     }
+ 
+     #[test]
+@@ -953,10 +989,67 @@ mod tests {
+         }
+     }
+ 
++    fn encode_env_var(key: &str) -> String {
++        format!(
++            "MDBOOK_{}",
++            key.to_uppercase().replace('.', "__").replace('-', "_")
++        )
++    }
++
++    #[test]
++    fn update_config_using_env_var() {
++        let mut cfg = Config::default();
++        let key = "foo.bar";
++        let value = "baz";
++
++        assert!(cfg.get::<String>(key).unwrap().is_none());
++
++        let encoded_key = encode_env_var(key);
++        // TODO: This is unsafe, and should be rewritten to use a process.
++        unsafe { env::set_var(encoded_key, value) };
++
++        cfg.update_from_env();
++
++        assert_eq!(cfg.get::<String>(key).unwrap().unwrap(), value);
++    }
++
++    #[test]
++    fn update_config_using_env_var_and_complex_value() {
++        let mut cfg = Config::default();
++        let key = "foo-bar.baz";
++        let value = json!({"array": [1, 2, 3], "number": 13.37});
++        let value_str = serde_json::to_string(&value).unwrap();
++
++        assert!(cfg.get::<serde_json::Value>(key).unwrap().is_none());
++
++        let encoded_key = encode_env_var(key);
++        // TODO: This is unsafe, and should be rewritten to use a process.
++        unsafe { env::set_var(encoded_key, value_str) };
++
++        cfg.update_from_env();
++
++        assert_eq!(cfg.get::<serde_json::Value>(key).unwrap().unwrap(), value);
++    }
++
++    #[test]
++    fn update_book_title_via_env() {
++        let mut cfg = Config::default();
++        let should_be = "Something else".to_string();
++
++        assert_ne!(cfg.book.title, Some(should_be.clone()));
++
++        // TODO: This is unsafe, and should be rewritten to use a process.
++        unsafe { env::set_var("MDBOOK_BOOK__TITLE", &should_be) };
++        cfg.update_from_env();
++
++        assert_eq!(cfg.book.title, Some(should_be));
++    }
++
+     #[test]
+     fn file_404_default() {
+         let src = r#"
+         [output.html]
++        destination = "my-book"
+         "#;
+ 
+         let got = Config::from_str(src).unwrap();
+@@ -970,6 +1063,7 @@ mod tests {
+         let src = r#"
+         [output.html]
+         input-404= "missing.md"
++        output-404= "missing.html"
+         "#;
+ 
+         let got = Config::from_str(src).unwrap();
+diff --git a/crates/mdbook-driver/src/mdbook.rs b/crates/mdbook-driver/src/mdbook.rs
+index 4d7c4996..38c2bd8d 100644
+--- a/crates/mdbook-driver/src/mdbook.rs
++++ b/crates/mdbook-driver/src/mdbook.rs
+@@ -14,6 +14,7 @@ use mdbook_preprocessor::{Preprocessor, PreprocessorContext};
+ use mdbook_renderer::{RenderContext, Renderer};
+ use mdbook_summary::Summary;
+ use serde::Deserialize;
++use std::collections::HashMap;
+ use std::ffi::OsString;
+ use std::io::{IsTerminal, Write};
+ use std::path::{Path, PathBuf};
+@@ -422,17 +423,22 @@ struct OutputConfig {
+ fn determine_renderers(config: &Config) -> Result<Vec<Box<dyn Renderer>>> {
+     let mut renderers = Vec::new();
+ 
+-    let outputs = config.outputs::<OutputConfig>()?;
+-    renderers.extend(outputs.into_iter().map(|(key, table)| {
+-        if key == "html" {
+-            Box::new(HtmlHandlebars::new()) as Box<dyn Renderer>
+-        } else if key == "markdown" {
+-            Box::new(MarkdownRenderer::new()) as Box<dyn Renderer>
+-        } else {
+-            let command = table.command.unwrap_or_else(|| format!("mdbook-{key}"));
+-            Box::new(CmdRenderer::new(key, command))
++    match config.get::<HashMap<String, OutputConfig>>("output") {
++        Ok(Some(output_table)) => {
++            renderers.extend(output_table.into_iter().map(|(key, table)| {
++                if key == "html" {
++                    Box::new(HtmlHandlebars::new()) as Box<dyn Renderer>
++                } else if key == "markdown" {
++                    Box::new(MarkdownRenderer::new()) as Box<dyn Renderer>
++                } else {
++                    let command = table.command.unwrap_or_else(|| format!("mdbook-{key}"));
++                    Box::new(CmdRenderer::new(key, command))
++                }
++            }));
+         }
+-    }));
++        Ok(None) => {}
++        Err(e) => bail!("failed to get output table config: {e}"),
++    }
+ 
+     // if we couldn't find anything, add the HTML renderer as a default
+     if renderers.is_empty() {
+@@ -471,7 +477,12 @@ fn determine_preprocessors(config: &Config) -> Result<Vec<Box<dyn Preprocessor>>
+         }
+     }
+ 
+-    let preprocessor_table = config.preprocessors::<PreprocessorConfig>()?;
++    let preprocessor_table = match config.get::<HashMap<String, PreprocessorConfig>>("preprocessor")
++    {
++        Ok(Some(preprocessor_table)) => preprocessor_table,
++        Ok(None) => HashMap::new(),
++        Err(e) => bail!("failed to get preprocessor table config: {e}"),
++    };
+ 
+     for (name, table) in preprocessor_table.iter() {
+         preprocessor_names.insert(name.to_string());
+diff --git a/crates/mdbook-driver/src/mdbook/tests.rs b/crates/mdbook-driver/src/mdbook/tests.rs
+index ba3a3c58..cdcd4e77 100644
+--- a/crates/mdbook-driver/src/mdbook/tests.rs
++++ b/crates/mdbook-driver/src/mdbook/tests.rs
+@@ -7,7 +7,7 @@ fn config_defaults_to_html_renderer_if_empty() {
+     let cfg = Config::default();
+ 
+     // make sure we haven't got anything in the `output` table
+-    assert!(cfg.outputs::<toml::Value>().unwrap().is_empty());
++    assert!(cfg.get::<Value>("output").unwrap().is_none());
+ 
+     let got = determine_renderers(&cfg).unwrap();
+ 
+@@ -45,7 +45,7 @@ fn config_defaults_to_link_and_index_preprocessor_if_not_set() {
+     let cfg = Config::default();
+ 
+     // make sure we haven't got anything in the `preprocessor` table
+-    assert!(cfg.preprocessors::<toml::Value>().unwrap().is_empty());
++    assert!(cfg.get::<Value>("preprocessor").unwrap().is_none());
+ 
+     let got = determine_preprocessors(&cfg);
+ 
+diff --git a/src/cmd/serve.rs b/src/cmd/serve.rs
+index 5fc20f9a..a8751c5a 100644
+--- a/src/cmd/serve.rs
++++ b/src/cmd/serve.rs
+@@ -2,7 +2,7 @@ use super::command_prelude::*;
+ #[cfg(feature = "watch")]
+ use super::watch;
+ use crate::{get_book_dir, open};
+-use anyhow::Result;
++use anyhow::{Result, bail};
+ use axum::Router;
+ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+ use axum::routing::get;
+@@ -76,8 +76,10 @@ pub fn execute(args: &ArgMatches) -> Result<()> {
+         .next()
+         .ok_or_else(|| anyhow::anyhow!("no address found for {}", address))?;
+     let build_dir = book.build_dir_for("html");
+-    let html_config = book.config.html_config();
+-    let input_404 = html_config.and_then(|c| c.input_404);
++    let input_404 = match book.config.get::<String>("output.html.input-404") {
++        Ok(v) => v,
++        Err(e) => bail!("expected string for output.html.input-404: {e}"),
++    };
+     let file_404 = get_404_output_file(&input_404);
+ 
+     // A channel used to broadcast to any websockets to reload when a file changes.
+diff --git a/tests/testsuite/config.rs b/tests/testsuite/config.rs
+deleted file mode 100644
+index 59d962b4..00000000
+--- a/tests/testsuite/config.rs
++++ /dev/null
+@@ -1,159 +0,0 @@
+-//! Tests for book configuration loading.
+-
+-use crate::prelude::*;
+-
+-// Test that config can load from environment variable.
+-#[test]
+-fn config_from_env() {
+-    BookTest::from_dir("config/empty")
+-        .run("build", |cmd| {
+-            cmd.env("MDBOOK_BOOK__TITLE", "Custom env title");
+-        })
+-        .check_file_contains(
+-            "book/index.html",
+-            "<title>Chapter 1 - Custom env title</title>",
+-        );
+-
+-    // json for some subtable
+-    //
+-}
+-
+-// Test environment config with JSON.
+-#[test]
+-fn config_json_from_env() {
+-    // build table
+-    BookTest::from_dir("config/empty")
+-        .run("build", |cmd| {
+-            cmd.env(
+-                "MDBOOK_BOOK",
+-                r#"{"title": "My Awesome Book", "authors": ["Michael-F-Bryan"]}"#,
+-            );
+-        })
+-        .check_file_contains(
+-            "book/index.html",
+-            "<title>Chapter 1 - My Awesome Book</title>",
+-        );
+-
+-    // book table
+-    BookTest::from_dir("config/empty")
+-        .run("build", |cmd| {
+-            cmd.env("MDBOOK_BUILD", r#"{"build-dir": "alt"}"#);
+-        })
+-        .check_file_contains("alt/index.html", "<title>Chapter 1</title>");
+-}
+-
+-// Test that a preprocessor receives config set in the environment.
+-#[test]
+-fn preprocessor_cfg_from_env() {
+-    let mut test = BookTest::from_dir("config/empty");
+-    test.rust_program(
+-        "cat-to-file",
+-        r#"
+-        fn main() {
+-            use std::io::Read;
+-            let mut s = String::new();
+-            std::io::stdin().read_to_string(&mut s).unwrap();
+-            std::fs::write("out.txt", s).unwrap();
+-            println!("{{\"sections\": []}}");
+-        }
+-        "#,
+-    )
+-    .run("build", |cmd| {
+-        cmd.env(
+-            "MDBOOK_PREPROCESSOR__CAT_TO_FILE",
+-            r#"{"command":"./cat-to-file", "array": [1,2,3], "number": 123}"#,
+-        );
+-    });
+-    let out = read_to_string(test.dir.join("out.txt"));
+-    let (ctx, _book) = mdbook_preprocessor::parse_input(out.as_bytes()).unwrap();
+-    let cfg: serde_json::Value = ctx.config.get("preprocessor.cat-to-file").unwrap().unwrap();
+-    assert_eq!(
+-        cfg,
+-        serde_json::json!({
+-            "command": "./cat-to-file",
+-            "array": [1,2,3],
+-            "number": 123,
+-        })
+-    );
+-}
+-
+-// Test that a renderer receives config set in the environment.
+-#[test]
+-fn output_cfg_from_env() {
+-    let mut test = BookTest::from_dir("config/empty");
+-    test.rust_program(
+-        "cat-to-file",
+-        r#"
+-        fn main() {
+-            use std::io::Read;
+-            let mut s = String::new();
+-            std::io::stdin().read_to_string(&mut s).unwrap();
+-            std::fs::write("out.txt", s).unwrap();
+-        }
+-        "#,
+-    )
+-    .run("build", |cmd| {
+-        cmd.env(
+-            "MDBOOK_OUTPUT__CAT_TO_FILE",
+-            r#"{"command":"./cat-to-file", "array": [1,2,3], "number": 123}"#,
+-        );
+-    });
+-    let out = read_to_string(test.dir.join("book/out.txt"));
+-    let ctx = mdbook_renderer::RenderContext::from_json(out.as_bytes()).unwrap();
+-    let cfg: serde_json::Value = ctx.config.get("output.cat-to-file").unwrap().unwrap();
+-    assert_eq!(
+-        cfg,
+-        serde_json::json!({
+-            "command": "./cat-to-file",
+-            "array": [1,2,3],
+-            "number": 123,
+-        })
+-    );
+-}
+-
+-// An invalid key at the top level.
+-#[test]
+-fn bad_config_top_level() {
+-    BookTest::init(|_| {})
+-        .change_file("book.toml", "foo = 123")
+-        .run("build", |cmd| {
+-            cmd.expect_failure()
+-                .expect_stdout(str![[""]])
+-                .expect_stderr(str![[r#"
+-[TIMESTAMP] [ERROR] (mdbook_core::utils): Error: Invalid configuration file
+-[TIMESTAMP] [ERROR] (mdbook_core::utils): [TAB]Caused By: TOML parse error at line 1, column 1
+-  |
+-1 | foo = 123
+-  | ^^^
+-unknown field `foo`, expected one of `book`, `build`, `rust`, `output`, `preprocessor`
+-
+-
+-"#]]);
+-        });
+-}
+-
+-// An invalid key in the main book table.
+-#[test]
+-fn bad_config_in_book_table() {
+-    BookTest::init(|_| {})
+-        .change_file(
+-            "book.toml",
+-            "[book]\n\
+-             title = \"bad-config\"\n\
+-             foo = 123"
+-        )
+-        .run("build", |cmd| {
+-            cmd.expect_failure()
+-                .expect_stdout(str![[""]])
+-                .expect_stderr(str![[r#"
+-[TIMESTAMP] [ERROR] (mdbook_core::utils): Error: Invalid configuration file
+-[TIMESTAMP] [ERROR] (mdbook_core::utils): [TAB]Caused By: TOML parse error at line 3, column 1
+-  |
+-3 | foo = 123
+-  | ^^^
+-unknown field `foo`, expected one of `title`, `authors`, `description`, `src`, `language`, `text-direction`
+-
+-
+-"#]]);
+-        });
+-}
+diff --git a/tests/testsuite/config/empty/book.toml b/tests/testsuite/config/empty/book.toml
+deleted file mode 100644
+index e69de29b..00000000
+diff --git a/tests/testsuite/config/empty/src/SUMMARY.md b/tests/testsuite/config/empty/src/SUMMARY.md
+deleted file mode 100644
+index 7390c828..00000000
+--- a/tests/testsuite/config/empty/src/SUMMARY.md
++++ /dev/null
+@@ -1,3 +0,0 @@
+-# Summary
+-
+-- [Chapter 1](./chapter_1.md)
+diff --git a/tests/testsuite/config/empty/src/chapter_1.md b/tests/testsuite/config/empty/src/chapter_1.md
+deleted file mode 100644
+index b743fda3..00000000
+--- a/tests/testsuite/config/empty/src/chapter_1.md
++++ /dev/null
+@@ -1 +0,0 @@
+-# Chapter 1
+diff --git a/tests/testsuite/init.rs b/tests/testsuite/init.rs
+index bf225a4d..946d9f23 100644
+--- a/tests/testsuite/init.rs
++++ b/tests/testsuite/init.rs
+@@ -28,8 +28,8 @@ All done, no errors...
+         str![[r#"
+ [book]
+ authors = []
+-src = "src"
+ language = "en"
++src = "src"
+ 
+ "#]],
+     )
+@@ -94,8 +94,8 @@ All done, no errors...
+         str![[r#"
+ [book]
+ authors = []
+-src = "src"
+ language = "en"
++src = "src"
+ 
+ "#]],
+     );
+@@ -126,10 +126,10 @@ All done, no errors...
+         "book.toml",
+         str![[r#"
+ [book]
+-title = "Example title"
+ authors = []
+-src = "src"
+ language = "en"
++src = "src"
++title = "Example title"
+ 
+ "#]],
+     );
+@@ -179,14 +179,14 @@ fn init_with_custom_book_and_src_locations() {
+         str![[r#"
+ [book]
+ authors = []
+-src = "in"
+ language = "en"
++src = "in"
+ 
+ [build]
+ build-dir = "out"
+ create-missing = true
+-use-default-preprocessors = true
+ extra-watch-dirs = []
++use-default-preprocessors = true
+ 
+ "#]],
+     )
+diff --git a/tests/testsuite/main.rs b/tests/testsuite/main.rs
+index 74091ec8..7a8aa7c2 100644
+--- a/tests/testsuite/main.rs
++++ b/tests/testsuite/main.rs
+@@ -7,7 +7,6 @@
+ mod book_test;
+ mod build;
+ mod cli;
+-mod config;
+ mod includes;
+ mod index;
+ mod init;
+diff --git a/tests/testsuite/renderer.rs b/tests/testsuite/renderer.rs
+index da89dbcc..43a022d3 100644
+--- a/tests/testsuite/renderer.rs
++++ b/tests/testsuite/renderer.rs
+@@ -186,11 +186,8 @@ fn backends_receive_render_context_via_stdin() {
+   "config": {
+     "book": {
+       "authors": [],
+-      "description": null,
+       "language": "en",
+-      "src": "src",
+-      "text-direction": null,
+-      "title": null
++      "src": "src"
+     },
+     "output": {
+       "cat-to-file": {

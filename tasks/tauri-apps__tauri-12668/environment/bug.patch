@@ -1,0 +1,338 @@
+diff --git a/.changes/introduce-run-return.md b/.changes/introduce-run-return.md
+deleted file mode 100644
+index c241275f6..000000000
+--- a/.changes/introduce-run-return.md
++++ /dev/null
+@@ -1,9 +0,0 @@
+----
+-tauri: 'minor:feat'
+-tauri-runtime: 'minor:feat'
+-tauri-runtime-wry: 'minor:feat'
+----
+-
+-Add `App::run_return` function. Contrary to `App::run`, this will **not** exit the process but instead return the requested exit-code. This allows the host app to perform further cleanup after Tauri has exited. `App::run_return` is not available on iOS and fallbacks to the regular `App::run` functionality.
+-
+-The `App::run_iteration` function is deprecated as part of this because calling it in a loop - as suggested by the name - will cause a busy-loop.
+diff --git a/crates/tauri-runtime-wry/src/lib.rs b/crates/tauri-runtime-wry/src/lib.rs
+index a4a2362da..48ca102dd 100644
+--- a/crates/tauri-runtime-wry/src/lib.rs
++++ b/crates/tauri-runtime-wry/src/lib.rs
+@@ -2830,51 +2830,39 @@ impl<T: UserEvent> Runtime<T> for Wry<T> {
+       });
+   }
+ 
+-  fn run<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) {
+-    let event_handler = make_event_handler(&self, callback);
+-
+-    self.event_loop.run(event_handler)
+-  }
+-
+-  #[cfg(not(target_os = "ios"))]
+-  fn run_return<F: FnMut(RunEvent<T>) + 'static>(mut self, callback: F) -> i32 {
+-    use tao::platform::run_return::EventLoopExtRunReturn;
+-
+-    let event_handler = make_event_handler(&self, callback);
+-
+-    self.event_loop.run_return(event_handler)
+-  }
+-
+-  #[cfg(target_os = "ios")]
+-  fn run_return<F: FnMut(RunEvent<T>) + 'static>(mut self, callback: F) -> i32 {
+-    self.run(callback);
+-    0
+-  }
+-}
+-
+-fn make_event_handler<T, F>(
+-  runtime: &Wry<T>,
+-  mut callback: F,
+-) -> impl FnMut(Event<'_, Message<T>>, &EventLoopWindowTarget<Message<T>>, &mut ControlFlow)
+-where
+-  T: UserEvent,
+-  F: FnMut(RunEvent<T>) + 'static,
+-{
+-  let windows = runtime.context.main_thread.windows.clone();
+-  let window_id_map = runtime.context.window_id_map.clone();
+-  let web_context = runtime.context.main_thread.web_context.clone();
+-  let plugins = runtime.context.plugins.clone();
++  fn run<F: FnMut(RunEvent<T>) + 'static>(self, mut callback: F) {
++    let windows = self.context.main_thread.windows.clone();
++    let window_id_map = self.context.window_id_map.clone();
++    let web_context = self.context.main_thread.web_context;
++    let plugins = self.context.plugins.clone();
+ 
+-  #[cfg(feature = "tracing")]
+-  let active_tracing_spans = runtime.context.main_thread.active_tracing_spans.clone();
+-  let proxy = runtime.event_loop.create_proxy();
++    #[cfg(feature = "tracing")]
++    let active_tracing_spans = self.context.main_thread.active_tracing_spans.clone();
++    let proxy = self.event_loop.create_proxy();
+ 
+-  move |event, event_loop, control_flow| {
+-    for p in plugins.lock().unwrap().iter_mut() {
+-      let prevent_default = p.on_event(
+-        &event,
++    self.event_loop.run(move |event, event_loop, control_flow| {
++      for p in plugins.lock().unwrap().iter_mut() {
++        let prevent_default = p.on_event(
++          &event,
++          event_loop,
++          &proxy,
++          control_flow,
++          EventLoopIterationContext {
++            callback: &mut callback,
++            window_id_map: window_id_map.clone(),
++            windows: windows.clone(),
++            #[cfg(feature = "tracing")]
++            active_tracing_spans: active_tracing_spans.clone(),
++          },
++          &web_context,
++        );
++        if prevent_default {
++          return;
++        }
++      }
++      handle_event_loop(
++        event,
+         event_loop,
+-        &proxy,
+         control_flow,
+         EventLoopIterationContext {
+           callback: &mut callback,
+@@ -2883,24 +2871,8 @@ where
+           #[cfg(feature = "tracing")]
+           active_tracing_spans: active_tracing_spans.clone(),
+         },
+-        &web_context,
+       );
+-      if prevent_default {
+-        return;
+-      }
+-    }
+-    handle_event_loop(
+-      event,
+-      event_loop,
+-      control_flow,
+-      EventLoopIterationContext {
+-        callback: &mut callback,
+-        window_id_map: window_id_map.clone(),
+-        windows: windows.clone(),
+-        #[cfg(feature = "tracing")]
+-        active_tracing_spans: active_tracing_spans.clone(),
+-      },
+-    );
++    })
+   }
+ }
+ 
+diff --git a/crates/tauri-runtime/src/lib.rs b/crates/tauri-runtime/src/lib.rs
+index e8bd2b5be..8c93a19a0 100644
+--- a/crates/tauri-runtime/src/lib.rs
++++ b/crates/tauri-runtime/src/lib.rs
+@@ -437,9 +437,6 @@ pub trait Runtime<T: UserEvent>: Debug + Sized + 'static {
+   #[cfg(desktop)]
+   fn run_iteration<F: FnMut(RunEvent<T>) + 'static>(&mut self, callback: F);
+ 
+-  /// Equivalent to [`Runtime::run`] but returns the exit code instead of exiting the process.
+-  fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) -> i32;
+-
+   /// Run the webview runtime.
+   fn run<F: FnMut(RunEvent<T>) + 'static>(self, callback: F);
+ }
+diff --git a/crates/tauri/Cargo.toml b/crates/tauri/Cargo.toml
+index 538e461af..660204bcd 100644
+--- a/crates/tauri/Cargo.toml
++++ b/crates/tauri/Cargo.toml
+@@ -226,8 +226,8 @@ name = "multiwindow"
+ path = "../../examples/multiwindow/main.rs"
+ 
+ [[example]]
+-name = "run-return"
+-path = "../../examples/run-return/main.rs"
++name = "run-iteration"
++path = "../../examples/run-iteration/main.rs"
+ 
+ [[example]]
+ name = "splashscreen"
+diff --git a/crates/tauri/src/app.rs b/crates/tauri/src/app.rs
+index 2f37e0fe9..e5ec678ff 100644
+--- a/crates/tauri/src/app.rs
++++ b/crates/tauri/src/app.rs
+@@ -1056,13 +1056,6 @@ impl<R: Runtime> App<R> {
+ 
+   /// Runs the application.
+   ///
+-  /// This function never returns. When the application finishes, the process is exited directly using [`std::process::exit`].
+-  /// See [`run_return`](Self::run_return) if you need to run code after the application event loop exits.
+-  ///
+-  /// # Panics
+-  ///
+-  /// This function will panic if the setup-function supplied in [`Builder::setup`] fails.
+-  ///
+   /// # Examples
+   /// ```,no_run
+   /// let app = tauri::Builder::default()
+@@ -1099,60 +1092,6 @@ impl<R: Runtime> App<R> {
+     });
+   }
+ 
+-  /// Runs the application, returning its intended exit code.
+-  ///
+-  /// ## Platform-specific
+-  ///
+-  /// - **iOS**: Unsupported. The application will fallback to [`run`](Self::run).
+-  ///
+-  /// # Panics
+-  ///
+-  /// This function will panic if the setup-function supplied in [`Builder::setup`] fails.
+-  ///
+-  /// # Examples
+-  /// ```,no_run
+-  /// let app = tauri::Builder::default()
+-  ///   // on an actual app, remove the string argument
+-  ///   .build(tauri::generate_context!("test/fixture/src-tauri/tauri.conf.json"))
+-  ///   .expect("error while building tauri application");
+-  /// let exit_code = app
+-  ///   .run_return(|_app_handle, event| match event {
+-  ///     tauri::RunEvent::ExitRequested { api, .. } => {
+-  ///      api.prevent_exit();
+-  ///     }
+-  ///      _ => {}
+-  ///   });
+-  ///
+-  /// std::process::exit(exit_code);
+-  /// ```
+-  pub fn run_return<F: FnMut(&AppHandle<R>, RunEvent) + 'static>(mut self, mut callback: F) -> i32 {
+-    let manager = self.manager.clone();
+-    let app_handle = self.handle().clone();
+-
+-    self
+-      .runtime
+-      .take()
+-      .unwrap()
+-      .run_return(move |event| match event {
+-        RuntimeRunEvent::Ready => {
+-          if let Err(e) = setup(&mut self) {
+-            panic!("Failed to setup app: {e}");
+-          }
+-          let event = on_event_loop_event(&app_handle, RuntimeRunEvent::Ready, &manager);
+-          callback(&app_handle, event);
+-        }
+-        RuntimeRunEvent::Exit => {
+-          let event = on_event_loop_event(&app_handle, RuntimeRunEvent::Exit, &manager);
+-          callback(&app_handle, event);
+-          app_handle.cleanup_before_exit();
+-        }
+-        _ => {
+-          let event = on_event_loop_event(&app_handle, event, &manager);
+-          callback(&app_handle, event);
+-        }
+-      })
+-  }
+-
+   /// Runs an iteration of the runtime event loop and immediately return.
+   ///
+   /// Note that when using this API, app cleanup is not automatically done.
+@@ -1176,9 +1115,6 @@ impl<R: Runtime> App<R> {
+   /// }
+   /// ```
+   #[cfg(desktop)]
+-  #[deprecated(
+-    note = "When called in a loop (as suggested by the name), this function will busy-loop. To re-gain control of control flow after the app has exited, use `App::run_return` instead."
+-  )]
+   pub fn run_iteration<F: FnMut(&AppHandle<R>, RunEvent) + 'static>(&mut self, mut callback: F) {
+     let manager = self.manager.clone();
+     let app_handle = self.handle().clone();
+diff --git a/crates/tauri/src/test/mock_runtime.rs b/crates/tauri/src/test/mock_runtime.rs
+index 8d1ffe0b9..2d4579476 100644
+--- a/crates/tauri/src/test/mock_runtime.rs
++++ b/crates/tauri/src/test/mock_runtime.rs
+@@ -1188,12 +1188,6 @@ impl<T: UserEvent> Runtime<T> for MockRuntime {
+   ))]
+   fn run_iteration<F: FnMut(RunEvent<T>)>(&mut self, callback: F) {}
+ 
+-  fn run_return<F: FnMut(RunEvent<T>) + 'static>(self, callback: F) -> i32 {
+-    self.run(callback);
+-
+-    0
+-  }
+-
+   fn run<F: FnMut(RunEvent<T>) + 'static>(self, mut callback: F) {
+     self.is_running.store(true, Ordering::Relaxed);
+     callback(RunEvent::Ready);
+diff --git a/examples/run-iteration/README.md b/examples/run-iteration/README.md
+new file mode 100644
+index 000000000..81a408271
+--- /dev/null
++++ b/examples/run-iteration/README.md
+@@ -0,0 +1,3 @@
++# Run Iteration Example
++
++To execute run the following on the root directory of the repository: `cargo run --example run-iteration`.
+diff --git a/examples/run-return/index.html b/examples/run-iteration/index.html
+similarity index 100%
+rename from examples/run-return/index.html
+rename to examples/run-iteration/index.html
+diff --git a/examples/run-return/main.rs b/examples/run-iteration/main.rs
+similarity index 51%
+rename from examples/run-return/main.rs
+rename to examples/run-iteration/main.rs
+index 93f5dcd51..666de49fe 100644
+--- a/examples/run-return/main.rs
++++ b/examples/run-iteration/main.rs
+@@ -4,18 +4,23 @@
+ 
+ #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+ 
++use tauri::Manager;
++
+ fn main() {
+-  let app = tauri::Builder::default()
++  let mut app = tauri::Builder::default()
+     .build(tauri::generate_context!(
+-      "../../examples/run-return/tauri.conf.json"
++      "../../examples/run-iteration/tauri.conf.json"
+     ))
+     .expect("error while building tauri application");
+ 
+-  let exit_code = app.run_return(|_app, _event| {
+-    //println!("{:?}", _event);
+-  });
+-
+-  println!("I run after exit");
++  loop {
++    app.run_iteration(|_app, _event| {
++      //println!("{:?}", _event);
++    });
+ 
+-  std::process::exit(exit_code);
++    if app.webview_windows().is_empty() {
++      app.cleanup_before_exit();
++      break;
++    }
++  }
+ }
+diff --git a/examples/run-return/tauri.conf.json b/examples/run-iteration/tauri.conf.json
+similarity index 95%
+rename from examples/run-return/tauri.conf.json
+rename to examples/run-iteration/tauri.conf.json
+index fb3eaf94d..80851c7ae 100644
+--- a/examples/run-return/tauri.conf.json
++++ b/examples/run-iteration/tauri.conf.json
+@@ -1,6 +1,6 @@
+ {
+   "$schema": "../../crates/tauri-schema-generator/schemas/config.schema.json",
+-  "productName": "RunReturn",
++  "productName": "RunIteration",
+   "version": "0.1.0",
+   "identifier": "com.tauri.dev",
+   "build": {
+diff --git a/examples/run-return/README.md b/examples/run-return/README.md
+deleted file mode 100644
+index 919577049..000000000
+--- a/examples/run-return/README.md
++++ /dev/null
+@@ -1,3 +0,0 @@
+-# Run Return Example
+-
+-To execute run the following on the root directory of the repository: `cargo run --example run-return`.

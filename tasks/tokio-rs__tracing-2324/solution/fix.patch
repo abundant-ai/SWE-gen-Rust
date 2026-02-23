@@ -1,0 +1,1056 @@
+diff --git a/tracing-appender/Cargo.toml b/tracing-appender/Cargo.toml
+index c7716a25..97d1e7d0 100644
+--- a/tracing-appender/Cargo.toml
++++ b/tracing-appender/Cargo.toml
+@@ -22,7 +22,7 @@ rust-version = "1.53.0"
+ 
+ [dependencies]
+ crossbeam-channel = "0.5.6"
+-time = { version = "0.3.2", default-features = false, features = ["formatting"] }
++time = { version = "0.3.2", default-features = false, features = ["formatting", "parsing"] }
+ parking_lot = { optional = true, version = "0.12.1" }
+ thiserror = "1"
+ 
+@@ -33,10 +33,8 @@ default-features = false
+ features = ["fmt", "std"]
+ 
+ [dev-dependencies]
+-
+ criterion = { version = "0.3.6", default-features = false }
+ tracing = { path = "../tracing", version = "0.1.35" }
+-time = { version = "0.3.2", default-features = false, features = ["formatting", "parsing"] }
+ tempfile = "3"
+ 
+ [[bench]]
+diff --git a/tracing-appender/src/rolling.rs b/tracing-appender/src/rolling.rs
+index 8e9597c2..8e630cc9 100644
+--- a/tracing-appender/src/rolling.rs
++++ b/tracing-appender/src/rolling.rs
+@@ -34,7 +34,7 @@ use std::{
+     path::{Path, PathBuf},
+     sync::atomic::{AtomicUsize, Ordering},
+ };
+-use time::{format_description, Duration, OffsetDateTime, Time};
++use time::{format_description, Date, Duration, OffsetDateTime, Time};
+ 
+ mod builder;
+ pub use builder::{Builder, InitError};
+@@ -104,8 +104,10 @@ struct Inner {
+     log_directory: PathBuf,
+     log_filename_prefix: Option<String>,
+     log_filename_suffix: Option<String>,
++    date_format: Vec<format_description::FormatItem<'static>>,
+     rotation: Rotation,
+     next_date: AtomicUsize,
++    max_files: Option<usize>,
+ }
+ 
+ // === impl RollingFileAppender ===
+@@ -187,6 +189,7 @@ impl RollingFileAppender {
+             ref rotation,
+             ref prefix,
+             ref suffix,
++            ref max_files,
+         } = builder;
+         let directory = directory.as_ref().to_path_buf();
+         let now = OffsetDateTime::now_utc();
+@@ -196,6 +199,7 @@ impl RollingFileAppender {
+             directory,
+             prefix.clone(),
+             suffix.clone(),
++            *max_files,
+         )?;
+         Ok(Self {
+             state,
+@@ -242,7 +246,7 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for RollingFileAppender
+             // Did we get the right to lock the file? If not, another thread
+             // did it and we can just make a writer.
+             if self.state.advance_date(now, current_time) {
+-                self.state.refresh_writer(now, &mut *self.writer.write());
++                self.state.refresh_writer(now, &mut self.writer.write());
+             }
+         }
+         RollingWriter(self.writer.read())
+@@ -488,32 +492,14 @@ impl Rotation {
+         }
+     }
+ 
+-    pub(crate) fn join_date(
+-        &self,
+-        filename: Option<&str>,
+-        date: &OffsetDateTime,
+-        suffix: Option<&str>,
+-    ) -> String {
+-        let format = match *self {
++    fn date_format(&self) -> Vec<format_description::FormatItem<'static>> {
++        match *self {
+             Rotation::MINUTELY => format_description::parse("[year]-[month]-[day]-[hour]-[minute]"),
+             Rotation::HOURLY => format_description::parse("[year]-[month]-[day]-[hour]"),
+             Rotation::DAILY => format_description::parse("[year]-[month]-[day]"),
+             Rotation::NEVER => format_description::parse("[year]-[month]-[day]"),
+         }
+-        .expect("Unable to create a formatter; this is a bug in tracing-appender");
+-        let date = date
+-            .format(&format)
+-            .expect("Unable to format OffsetDateTime; this is a bug in tracing-appender");
+-
+-        match (self, filename, suffix) {
+-            (&Rotation::NEVER, Some(filename), None) => filename.to_string(),
+-            (&Rotation::NEVER, Some(filename), Some(suffix)) => format!("{}.{}", filename, suffix),
+-            (&Rotation::NEVER, None, Some(suffix)) => suffix.to_string(),
+-            (_, Some(filename), Some(suffix)) => format!("{}.{}.{}", filename, date, suffix),
+-            (_, Some(filename), None) => format!("{}.{}", filename, date),
+-            (_, None, Some(suffix)) => format!("{}.{}", date, suffix),
+-            (_, None, None) => date,
+-        }
++        .expect("Unable to create a formatter; this is a bug in tracing-appender")
+     }
+ }
+ 
+@@ -538,36 +524,122 @@ impl Inner {
+         directory: impl AsRef<Path>,
+         log_filename_prefix: Option<String>,
+         log_filename_suffix: Option<String>,
++        max_files: Option<usize>,
+     ) -> Result<(Self, RwLock<File>), builder::InitError> {
+         let log_directory = directory.as_ref().to_path_buf();
+-        let filename = rotation.join_date(
+-            log_filename_prefix.as_deref(),
+-            &now,
+-            log_filename_suffix.as_deref(),
+-        );
++        let date_format = rotation.date_format();
+         let next_date = rotation.next_date(&now);
+-        let writer = RwLock::new(create_writer(log_directory.as_ref(), &filename)?);
+ 
+         let inner = Inner {
+             log_directory,
+             log_filename_prefix,
+             log_filename_suffix,
++            date_format,
+             next_date: AtomicUsize::new(
+                 next_date
+                     .map(|date| date.unix_timestamp() as usize)
+                     .unwrap_or(0),
+             ),
+             rotation,
++            max_files,
+         };
++        let filename = inner.join_date(&now);
++        let writer = RwLock::new(create_writer(inner.log_directory.as_ref(), &filename)?);
+         Ok((inner, writer))
+     }
+ 
++    pub(crate) fn join_date(&self, date: &OffsetDateTime) -> String {
++        let date = date
++            .format(&self.date_format)
++            .expect("Unable to format OffsetDateTime; this is a bug in tracing-appender");
++
++        match (
++            &self.rotation,
++            &self.log_filename_prefix,
++            &self.log_filename_suffix,
++        ) {
++            (&Rotation::NEVER, Some(filename), None) => filename.to_string(),
++            (&Rotation::NEVER, Some(filename), Some(suffix)) => format!("{}.{}", filename, suffix),
++            (&Rotation::NEVER, None, Some(suffix)) => suffix.to_string(),
++            (_, Some(filename), Some(suffix)) => format!("{}.{}.{}", filename, date, suffix),
++            (_, Some(filename), None) => format!("{}.{}", filename, date),
++            (_, None, Some(suffix)) => format!("{}.{}", date, suffix),
++            (_, None, None) => date,
++        }
++    }
++
++    fn prune_old_logs(&self, max_files: usize) {
++        let files = fs::read_dir(&self.log_directory).map(|dir| {
++            dir.filter_map(|entry| {
++                let entry = entry.ok()?;
++                let metadata = entry.metadata().ok()?;
++
++                // the appender only creates files, not directories or symlinks,
++                // so we should never delete a dir or symlink.
++                if !metadata.is_file() {
++                    return None;
++                }
++
++                let filename = entry.file_name();
++                // if the filename is not a UTF-8 string, skip it.
++                let filename = filename.to_str()?;
++                if let Some(prefix) = &self.log_filename_prefix {
++                    if !filename.starts_with(prefix) {
++                        return None;
++                    }
++                }
++
++                if let Some(suffix) = &self.log_filename_suffix {
++                    if !filename.ends_with(suffix) {
++                        return None;
++                    }
++                }
++
++                if self.log_filename_prefix.is_none()
++                    && self.log_filename_suffix.is_none()
++                    && Date::parse(filename, &self.date_format).is_err()
++                {
++                    return None;
++                }
++
++                let created = metadata.created().ok()?;
++                Some((entry, created))
++            })
++            .collect::<Vec<_>>()
++        });
++
++        let mut files = match files {
++            Ok(files) => files,
++            Err(error) => {
++                eprintln!("Error reading the log directory/files: {}", error);
++                return;
++            }
++        };
++        if files.len() < max_files {
++            return;
++        }
++
++        // sort the files by their creation timestamps.
++        files.sort_by_key(|(_, created_at)| *created_at);
++
++        // delete files, so that (n-1) files remain, because we will create another log file
++        for (file, _) in files.iter().take(files.len() - (max_files - 1)) {
++            if let Err(error) = fs::remove_file(file.path()) {
++                eprintln!(
++                    "Failed to remove old log file {}: {}",
++                    file.path().display(),
++                    error
++                );
++            }
++        }
++    }
++
+     fn refresh_writer(&self, now: OffsetDateTime, file: &mut File) {
+-        let filename = self.rotation.join_date(
+-            self.log_filename_prefix.as_deref(),
+-            &now,
+-            self.log_filename_suffix.as_deref(),
+-        );
++        let filename = self.join_date(&now);
++
++        if let Some(max_files) = self.max_files {
++            self.prune_old_logs(max_files);
++        }
+ 
+         match create_writer(&self.log_directory, &filename) {
+             Ok(new_file) => {
+@@ -727,66 +799,212 @@ mod test {
+     }
+ 
+     #[test]
+-    fn test_path_concatination() {
++    fn test_path_concatenation() {
+         let format = format_description::parse(
+             "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
+          sign:mandatory]:[offset_minute]:[offset_second]",
+         )
+         .unwrap();
++        let directory = tempfile::tempdir().expect("failed to create tempdir");
+ 
+         let now = OffsetDateTime::parse("2020-02-01 10:01:00 +00:00:00", &format).unwrap();
+ 
+-        // per-minute
+-        let path = Rotation::MINUTELY.join_date(Some("app.log"), &now, None);
+-        assert_eq!("app.log.2020-02-01-10-01", path);
++        struct TestCase {
++            expected: &'static str,
++            rotation: Rotation,
++            prefix: Option<&'static str>,
++            suffix: Option<&'static str>,
++        }
+ 
+-        // per-hour
+-        let path = Rotation::HOURLY.join_date(Some("app.log"), &now, None);
+-        assert_eq!("app.log.2020-02-01-10", path);
++        let test = |TestCase {
++                        expected,
++                        rotation,
++                        prefix,
++                        suffix,
++                    }| {
++            let (inner, _) = Inner::new(
++                now,
++                rotation.clone(),
++                directory.path(),
++                prefix.map(ToString::to_string),
++                suffix.map(ToString::to_string),
++                None,
++            )
++            .unwrap();
++            let path = inner.join_date(&now);
++            assert_eq!(
++                expected, path,
++                "rotation = {:?}, prefix = {:?}, suffix = {:?}",
++                rotation, prefix, suffix
++            );
++        };
+ 
+-        // per-day
+-        let path = Rotation::DAILY.join_date(Some("app.log"), &now, None);
+-        assert_eq!("app.log.2020-02-01", path);
++        let test_cases = vec![
++            // prefix only
++            TestCase {
++                expected: "app.log.2020-02-01-10-01",
++                rotation: Rotation::MINUTELY,
++                prefix: Some("app.log"),
++                suffix: None,
++            },
++            TestCase {
++                expected: "app.log.2020-02-01-10",
++                rotation: Rotation::HOURLY,
++                prefix: Some("app.log"),
++                suffix: None,
++            },
++            TestCase {
++                expected: "app.log.2020-02-01",
++                rotation: Rotation::DAILY,
++                prefix: Some("app.log"),
++                suffix: None,
++            },
++            TestCase {
++                expected: "app.log",
++                rotation: Rotation::NEVER,
++                prefix: Some("app.log"),
++                suffix: None,
++            },
++            // prefix and suffix
++            TestCase {
++                expected: "app.2020-02-01-10-01.log",
++                rotation: Rotation::MINUTELY,
++                prefix: Some("app"),
++                suffix: Some("log"),
++            },
++            TestCase {
++                expected: "app.2020-02-01-10.log",
++                rotation: Rotation::HOURLY,
++                prefix: Some("app"),
++                suffix: Some("log"),
++            },
++            TestCase {
++                expected: "app.2020-02-01.log",
++                rotation: Rotation::DAILY,
++                prefix: Some("app"),
++                suffix: Some("log"),
++            },
++            TestCase {
++                expected: "app.log",
++                rotation: Rotation::NEVER,
++                prefix: Some("app"),
++                suffix: Some("log"),
++            },
++            // suffix only
++            TestCase {
++                expected: "2020-02-01-10-01.log",
++                rotation: Rotation::MINUTELY,
++                prefix: None,
++                suffix: Some("log"),
++            },
++            TestCase {
++                expected: "2020-02-01-10.log",
++                rotation: Rotation::HOURLY,
++                prefix: None,
++                suffix: Some("log"),
++            },
++            TestCase {
++                expected: "2020-02-01.log",
++                rotation: Rotation::DAILY,
++                prefix: None,
++                suffix: Some("log"),
++            },
++            TestCase {
++                expected: "log",
++                rotation: Rotation::NEVER,
++                prefix: None,
++                suffix: Some("log"),
++            },
++        ];
++        for test_case in test_cases {
++            test(test_case)
++        }
++    }
+ 
+-        // never
+-        let path = Rotation::NEVER.join_date(Some("app.log"), &now, None);
+-        assert_eq!("app.log", path);
++    #[test]
++    fn test_make_writer() {
++        use std::sync::{Arc, Mutex};
++        use tracing_subscriber::prelude::*;
+ 
+-        // per-minute with suffix
+-        let path = Rotation::MINUTELY.join_date(Some("app"), &now, Some("log"));
+-        assert_eq!("app.2020-02-01-10-01.log", path);
++        let format = format_description::parse(
++            "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
++         sign:mandatory]:[offset_minute]:[offset_second]",
++        )
++        .unwrap();
+ 
+-        // per-hour with suffix
+-        let path = Rotation::HOURLY.join_date(Some("app"), &now, Some("log"));
+-        assert_eq!("app.2020-02-01-10.log", path);
++        let now = OffsetDateTime::parse("2020-02-01 10:01:00 +00:00:00", &format).unwrap();
++        let directory = tempfile::tempdir().expect("failed to create tempdir");
++        let (state, writer) = Inner::new(
++            now,
++            Rotation::HOURLY,
++            directory.path(),
++            Some("test_make_writer".to_string()),
++            None,
++            None,
++        )
++        .unwrap();
++
++        let clock = Arc::new(Mutex::new(now));
++        let now = {
++            let clock = clock.clone();
++            Box::new(move || *clock.lock().unwrap())
++        };
++        let appender = RollingFileAppender { state, writer, now };
++        let default = tracing_subscriber::fmt()
++            .without_time()
++            .with_level(false)
++            .with_target(false)
++            .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
++            .with_writer(appender)
++            .finish()
++            .set_default();
++
++        tracing::info!("file 1");
+ 
+-        // per-day with suffix
+-        let path = Rotation::DAILY.join_date(Some("app"), &now, Some("log"));
+-        assert_eq!("app.2020-02-01.log", path);
++        // advance time by one second
++        (*clock.lock().unwrap()) += Duration::seconds(1);
+ 
+-        // never with suffix
+-        let path = Rotation::NEVER.join_date(Some("app"), &now, Some("log"));
+-        assert_eq!("app.log", path);
++        tracing::info!("file 1");
+ 
+-        // per-minute without prefix
+-        let path = Rotation::MINUTELY.join_date(None, &now, Some("app.log"));
+-        assert_eq!("2020-02-01-10-01.app.log", path);
++        // advance time by one hour
++        (*clock.lock().unwrap()) += Duration::hours(1);
+ 
+-        // per-hour without prefix
+-        let path = Rotation::HOURLY.join_date(None, &now, Some("app.log"));
+-        assert_eq!("2020-02-01-10.app.log", path);
++        tracing::info!("file 2");
+ 
+-        // per-day without prefix
+-        let path = Rotation::DAILY.join_date(None, &now, Some("app.log"));
+-        assert_eq!("2020-02-01.app.log", path);
++        // advance time by one second
++        (*clock.lock().unwrap()) += Duration::seconds(1);
++
++        tracing::info!("file 2");
++
++        drop(default);
++
++        let dir_contents = fs::read_dir(directory.path()).expect("Failed to read directory");
++        println!("dir={:?}", dir_contents);
++        for entry in dir_contents {
++            println!("entry={:?}", entry);
++            let path = entry.expect("Expected dir entry").path();
++            let file = fs::read_to_string(&path).expect("Failed to read file");
++            println!("path={}\nfile={:?}", path.display(), file);
+ 
+-        // never without prefix
+-        let path = Rotation::NEVER.join_date(None, &now, Some("app.log"));
+-        assert_eq!("app.log", path);
++            match path
++                .extension()
++                .expect("found a file without a date!")
++                .to_str()
++                .expect("extension should be UTF8")
++            {
++                "2020-02-01-10" => {
++                    assert_eq!("file 1\nfile 1\n", file);
++                }
++                "2020-02-01-11" => {
++                    assert_eq!("file 2\nfile 2\n", file);
++                }
++                x => panic!("unexpected date {}", x),
++            }
++        }
+     }
+ 
+     #[test]
+-    fn test_make_writer() {
++    fn test_max_log_files() {
+         use std::sync::{Arc, Mutex};
+         use tracing_subscriber::prelude::*;
+ 
+@@ -802,8 +1020,9 @@ mod test {
+             now,
+             Rotation::HOURLY,
+             directory.path(),
+-            Some("test_make_writer".to_string()),
++            Some("test_max_log_files".to_string()),
+             None,
++            Some(2),
+         )
+         .unwrap();
+ 
+@@ -832,6 +1051,11 @@ mod test {
+         // advance time by one hour
+         (*clock.lock().unwrap()) += Duration::hours(1);
+ 
++        // depending on the filesystem, the creation timestamp's resolution may
++        // be as coarse as one second, so we need to wait a bit here to ensure
++        // that the next file actually is newer than the old one.
++        std::thread::sleep(std::time::Duration::from_secs(1));
++
+         tracing::info!("file 2");
+ 
+         // advance time by one second
+@@ -839,10 +1063,24 @@ mod test {
+ 
+         tracing::info!("file 2");
+ 
++        // advance time by one hour
++        (*clock.lock().unwrap()) += Duration::hours(1);
++
++        // again, sleep to ensure that the creation timestamps actually differ.
++        std::thread::sleep(std::time::Duration::from_secs(1));
++
++        tracing::info!("file 3");
++
++        // advance time by one second
++        (*clock.lock().unwrap()) += Duration::seconds(1);
++
++        tracing::info!("file 3");
++
+         drop(default);
+ 
+         let dir_contents = fs::read_dir(directory.path()).expect("Failed to read directory");
+         println!("dir={:?}", dir_contents);
++
+         for entry in dir_contents {
+             println!("entry={:?}", entry);
+             let path = entry.expect("Expected dir entry").path();
+@@ -856,11 +1094,14 @@ mod test {
+                 .expect("extension should be UTF8")
+             {
+                 "2020-02-01-10" => {
+-                    assert_eq!("file 1\nfile 1\n", file);
++                    panic!("this file should have been pruned already!");
+                 }
+                 "2020-02-01-11" => {
+                     assert_eq!("file 2\nfile 2\n", file);
+                 }
++                "2020-02-01-12" => {
++                    assert_eq!("file 3\nfile 3\n", file);
++                }
+                 x => panic!("unexpected date {}", x),
+             }
+         }
+diff --git a/tracing-appender/src/rolling/builder.rs b/tracing-appender/src/rolling/builder.rs
+index ea5d39cd..8c92ca12 100644
+--- a/tracing-appender/src/rolling/builder.rs
++++ b/tracing-appender/src/rolling/builder.rs
+@@ -10,6 +10,7 @@ pub struct Builder {
+     pub(super) rotation: Rotation,
+     pub(super) prefix: Option<String>,
+     pub(super) suffix: Option<String>,
++    pub(super) max_files: Option<usize>,
+ }
+ 
+ /// Errors returned by [`Builder::build`].
+@@ -39,15 +40,20 @@ impl Builder {
+     /// | :-------- | :------------ | :---- |
+     /// | [`rotation`] | [`Rotation::NEVER`] | By default, log files will never be rotated. |
+     /// | [`filename_prefix`] | `""` | By default, log file names will not have a prefix. |
++    /// | [`filename_suffix`] | `""` | By default, log file names will not have a suffix. |
++    /// | [`max_log_files`] | `None` | By default, there is no limit for maximum log file count. |
+     ///
+     /// [`rotation`]: Self::rotation
+     /// [`filename_prefix`]: Self::filename_prefix
++    /// [`filename_suffix`]: Self::filename_suffix
++    /// [`max_log_files`]: Self::max_log_files
+     #[must_use]
+     pub const fn new() -> Self {
+         Self {
+             rotation: Rotation::NEVER,
+             prefix: None,
+             suffix: None,
++            max_files: None,
+         }
+     }
+ 
+@@ -181,6 +187,52 @@ impl Builder {
+         Self { suffix, ..self }
+     }
+ 
++    /// Keeps the last `n` log files on disk.
++    ///
++    /// When a new log file is created, if there are `n` or more
++    /// existing log files in the directory, the oldest will be deleted.
++    /// If no value is supplied, the `RollingAppender` will not remove any files.
++    ///
++    /// Files are considered candidates for deletion based on the following
++    /// criteria:
++    ///
++    /// * The file must not be a directory or symbolic link.
++    /// * If the appender is configured with a [`filename_prefix`], the file
++    ///   name must start with that prefix.
++    /// * If the appender is configured with a [`filename_suffix`], the file
++    ///   name must end with that suffix.
++    /// * If the appender has neither a filename prefix nor a suffix, then the
++    ///   file name must parse as a valid date based on the appender's date
++    ///   format.
++    ///
++    /// Files matching these criteria may be deleted if the maximum number of
++    /// log files in the directory has been reached.
++    ///
++    /// [`filename_prefix`]: Self::filename_prefix
++    /// [`filename_suffix`]: Self::filename_suffix
++    ///
++    /// # Examples
++    ///
++    /// ```
++    /// use tracing_appender::rolling::RollingFileAppender;
++    ///
++    /// # fn docs() {
++    /// let appender = RollingFileAppender::builder()
++    ///     .max_log_files(5) // only the most recent 5 log files will be kept
++    ///     // ...
++    ///     .build("/var/log")
++    ///     .expect("failed to initialize rolling file appender");
++    /// # drop(appender)
++    /// # }
++    /// ```
++    #[must_use]
++    pub fn max_log_files(self, n: usize) -> Self {
++        Self {
++            max_files: Some(n),
++            ..self
++        }
++    }
++
+     /// Builds a new [`RollingFileAppender`] with the configured parameters,
+     /// emitting log files to the provided directory.
+     ///
+diff --git a/tracing-core/src/dispatcher.rs b/tracing-core/src/dispatcher.rs
+index be6b5c62..36b3cfd8 100644
+--- a/tracing-core/src/dispatcher.rs
++++ b/tracing-core/src/dispatcher.rs
+@@ -134,7 +134,7 @@ use crate::stdlib::{
+     fmt,
+     sync::{
+         atomic::{AtomicBool, AtomicUsize, Ordering},
+-        Arc,
++        Arc, Weak,
+     },
+ };
+ 
+@@ -142,16 +142,50 @@ use crate::stdlib::{
+ use crate::stdlib::{
+     cell::{Cell, RefCell, RefMut},
+     error,
+-    sync::Weak,
+ };
+ 
++#[cfg(feature = "alloc")]
++use alloc::sync::{Arc, Weak};
++
++#[cfg(feature = "alloc")]
++use core::ops::Deref;
++
+ /// `Dispatch` trace data to a [`Subscriber`].
+-///
+ #[derive(Clone)]
+ pub struct Dispatch {
+     subscriber: Arc<dyn Subscriber + Send + Sync>,
+ }
+ 
++/// `WeakDispatch` is a version of [`Dispatch`] that holds a non-owning reference
++/// to a [`Subscriber`].
++///
++/// The Subscriber` may be accessed by calling [`WeakDispatch::upgrade`],
++/// which returns an `Option<Dispatch>`. If all [`Dispatch`] clones that point
++/// at the `Subscriber` have been dropped, [`WeakDispatch::upgrade`] will return
++/// `None`. Otherwise, it will return `Some(Dispatch)`.
++///
++/// A `WeakDispatch` may be created from a [`Dispatch`] by calling the
++/// [`Dispatch::downgrade`] method. The primary use for creating a
++/// [`WeakDispatch`] is to allow a Subscriber` to hold a cyclical reference to
++/// itself without creating a memory leak. See [here] for details.
++///
++/// This type is analogous to the [`std::sync::Weak`] type, but for a
++/// [`Dispatch`] rather than an [`Arc`].
++///
++/// [`Arc`]: std::sync::Arc
++/// [here]: Subscriber#avoiding-memory-leaks
++#[derive(Clone)]
++pub struct WeakDispatch {
++    subscriber: Weak<dyn Subscriber + Send + Sync>,
++}
++
++#[cfg(feature = "alloc")]
++#[derive(Clone)]
++enum Kind<T> {
++    Global(&'static (dyn Collect + Send + Sync)),
++    Scoped(T),
++}
++
+ #[cfg(feature = "std")]
+ thread_local! {
+     static CURRENT_STATE: State = State {
+@@ -430,12 +464,23 @@ impl Dispatch {
+         Registrar(Arc::downgrade(&self.subscriber))
+     }
+ 
+-    #[inline(always)]
+-    #[cfg(feature = "alloc")]
+-    pub(crate) fn subscriber(&self) -> &(dyn Subscriber + Send + Sync) {
+-        match self.subscriber {
+-            Kind::Scoped(ref s) => Arc::deref(s),
+-            Kind::Global(s) => s,
++    /// Creates a [`WeakDispatch`] from this `Dispatch`.
++    ///
++    /// A [`WeakDispatch`] is similar to a [`Dispatch`], but it does not prevent
++    /// the underlying [`Subscriber`] from being dropped. Instead, it only permits
++    /// access while other references to the `Subscriber` exist. This is equivalent
++    /// to the standard library's [`Arc::downgrade`] method, but for `Dispatch`
++    /// rather than `Arc`.
++    ///
++    /// The primary use for creating a [`WeakDispatch`] is to allow a `Subscriber`
++    /// to hold a cyclical reference to itself without creating a memory leak.
++    /// See [here] for details.
++    ///
++    /// [`Arc::downgrade`]: std::sync::Arc::downgrade
++    /// [here]: Subscriber#avoiding-memory-leaks
++    pub fn downgrade(&self) -> WeakDispatch {
++        WeakDispatch {
++            subscriber: Arc::downgrade(&self.subscriber),
+         }
+     }
+ 
+@@ -682,6 +727,45 @@ where
+     }
+ }
+ 
++// === impl WeakDispatch ===
++
++impl WeakDispatch {
++    /// Attempts to upgrade this `WeakDispatch` to a [`Dispatch`].
++    ///
++    /// Returns `None` if the referenced `Dispatch` has already been dropped.
++    ///
++    /// ## Examples
++    ///
++    /// ```
++    /// # use tracing_core::subscriber::NoSubscriber;
++    /// # use tracing_core::dispatcher::Dispatch;
++    /// let strong = Dispatch::new(NoSubscriber::default());
++    /// let weak = strong.downgrade();
++    ///
++    /// // The strong here keeps it alive, so we can still access the object.
++    /// assert!(weak.upgrade().is_some());
++    ///
++    /// drop(strong); // But not any more.
++    /// assert!(weak.upgrade().is_none());
++    /// ```
++    pub fn upgrade(&self) -> Option<Dispatch> {
++        self.subscriber
++            .upgrade()
++            .map(|subscriber| Dispatch { subscriber })
++    }
++}
++
++impl fmt::Debug for WeakDispatch {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let mut tuple = f.debug_tuple("WeakDispatch");
++        match self.subscriber.upgrade() {
++            Some(subscriber) => tuple.field(&format_args!("Some({:p})", subscriber)),
++            None => tuple.field(&format_args!("None")),
++        };
++        tuple.finish()
++    }
++}
++
+ #[cfg(feature = "std")]
+ impl Registrar {
+     pub(crate) fn upgrade(&self) -> Option<Dispatch> {
+diff --git a/tracing-core/src/subscriber.rs b/tracing-core/src/subscriber.rs
+index d6289758..e8f44411 100644
+--- a/tracing-core/src/subscriber.rs
++++ b/tracing-core/src/subscriber.rs
+@@ -82,6 +82,24 @@ use crate::stdlib::{
+ /// [`event_enabled`]: Subscriber::event_enabled
+ pub trait Subscriber: 'static {
+     /// Invoked when this subscriber becomes a [`Dispatch`].
++    ///
++    /// ## Avoiding Memory Leaks
++    ///
++    /// `Subscriber`s should not store their own [`Dispatch`]. Because the
++    /// `Dispatch` owns the `Subscriber`, storing the `Dispatch` within the
++    /// `Subscriber` will create a reference count cycle, preventing the `Dispatch`
++    /// from ever being dropped.
++    ///
++    /// Instead, when it is necessary to store a cyclical reference to the
++    /// `Dispatch` within a `Subscriber`, use [`Dispatch::downgrade`] to convert a
++    /// `Dispatch` into a [`WeakDispatch`]. This type is analogous to
++    /// [`std::sync::Weak`], and does not create a reference count cycle. A
++    /// [`WeakDispatch`] can be stored within a `Subscriber` without causing a
++    /// memory leak, and can be [upgraded] into a `Dispatch` temporarily when
++    /// the `Dispatch` must be accessed by the `Subscriber`.
++    ///
++    /// [`WeakDispatch`]: crate::dispatcher::WeakDispatch
++    /// [upgraded]: crate::dispatcher::WeakDispatch::upgrade
+     fn on_register_dispatch(&self, subscriber: &Dispatch) {
+         let _ = subscriber;
+     }
+diff --git a/tracing-opentelemetry/src/metrics.rs b/tracing-opentelemetry/src/metrics.rs
+index 91b9e63a..42c90bae 100644
+--- a/tracing-opentelemetry/src/metrics.rs
++++ b/tracing-opentelemetry/src/metrics.rs
+@@ -263,7 +263,7 @@ impl<'a> Visit for MetricVisitor<'a> {
+ /// - `monotonic_counter.` (non-negative numbers): Used when the counter should
+ ///   only ever increase
+ /// - `counter.`: Used when the counter can go up or down
+-/// - `value.`: Used for discrete data points (i.e., summing them does not make
++/// - `histogram.`: Used for discrete data points (i.e., summing them does not make
+ ///   semantic sense)
+ ///
+ /// Examples:
+@@ -276,9 +276,9 @@ impl<'a> Visit for MetricVisitor<'a> {
+ /// info!(counter.baz = -1);
+ /// info!(counter.xyz = 1.1);
+ ///
+-/// info!(value.qux = 1);
+-/// info!(value.abc = -1);
+-/// info!(value.def = 1.1);
++/// info!(histogram.qux = 1);
++/// info!(histogram.abc = -1);
++/// info!(histogram.def = 1.1);
+ /// ```
+ ///
+ /// # Mixing data types
+diff --git a/tracing-subscriber/src/layer/layered.rs b/tracing-subscriber/src/layer/layered.rs
+index 91e475f6..f09c58c9 100644
+--- a/tracing-subscriber/src/layer/layered.rs
++++ b/tracing-subscriber/src/layer/layered.rs
+@@ -115,7 +115,11 @@ where
+     }
+ 
+     fn max_level_hint(&self) -> Option<LevelFilter> {
+-        self.pick_level_hint(self.layer.max_level_hint(), self.inner.max_level_hint())
++        self.pick_level_hint(
++            self.layer.max_level_hint(),
++            self.inner.max_level_hint(),
++            super::subscriber_is_none(&self.inner),
++        )
+     }
+ 
+     fn new_span(&self, span: &span::Attributes<'_>) -> span::Id {
+@@ -267,7 +271,11 @@ where
+     }
+ 
+     fn max_level_hint(&self) -> Option<LevelFilter> {
+-        self.pick_level_hint(self.layer.max_level_hint(), self.inner.max_level_hint())
++        self.pick_level_hint(
++            self.layer.max_level_hint(),
++            self.inner.max_level_hint(),
++            super::layer_is_none(&self.inner),
++        )
+     }
+ 
+     #[inline]
+@@ -470,6 +478,7 @@ where
+         &self,
+         outer_hint: Option<LevelFilter>,
+         inner_hint: Option<LevelFilter>,
++        inner_is_none: bool,
+     ) -> Option<LevelFilter> {
+         if self.inner_is_registry {
+             return outer_hint;
+@@ -487,6 +496,31 @@ where
+             return None;
+         }
+ 
++        // If the layer is `Option::None`, then we
++        // want to short-circuit the layer underneath, if it
++        // returns `None`, to override the `None` layer returning
++        // `Some(OFF)`, which should ONLY apply when there are
++        // no other layers that return `None`. Note this
++        // `None` does not == `Some(TRACE)`, it means
++        // something more like: "whatever all the other
++        // layers agree on, default to `TRACE` if none
++        // have an opinion". We also choose do this AFTER
++        // we check for per-layer filters, which
++        // have their own logic.
++        //
++        // Also note that this does come at some perf cost, but
++        // this function is only called on initialization and
++        // subscriber reloading.
++        if super::layer_is_none(&self.layer) {
++            return cmp::max(outer_hint, Some(inner_hint?));
++        }
++
++        // Similarly, if the layer on the inside is `None` and it returned an
++        // `Off` hint, we want to override that with the outer hint.
++        if inner_is_none && inner_hint == Some(LevelFilter::OFF) {
++            return outer_hint;
++        }
++
+         cmp::max(outer_hint, inner_hint)
+     }
+ }
+diff --git a/tracing-subscriber/src/layer/mod.rs b/tracing-subscriber/src/layer/mod.rs
+index 3283a5ef..b4533771 100644
+--- a/tracing-subscriber/src/layer/mod.rs
++++ b/tracing-subscriber/src/layer/mod.rs
+@@ -712,11 +712,28 @@ where
+     Self: 'static,
+ {
+     /// Performs late initialization when installing this layer as a
+-    /// [subscriber].
++    /// [`Subscriber`].
+     ///
+-    /// [subscriber]: tracing_core::Subscriber
+-    fn on_register_dispatch(&self, subscriber: &Dispatch) {
+-        let _ = subscriber;
++    /// ## Avoiding Memory Leaks
++    ///
++    /// `Layer`s should not store the [`Dispatch`] pointing to the [`Subscriber`]
++    /// that they are a part of. Because the `Dispatch` owns the `Subscriber`,
++    /// storing the `Dispatch` within the `Subscriber` will create a reference
++    /// count cycle, preventing the `Dispatch` from ever being dropped.
++    ///
++    /// Instead, when it is necessary to store a cyclical reference to the
++    /// `Dispatch` within a `Layer`, use [`Dispatch::downgrade`] to convert a
++    /// `Dispatch` into a [`WeakDispatch`]. This type is analogous to
++    /// [`std::sync::Weak`], and does not create a reference count cycle. A
++    /// [`WeakDispatch`] can be stored within a subscriber without causing a
++    /// memory leak, and can be [upgraded] into a `Dispatch` temporarily when
++    /// the `Dispatch` must be accessed by the subscriber.
++    ///
++    /// [`WeakDispatch`]: tracing_core::dispatcher::WeakDispatch
++    /// [upgraded]: tracing_core::dispatcher::WeakDispatch::upgrade
++    /// [`Subscriber`]: tracing_core::Subscriber
++    fn on_register_dispatch(&self, collector: &Dispatch) {
++        let _ = collector;
+     }
+ 
+     /// Performs late initialization when attaching a `Layer` to a
+@@ -1480,6 +1497,47 @@ pub struct Identity {
+ 
+ // === impl Layer ===
+ 
++#[derive(Clone, Copy)]
++pub(crate) struct NoneLayerMarker(());
++static NONE_LAYER_MARKER: NoneLayerMarker = NoneLayerMarker(());
++
++/// Is a type implementing `Layer` `Option::<_>::None`?
++pub(crate) fn layer_is_none<L, S>(layer: &L) -> bool
++where
++    L: Layer<S>,
++    S: Subscriber,
++{
++    unsafe {
++        // Safety: we're not actually *doing* anything with this pointer ---
++        // this only care about the `Option`, which is essentially being used
++        // as a bool. We can rely on the pointer being valid, because it is
++        // a crate-private type, and is only returned by the `Layer` impl
++        // for `Option`s. However, even if the layer *does* decide to be
++        // evil and give us an invalid pointer here, that's fine, because we'll
++        // never actually dereference it.
++        layer.downcast_raw(TypeId::of::<NoneLayerMarker>())
++    }
++    .is_some()
++}
++
++/// Is a type implementing `Subscriber` `Option::<_>::None`?
++pub(crate) fn subscriber_is_none<S>(subscriber: &S) -> bool
++where
++    S: Subscriber,
++{
++    unsafe {
++        // Safety: we're not actually *doing* anything with this pointer ---
++        // this only care about the `Option`, which is essentially being used
++        // as a bool. We can rely on the pointer being valid, because it is
++        // a crate-private type, and is only returned by the `Layer` impl
++        // for `Option`s. However, even if the subscriber *does* decide to be
++        // evil and give us an invalid pointer here, that's fine, because we'll
++        // never actually dereference it.
++        subscriber.downcast_raw(TypeId::of::<NoneLayerMarker>())
++    }
++    .is_some()
++}
++
+ impl<L, S> Layer<S> for Option<L>
+ where
+     L: Layer<S>,
+@@ -1588,6 +1646,8 @@ where
+     unsafe fn downcast_raw(&self, id: TypeId) -> Option<*const ()> {
+         if id == TypeId::of::<Self>() {
+             Some(self as *const _ as *const ())
++        } else if id == TypeId::of::<NoneLayerMarker>() && self.is_none() {
++            Some(&NONE_LAYER_MARKER as *const _ as *const ())
+         } else {
+             self.as_ref().and_then(|inner| inner.downcast_raw(id))
+         }
+diff --git a/tracing-subscriber/src/reload.rs b/tracing-subscriber/src/reload.rs
+index c72e824b..096f83d3 100644
+--- a/tracing-subscriber/src/reload.rs
++++ b/tracing-subscriber/src/reload.rs
+@@ -67,6 +67,7 @@
+ use crate::layer;
+ use crate::sync::RwLock;
+ 
++use core::any::TypeId;
+ use std::{
+     error, fmt,
+     marker::PhantomData,
+@@ -182,6 +183,25 @@ where
+     fn max_level_hint(&self) -> Option<LevelFilter> {
+         try_lock!(self.inner.read(), else return None).max_level_hint()
+     }
++
++    #[doc(hidden)]
++    unsafe fn downcast_raw(&self, id: TypeId) -> Option<*const ()> {
++        // Safety: it is generally unsafe to downcast through a reload, because
++        // the pointer can be invalidated after the lock is dropped.
++        // `NoneLayerMarker` is a special case because it
++        // is never dereferenced.
++        //
++        // Additionally, even if the marker type *is* dereferenced (which it
++        // never will be), the pointer should be valid even if the subscriber
++        // is reloaded, because all `NoneLayerMarker` pointers that we return
++        // actually point to the global static singleton `NoneLayerMarker`,
++        // rather than to a field inside the lock.
++        if id == TypeId::of::<layer::NoneLayerMarker>() {
++            return try_lock!(self.inner.read(), else return None).downcast_raw(id);
++        }
++
++        None
++    }
+ }
+ 
+ // ===== impl Filter =====
+diff --git a/tracing/src/dispatcher.rs b/tracing/src/dispatcher.rs
+index 8817ac03..a84b99f4 100644
+--- a/tracing/src/dispatcher.rs
++++ b/tracing/src/dispatcher.rs
+@@ -133,7 +133,7 @@ pub use tracing_core::dispatcher::with_default;
+ #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+ pub use tracing_core::dispatcher::DefaultGuard;
+ pub use tracing_core::dispatcher::{
+-    get_default, set_global_default, Dispatch, SetGlobalDefaultError,
++    get_default, set_global_default, Dispatch, SetGlobalDefaultError, WeakDispatch,
+ };
+ 
+ /// Private API for internal use by tracing's macros.

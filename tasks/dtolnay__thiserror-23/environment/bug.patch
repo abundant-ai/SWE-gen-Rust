@@ -1,0 +1,222 @@
+diff --git a/impl/src/ast.rs b/impl/src/ast.rs
+index f68820e..0d15388 100644
+--- a/impl/src/ast.rs
++++ b/impl/src/ast.rs
+@@ -10,14 +10,14 @@ pub enum Input<'a> {
+ }
+ 
+ pub struct Struct<'a> {
+-    pub attrs: Attrs<'a>,
++    pub attrs: Attrs,
+     pub ident: Ident,
+     pub generics: &'a Generics,
+     pub fields: Vec<Field<'a>>,
+ }
+ 
+ pub struct Enum<'a> {
+-    pub attrs: Attrs<'a>,
++    pub attrs: Attrs,
+     pub ident: Ident,
+     pub generics: &'a Generics,
+     pub variants: Vec<Variant<'a>>,
+@@ -25,14 +25,14 @@ pub struct Enum<'a> {
+ 
+ pub struct Variant<'a> {
+     pub original: &'a syn::Variant,
+-    pub attrs: Attrs<'a>,
++    pub attrs: Attrs,
+     pub ident: Ident,
+     pub fields: Vec<Field<'a>>,
+ }
+ 
+ pub struct Field<'a> {
+     pub original: &'a syn::Field,
+-    pub attrs: Attrs<'a>,
++    pub attrs: Attrs,
+     pub member: Member,
+     pub ty: &'a Type,
+ }
+diff --git a/impl/src/attr.rs b/impl/src/attr.rs
+index e741c64..32eac1a 100644
+--- a/impl/src/attr.rs
++++ b/impl/src/attr.rs
+@@ -7,9 +7,9 @@ use syn::{
+     Result, Token,
+ };
+ 
+-pub struct Attrs<'a> {
++pub struct Attrs {
+     pub display: Option<Display>,
+-    pub source: Option<Source<'a>>,
++    pub source: bool,
+ }
+ 
+ pub struct Display {
+@@ -18,14 +18,10 @@ pub struct Display {
+     pub was_shorthand: bool,
+ }
+ 
+-pub struct Source<'a> {
+-    pub original: &'a Attribute,
+-}
+-
+ pub fn get(input: &[Attribute]) -> Result<Attrs> {
+     let mut attrs = Attrs {
+         display: None,
+-        source: None,
++        source: false,
+     };
+ 
+     for attr in input {
+@@ -39,11 +35,11 @@ pub fn get(input: &[Attribute]) -> Result<Attrs> {
+             }
+             attrs.display = Some(display);
+         } else if attr.path.is_ident("source") {
+-            let source = parse_source(attr)?;
+-            if attrs.source.is_some() {
++            parse_source(attr)?;
++            if attrs.source {
+                 return Err(Error::new_spanned(attr, "duplicate #[source] attribute"));
+             }
+-            attrs.source = Some(source);
++            attrs.source = true;
+         }
+     }
+ 
+@@ -110,9 +106,9 @@ fn parse_token_expr(input: ParseStream, mut last_is_comma: bool) -> Result<Token
+     Ok(tokens)
+ }
+ 
+-fn parse_source(attr: &Attribute) -> Result<Source> {
++fn parse_source(attr: &Attribute) -> Result<()> {
+     syn::parse2::<Nothing>(attr.tokens.clone())?;
+-    Ok(Source { original: attr })
++    Ok(())
+ }
+ 
+ impl ToTokens for Display {
+diff --git a/impl/src/prop.rs b/impl/src/prop.rs
+index 47bf65f..36129f5 100644
+--- a/impl/src/prop.rs
++++ b/impl/src/prop.rs
+@@ -42,8 +42,8 @@ impl Variant<'_> {
+ }
+ 
+ impl Field<'_> {
+-    pub(crate) fn is_source(&self) -> bool {
+-        self.attrs.source.is_some()
++    fn is_source(&self) -> bool {
++        self.attrs.source
+     }
+ 
+     fn is_backtrace(&self) -> bool {
+diff --git a/impl/src/valid.rs b/impl/src/valid.rs
+index d420d04..5372766 100644
+--- a/impl/src/valid.rs
++++ b/impl/src/valid.rs
+@@ -1,4 +1,4 @@
+-use crate::ast::{Enum, Field, Input, Struct, Variant};
++use crate::ast::{Enum, Input, Struct};
+ use syn::{Error, Result};
+ 
+ pub(crate) const CHECKED: &str = "checked in validation";
+@@ -14,46 +14,23 @@ impl Input<'_> {
+ 
+ impl Struct<'_> {
+     fn validate(&self) -> Result<()> {
+-        find_duplicate_source(&self.fields)?;
++        // nothing for now
+         Ok(())
+     }
+ }
+ 
+ impl Enum<'_> {
+     fn validate(&self) -> Result<()> {
+-        let has_display = self.has_display();
+-        for variant in &self.variants {
+-            variant.validate()?;
+-            if has_display && variant.attrs.display.is_none() {
+-                return Err(Error::new_spanned(
+-                    variant.original,
+-                    "missing #[error(\"...\")] display attribute",
+-                ));
++        if self.has_display() {
++            for variant in &self.variants {
++                if variant.attrs.display.is_none() {
++                    return Err(Error::new_spanned(
++                        variant.original,
++                        "missing #[error(\"...\")] display attribute",
++                    ));
++                }
+             }
+         }
+         Ok(())
+     }
+ }
+-
+-impl Variant<'_> {
+-    fn validate(&self) -> Result<()> {
+-        find_duplicate_source(&self.fields)?;
+-        Ok(())
+-    }
+-}
+-
+-fn find_duplicate_source(fields: &[Field]) -> Result<()> {
+-    let mut has_source = false;
+-    for field in fields {
+-        if let Some(source) = &field.attrs.source {
+-            if has_source {
+-                return Err(Error::new_spanned(
+-                    source.original,
+-                    "duplicate #[source] attribute",
+-                ));
+-            }
+-            has_source = true;
+-        }
+-    }
+-    Ok(())
+-}
+diff --git a/tests/ui/duplicate-source.rs b/tests/ui/duplicate-source.rs
+deleted file mode 100644
+index 2d599d1..0000000
+--- a/tests/ui/duplicate-source.rs
++++ /dev/null
+@@ -1,21 +0,0 @@
+-use thiserror::Error;
+-
+-#[derive(Error, Debug)]
+-pub struct ErrorStruct {
+-    #[source]
+-    a: std::io::Error,
+-    #[source]
+-    b: anyhow::Error,
+-}
+-
+-#[derive(Error, Debug)]
+-pub enum ErrorEnum {
+-    Confusing {
+-        #[source]
+-        a: std::io::Error,
+-        #[source]
+-        b: anyhow::Error,
+-    },
+-}
+-
+-fn main() {}
+diff --git a/tests/ui/duplicate-source.stderr b/tests/ui/duplicate-source.stderr
+deleted file mode 100644
+index 6094a3d..0000000
+--- a/tests/ui/duplicate-source.stderr
++++ /dev/null
+@@ -1,11 +0,0 @@
+-error: duplicate #[source] attribute
+- --> $DIR/duplicate-source.rs:7:5
+-  |
+-7 |     #[source]
+-  |     ^^^^^^^^^
+-
+-error: duplicate #[source] attribute
+-  --> $DIR/duplicate-source.rs:16:9
+-   |
+-16 |         #[source]
+-   |         ^^^^^^^^^

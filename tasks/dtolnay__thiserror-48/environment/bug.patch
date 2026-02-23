@@ -1,0 +1,162 @@
+diff --git a/impl/Cargo.toml b/impl/Cargo.toml
+index 9dc88b2..b92842f 100644
+--- a/impl/Cargo.toml
++++ b/impl/Cargo.toml
+@@ -13,4 +13,4 @@ proc-macro = true
+ [dependencies]
+ proc-macro2 = "1.0"
+ quote = "1.0"
+-syn = "1.0.11"
++syn = "1.0"
+diff --git a/impl/src/ast.rs b/impl/src/ast.rs
+index 134ce79..bc4e90a 100644
+--- a/impl/src/ast.rs
++++ b/impl/src/ast.rs
+@@ -52,16 +52,11 @@ impl<'a> Input<'a> {
+ 
+ impl<'a> Struct<'a> {
+     fn from_syn(node: &'a DeriveInput, data: &'a DataStruct) -> Result<Self> {
+-        let mut attrs = attr::get(&node.attrs)?;
+-        let fields = Field::multiple_from_syn(&data.fields)?;
+-        if let Some(display) = &mut attrs.display {
+-            display.expand_shorthand(&fields);
+-        }
+         Ok(Struct {
+-            attrs,
++            attrs: attr::get(&node.attrs)?,
+             ident: node.ident.clone(),
+             generics: &node.generics,
+-            fields,
++            fields: Field::multiple_from_syn(&data.fields)?,
+         })
+     }
+ }
+@@ -77,9 +72,6 @@ impl<'a> Enum<'a> {
+                 if let display @ None = &mut variant.attrs.display {
+                     *display = attrs.display.clone();
+                 }
+-                if let Some(display) = &mut variant.attrs.display {
+-                    display.expand_shorthand(&variant.fields);
+-                }
+                 Ok(variant)
+             })
+             .collect::<Result<_>>()?;
+diff --git a/impl/src/attr.rs b/impl/src/attr.rs
+index fe1a867..a361b89 100644
+--- a/impl/src/attr.rs
++++ b/impl/src/attr.rs
+@@ -70,13 +70,15 @@ pub fn get(input: &[Attribute]) -> Result<Attrs> {
+ 
+ fn parse_display(attr: &Attribute) -> Result<Display> {
+     attr.parse_args_with(|input: ParseStream| {
+-        Ok(Display {
++        let mut display = Display {
+             original: attr,
+             fmt: input.parse()?,
+             args: parse_token_expr(input, false)?,
+             was_shorthand: false,
+             has_bonus_display: false,
+-        })
++        };
++        display.expand_shorthand();
++        Ok(display)
+     })
+ }
+ 
+diff --git a/impl/src/fmt.rs b/impl/src/fmt.rs
+index e792d0e..24d4fa5 100644
+--- a/impl/src/fmt.rs
++++ b/impl/src/fmt.rs
+@@ -1,13 +1,11 @@
+-use crate::ast::Field;
+ use crate::attr::Display;
+ use proc_macro2::TokenStream;
+-use quote::{format_ident, quote_spanned};
+-use std::collections::HashSet as Set;
+-use syn::{Ident, Index, LitStr, Member};
++use quote::quote_spanned;
++use syn::{Ident, LitStr};
+ 
+ impl Display<'_> {
+     // Transform `"error {var}"` to `"error {}", var`.
+-    pub fn expand_shorthand(&mut self, fields: &[Field]) {
++    pub fn expand_shorthand(&mut self) {
+         if !self.args.is_empty() {
+             return;
+         }
+@@ -18,7 +16,6 @@ impl Display<'_> {
+         let mut out = String::new();
+         let mut args = TokenStream::new();
+         let mut has_bonus_display = false;
+-        let fields: Set<Member> = fields.iter().map(|f| f.member.clone()).collect();
+ 
+         while let Some(brace) = read.find('{') {
+             out += &read[..brace + 1];
+@@ -32,26 +29,14 @@ impl Display<'_> {
+                 Some(next) => next,
+                 None => return,
+             };
+-            let member = match next {
+-                '0'..='9' => {
+-                    let int = take_int(&mut read);
+-                    match int.parse::<u32>() {
+-                        Ok(index) => Member::Unnamed(Index { index, span }),
+-                        Err(_) => return,
+-                    }
+-                }
+-                'a'..='z' | 'A'..='Z' | '_' => {
+-                    let ident = take_ident(&mut read);
+-                    Member::Named(Ident::new(&ident, span))
+-                }
++            let var = match next {
++                '0'..='9' => take_int(&mut read),
++                'a'..='z' | 'A'..='Z' | '_' => take_ident(&mut read),
+                 _ => return,
+             };
+-            let ident = match &member {
+-                Member::Unnamed(index) => format_ident!("_{}", index),
+-                Member::Named(ident) => ident.clone(),
+-            };
++            let ident = Ident::new(&var, span);
+             args.extend(quote_spanned!(span=> , #ident));
+-            if read.starts_with('}') && fields.contains(&member) {
++            if read.starts_with('}') {
+                 has_bonus_display = true;
+                 args.extend(quote_spanned!(span=> .as_display()));
+             }
+@@ -67,6 +52,7 @@ impl Display<'_> {
+ 
+ fn take_int(read: &mut &str) -> String {
+     let mut int = String::new();
++    int.push('_');
+     for (i, ch) in read.char_indices() {
+         match ch {
+             '0'..='9' => int.push(ch),
+diff --git a/tests/test_display.rs b/tests/test_display.rs
+index 5745391..87517f8 100644
+--- a/tests/test_display.rs
++++ b/tests/test_display.rs
+@@ -31,15 +31,6 @@ enum EnumError {
+     Unit,
+ }
+ 
+-#[derive(Error, Debug)]
+-#[error("{MSG}: {id:?} (code {CODE:?})")]
+-struct WithConstant {
+-    id: &'static str,
+-}
+-
+-const MSG: &str = "failed to do";
+-const CODE: usize = 9;
+-
+ #[derive(Error, Debug)]
+ #[error("{0}")]
+ enum Inherit {
+@@ -82,7 +73,6 @@ fn test_display() {
+     assert("braced error: 0", EnumError::Braced { id: 0 });
+     assert("tuple error: 0", EnumError::Tuple(0));
+     assert("unit error", EnumError::Unit);
+-    assert("failed to do: \"\" (code 9)", WithConstant { id: "" });
+     assert("unit error", Inherit::Unit(UnitError));
+     assert("other error", Inherit::Other(UnitError));
+     assert("fn main() {}", Braces);

@@ -1,0 +1,288 @@
+diff --git a/tracing-attributes/src/attr.rs b/tracing-attributes/src/attr.rs
+index 2af0400f..34ca3d66 100644
+--- a/tracing-attributes/src/attr.rs
++++ b/tracing-attributes/src/attr.rs
+@@ -12,7 +12,6 @@ pub(crate) struct InstrumentArgs {
+     pub(crate) name: Option<LitStr>,
+     target: Option<LitStr>,
+     pub(crate) parent: Option<Expr>,
+-    pub(crate) follows_from: Option<Expr>,
+     pub(crate) skips: HashSet<Ident>,
+     pub(crate) fields: Option<Fields>,
+     pub(crate) err_mode: Option<FormatMode>,
+@@ -130,12 +129,6 @@ impl Parse for InstrumentArgs {
+                 }
+                 let parent = input.parse::<ExprArg<kw::parent>>()?;
+                 args.parent = Some(parent.value);
+-            } else if lookahead.peek(kw::follows_from) {
+-                if args.target.is_some() {
+-                    return Err(input.error("expected only a single `follows_from` argument"));
+-                }
+-                let follows_from = input.parse::<ExprArg<kw::follows_from>>()?;
+-                args.follows_from = Some(follows_from.value);
+             } else if lookahead.peek(kw::level) {
+                 if args.level.is_some() {
+                     return Err(input.error("expected only a single `level` argument"));
+@@ -392,7 +385,6 @@ mod kw {
+     syn::custom_keyword!(level);
+     syn::custom_keyword!(target);
+     syn::custom_keyword!(parent);
+-    syn::custom_keyword!(follows_from);
+     syn::custom_keyword!(name);
+     syn::custom_keyword!(err);
+     syn::custom_keyword!(ret);
+diff --git a/tracing-attributes/src/expand.rs b/tracing-attributes/src/expand.rs
+index 0206beb8..e2004e8e 100644
+--- a/tracing-attributes/src/expand.rs
++++ b/tracing-attributes/src/expand.rs
+@@ -88,13 +88,6 @@ fn gen_block<B: ToTokens>(
+ 
+     let level = args.level();
+ 
+-    let follows_from = args.follows_from.iter();
+-    let follows_from = quote! {
+-        #(for cause in #follows_from {
+-            __tracing_attr_span.follows_from(cause);
+-        })*
+-    };
+-
+     // generate this inside a closure, so we can return early on errors.
+     let span = (|| {
+         // Pull out the arguments-to-be-skipped first, so we can filter results
+@@ -268,7 +261,6 @@ fn gen_block<B: ToTokens>(
+             let __tracing_attr_span = #span;
+             let __tracing_instrument_future = #mk_fut;
+             if !__tracing_attr_span.is_disabled() {
+-                #follows_from
+                 tracing::Instrument::instrument(
+                     __tracing_instrument_future,
+                     __tracing_attr_span
+@@ -295,7 +287,6 @@ fn gen_block<B: ToTokens>(
+         let __tracing_attr_guard;
+         if tracing::level_enabled!(#level) {
+             __tracing_attr_span = #span;
+-            #follows_from
+             __tracing_attr_guard = __tracing_attr_span.enter();
+         }
+     );
+diff --git a/tracing-attributes/src/lib.rs b/tracing-attributes/src/lib.rs
+index f93b37a7..6ac07cef 100644
+--- a/tracing-attributes/src/lib.rs
++++ b/tracing-attributes/src/lib.rs
+@@ -176,24 +176,6 @@ mod expand;
+ ///     fn my_method(&self) {}
+ /// }
+ /// ```
+-/// Specifying [`follows_from`] relationships:
+-/// ```
+-/// # use tracing_attributes::instrument;
+-/// #[instrument(follows_from = causes)]
+-/// pub fn my_function(causes: &[tracing::Id]) {
+-///     // ...
+-/// }
+-/// ```
+-/// Any expression of type `impl IntoIterator<Item = impl Into<Option<Id>>>`
+-/// may be provided to `follows_from`; e.g.:
+-/// ```
+-/// # use tracing_attributes::instrument;
+-/// #[instrument(follows_from = [cause])]
+-/// pub fn my_function(cause: &tracing::span::EnteredSpan) {
+-///     // ...
+-/// }
+-/// ```
+-///
+ ///
+ /// To skip recording an argument, pass the argument's name to the `skip`:
+ ///
+@@ -343,7 +325,6 @@ mod expand;
+ /// (or maybe you can just bump `async-trait`).
+ ///
+ /// [span]: https://docs.rs/tracing/latest/tracing/span/index.html
+-/// [`follows_from`]: https://docs.rs/tracing/latest/tracing/struct.Span.html#method.follows_from
+ /// [`tracing`]: https://github.com/tokio-rs/tracing
+ /// [`fmt::Debug`]: std::fmt::Debug
+ #[proc_macro_attribute]
+diff --git a/tracing-attributes/tests/follows_from.rs b/tracing-attributes/tests/follows_from.rs
+deleted file mode 100644
+index bd4806af..00000000
+--- a/tracing-attributes/tests/follows_from.rs
++++ /dev/null
+@@ -1,99 +0,0 @@
+-use tracing::{collect::with_default, Id, Level, Span};
+-use tracing_attributes::instrument;
+-use tracing_mock::*;
+-
+-#[instrument(follows_from = causes, skip(causes))]
+-fn with_follows_from_sync(causes: impl IntoIterator<Item = impl Into<Option<Id>>>) {}
+-
+-#[instrument(follows_from = causes, skip(causes))]
+-async fn with_follows_from_async(causes: impl IntoIterator<Item = impl Into<Option<Id>>>) {}
+-
+-#[instrument(follows_from = [&Span::current()])]
+-fn follows_from_current() {}
+-
+-#[test]
+-fn follows_from_sync_test() {
+-    let cause_a = span::mock().named("cause_a");
+-    let cause_b = span::mock().named("cause_b");
+-    let cause_c = span::mock().named("cause_c");
+-    let consequence = span::mock().named("with_follows_from_sync");
+-
+-    let (collector, handle) = collector::mock()
+-        .new_span(cause_a.clone())
+-        .new_span(cause_b.clone())
+-        .new_span(cause_c.clone())
+-        .new_span(consequence.clone())
+-        .follows_from(consequence.clone(), cause_a)
+-        .follows_from(consequence.clone(), cause_b)
+-        .follows_from(consequence.clone(), cause_c)
+-        .enter(consequence.clone())
+-        .exit(consequence)
+-        .done()
+-        .run_with_handle();
+-
+-    with_default(collector, || {
+-        let cause_a = tracing::span!(Level::TRACE, "cause_a");
+-        let cause_b = tracing::span!(Level::TRACE, "cause_b");
+-        let cause_c = tracing::span!(Level::TRACE, "cause_c");
+-
+-        with_follows_from_sync(&[cause_a, cause_b, cause_c])
+-    });
+-
+-    handle.assert_finished();
+-}
+-
+-#[test]
+-fn follows_from_async_test() {
+-    let cause_a = span::mock().named("cause_a");
+-    let cause_b = span::mock().named("cause_b");
+-    let cause_c = span::mock().named("cause_c");
+-    let consequence = span::mock().named("with_follows_from_async");
+-
+-    let (collector, handle) = collector::mock()
+-        .new_span(cause_a.clone())
+-        .new_span(cause_b.clone())
+-        .new_span(cause_c.clone())
+-        .new_span(consequence.clone())
+-        .follows_from(consequence.clone(), cause_a)
+-        .follows_from(consequence.clone(), cause_b)
+-        .follows_from(consequence.clone(), cause_c)
+-        .enter(consequence.clone())
+-        .exit(consequence)
+-        .done()
+-        .run_with_handle();
+-
+-    with_default(collector, || {
+-        block_on_future(async {
+-            let cause_a = tracing::span!(Level::TRACE, "cause_a");
+-            let cause_b = tracing::span!(Level::TRACE, "cause_b");
+-            let cause_c = tracing::span!(Level::TRACE, "cause_c");
+-
+-            with_follows_from_async(&[cause_a, cause_b, cause_c]).await
+-        })
+-    });
+-
+-    handle.assert_finished();
+-}
+-
+-#[test]
+-fn follows_from_current_test() {
+-    let cause = span::mock().named("cause");
+-    let consequence = span::mock().named("follows_from_current");
+-
+-    let (collector, handle) = collector::mock()
+-        .new_span(cause.clone())
+-        .enter(cause.clone())
+-        .new_span(consequence.clone())
+-        .follows_from(consequence.clone(), cause.clone())
+-        .enter(consequence.clone())
+-        .exit(consequence)
+-        .exit(cause)
+-        .done()
+-        .run_with_handle();
+-
+-    with_default(collector, || {
+-        tracing::span!(Level::TRACE, "cause").in_scope(follows_from_current)
+-    });
+-
+-    handle.assert_finished();
+-}
+diff --git a/tracing-mock/src/collector.rs b/tracing-mock/src/collector.rs
+index 9c61f2c8..48c8bb49 100644
+--- a/tracing-mock/src/collector.rs
++++ b/tracing-mock/src/collector.rs
+@@ -23,10 +23,6 @@ use tracing::{
+ #[derive(Debug, Eq, PartialEq)]
+ pub enum Expect {
+     Event(MockEvent),
+-    FollowsFrom {
+-        consequence: MockSpan,
+-        cause: MockSpan,
+-    },
+     Enter(MockSpan),
+     Exit(MockSpan),
+     CloneSpan(MockSpan),
+@@ -102,12 +98,6 @@ where
+         self
+     }
+ 
+-    pub fn follows_from(mut self, consequence: MockSpan, cause: MockSpan) -> Self {
+-        self.expected
+-            .push_back(Expect::FollowsFrom { consequence, cause });
+-        self
+-    }
+-
+     pub fn event(mut self, event: MockEvent) -> Self {
+         self.expected.push_back(Expect::Event(event));
+         self
+@@ -259,37 +249,8 @@ where
+         }
+     }
+ 
+-    fn record_follows_from(&self, consequence_id: &Id, cause_id: &Id) {
+-        let spans = self.spans.lock().unwrap();
+-        if let Some(consequence_span) = spans.get(consequence_id) {
+-            if let Some(cause_span) = spans.get(cause_id) {
+-                println!(
+-                    "[{}] record_follows_from: {} (id={:?}) follows {} (id={:?})",
+-                    self.name, consequence_span.name, consequence_id, cause_span.name, cause_id,
+-                );
+-                match self.expected.lock().unwrap().pop_front() {
+-                    None => {}
+-                    Some(Expect::FollowsFrom {
+-                        consequence: ref expected_consequence,
+-                        cause: ref expected_cause,
+-                    }) => {
+-                        if let Some(name) = expected_consequence.name() {
+-                            assert_eq!(name, consequence_span.name);
+-                        }
+-                        if let Some(name) = expected_cause.name() {
+-                            assert_eq!(name, cause_span.name);
+-                        }
+-                    }
+-                    Some(ex) => ex.bad(
+-                        &self.name,
+-                        format_args!(
+-                            "consequence {:?} followed cause {:?}",
+-                            consequence_span.name, cause_span.name
+-                        ),
+-                    ),
+-                }
+-            }
+-        };
++    fn record_follows_from(&self, _span: &Id, _follows: &Id) {
++        // TODO: it should be possible to expect spans to follow from other spans
+     }
+ 
+     fn new_span(&self, span: &Attributes<'_>) -> Id {
+@@ -493,10 +454,6 @@ impl Expect {
+                 "\n[{}] expected event {}\n[{}] but instead {}",
+                 name, e, name, what,
+             ),
+-            Expect::FollowsFrom { consequence, cause } => panic!(
+-                "\n[{}] expected consequence {} to follow cause {} but instead {}",
+-                name, consequence, cause, what,
+-            ),
+             Expect::Enter(e) => panic!(
+                 "\n[{}] expected to enter {}\n[{}] but instead {}",
+                 name, e, name, what,

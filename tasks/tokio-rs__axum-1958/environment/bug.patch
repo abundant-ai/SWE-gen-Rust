@@ -1,0 +1,336 @@
+diff --git a/axum/CHANGELOG.md b/axum/CHANGELOG.md
+index 5eff31dc..c0f92e36 100644
+--- a/axum/CHANGELOG.md
++++ b/axum/CHANGELOG.md
+@@ -7,9 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ # Unreleased
+ 
+-- **fixed:** Fix fallbacks causing a panic on `CONNECT` requests ([#1958])
+-
+-[#1958]: https://github.com/tokio-rs/axum/pull/1958
++- None.
+ 
+ # 0.6.16 (18. April, 2023)
+ 
+diff --git a/axum/src/routing/method_routing.rs b/axum/src/routing/method_routing.rs
+index 98683573..cd942902 100644
+--- a/axum/src/routing/method_routing.rs
++++ b/axum/src/routing/method_routing.rs
+@@ -1119,7 +1119,15 @@ where
+         call!(req, method, DELETE, delete);
+         call!(req, method, TRACE, trace);
+ 
+-        let future = fallback.call_with_state(req, state);
++        let future = match fallback {
++            Fallback::Default(route) | Fallback::Service(route) => {
++                RouteFuture::from_future(route.oneshot_inner(req))
++            }
++            Fallback::BoxedHandler(handler) => {
++                let mut route = handler.clone().into_route(state);
++                RouteFuture::from_future(route.oneshot_inner(req))
++            }
++        };
+ 
+         match allow_header {
+             AllowHeader::None => future.allow_header(Bytes::new()),
+diff --git a/axum/src/routing/mod.rs b/axum/src/routing/mod.rs
+index 54dc772e..a1d8c715 100644
+--- a/axum/src/routing/mod.rs
++++ b/axum/src/routing/mod.rs
+@@ -60,7 +60,6 @@ pub struct Router<S = (), B = Body> {
+     path_router: PathRouter<S, B, false>,
+     fallback_router: PathRouter<S, B, true>,
+     default_fallback: bool,
+-    catch_all_fallback: Fallback<S, B>,
+ }
+ 
+ impl<S, B> Clone for Router<S, B> {
+@@ -69,7 +68,6 @@ impl<S, B> Clone for Router<S, B> {
+             path_router: self.path_router.clone(),
+             fallback_router: self.fallback_router.clone(),
+             default_fallback: self.default_fallback,
+-            catch_all_fallback: self.catch_all_fallback.clone(),
+         }
+     }
+ }
+@@ -90,7 +88,6 @@ impl<S, B> fmt::Debug for Router<S, B> {
+             .field("path_router", &self.path_router)
+             .field("fallback_router", &self.fallback_router)
+             .field("default_fallback", &self.default_fallback)
+-            .field("catch_all_fallback", &self.catch_all_fallback)
+             .finish()
+     }
+ }
+@@ -109,12 +106,14 @@ where
+     /// Unless you add additional routes this will respond with `404 Not Found` to
+     /// all requests.
+     pub fn new() -> Self {
+-        Self {
++        let mut this = Self {
+             path_router: Default::default(),
+-            fallback_router: PathRouter::new_fallback(),
++            fallback_router: Default::default(),
+             default_fallback: true,
+-            catch_all_fallback: Fallback::Default(Route::new(NotFound)),
+-        }
++        };
++        this = this.fallback_service(NotFound);
++        this.default_fallback = true;
++        this
+     }
+ 
+     #[doc = include_str!("../docs/routing/route.md")]
+@@ -152,10 +151,6 @@ where
+             path_router,
+             fallback_router,
+             default_fallback,
+-            // we don't need to inherit the catch-all fallback. It is only used for CONNECT
+-            // requests with an empty path. If we were to inherit the catch-all fallback
+-            // it would end up matching `/{path}/*` which doesn't match empty paths.
+-            catch_all_fallback: _,
+         } = router;
+ 
+         panic_on_err!(self.path_router.nest(path, path_router));
+@@ -189,7 +184,6 @@ where
+             path_router,
+             fallback_router: other_fallback,
+             default_fallback,
+-            catch_all_fallback,
+         } = other.into();
+ 
+         panic_on_err!(self.path_router.merge(path_router));
+@@ -214,11 +208,6 @@ where
+             }
+         };
+ 
+-        self.catch_all_fallback = self
+-            .catch_all_fallback
+-            .merge(catch_all_fallback)
+-            .unwrap_or_else(|| panic!("Cannot merge two `Router`s that both have a fallback"));
+-
+         self
+     }
+ 
+@@ -234,9 +223,8 @@ where
+     {
+         Router {
+             path_router: self.path_router.layer(layer.clone()),
+-            fallback_router: self.fallback_router.layer(layer.clone()),
++            fallback_router: self.fallback_router.layer(layer),
+             default_fallback: self.default_fallback,
+-            catch_all_fallback: self.catch_all_fallback.map(|route| route.layer(layer)),
+         }
+     }
+ 
+@@ -254,38 +242,36 @@ where
+             path_router: self.path_router.route_layer(layer),
+             fallback_router: self.fallback_router,
+             default_fallback: self.default_fallback,
+-            catch_all_fallback: self.catch_all_fallback,
+         }
+     }
+ 
+     #[track_caller]
+     #[doc = include_str!("../docs/routing/fallback.md")]
+-    pub fn fallback<H, T>(mut self, handler: H) -> Self
++    pub fn fallback<H, T>(self, handler: H) -> Self
+     where
+         H: Handler<T, S, B>,
+         T: 'static,
+     {
+-        self.catch_all_fallback =
+-            Fallback::BoxedHandler(BoxedIntoRoute::from_handler(handler.clone()));
+-        self.fallback_endpoint(Endpoint::MethodRouter(any(handler)))
++        let endpoint = Endpoint::MethodRouter(any(handler));
++        self.fallback_endpoint(endpoint)
+     }
+ 
+     /// Add a fallback [`Service`] to the router.
+     ///
+     /// See [`Router::fallback`] for more details.
+-    pub fn fallback_service<T>(mut self, service: T) -> Self
++    pub fn fallback_service<T>(self, service: T) -> Self
+     where
+         T: Service<Request<B>, Error = Infallible> + Clone + Send + 'static,
+         T::Response: IntoResponse,
+         T::Future: Send + 'static,
+     {
+-        let route = Route::new(service);
+-        self.catch_all_fallback = Fallback::Service(route.clone());
+-        self.fallback_endpoint(Endpoint::Route(route))
++        self.fallback_endpoint(Endpoint::Route(Route::new(service)))
+     }
+ 
+     fn fallback_endpoint(mut self, endpoint: Endpoint<S, B>) -> Self {
+-        self.fallback_router.set_fallback(endpoint);
++        self.fallback_router.replace_endpoint("/", endpoint.clone());
++        self.fallback_router
++            .replace_endpoint(&format!("/*{FALLBACK_PARAM}"), endpoint);
+         self.default_fallback = false;
+         self
+     }
+@@ -294,9 +280,8 @@ where
+     pub fn with_state<S2>(self, state: S) -> Router<S2, B> {
+         Router {
+             path_router: self.path_router.with_state(state.clone()),
+-            fallback_router: self.fallback_router.with_state(state.clone()),
++            fallback_router: self.fallback_router.with_state(state),
+             default_fallback: self.default_fallback,
+-            catch_all_fallback: self.catch_all_fallback.with_state(state),
+         }
+     }
+ 
+@@ -322,17 +307,19 @@ where
+                     .map(|SuperFallback(path_router)| path_router.into_inner());
+ 
+                 if let Some(mut super_fallback) = super_fallback {
+-                    match super_fallback.call_with_state(req, state) {
+-                        Ok(future) => return future,
+-                        Err((req, state)) => {
+-                            return self.catch_all_fallback.call_with_state(req, state);
+-                        }
+-                    }
++                    return super_fallback
++                        .call_with_state(req, state)
++                        .unwrap_or_else(|_| unreachable!());
+                 }
+ 
+                 match self.fallback_router.call_with_state(req, state) {
+                     Ok(future) => future,
+-                    Err((req, state)) => self.catch_all_fallback.call_with_state(req, state),
++                    Err((_req, _state)) => {
++                        unreachable!(
++                            "the default fallback added in `Router::new` \
++                             matches everything"
++                        )
++                    }
+                 }
+             }
+         }
+@@ -441,18 +428,6 @@ where
+             Fallback::BoxedHandler(handler) => Fallback::Service(handler.into_route(state)),
+         }
+     }
+-
+-    fn call_with_state(&mut self, req: Request<B>, state: S) -> RouteFuture<B, E> {
+-        match self {
+-            Fallback::Default(route) | Fallback::Service(route) => {
+-                RouteFuture::from_future(route.oneshot_inner(req))
+-            }
+-            Fallback::BoxedHandler(handler) => {
+-                let mut route = handler.clone().into_route(state);
+-                RouteFuture::from_future(route.oneshot_inner(req))
+-            }
+-        }
+-    }
+ }
+ 
+ impl<S, B, E> Clone for Fallback<S, B, E> {
+diff --git a/axum/src/routing/path_router.rs b/axum/src/routing/path_router.rs
+index e05a7997..ca618e75 100644
+--- a/axum/src/routing/path_router.rs
++++ b/axum/src/routing/path_router.rs
+@@ -7,8 +7,8 @@ use tower_layer::Layer;
+ use tower_service::Service;
+ 
+ use super::{
+-    future::RouteFuture, not_found::NotFound, strip_prefix::StripPrefix, url_params, Endpoint,
+-    MethodRouter, Route, RouteId, FALLBACK_PARAM, NEST_TAIL_PARAM,
++    future::RouteFuture, strip_prefix::StripPrefix, url_params, Endpoint, MethodRouter, Route,
++    RouteId, NEST_TAIL_PARAM,
+ };
+ 
+ pub(super) struct PathRouter<S, B, const IS_FALLBACK: bool> {
+@@ -17,23 +17,6 @@ pub(super) struct PathRouter<S, B, const IS_FALLBACK: bool> {
+     prev_route_id: RouteId,
+ }
+ 
+-impl<S, B> PathRouter<S, B, true>
+-where
+-    B: HttpBody + Send + 'static,
+-    S: Clone + Send + Sync + 'static,
+-{
+-    pub(super) fn new_fallback() -> Self {
+-        let mut this = Self::default();
+-        this.set_fallback(Endpoint::Route(Route::new(NotFound)));
+-        this
+-    }
+-
+-    pub(super) fn set_fallback(&mut self, endpoint: Endpoint<S, B>) {
+-        self.replace_endpoint("/", endpoint.clone());
+-        self.replace_endpoint(&format!("/*{FALLBACK_PARAM}"), endpoint);
+-    }
+-}
+-
+ impl<S, B, const IS_FALLBACK: bool> PathRouter<S, B, IS_FALLBACK>
+ where
+     B: HttpBody + Send + 'static,
+diff --git a/axum/src/routing/tests/mod.rs b/axum/src/routing/tests/mod.rs
+index ad7d5067..950d601a 100644
+--- a/axum/src/routing/tests/mod.rs
++++ b/axum/src/routing/tests/mod.rs
+@@ -15,11 +15,7 @@ use crate::{
+     BoxError, Extension, Json, Router,
+ };
+ use futures_util::stream::StreamExt;
+-use http::{
+-    header::CONTENT_LENGTH,
+-    header::{ALLOW, HOST},
+-    HeaderMap, Method, Request, Response, StatusCode, Uri,
+-};
++use http::{header::ALLOW, header::CONTENT_LENGTH, HeaderMap, Request, Response, StatusCode, Uri};
+ use hyper::Body;
+ use serde::Deserialize;
+ use serde_json::json;
+@@ -30,9 +26,7 @@ use std::{
+     task::{Context, Poll},
+     time::Duration,
+ };
+-use tower::{
+-    service_fn, timeout::TimeoutLayer, util::MapResponseLayer, ServiceBuilder, ServiceExt,
+-};
++use tower::{service_fn, timeout::TimeoutLayer, util::MapResponseLayer, ServiceBuilder};
+ use tower_http::{limit::RequestBodyLimitLayer, validate_request::ValidateRequestHeaderLayer};
+ use tower_service::Service;
+ 
+@@ -990,39 +984,3 @@ async fn logging_rejections() {
+         ])
+     )
+ }
+-
+-// https://github.com/tokio-rs/axum/issues/1955
+-#[crate::test]
+-async fn connect_going_to_custom_fallback() {
+-    let app = Router::new().fallback(|| async { (StatusCode::NOT_FOUND, "custom fallback") });
+-
+-    let req = Request::builder()
+-        .uri("example.com:443")
+-        .method(Method::CONNECT)
+-        .header(HOST, "example.com:443")
+-        .body(Body::empty())
+-        .unwrap();
+-
+-    let res = app.oneshot(req).await.unwrap();
+-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+-    let text = String::from_utf8(hyper::body::to_bytes(res).await.unwrap().to_vec()).unwrap();
+-    assert_eq!(text, "custom fallback");
+-}
+-
+-// https://github.com/tokio-rs/axum/issues/1955
+-#[crate::test]
+-async fn connect_going_to_default_fallback() {
+-    let app = Router::new();
+-
+-    let req = Request::builder()
+-        .uri("example.com:443")
+-        .method(Method::CONNECT)
+-        .header(HOST, "example.com:443")
+-        .body(Body::empty())
+-        .unwrap();
+-
+-    let res = app.oneshot(req).await.unwrap();
+-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+-    let body = hyper::body::to_bytes(res).await.unwrap();
+-    assert!(body.is_empty());
+-}

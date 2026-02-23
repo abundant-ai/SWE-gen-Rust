@@ -1,0 +1,336 @@
+diff --git a/impl/src/attr.rs b/impl/src/attr.rs
+index 7a290bb..efd3e65 100644
+--- a/impl/src/attr.rs
++++ b/impl/src/attr.rs
+@@ -11,7 +11,6 @@ pub struct Attrs<'a> {
+     pub display: Option<Display<'a>>,
+     pub source: Option<&'a Attribute>,
+     pub backtrace: Option<&'a Attribute>,
+-    pub from: Option<&'a Attribute>,
+ }
+ 
+ #[derive(Clone)]
+@@ -27,7 +26,6 @@ pub fn get(input: &[Attribute]) -> Result<Attrs> {
+         display: None,
+         source: None,
+         backtrace: None,
+-        from: None,
+     };
+ 
+     for attr in input {
+@@ -52,15 +50,6 @@ pub fn get(input: &[Attribute]) -> Result<Attrs> {
+                 return Err(Error::new_spanned(attr, "duplicate #[backtrace] attribute"));
+             }
+             attrs.backtrace = Some(attr);
+-        } else if attr.path.is_ident("from") {
+-            if !attr.tokens.is_empty() {
+-                // Assume this is meant for derive_more crate or something.
+-                continue;
+-            }
+-            if attrs.from.is_some() {
+-                return Err(Error::new_spanned(attr, "duplicate #[from] attribute"));
+-            }
+-            attrs.from = Some(attr);
+         }
+     }
+ 
+diff --git a/impl/src/expand.rs b/impl/src/expand.rs
+index 94b5592..42c0e86 100644
+--- a/impl/src/expand.rs
++++ b/impl/src/expand.rs
+@@ -89,25 +89,12 @@ fn impl_struct(input: Struct) -> TokenStream {
+         }
+     });
+ 
+-    let from_impl = input.from_field().map(|from_field| {
+-        let member = &from_field.member;
+-        let from = from_field.ty;
+-        quote! {
+-            impl #impl_generics std::convert::From<#from> for #ty #ty_generics #where_clause {
+-                fn from(source: #from) -> Self {
+-                    #ty { #member: source }
+-                }
+-            }
+-        }
+-    });
+-
+     quote! {
+         impl #impl_generics std::error::Error for #ty #ty_generics #where_clause {
+             #source_method
+             #backtrace_method
+         }
+         #display_impl
+-        #from_impl
+     }
+ }
+ 
+@@ -241,27 +228,12 @@ fn impl_enum(input: Enum) -> TokenStream {
+         None
+     };
+ 
+-    let from_impls = input.variants.iter().filter_map(|variant| {
+-        let from_field = variant.from_field()?;
+-        let variant = &variant.ident;
+-        let member = &from_field.member;
+-        let from = from_field.ty;
+-        Some(quote! {
+-            impl #impl_generics std::convert::From<#from> for #ty #ty_generics #where_clause {
+-                fn from(source: #from) -> Self {
+-                    #ty::#variant { #member: source }
+-                }
+-            }
+-        })
+-    });
+-
+     quote! {
+         impl #impl_generics std::error::Error for #ty #ty_generics #where_clause {
+             #source_method
+             #backtrace_method
+         }
+         #display_impl
+-        #(#from_impls)*
+     }
+ }
+ 
+diff --git a/impl/src/lib.rs b/impl/src/lib.rs
+index 119e243..2ea966b 100644
+--- a/impl/src/lib.rs
++++ b/impl/src/lib.rs
+@@ -10,7 +10,7 @@ mod valid;
+ use proc_macro::TokenStream;
+ use syn::{parse_macro_input, DeriveInput};
+ 
+-#[proc_macro_derive(Error, attributes(backtrace, error, from, source))]
++#[proc_macro_derive(Error, attributes(backtrace, error, source))]
+ pub fn derive_error(input: TokenStream) -> TokenStream {
+     let input = parse_macro_input!(input as DeriveInput);
+     expand::derive(&input)
+diff --git a/impl/src/prop.rs b/impl/src/prop.rs
+index 3e40539..56b6108 100644
+--- a/impl/src/prop.rs
++++ b/impl/src/prop.rs
+@@ -2,10 +2,6 @@ use crate::ast::{Enum, Field, Struct, Variant};
+ use syn::{Member, Type};
+ 
+ impl Struct<'_> {
+-    pub(crate) fn from_field(&self) -> Option<&Field> {
+-        from_field(&self.fields)
+-    }
+-
+     pub(crate) fn source_field(&self) -> Option<&Field> {
+         source_field(&self.fields)
+     }
+@@ -38,10 +34,6 @@ impl Enum<'_> {
+ }
+ 
+ impl Variant<'_> {
+-    pub(crate) fn from_field(&self) -> Option<&Field> {
+-        from_field(&self.fields)
+-    }
+-
+     pub(crate) fn source_field(&self) -> Option<&Field> {
+         source_field(&self.fields)
+     }
+@@ -51,18 +43,9 @@ impl Variant<'_> {
+     }
+ }
+ 
+-fn from_field<'a, 'b>(fields: &'a [Field<'b>]) -> Option<&'a Field<'b>> {
+-    for field in fields {
+-        if field.attrs.from.is_some() {
+-            return Some(&field);
+-        }
+-    }
+-    None
+-}
+-
+ fn source_field<'a, 'b>(fields: &'a [Field<'b>]) -> Option<&'a Field<'b>> {
+     for field in fields {
+-        if field.attrs.from.is_some() || field.attrs.source.is_some() {
++        if field.attrs.source.is_some() {
+             return Some(&field);
+         }
+     }
+diff --git a/impl/src/valid.rs b/impl/src/valid.rs
+index d52882d..5c0fd58 100644
+--- a/impl/src/valid.rs
++++ b/impl/src/valid.rs
+@@ -1,8 +1,6 @@
+ use crate::ast::{Enum, Field, Input, Struct, Variant};
+ use crate::attr::Attrs;
+-use quote::ToTokens;
+-use std::collections::BTreeSet as Set;
+-use syn::{Error, Member, Result};
++use syn::{Error, Result};
+ 
+ pub(crate) const CHECKED: &str = "checked in validation";
+ 
+@@ -39,18 +37,6 @@ impl Enum<'_> {
+                 ));
+             }
+         }
+-        let mut from_types = Set::new();
+-        for variant in &self.variants {
+-            if let Some(from_field) = variant.from_field() {
+-                let repr = from_field.ty.to_token_stream().to_string();
+-                if !from_types.insert(repr) {
+-                    return Err(Error::new_spanned(
+-                        from_field.original,
+-                        "cannot derive From because another variant has the same source type",
+-                    ));
+-                }
+-            }
+-        }
+         Ok(())
+     }
+ }
+@@ -79,12 +65,6 @@ impl Field<'_> {
+ }
+ 
+ fn check_non_field_attrs(attrs: &Attrs) -> Result<()> {
+-    if let Some(from) = &attrs.from {
+-        return Err(Error::new_spanned(
+-            from,
+-            "not expected here; the #[from] attribute belongs on a specific field",
+-        ));
+-    }
+     if let Some(source) = &attrs.source {
+         return Err(Error::new_spanned(
+             source,
+@@ -101,55 +81,24 @@ fn check_non_field_attrs(attrs: &Attrs) -> Result<()> {
+ }
+ 
+ fn check_field_attrs(fields: &[Field]) -> Result<()> {
+-    let mut from_field = None;
+-    let mut source_field = None;
+-    let mut backtrace_field = None;
++    let mut has_source = false;
++    let mut has_backtrace = false;
+     for field in fields {
+-        if let Some(from) = field.attrs.from {
+-            if from_field.is_some() {
+-                return Err(Error::new_spanned(from, "duplicate #[from] attribute"));
+-            }
+-            from_field = Some(field);
+-        }
+-        if let Some(source) = field.attrs.source {
+-            if source_field.is_some() {
++        if let Some(source) = &field.attrs.source {
++            if has_source {
+                 return Err(Error::new_spanned(source, "duplicate #[source] attribute"));
+             }
+-            source_field = Some(field);
++            has_source = true;
+         }
+-        if let Some(backtrace) = field.attrs.backtrace {
+-            if backtrace_field.is_some() {
++        if let Some(backtrace) = &field.attrs.backtrace {
++            if has_backtrace {
+                 return Err(Error::new_spanned(
+                     backtrace,
+                     "duplicate #[backtrace] attribute",
+                 ));
+             }
+-            backtrace_field = Some(field);
+-        }
+-    }
+-    if let (Some(from_field), Some(source_field)) = (from_field, source_field) {
+-        if !same_member(from_field, source_field) {
+-            return Err(Error::new_spanned(
+-                from_field.attrs.from,
+-                "#[from] is only supported on the source field, not any other field",
+-            ));
+-        }
+-    }
+-    if let Some(from_field) = from_field {
+-        if fields.len() > 1 {
+-            return Err(Error::new_spanned(
+-                from_field.attrs.from,
+-                "deriving From requires no fields other than source",
+-            ));
++            has_backtrace = true;
+         }
+     }
+     Ok(())
+ }
+-
+-fn same_member(one: &Field, two: &Field) -> bool {
+-    match (&one.member, &two.member) {
+-        (Member::Named(one), Member::Named(two)) => one == two,
+-        (Member::Unnamed(one), Member::Unnamed(two)) => one.index == two.index,
+-        _ => unreachable!(),
+-    }
+-}
+diff --git a/tests/test_from.rs b/tests/test_from.rs
+deleted file mode 100644
+index f1755fb..0000000
+--- a/tests/test_from.rs
++++ /dev/null
+@@ -1,39 +0,0 @@
+-use std::io;
+-use thiserror::Error;
+-
+-#[derive(Error, Debug)]
+-#[error("...")]
+-pub struct ErrorStruct {
+-    #[from]
+-    source: io::Error,
+-}
+-
+-#[derive(Error, Debug)]
+-#[error("...")]
+-pub struct ErrorTuple(#[from] io::Error);
+-
+-#[derive(Error, Debug)]
+-#[error("...")]
+-pub enum ErrorEnum {
+-    Test {
+-        #[from]
+-        source: io::Error,
+-    },
+-}
+-
+-#[derive(Error, Debug)]
+-#[error("...")]
+-pub enum Many {
+-    Any(#[from] anyhow::Error),
+-    Io(#[from] io::Error),
+-}
+-
+-fn assert_impl<T: From<io::Error>>() {}
+-
+-#[test]
+-fn test_from() {
+-    assert_impl::<ErrorStruct>();
+-    assert_impl::<ErrorTuple>();
+-    assert_impl::<ErrorEnum>();
+-    assert_impl::<Many>();
+-}
+diff --git a/tests/ui/from-not-source.rs b/tests/ui/from-not-source.rs
+deleted file mode 100644
+index d1855be..0000000
+--- a/tests/ui/from-not-source.rs
++++ /dev/null
+@@ -1,11 +0,0 @@
+-use thiserror::Error;
+-
+-#[derive(Debug, Error)]
+-pub struct Error {
+-    #[source]
+-    source: std::io::Error,
+-    #[from]
+-    other: anyhow::Error,
+-}
+-
+-fn main() {}
+diff --git a/tests/ui/from-not-source.stderr b/tests/ui/from-not-source.stderr
+deleted file mode 100644
+index b656c8e..0000000
+--- a/tests/ui/from-not-source.stderr
++++ /dev/null
+@@ -1,5 +0,0 @@
+-error: #[from] is only supported on the source field, not any other field
+- --> $DIR/from-not-source.rs:7:5
+-  |
+-7 |     #[from]
+-  |     ^^^^^^^

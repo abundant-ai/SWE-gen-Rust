@@ -1,0 +1,270 @@
+diff --git a/src/cargo/ops/cargo_add/mod.rs b/src/cargo/ops/cargo_add/mod.rs
+index 44c20df72..9b9021ae2 100644
+--- a/src/cargo/ops/cargo_add/mod.rs
++++ b/src/cargo/ops/cargo_add/mod.rs
+@@ -253,7 +253,9 @@ pub fn add(workspace: &Workspace<'_>, options: &AddOptions<'_>) -> CargoResult<(
+             if is_namespaced_features_supported {
+                 let dep_key = dep.toml_key();
+                 if !manifest.is_explicit_dep_activation(dep_key) {
+-                    let table = manifest.get_table_mut(&[String::from("features")])?;
++                    let table = manifest
++                        .get_table_mut(&[String::from("features")])
++                        .expect("manifest validated");
+                     let dep_name = dep.rename.as_deref().unwrap_or(&dep.name);
+                     let new_feature: toml_edit::Value =
+                         [format!("dep:{dep_name}")].iter().collect();
+@@ -271,7 +273,6 @@ pub fn add(workspace: &Workspace<'_>, options: &AddOptions<'_>) -> CargoResult<(
+     if was_sorted {
+         if let Some(table) = manifest
+             .get_table_mut(&dep_table)
+-            .ok()
+             .and_then(TomlItem::as_table_like_mut)
+         {
+             table.sort_values();
+diff --git a/src/cargo/ops/cargo_remove.rs b/src/cargo/ops/cargo_remove.rs
+index 81d7b42e2..9b2877ee3 100644
+--- a/src/cargo/ops/cargo_remove.rs
++++ b/src/cargo/ops/cargo_remove.rs
+@@ -5,6 +5,7 @@ use crate::GlobalContext;
+ use crate::core::Package;
+ use crate::util::toml_mut::manifest::DepTable;
+ use crate::util::toml_mut::manifest::LocalManifest;
++use crate::util::toml_mut::manifest::MissingDependencyError;
+ 
+ /// Remove a dependency from a Cargo.toml manifest file.
+ #[derive(Debug)]
+@@ -44,7 +45,60 @@ pub fn remove(options: &RemoveOptions<'_>) -> CargoResult<()> {
+             .shell()
+             .status("Removing", format!("{dep} from {section}"))?;
+ 
+-        manifest.remove_from_table(&dep_table, dep)?;
++        manifest.remove_from_table(&dep_table, dep).map_err(
++            |MissingDependencyError {
++                 expected_name,
++                 expected_path,
++                 alt_name,
++                 alt_path,
++             }| {
++                use std::fmt::Write as _;
++
++                let mut error = String::new();
++                let path = expected_path.join(".");
++                let _ = write!(
++                    &mut error,
++                    "the dependency `{expected_name}` could not be found in `{path}`"
++                );
++                if let Some(alt_path) = alt_path {
++                    let mut flags = Vec::new();
++                    match (
++                        expected_path.last().unwrap().as_str(),
++                        alt_path.last().unwrap().as_str(),
++                    ) {
++                        ("build-dependencies", "build-dependencies") => {}
++                        ("dev-dependencies", "dev-dependencies") => {}
++                        ("dependencies", "dependencies") => {}
++                        (_, "build-dependencies") => flags.push("--build"),
++                        (_, "dev-dependencies") => flags.push("--dev"),
++                        (_, _) => {}
++                    }
++                    if expected_path[0] != "target" && alt_path[0] == "target" {
++                        flags.push(&"--target");
++                        flags.push(&alt_path[1]);
++                    }
++                    let alt_path = alt_path.join(".");
++                    if !flags.is_empty() {
++                        let flags = flags.join(" ");
++                        let _ = write!(
++                            &mut error,
++                            "\n\nhelp: pass `{flags}` to remove `{expected_name}` from `{alt_path}`"
++                        );
++                    } else {
++                        let _ = write!(
++                            &mut error,
++                            "\n\nhelp: a dependency with the same name exists in `{alt_path}`"
++                        );
++                    }
++                } else if let Some(alt_name) = alt_name {
++                    let _ = write!(
++                        &mut error,
++                        "\n\nhelp: a dependency with a similar name exists: `{alt_name}`"
++                    );
++                }
++                anyhow::format_err!("{error}")
++            },
++        )?;
+ 
+         // Now that we have removed the crate, if that was the last reference to that
+         // crate, then we need to drop any explicitly activated features on
+diff --git a/src/cargo/util/toml_mut/manifest.rs b/src/cargo/util/toml_mut/manifest.rs
+index cb889b74d..812bdad55 100644
+--- a/src/cargo/util/toml_mut/manifest.rs
++++ b/src/cargo/util/toml_mut/manifest.rs
+@@ -99,24 +99,19 @@ impl Manifest {
+     }
+ 
+     /// Get the specified table from the manifest.
+-    pub fn get_table<'a>(&'a self, table_path: &[String]) -> CargoResult<&'a toml_edit::Item> {
++    pub fn get_table<'a>(&'a self, table_path: &[String]) -> Option<&'a toml_edit::Item> {
+         /// Descend into a manifest until the required table is found.
+-        fn descend<'a>(
+-            input: &'a toml_edit::Item,
+-            path: &[String],
+-        ) -> CargoResult<&'a toml_edit::Item> {
++        fn descend<'a>(input: &'a toml_edit::Item, path: &[String]) -> Option<&'a toml_edit::Item> {
+             if let Some(segment) = path.get(0) {
+-                let value = input
+-                    .get(&segment)
+-                    .ok_or_else(|| non_existent_table_err(segment))?;
++                let value = input.get(&segment)?;
+ 
+                 if value.is_table_like() {
+                     descend(value, &path[1..])
+                 } else {
+-                    Err(non_existent_table_err(segment))
++                    None
+                 }
+             } else {
+-                Ok(input)
++                Some(input)
+             }
+         }
+ 
+@@ -127,12 +122,12 @@ impl Manifest {
+     pub fn get_table_mut<'a>(
+         &'a mut self,
+         table_path: &[String],
+-    ) -> CargoResult<&'a mut toml_edit::Item> {
++    ) -> Option<&'a mut toml_edit::Item> {
+         /// Descend into a manifest until the required table is found.
+         fn descend<'a>(
+             input: &'a mut toml_edit::Item,
+             path: &[String],
+-        ) -> CargoResult<&'a mut toml_edit::Item> {
++        ) -> Option<&'a mut toml_edit::Item> {
+             if let Some(segment) = path.get(0) {
+                 let mut default_table = toml_edit::Table::new();
+                 default_table.set_implicit(true);
+@@ -141,10 +136,10 @@ impl Manifest {
+                 if value.is_table_like() {
+                     descend(value, &path[1..])
+                 } else {
+-                    Err(non_existent_table_err(segment))
++                    None
+                 }
+             } else {
+-                Ok(input)
++                Some(input)
+             }
+         }
+ 
+@@ -374,7 +369,9 @@ impl LocalManifest {
+             .to_owned();
+         let dep_key = dep.toml_key();
+ 
+-        let table = self.get_table_mut(table_path)?;
++        let table = self
++            .get_table_mut(table_path)
++            .expect("manifest validated, path should be to a table");
+         if let Some((mut dep_key, dep_item)) = table
+             .as_table_like_mut()
+             .unwrap()
+@@ -404,8 +401,14 @@ impl LocalManifest {
+     }
+ 
+     /// Remove entry from a Cargo.toml.
+-    pub fn remove_from_table(&mut self, table_path: &[String], name: &str) -> CargoResult<()> {
+-        let parent_table = self.get_table_mut(table_path)?;
++    pub fn remove_from_table(
++        &mut self,
++        table_path: &[String],
++        name: &str,
++    ) -> Result<(), MissingDependencyError> {
++        let parent_table = self
++            .get_table_mut(table_path)
++            .expect("manifest validated, path should be to a table");
+ 
+         match parent_table.get_mut(name).filter(|t| !t.is_none()) {
+             Some(dep) => {
+@@ -430,15 +433,15 @@ impl LocalManifest {
+                 let found_table_path = sections.iter().find_map(|(t, i)| {
+                     let table_path: Vec<String> =
+                         t.to_table().iter().map(|s| s.to_string()).collect();
+-                    i.get(name).is_some().then(|| table_path.join("."))
++                    i.get(name).is_some().then(|| table_path)
+                 });
+ 
+-                return Err(non_existent_dependency_err(
+-                    name,
+-                    table_path.join("."),
+-                    found_table_path,
+-                    alt_name.as_deref(),
+-                ));
++                return Err(MissingDependencyError {
++                    expected_name: name.to_owned(),
++                    expected_path: table_path.to_owned(),
++                    alt_name: alt_name,
++                    alt_path: found_table_path,
++                });
+             }
+         }
+ 
+@@ -669,29 +672,40 @@ fn parse_manifest_err() -> anyhow::Error {
+     anyhow::format_err!("unable to parse external Cargo.toml")
+ }
+ 
+-fn non_existent_table_err(table: impl std::fmt::Display) -> anyhow::Error {
+-    anyhow::format_err!("the table `{table}` could not be found.")
++#[derive(Debug)]
++pub struct MissingDependencyError {
++    pub expected_name: String,
++    pub expected_path: Vec<String>,
++    pub alt_path: Option<Vec<String>>,
++    pub alt_name: Option<String>,
+ }
+ 
+-fn non_existent_dependency_err(
+-    name: impl std::fmt::Display,
+-    search_table: impl std::fmt::Display,
+-    found_table: Option<impl std::fmt::Display>,
+-    alt_name: Option<&str>,
+-) -> anyhow::Error {
+-    let mut msg = format!("the dependency `{name}` could not be found in `{search_table}`");
+-    if let Some(found_table) = found_table {
+-        msg.push_str(&format!(
+-            "\n\nhelp: a dependency with the same name exists in `{found_table}`"
+-        ));
+-    } else if let Some(alt_name) = alt_name {
+-        msg.push_str(&format!(
+-            "\n\nhelp: a dependency with a similar name exists: `{alt_name}`"
+-        ));
+-    }
+-    anyhow::format_err!(msg)
++impl std::fmt::Display for MissingDependencyError {
++    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        let expected_name = &self.expected_name;
++        let expected_path = self.expected_path.join(".");
++        write!(
++            fmt,
++            "the dependency `{expected_name}` could not be found in `{expected_path}`"
++        )?;
++        if let Some(alt_path) = &self.alt_path {
++            let alt_path = alt_path.join(".");
++            write!(
++                fmt,
++                "\n\nhelp: a dependency with the same name exists in `{alt_path}`"
++            )?;
++        } else if let Some(alt_name) = &self.alt_name {
++            write!(
++                fmt,
++                "\n\nhelp: a dependency with a similar name exists: `{alt_name}`"
++            )?;
++        }
++        Ok(())
++    }
+ }
+ 
++impl std::error::Error for MissingDependencyError {}
++
+ fn remove_array_index(array: &mut toml_edit::Array, index: usize) {
+     let value = array.remove(index);
+ 

@@ -1,0 +1,400 @@
+diff --git a/tracing-subscriber/src/reload.rs b/tracing-subscriber/src/reload.rs
+index 22370cc4..f1fa0f1f 100644
+--- a/tracing-subscriber/src/reload.rs
++++ b/tracing-subscriber/src/reload.rs
+@@ -23,7 +23,6 @@
+ use crate::subscribe;
+ use crate::sync::RwLock;
+ 
+-use core::{any::TypeId, ptr::NonNull};
+ use std::{
+     error, fmt,
+     sync::{Arc, Weak},
+@@ -145,25 +144,6 @@ where
+     fn max_level_hint(&self) -> Option<LevelFilter> {
+         try_lock!(self.inner.read(), else return None).max_level_hint()
+     }
+-
+-    #[doc(hidden)]
+-    unsafe fn downcast_raw(&self, id: TypeId) -> Option<NonNull<()>> {
+-        // Safety: it is generally unsafe to downcast through a reload, because
+-        // the pointer can be invalidated after the lock is dropped.
+-        // `NoneLayerMarker` is a special case because it
+-        // is never dereferenced.
+-        //
+-        // Additionally, even if the marker type *is* dereferenced (which it
+-        // never will be), the pointer should be valid even if the subscriber
+-        // is reloaded, because all `NoneLayerMarker` pointers that we return
+-        // actually point to the global static singleton `NoneLayerMarker`,
+-        // rather than to a field inside the lock.
+-        if id == TypeId::of::<subscribe::NoneLayerMarker>() {
+-            return try_lock!(self.inner.read(), else return None).downcast_raw(id);
+-        }
+-
+-        None
+-    }
+ }
+ 
+ #[cfg(all(feature = "registry", feature = "std"))]
+diff --git a/tracing-subscriber/src/subscribe/layered.rs b/tracing-subscriber/src/subscribe/layered.rs
+index bc67cc10..787472de 100644
+--- a/tracing-subscriber/src/subscribe/layered.rs
++++ b/tracing-subscriber/src/subscribe/layered.rs
+@@ -119,7 +119,6 @@ where
+         self.pick_level_hint(
+             self.subscriber.max_level_hint(),
+             self.inner.max_level_hint(),
+-            super::collector_is_none(&self.inner),
+         )
+     }
+ 
+@@ -275,7 +274,6 @@ where
+         self.pick_level_hint(
+             self.subscriber.max_level_hint(),
+             self.inner.max_level_hint(),
+-            super::subscriber_is_none(&self.inner),
+         )
+     }
+ 
+@@ -479,7 +477,6 @@ where
+         &self,
+         outer_hint: Option<LevelFilter>,
+         inner_hint: Option<LevelFilter>,
+-        inner_is_none: bool,
+     ) -> Option<LevelFilter> {
+         if self.inner_is_registry {
+             return outer_hint;
+@@ -497,31 +494,6 @@ where
+             return None;
+         }
+ 
+-        // If the subscriber is `Option::None`, then we
+-        // want to short-circuit the layer underneath, if it
+-        // returns `None`, to override the `None` layer returning
+-        // `Some(OFF)`, which should ONLY apply when there are
+-        // no other layers that return `None`. Note this
+-        // `None` does not == `Some(TRACE)`, it means
+-        // something more like: "whatever all the other
+-        // layers agree on, default to `TRACE` if none
+-        // have an opinion". We also choose do this AFTER
+-        // we check for per-subscriber filters, which
+-        // have their own logic.
+-        //
+-        // Also note that this does come at some perf cost, but
+-        // this function is only called on initialization and
+-        // subscriber reloading.
+-        if super::subscriber_is_none(&self.subscriber) {
+-            return cmp::max(outer_hint, Some(inner_hint?));
+-        }
+-
+-        // Similarly, if the layer on the inside is `None` and it returned an
+-        // `Off` hint, we want to override that with the outer hint.
+-        if inner_is_none && inner_hint == Some(LevelFilter::OFF) {
+-            return outer_hint;
+-        }
+-
+         cmp::max(outer_hint, inner_hint)
+     }
+ }
+diff --git a/tracing-subscriber/src/subscribe/mod.rs b/tracing-subscriber/src/subscribe/mod.rs
+index a18d95fc..6d77eb05 100644
+--- a/tracing-subscriber/src/subscribe/mod.rs
++++ b/tracing-subscriber/src/subscribe/mod.rs
+@@ -1492,47 +1492,6 @@ pub struct Identity {
+ 
+ // === impl Subscribe ===
+ 
+-#[derive(Clone, Copy)]
+-pub(crate) struct NoneLayerMarker(());
+-static NONE_LAYER_MARKER: NoneLayerMarker = NoneLayerMarker(());
+-
+-/// Is a type implementing `Subscriber` `Option::<_>::None`?
+-pub(crate) fn subscriber_is_none<S, C>(subscriber: &S) -> bool
+-where
+-    S: Subscribe<C>,
+-    C: Collect,
+-{
+-    unsafe {
+-        // Safety: we're not actually *doing* anything with this pointer ---
+-        // this only care about the `Option`, which is essentially being used
+-        // as a bool. We can rely on the pointer being valid, because it is
+-        // a crate-private type, and is only returned by the `Subscribe` impl
+-        // for `Option`s. However, even if the subscriber *does* decide to be
+-        // evil and give us an invalid pointer here, that's fine, because we'll
+-        // never actually dereference it.
+-        subscriber.downcast_raw(TypeId::of::<NoneLayerMarker>())
+-    }
+-    .is_some()
+-}
+-
+-/// Is a type implementing `Collect` `Option::<_>::None`?
+-pub(crate) fn collector_is_none<C>(collector: &C) -> bool
+-where
+-    C: Collect,
+-{
+-    unsafe {
+-        // Safety: we're not actually *doing* anything with this pointer ---
+-        // this only care about the `Option`, which is essentially being used
+-        // as a bool. We can rely on the pointer being valid, because it is
+-        // a crate-private type, and is only returned by the `Subscribe` impl
+-        // for `Option`s. However, even if the subscriber *does* decide to be
+-        // evil and give us an invalid pointer here, that's fine, because we'll
+-        // never actually dereference it.
+-        collector.downcast_raw(TypeId::of::<NoneLayerMarker>())
+-    }
+-    .is_some()
+-}
+-
+ impl<S, C> Subscribe<C> for Option<S>
+ where
+     S: Subscribe<C>,
+@@ -1647,8 +1606,6 @@ where
+     unsafe fn downcast_raw(&self, id: TypeId) -> Option<NonNull<()>> {
+         if id == TypeId::of::<Self>() {
+             Some(NonNull::from(self).cast())
+-        } else if id == TypeId::of::<NoneLayerMarker>() && self.is_none() {
+-            Some(NonNull::from(&NONE_LAYER_MARKER).cast())
+         } else {
+             self.as_ref().and_then(|inner| inner.downcast_raw(id))
+         }
+diff --git a/tracing-subscriber/tests/option.rs b/tracing-subscriber/tests/option.rs
+index 92585e70..a0f127e2 100644
+--- a/tracing-subscriber/tests/option.rs
++++ b/tracing-subscriber/tests/option.rs
+@@ -1,23 +1,7 @@
+ #![cfg(feature = "registry")]
+-use tracing_core::{collect::Interest, Collect, LevelFilter, Metadata};
+-use tracing_subscriber::{prelude::*, subscribe};
+-
+-// A basic layer that returns its inner for `max_level_hint`
+-#[derive(Debug)]
+-struct BasicLayer(Option<LevelFilter>);
+-impl<C: Collect> tracing_subscriber::Subscribe<C> for BasicLayer {
+-    fn register_callsite(&self, _m: &Metadata<'_>) -> Interest {
+-        Interest::sometimes()
+-    }
+-
+-    fn enabled(&self, _m: &Metadata<'_>, _: subscribe::Context<'_, C>) -> bool {
+-        true
+-    }
+-
+-    fn max_level_hint(&self) -> Option<LevelFilter> {
+-        self.0
+-    }
+-}
++use tracing::level_filters::LevelFilter;
++use tracing::Collect;
++use tracing_subscriber::prelude::*;
+ 
+ // This test is just used to compare to the tests below
+ #[test]
+@@ -55,209 +39,3 @@ fn just_option_none_subscriber() {
+     let collector = tracing_subscriber::registry().with(Some(LevelFilter::ERROR));
+     assert_eq!(collector.max_level_hint(), Some(LevelFilter::ERROR));
+ }
+-
+-// Test that the `None` max level hint only applies if its the only layer
+-#[test]
+-fn none_outside_doesnt_override_max_level() {
+-    // None means the other layer takes control
+-    let subscriber = tracing_subscriber::registry()
+-        .with(BasicLayer(None))
+-        .with(None::<LevelFilter>);
+-    assert_eq!(
+-        subscriber.max_level_hint(),
+-        None,
+-        "\n stack: {:#?}",
+-        subscriber
+-    );
+-
+-    // The `None`-returning layer still wins
+-    let subscriber = tracing_subscriber::registry()
+-        .with(BasicLayer(None))
+-        .with(Some(LevelFilter::ERROR));
+-    assert_eq!(
+-        subscriber.max_level_hint(),
+-        Some(LevelFilter::ERROR),
+-        "\n stack: {:#?}",
+-        subscriber
+-    );
+-
+-    // Check that we aren't doing anything truly wrong
+-    let subscriber = tracing_subscriber::registry()
+-        .with(BasicLayer(Some(LevelFilter::DEBUG)))
+-        .with(None::<LevelFilter>);
+-    assert_eq!(
+-        subscriber.max_level_hint(),
+-        Some(LevelFilter::DEBUG),
+-        "\n stack: {:#?}",
+-        subscriber
+-    );
+-
+-    // Test that per-subscriber filters aren't affected
+-
+-    // One layer is None so it "wins"
+-    let subscriber = tracing_subscriber::registry()
+-        .with(BasicLayer(None))
+-        .with(None::<LevelFilter>.with_filter(LevelFilter::DEBUG));
+-    assert_eq!(
+-        subscriber.max_level_hint(),
+-        None,
+-        "\n stack: {:#?}",
+-        subscriber
+-    );
+-
+-    // The max-levels wins
+-    let subscriber = tracing_subscriber::registry()
+-        .with(BasicLayer(Some(LevelFilter::INFO)))
+-        .with(None::<LevelFilter>.with_filter(LevelFilter::DEBUG));
+-    assert_eq!(
+-        subscriber.max_level_hint(),
+-        Some(LevelFilter::DEBUG),
+-        "\n stack: {:#?}",
+-        subscriber
+-    );
+-
+-    // Test filter on the other layer
+-    let subscriber = tracing_subscriber::registry()
+-        .with(BasicLayer(Some(LevelFilter::INFO)).with_filter(LevelFilter::DEBUG))
+-        .with(None::<LevelFilter>);
+-    assert_eq!(
+-        subscriber.max_level_hint(),
+-        Some(LevelFilter::DEBUG),
+-        "\n stack: {:#?}",
+-        subscriber
+-    );
+-    let subscriber = tracing_subscriber::registry()
+-        .with(BasicLayer(None).with_filter(LevelFilter::DEBUG))
+-        .with(None::<LevelFilter>);
+-    assert_eq!(
+-        subscriber.max_level_hint(),
+-        Some(LevelFilter::DEBUG),
+-        "\n stack: {:#?}",
+-        subscriber
+-    );
+-
+-    // The `OFF` from `None` over overridden.
+-    let subscriber = tracing_subscriber::registry()
+-        .with(BasicLayer(Some(LevelFilter::INFO)))
+-        .with(None::<LevelFilter>);
+-    assert_eq!(
+-        subscriber.max_level_hint(),
+-        Some(LevelFilter::INFO),
+-        "\n stack: {:#?}",
+-        subscriber
+-    );
+-}
+-
+-// Test that the `None` max level hint only applies if its the only layer
+-#[test]
+-fn none_inside_doesnt_override_max_level() {
+-    // None means the other layer takes control
+-    let subscriber = tracing_subscriber::registry()
+-        .with(None::<LevelFilter>)
+-        .with(BasicLayer(None));
+-    assert_eq!(
+-        subscriber.max_level_hint(),
+-        None,
+-        "\n stack: {:#?}",
+-        subscriber
+-    );
+-
+-    // The `None`-returning layer still wins
+-    let subscriber = tracing_subscriber::registry()
+-        .with(Some(LevelFilter::ERROR))
+-        .with(BasicLayer(None));
+-    assert_eq!(
+-        subscriber.max_level_hint(),
+-        Some(LevelFilter::ERROR),
+-        "\n stack: {:#?}",
+-        subscriber
+-    );
+-
+-    // Check that we aren't doing anything truly wrong
+-    let subscriber = tracing_subscriber::registry()
+-        .with(None::<LevelFilter>)
+-        .with(BasicLayer(Some(LevelFilter::DEBUG)));
+-    assert_eq!(
+-        subscriber.max_level_hint(),
+-        Some(LevelFilter::DEBUG),
+-        "\n stack: {:#?}",
+-        subscriber
+-    );
+-
+-    // Test that per-subscriber filters aren't affected
+-
+-    // One layer is None so it "wins"
+-    let subscriber = tracing_subscriber::registry()
+-        .with(None::<LevelFilter>.with_filter(LevelFilter::DEBUG))
+-        .with(BasicLayer(None));
+-    assert_eq!(
+-        subscriber.max_level_hint(),
+-        None,
+-        "\n stack: {:#?}",
+-        subscriber
+-    );
+-
+-    // The max-levels wins
+-    let subscriber = tracing_subscriber::registry()
+-        .with(None::<LevelFilter>.with_filter(LevelFilter::DEBUG))
+-        .with(BasicLayer(Some(LevelFilter::INFO)));
+-    assert_eq!(
+-        subscriber.max_level_hint(),
+-        Some(LevelFilter::DEBUG),
+-        "\n stack: {:#?}",
+-        subscriber
+-    );
+-
+-    // Test filter on the other layer
+-    let subscriber = tracing_subscriber::registry()
+-        .with(None::<LevelFilter>)
+-        .with(BasicLayer(Some(LevelFilter::INFO)).with_filter(LevelFilter::DEBUG));
+-    assert_eq!(
+-        subscriber.max_level_hint(),
+-        Some(LevelFilter::DEBUG),
+-        "\n stack: {:#?}",
+-        subscriber
+-    );
+-    let subscriber = tracing_subscriber::registry()
+-        .with(None::<LevelFilter>)
+-        .with(BasicLayer(None).with_filter(LevelFilter::DEBUG));
+-    assert_eq!(
+-        subscriber.max_level_hint(),
+-        Some(LevelFilter::DEBUG),
+-        "\n stack: {:#?}",
+-        subscriber
+-    );
+-
+-    // The `OFF` from `None` over overridden.
+-    let subscriber = tracing_subscriber::registry()
+-        .with(None::<LevelFilter>)
+-        .with(BasicLayer(Some(LevelFilter::INFO)));
+-    assert_eq!(
+-        subscriber.max_level_hint(),
+-        Some(LevelFilter::INFO),
+-        "\n stack: {:#?}",
+-        subscriber
+-    );
+-}
+-
+-/// Tests that the logic tested in `doesnt_override_none` works through the reload subscriber
+-#[test]
+-fn reload_works_with_none() {
+-    let (subscriber1, handle1) = tracing_subscriber::reload::Subscriber::new(None::<BasicLayer>);
+-    let (subscriber2, _handle2) = tracing_subscriber::reload::Subscriber::new(None::<BasicLayer>);
+-
+-    let subscriber = tracing_subscriber::registry()
+-        .with(subscriber1)
+-        .with(subscriber2);
+-    assert_eq!(subscriber.max_level_hint(), Some(LevelFilter::OFF));
+-
+-    // reloading one should pass through correctly.
+-    handle1.reload(Some(BasicLayer(None))).unwrap();
+-    assert_eq!(subscriber.max_level_hint(), None);
+-
+-    // Check pass-through of an actual level as well
+-    handle1
+-        .reload(Some(BasicLayer(Some(LevelFilter::DEBUG))))
+-        .unwrap();
+-    assert_eq!(subscriber.max_level_hint(), Some(LevelFilter::DEBUG));
+-}

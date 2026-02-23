@@ -1,0 +1,349 @@
+diff --git a/crates/hir-def/src/lang_item.rs b/crates/hir-def/src/lang_item.rs
+index 092ff6e486..51dd55301f 100644
+--- a/crates/hir-def/src/lang_item.rs
++++ b/crates/hir-def/src/lang_item.rs
+@@ -499,6 +499,11 @@ language_item_table! { LangItems =>
+     RangeToInclusive,        sym::RangeToInclusive,    StructId;
+     RangeTo,                 sym::RangeTo,             StructId;
+ 
++    RangeFromCopy,           sym::RangeFromCopy,           StructId;
++    RangeInclusiveCopy,      sym::RangeInclusiveCopy,      StructId;
++    RangeCopy,               sym::RangeCopy,               StructId;
++    RangeToInclusiveCopy,    sym::RangeToInclusiveCopy,    StructId;
++
+     String,                  sym::String,              StructId;
+     CStr,                    sym::CStr,                StructId;
+     Ordering,                sym::Ordering,            EnumId;
+diff --git a/crates/hir-expand/src/mod_path.rs b/crates/hir-expand/src/mod_path.rs
+index 1712c28aa8..78228cf82e 100644
+--- a/crates/hir-expand/src/mod_path.rs
++++ b/crates/hir-expand/src/mod_path.rs
+@@ -423,6 +423,10 @@ macro_rules! __known_path {
+     (core::ops::RangeTo) => {};
+     (core::ops::RangeToInclusive) => {};
+     (core::ops::RangeInclusive) => {};
++    (core::range::Range) => {};
++    (core::range::RangeFrom) => {};
++    (core::range::RangeInclusive) => {};
++    (core::range::RangeToInclusive) => {};
+     (core::future::Future) => {};
+     (core::future::IntoFuture) => {};
+     (core::fmt::Debug) => {};
+diff --git a/crates/hir-ty/src/infer.rs b/crates/hir-ty/src/infer.rs
+index d527a4ae29..35d744e7d1 100644
+--- a/crates/hir-ty/src/infer.rs
++++ b/crates/hir-ty/src/infer.rs
+@@ -1815,18 +1815,34 @@ impl<'body, 'db> InferenceContext<'body, 'db> {
+         Some(struct_.into())
+     }
+ 
++    fn has_new_range_feature(&self) -> bool {
++        self.resolver.top_level_def_map().is_unstable_feature_enabled(&sym::new_range)
++    }
++
+     fn resolve_range(&self) -> Option<AdtId> {
+-        let struct_ = self.lang_items.Range?;
++        let struct_ = if self.has_new_range_feature() {
++            self.lang_items.RangeCopy?
++        } else {
++            self.lang_items.Range?
++        };
+         Some(struct_.into())
+     }
+ 
+     fn resolve_range_inclusive(&self) -> Option<AdtId> {
+-        let struct_ = self.lang_items.RangeInclusiveStruct?;
++        let struct_ = if self.has_new_range_feature() {
++            self.lang_items.RangeInclusiveCopy?
++        } else {
++            self.lang_items.RangeInclusiveStruct?
++        };
+         Some(struct_.into())
+     }
+ 
+     fn resolve_range_from(&self) -> Option<AdtId> {
+-        let struct_ = self.lang_items.RangeFrom?;
++        let struct_ = if self.has_new_range_feature() {
++            self.lang_items.RangeFromCopy?
++        } else {
++            self.lang_items.RangeFrom?
++        };
+         Some(struct_.into())
+     }
+ 
+@@ -1836,7 +1852,11 @@ impl<'body, 'db> InferenceContext<'body, 'db> {
+     }
+ 
+     fn resolve_range_to_inclusive(&self) -> Option<AdtId> {
+-        let struct_ = self.lang_items.RangeToInclusive?;
++        let struct_ = if self.has_new_range_feature() {
++            self.lang_items.RangeToInclusiveCopy?
++        } else {
++            self.lang_items.RangeToInclusive?
++        };
+         Some(struct_.into())
+     }
+ 
+diff --git a/crates/hir/src/source_analyzer.rs b/crates/hir/src/source_analyzer.rs
+index 6ba7a42c19..38e9c5b3f7 100644
+--- a/crates/hir/src/source_analyzer.rs
++++ b/crates/hir/src/source_analyzer.rs
+@@ -531,18 +531,12 @@ impl<'db> SourceAnalyzer<'db> {
+         db: &'db dyn HirDatabase,
+         range_pat: &ast::RangePat,
+     ) -> Option<StructId> {
+-        let path: ModPath = match (range_pat.op_kind()?, range_pat.start(), range_pat.end()) {
+-            (RangeOp::Exclusive, None, Some(_)) => path![core::ops::RangeTo],
+-            (RangeOp::Exclusive, Some(_), None) => path![core::ops::RangeFrom],
+-            (RangeOp::Exclusive, Some(_), Some(_)) => path![core::ops::Range],
+-            (RangeOp::Inclusive, None, Some(_)) => path![core::ops::RangeToInclusive],
+-            (RangeOp::Inclusive, Some(_), Some(_)) => path![core::ops::RangeInclusive],
+-
+-            (RangeOp::Exclusive, None, None) => return None,
+-            (RangeOp::Inclusive, None, None) => return None,
+-            (RangeOp::Inclusive, Some(_), None) => return None,
+-        };
+-        self.resolver.resolve_known_struct(db, &path)
++        self.resolve_range_struct(
++            db,
++            range_pat.op_kind()?,
++            range_pat.start().is_some(),
++            range_pat.end().is_some(),
++        )
+     }
+ 
+     pub(crate) fn resolve_range_expr(
+@@ -550,19 +544,59 @@ impl<'db> SourceAnalyzer<'db> {
+         db: &'db dyn HirDatabase,
+         range_expr: &ast::RangeExpr,
+     ) -> Option<StructId> {
+-        let path: ModPath = match (range_expr.op_kind()?, range_expr.start(), range_expr.end()) {
+-            (RangeOp::Exclusive, None, None) => path![core::ops::RangeFull],
+-            (RangeOp::Exclusive, None, Some(_)) => path![core::ops::RangeTo],
+-            (RangeOp::Exclusive, Some(_), None) => path![core::ops::RangeFrom],
+-            (RangeOp::Exclusive, Some(_), Some(_)) => path![core::ops::Range],
+-            (RangeOp::Inclusive, None, Some(_)) => path![core::ops::RangeToInclusive],
+-            (RangeOp::Inclusive, Some(_), Some(_)) => path![core::ops::RangeInclusive],
++        self.resolve_range_struct(
++            db,
++            range_expr.op_kind()?,
++            range_expr.start().is_some(),
++            range_expr.end().is_some(),
++        )
++    }
+ 
++    fn resolve_range_struct(
++        &self,
++        db: &'db dyn HirDatabase,
++        op_kind: RangeOp,
++        has_start: bool,
++        has_end: bool,
++    ) -> Option<StructId> {
++        let has_new_range =
++            self.resolver.top_level_def_map().is_unstable_feature_enabled(&sym::new_range);
++        let lang_items = self.lang_items(db);
++        match (op_kind, has_start, has_end) {
++            (RangeOp::Exclusive, false, false) => lang_items.RangeFull,
++            (RangeOp::Exclusive, false, true) => lang_items.RangeTo,
++            (RangeOp::Exclusive, true, false) => {
++                if has_new_range {
++                    lang_items.RangeFromCopy
++                } else {
++                    lang_items.RangeFrom
++                }
++            }
++            (RangeOp::Exclusive, true, true) => {
++                if has_new_range {
++                    lang_items.RangeCopy
++                } else {
++                    lang_items.Range
++                }
++            }
++            (RangeOp::Inclusive, false, true) => {
++                if has_new_range {
++                    lang_items.RangeToInclusiveCopy
++                } else {
++                    lang_items.RangeToInclusive
++                }
++            }
++            (RangeOp::Inclusive, true, true) => {
++                if has_new_range {
++                    lang_items.RangeInclusiveCopy
++                } else {
++                    lang_items.RangeInclusiveStruct
++                }
++            }
+             // [E0586] inclusive ranges must be bounded at the end
+-            (RangeOp::Inclusive, None, None) => return None,
+-            (RangeOp::Inclusive, Some(_), None) => return None,
+-        };
+-        self.resolver.resolve_known_struct(db, &path)
++            (RangeOp::Inclusive, false, false) => None,
++            (RangeOp::Inclusive, true, false) => None,
++        }
+     }
+ 
+     pub(crate) fn resolve_await_to_poll(
+diff --git a/crates/intern/src/symbol/symbols.rs b/crates/intern/src/symbol/symbols.rs
+index 781e58a120..513f51faba 100644
+--- a/crates/intern/src/symbol/symbols.rs
++++ b/crates/intern/src/symbol/symbols.rs
+@@ -525,6 +525,12 @@ define_symbols! {
+     arbitrary_self_types,
+     arbitrary_self_types_pointers,
+     supertrait_item_shadowing,
++    new_range,
++    range,
++    RangeCopy,
++    RangeFromCopy,
++    RangeInclusiveCopy,
++    RangeToInclusiveCopy,
+     hash,
+     partial_cmp,
+     cmp,
+diff --git a/crates/test-utils/src/minicore.rs b/crates/test-utils/src/minicore.rs
+index c3429356d9..26e125f8f2 100644
+--- a/crates/test-utils/src/minicore.rs
++++ b/crates/test-utils/src/minicore.rs
+@@ -58,6 +58,7 @@
+ //!     pin:
+ //!     pointee: copy, send, sync, ord, hash, unpin, phantom_data
+ //!     range:
++//!     new_range:
+ //!     receiver: deref
+ //!     result:
+ //!     send: sized
+@@ -175,7 +176,9 @@ pub mod marker {
+ 
+     // region:clone
+     impl<T: PointeeSized> Clone for PhantomData<T> {
+-        fn clone(&self) -> Self { Self }
++        fn clone(&self) -> Self {
++            Self
++        }
+     }
+     // endregion:clone
+ 
+@@ -1128,6 +1131,32 @@ pub mod ops {
+     // endregion:dispatch_from_dyn
+ }
+ 
++// region:new_range
++pub mod range {
++    #[lang = "RangeCopy"]
++    pub struct Range<Idx> {
++        pub start: Idx,
++        pub end: Idx,
++    }
++
++    #[lang = "RangeFromCopy"]
++    pub struct RangeFrom<Idx> {
++        pub start: Idx,
++    }
++
++    #[lang = "RangeInclusiveCopy"]
++    pub struct RangeInclusive<Idx> {
++        pub start: Idx,
++        pub end: Idx,
++    }
++
++    #[lang = "RangeToInclusiveCopy"]
++    pub struct RangeToInclusive<Idx> {
++        pub end: Idx,
++    }
++}
++// endregion:new_range
++
+ // region:eq
+ pub mod cmp {
+     use crate::marker::PointeeSized;
+@@ -1144,7 +1173,9 @@ pub mod cmp {
+ 
+     // region:builtin_impls
+     impl PartialEq for () {
+-        fn eq(&self, other: &()) -> bool { true }
++        fn eq(&self, other: &()) -> bool {
++            true
++        }
+     }
+     // endregion:builtin_impls
+ 
+@@ -1567,10 +1598,7 @@ pub mod pin {
+     }
+     // endregion:dispatch_from_dyn
+     // region:coerce_unsized
+-    impl<Ptr, U> crate::ops::CoerceUnsized<Pin<U>> for Pin<Ptr> where
+-        Ptr: crate::ops::CoerceUnsized<U>
+-    {
+-    }
++    impl<Ptr, U> crate::ops::CoerceUnsized<Pin<U>> for Pin<Ptr> where Ptr: crate::ops::CoerceUnsized<U> {}
+     // endregion:coerce_unsized
+ }
+ // endregion:pin
+@@ -1792,9 +1820,9 @@ pub mod iter {
+                 fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self;
+             }
+         }
+-        pub use self::collect::{IntoIterator, FromIterator};
++        pub use self::collect::{FromIterator, IntoIterator};
+     }
+-    pub use self::traits::{IntoIterator, FromIterator, Iterator};
++    pub use self::traits::{FromIterator, IntoIterator, Iterator};
+ }
+ // endregion:iterator
+ 
+@@ -2087,30 +2115,30 @@ macro_rules! column {
+ pub mod prelude {
+     pub mod v1 {
+         pub use crate::{
+-            clone::Clone,                            // :clone
+-            cmp::{Eq, PartialEq},                    // :eq
+-            cmp::{Ord, PartialOrd},                  // :ord
+-            convert::AsMut,                          // :as_mut
+-            convert::AsRef,                          // :as_ref
+-            convert::{From, Into, TryFrom, TryInto}, // :from
+-            default::Default,                        // :default
+-            iter::{IntoIterator, Iterator, FromIterator}, // :iterator
+-            macros::builtin::{derive, derive_const}, // :derive
+-            marker::Copy,                            // :copy
+-            marker::Send,                            // :send
+-            marker::Sized,                           // :sized
+-            marker::Sync,                            // :sync
+-            mem::drop,                               // :drop
+-            mem::size_of,                            // :size_of
+-            ops::Drop,                               // :drop
+-            ops::{AsyncFn, AsyncFnMut, AsyncFnOnce}, // :async_fn
+-            ops::{Fn, FnMut, FnOnce},                // :fn
+-            option::Option::{self, None, Some},      // :option
+-            panic,                                   // :panic
+-            result::Result::{self, Err, Ok},         // :result
+-            str::FromStr,                            // :str
+-            fmt::derive::Debug,                      // :fmt, derive
+-            hash::derive::Hash,                      // :hash, derive
++            clone::Clone,                                 // :clone
++            cmp::{Eq, PartialEq},                         // :eq
++            cmp::{Ord, PartialOrd},                       // :ord
++            convert::AsMut,                               // :as_mut
++            convert::AsRef,                               // :as_ref
++            convert::{From, Into, TryFrom, TryInto},      // :from
++            default::Default,                             // :default
++            fmt::derive::Debug,                           // :fmt, derive
++            hash::derive::Hash,                           // :hash, derive
++            iter::{FromIterator, IntoIterator, Iterator}, // :iterator
++            macros::builtin::{derive, derive_const},      // :derive
++            marker::Copy,                                 // :copy
++            marker::Send,                                 // :send
++            marker::Sized,                                // :sized
++            marker::Sync,                                 // :sync
++            mem::drop,                                    // :drop
++            mem::size_of,                                 // :size_of
++            ops::Drop,                                    // :drop
++            ops::{AsyncFn, AsyncFnMut, AsyncFnOnce},      // :async_fn
++            ops::{Fn, FnMut, FnOnce},                     // :fn
++            option::Option::{self, None, Some},           // :option
++            panic,                                        // :panic
++            result::Result::{self, Err, Ok},              // :result
++            str::FromStr,                                 // :str
+         };
+     }
+ 

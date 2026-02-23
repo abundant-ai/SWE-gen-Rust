@@ -1,0 +1,136 @@
+diff --git a/crates/hir-ty/src/method_resolution/probe.rs b/crates/hir-ty/src/method_resolution/probe.rs
+index fdd501723f..42a590e8b4 100644
+--- a/crates/hir-ty/src/method_resolution/probe.rs
++++ b/crates/hir-ty/src/method_resolution/probe.rs
+@@ -1246,9 +1246,9 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
+             .filter(|step| step.reachable_via_deref)
+             .filter(|step| {
+                 debug!("pick_all_method: step={:?}", step);
+-                // Skip types with type errors (but not const/lifetime errors, which are
+-                // often spurious due to incomplete const evaluation) and raw pointer derefs.
+-                !step.self_ty.value.value.references_only_ty_error() && !step.from_unsafe_deref
++                // skip types that are from a type error or that would require dereferencing
++                // a raw pointer
++                !step.self_ty.value.value.references_non_lt_error() && !step.from_unsafe_deref
+             })
+             .try_for_each(|step| {
+                 let InferOk { value: self_ty, obligations: instantiate_self_ty_obligations } = self
+diff --git a/crates/hir-ty/src/next_solver/ty.rs b/crates/hir-ty/src/next_solver/ty.rs
+index 1173028a10..66a24d3949 100644
+--- a/crates/hir-ty/src/next_solver/ty.rs
++++ b/crates/hir-ty/src/next_solver/ty.rs
+@@ -508,11 +508,6 @@ impl<'db> Ty<'db> {
+         references_non_lt_error(&self)
+     }
+ 
+-    /// Whether the type contains a type error (ignoring const and lifetime errors).
+-    pub fn references_only_ty_error(self) -> bool {
+-        references_only_ty_error(&self)
+-    }
+-
+     pub fn callable_sig(self, interner: DbInterner<'db>) -> Option<Binder<'db, FnSig<'db>>> {
+         match self.kind() {
+             TyKind::FnDef(callable, args) => {
+@@ -782,20 +777,6 @@ impl<'db> TypeVisitor<DbInterner<'db>> for ReferencesNonLifetimeError {
+     }
+ }
+ 
+-pub fn references_only_ty_error<'db, T: TypeVisitableExt<DbInterner<'db>>>(t: &T) -> bool {
+-    t.references_error() && t.visit_with(&mut ReferencesOnlyTyError).is_break()
+-}
+-
+-struct ReferencesOnlyTyError;
+-
+-impl<'db> TypeVisitor<DbInterner<'db>> for ReferencesOnlyTyError {
+-    type Result = ControlFlow<()>;
+-
+-    fn visit_ty(&mut self, ty: Ty<'db>) -> Self::Result {
+-        if ty.is_ty_error() { ControlFlow::Break(()) } else { ty.super_visit_with(self) }
+-    }
+-}
+-
+ impl<'db> std::fmt::Debug for Ty<'db> {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         self.inner().internee.fmt(f)
+diff --git a/crates/hir-ty/src/tests/regression/new_solver.rs b/crates/hir-ty/src/tests/regression/new_solver.rs
+index f47a26d429..be6ab23ad7 100644
+--- a/crates/hir-ty/src/tests/regression/new_solver.rs
++++ b/crates/hir-ty/src/tests/regression/new_solver.rs
+@@ -471,76 +471,7 @@ fn foo() {
+             244..246 '_x': {unknown}
+             249..257 'to_bytes': fn to_bytes() -> [u8; _]
+             249..259 'to_bytes()': [u8; _]
+-            249..268 'to_byt..._vec()': Vec<<[u8; _] as Foo>::Item>
+-        "#]],
+-    );
+-}
+-
+-#[test]
+-fn regression_21315() {
+-    check_infer(
+-        r#"
+-struct Consts;
+-impl Consts { const MAX: usize = 0; }
+-
+-struct Between<const M: usize, const N: usize, T>(T);
+-
+-impl<const M: usize, T> Between<M, { Consts::MAX }, T> {
+-    fn sep_once(self, _sep: &str, _other: Self) -> Self {
+-        self
+-    }
+-}
+-
+-trait Parser: Sized {
+-    fn at_least<const M: usize>(self) -> Between<M, { Consts::MAX }, Self> {
+-        Between(self)
+-    }
+-    fn at_most<const N: usize>(self) -> Between<0, N, Self> {
+-        Between(self)
+-    }
+-}
+-
+-impl Parser for char {}
+-
+-fn test_at_least() {
+-    let num = '9'.at_least::<1>();
+-    let _ver = num.sep_once(".", num);
+-}
+-
+-fn test_at_most() {
+-    let num = '9'.at_most::<1>();
+-}
+-    "#,
+-        expect![[r#"
+-            48..49 '0': usize
+-            182..186 'self': Between<M, _, T>
+-            188..192 '_sep': &'? str
+-            200..206 '_other': Between<M, _, T>
+-            222..242 '{     ...     }': Between<M, _, T>
+-            232..236 'self': Between<M, _, T>
+-            300..304 'self': Self
+-            343..372 '{     ...     }': Between<M, _, Self>
+-            353..360 'Between': fn Between<M, _, Self>(Self) -> Between<M, _, Self>
+-            353..366 'Between(self)': Between<M, _, Self>
+-            361..365 'self': Self
+-            404..408 'self': Self
+-            433..462 '{     ...     }': Between<0, N, Self>
+-            443..450 'Between': fn Between<0, N, Self>(Self) -> Between<0, N, Self>
+-            443..456 'Between(self)': Between<0, N, Self>
+-            451..455 'self': Self
+-            510..587 '{     ...um); }': ()
+-            520..523 'num': Between<1, _, char>
+-            526..529 ''9'': char
+-            526..545 ''9'.at...:<1>()': Between<1, _, char>
+-            555..559 '_ver': Between<1, _, char>
+-            562..565 'num': Between<1, _, char>
+-            562..584 'num.se..., num)': Between<1, _, char>
+-            575..578 '"."': &'static str
+-            580..583 'num': Between<1, _, char>
+-            607..644 '{     ...>(); }': ()
+-            617..620 'num': Between<0, 1, char>
+-            623..626 ''9'': char
+-            623..641 ''9'.at...:<1>()': Between<0, 1, char>
++            249..268 'to_byt..._vec()': {unknown}
+         "#]],
+     );
+ }

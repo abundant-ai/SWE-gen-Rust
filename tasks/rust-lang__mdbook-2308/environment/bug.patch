@@ -1,0 +1,785 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 906fa56c..66a3a493 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1337,22 +1337,15 @@ dependencies = [
+ 
+ [[package]]
+ name = "pulldown-cmark"
+-version = "0.10.0"
++version = "0.9.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "dce76ce678ffc8e5675b22aa1405de0b7037e2fdf8913fea40d1926c6fe1e6e7"
++checksum = "77a1a2f1f0a7ecff9c31abbe177637be0e97a0aef46cf8738ece09327985d998"
+ dependencies = [
+- "bitflags 2.4.1",
++ "bitflags 1.3.2",
+  "memchr",
+- "pulldown-cmark-escape",
+  "unicase",
+ ]
+ 
+-[[package]]
+-name = "pulldown-cmark-escape"
+-version = "0.10.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "d5d8f9aa0e3cbcfaf8bf00300004ee3b72f74770f9cbac93f6928771f613276b"
+-
+ [[package]]
+ name = "quote"
+ version = "1.0.33"
+diff --git a/Cargo.toml b/Cargo.toml
+index 8e370ace..9a6e7769 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -27,7 +27,7 @@ handlebars = "5.0"
+ log = "0.4.17"
+ memchr = "2.5.0"
+ opener = "0.6.1"
+-pulldown-cmark = { version = "0.10.0", default-features = false, features = ["html"] }
++pulldown-cmark = { version = "0.9.3", default-features = false }
+ regex = "1.8.1"
+ serde = { version = "1.0.163", features = ["derive"] }
+ serde_json = "1.0.96"
+diff --git a/src/book/summary.rs b/src/book/summary.rs
+index ed8f8337..b2784ce5 100644
+--- a/src/book/summary.rs
++++ b/src/book/summary.rs
+@@ -1,7 +1,7 @@
+ use crate::errors::*;
+ use log::{debug, trace, warn};
+-use memchr::Memchr;
+-use pulldown_cmark::{DefaultBrokenLinkCallback, Event, HeadingLevel, Tag, TagEnd};
++use memchr::{self, Memchr};
++use pulldown_cmark::{self, Event, HeadingLevel, Tag};
+ use serde::{Deserialize, Serialize};
+ use std::fmt::{self, Display, Formatter};
+ use std::iter::FromIterator;
+@@ -163,7 +163,7 @@ impl From<Link> for SummaryItem {
+ /// > match the following regex: "[^<>\n[]]+".
+ struct SummaryParser<'a> {
+     src: &'a str,
+-    stream: pulldown_cmark::OffsetIter<'a, DefaultBrokenLinkCallback>,
++    stream: pulldown_cmark::OffsetIter<'a, 'a>,
+     offset: usize,
+ 
+     /// We can't actually put an event back into the `OffsetIter` stream, so instead we store it
+@@ -210,7 +210,7 @@ macro_rules! collect_events {
+ }
+ 
+ impl<'a> SummaryParser<'a> {
+-    fn new(text: &'a str) -> SummaryParser<'a> {
++    fn new(text: &str) -> SummaryParser<'_> {
+         let pulldown_parser = pulldown_cmark::Parser::new(text).into_offset_iter();
+ 
+         SummaryParser {
+@@ -265,12 +265,7 @@ impl<'a> SummaryParser<'a> {
+         loop {
+             match self.next_event() {
+                 Some(ev @ Event::Start(Tag::List(..)))
+-                | Some(
+-                    ev @ Event::Start(Tag::Heading {
+-                        level: HeadingLevel::H1,
+-                        ..
+-                    }),
+-                ) => {
++                | Some(ev @ Event::Start(Tag::Heading(HeadingLevel::H1, ..))) => {
+                     if is_prefix {
+                         // we've finished prefix chapters and are at the start
+                         // of the numbered section.
+@@ -280,8 +275,8 @@ impl<'a> SummaryParser<'a> {
+                         bail!(self.parse_error("Suffix chapters cannot be followed by a list"));
+                     }
+                 }
+-                Some(Event::Start(Tag::Link { dest_url, .. })) => {
+-                    let link = self.parse_link(dest_url.to_string());
++                Some(Event::Start(Tag::Link(_type, href, _title))) => {
++                    let link = self.parse_link(href.to_string());
+                     items.push(SummaryItem::Link(link));
+                 }
+                 Some(Event::Rule) => items.push(SummaryItem::Separator),
+@@ -309,13 +304,10 @@ impl<'a> SummaryParser<'a> {
+                     break;
+                 }
+ 
+-                Some(Event::Start(Tag::Heading {
+-                    level: HeadingLevel::H1,
+-                    ..
+-                })) => {
++                Some(Event::Start(Tag::Heading(HeadingLevel::H1, ..))) => {
+                     debug!("Found a h1 in the SUMMARY");
+ 
+-                    let tags = collect_events!(self.stream, end TagEnd::Heading(HeadingLevel::H1));
++                    let tags = collect_events!(self.stream, end Tag::Heading(HeadingLevel::H1, ..));
+                     Some(stringify_events(tags))
+                 }
+ 
+@@ -344,7 +336,7 @@ impl<'a> SummaryParser<'a> {
+     /// Finishes parsing a link once the `Event::Start(Tag::Link(..))` has been opened.
+     fn parse_link(&mut self, href: String) -> Link {
+         let href = href.replace("%20", " ");
+-        let link_content = collect_events!(self.stream, end TagEnd::Link);
++        let link_content = collect_events!(self.stream, end Tag::Link(..));
+         let name = stringify_events(link_content);
+ 
+         let path = if href.is_empty() {
+@@ -385,12 +377,7 @@ impl<'a> SummaryParser<'a> {
+                 }
+                 // The expectation is that pulldown cmark will terminate a paragraph before a new
+                 // heading, so we can always count on this to return without skipping headings.
+-                Some(
+-                    ev @ Event::Start(Tag::Heading {
+-                        level: HeadingLevel::H1,
+-                        ..
+-                    }),
+-                ) => {
++                Some(ev @ Event::Start(Tag::Heading(HeadingLevel::H1, ..))) => {
+                     // we're starting a new part
+                     self.back(ev);
+                     break;
+@@ -411,7 +398,7 @@ impl<'a> SummaryParser<'a> {
+ 
+                     // Skip over the contents of this tag
+                     while let Some(event) = self.next_event() {
+-                        if event == Event::End(other_tag.clone().into()) {
++                        if event == Event::End(other_tag.clone()) {
+                             break;
+                         }
+                     }
+@@ -482,7 +469,7 @@ impl<'a> SummaryParser<'a> {
+ 
+                     last_item.nested_items = sub_items;
+                 }
+-                Some(Event::End(TagEnd::List(..))) => break,
++                Some(Event::End(Tag::List(..))) => break,
+                 Some(_) => {}
+                 None => break,
+             }
+@@ -499,8 +486,8 @@ impl<'a> SummaryParser<'a> {
+         loop {
+             match self.next_event() {
+                 Some(Event::Start(Tag::Paragraph)) => continue,
+-                Some(Event::Start(Tag::Link { dest_url, .. })) => {
+-                    let mut link = self.parse_link(dest_url.to_string());
++                Some(Event::Start(Tag::Link(_type, href, _title))) => {
++                    let mut link = self.parse_link(href.to_string());
+ 
+                     let mut number = parent.clone();
+                     number.0.push(num_existing_items as u32 + 1);
+@@ -542,18 +529,14 @@ impl<'a> SummaryParser<'a> {
+     fn parse_title(&mut self) -> Option<String> {
+         loop {
+             match self.next_event() {
+-                Some(Event::Start(Tag::Heading {
+-                    level: HeadingLevel::H1,
+-                    ..
+-                })) => {
++                Some(Event::Start(Tag::Heading(HeadingLevel::H1, ..))) => {
+                     debug!("Found a h1 in the SUMMARY");
+ 
+-                    let tags = collect_events!(self.stream, end TagEnd::Heading(HeadingLevel::H1));
++                    let tags = collect_events!(self.stream, end Tag::Heading(HeadingLevel::H1, ..));
+                     return Some(stringify_events(tags));
+                 }
+                 // Skip a HTML element such as a comment line.
+-                Some(Event::Html(_) | Event::InlineHtml(_))
+-                | Some(Event::Start(Tag::HtmlBlock) | Event::End(TagEnd::HtmlBlock)) => {}
++                Some(Event::Html(_)) => {}
+                 // Otherwise, no title.
+                 Some(ev) => {
+                     self.back(ev);
+@@ -761,7 +744,7 @@ mod tests {
+         let _ = parser.stream.next(); // Discard opening paragraph
+ 
+         let href = match parser.stream.next() {
+-            Some((Event::Start(Tag::Link { dest_url, .. }), _range)) => dest_url.to_string(),
++            Some((Event::Start(Tag::Link(_type, href, _title)), _range)) => href.to_string(),
+             other => panic!("Unreachable, {:?}", other),
+         };
+ 
+diff --git a/src/renderer/html_handlebars/search.rs b/src/renderer/html_handlebars/search.rs
+index 1144c9f5..24d62fda 100644
+--- a/src/renderer/html_handlebars/search.rs
++++ b/src/renderer/html_handlebars/search.rs
+@@ -66,23 +66,10 @@ fn add_doc(
+     index: &mut Index,
+     doc_urls: &mut Vec<String>,
+     anchor_base: &str,
+-    heading: &str,
+-    id_counter: &mut HashMap<String, usize>,
+-    section_id: &Option<CowStr<'_>>,
++    section_id: &Option<String>,
+     items: &[&str],
+ ) {
+-    // Either use the explicit section id the user specified, or generate one
+-    // from the heading content.
+-    let section_id = section_id.as_ref().map(|id| id.to_string()).or_else(|| {
+-        if heading.is_empty() {
+-            // In the case where a chapter has no heading, don't set a section id.
+-            None
+-        } else {
+-            Some(utils::unique_id_from_content(heading, id_counter))
+-        }
+-    });
+-
+-    let url = if let Some(id) = section_id {
++    let url = if let Some(ref id) = *section_id {
+         Cow::Owned(format!("{}#{}", anchor_base, id))
+     } else {
+         Cow::Borrowed(anchor_base)
+@@ -132,7 +119,7 @@ fn render_item(
+     let mut id_counter = HashMap::new();
+     while let Some(event) = p.next() {
+         match event {
+-            Event::Start(Tag::Heading { level, id, .. }) if level as u32 <= max_section_depth => {
++            Event::Start(Tag::Heading(i, ..)) if i as u32 <= max_section_depth => {
+                 if !heading.is_empty() {
+                     // Section finished, the next heading is following now
+                     // Write the data to the index, and clear it for the next section
+@@ -140,21 +127,22 @@ fn render_item(
+                         index,
+                         doc_urls,
+                         &anchor_base,
+-                        &heading,
+-                        &mut id_counter,
+                         &section_id,
+                         &[&heading, &body, &breadcrumbs.join(" » ")],
+                     );
++                    section_id = None;
+                     heading.clear();
+                     body.clear();
+                     breadcrumbs.pop();
+                 }
+ 
+-                section_id = id;
+                 in_heading = true;
+             }
+-            Event::End(TagEnd::Heading(level)) if level as u32 <= max_section_depth => {
++            Event::End(Tag::Heading(i, id, _classes)) if i as u32 <= max_section_depth => {
+                 in_heading = false;
++                section_id = id
++                    .map(|id| id.to_string())
++                    .or_else(|| Some(utils::unique_id_from_content(&heading, &mut id_counter)));
+                 breadcrumbs.push(heading.clone());
+             }
+             Event::Start(Tag::FootnoteDefinition(name)) => {
+@@ -171,19 +159,9 @@ fn render_item(
+                     html_block.push_str(html);
+                     p.next();
+                 }
++
+                 body.push_str(&clean_html(&html_block));
+             }
+-            Event::InlineHtml(html) => {
+-                // This is not capable of cleaning inline tags like
+-                // `foo <script>…</script>`. The `<script>` tags show up as
+-                // individual InlineHtml events, and the content inside is
+-                // just a regular Text event. There isn't a very good way to
+-                // know how to collect all the content in-between. I'm not
+-                // sure if this is easily fixable. It should be extremely
+-                // rare, since script and style tags should almost always be
+-                // blocks, and worse case you have some noise in the index.
+-                body.push_str(&clean_html(&html));
+-            }
+             Event::Start(_) | Event::End(_) | Event::Rule | Event::SoftBreak | Event::HardBreak => {
+                 // Insert spaces where HTML output would usually separate text
+                 // to ensure words don't get merged together
+@@ -210,24 +188,18 @@ fn render_item(
+     }
+ 
+     if !body.is_empty() || !heading.is_empty() {
+-        let title = if heading.is_empty() {
++        if heading.is_empty() {
+             if let Some(chapter) = breadcrumbs.first() {
+-                chapter
+-            } else {
+-                ""
++                heading = chapter.clone();
+             }
+-        } else {
+-            &heading
+-        };
++        }
+         // Make sure the last section is added to the index
+         add_doc(
+             index,
+             doc_urls,
+             &anchor_base,
+-            &heading,
+-            &mut id_counter,
+             &section_id,
+-            &[title, &body, &breadcrumbs.join(" » ")],
++            &[&heading, &body, &breadcrumbs.join(" » ")],
+         );
+     }
+ 
+diff --git a/src/utils/mod.rs b/src/utils/mod.rs
+index c0be2030..9156916e 100644
+--- a/src/utils/mod.rs
++++ b/src/utils/mod.rs
+@@ -6,7 +6,7 @@ pub(crate) mod toml_ext;
+ use crate::errors::Error;
+ use log::error;
+ use once_cell::sync::Lazy;
+-use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
++use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser, Tag};
+ use regex::Regex;
+ 
+ use std::borrow::Cow;
+@@ -161,30 +161,13 @@ fn adjust_links<'a>(event: Event<'a>, path: Option<&Path>) -> Event<'a> {
+     }
+ 
+     match event {
+-        Event::Start(Tag::Link {
+-            link_type,
+-            dest_url,
+-            title,
+-            id,
+-        }) => Event::Start(Tag::Link {
+-            link_type,
+-            dest_url: fix(dest_url, path),
+-            title,
+-            id,
+-        }),
+-        Event::Start(Tag::Image {
+-            link_type,
+-            dest_url,
+-            title,
+-            id,
+-        }) => Event::Start(Tag::Image {
+-            link_type,
+-            dest_url: fix(dest_url, path),
+-            title,
+-            id,
+-        }),
++        Event::Start(Tag::Link(link_type, dest, title)) => {
++            Event::Start(Tag::Link(link_type, fix(dest, path), title))
++        }
++        Event::Start(Tag::Image(link_type, dest, title)) => {
++            Event::Start(Tag::Image(link_type, fix(dest, path), title))
++        }
+         Event::Html(html) => Event::Html(fix_html(html, path)),
+-        Event::InlineHtml(html) => Event::InlineHtml(fix_html(html, path)),
+         _ => event,
+     }
+ }
+@@ -194,7 +177,7 @@ pub fn render_markdown(text: &str, curly_quotes: bool) -> String {
+     render_markdown_with_path(text, curly_quotes, None)
+ }
+ 
+-pub fn new_cmark_parser(text: &str, curly_quotes: bool) -> Parser<'_> {
++pub fn new_cmark_parser(text: &str, curly_quotes: bool) -> Parser<'_, '_> {
+     let mut opts = Options::empty();
+     opts.insert(Options::ENABLE_TABLES);
+     opts.insert(Options::ENABLE_FOOTNOTES);
+@@ -229,7 +212,7 @@ fn wrap_tables(event: Event<'_>) -> (Option<Event<'_>>, Option<Event<'_>>) {
+             Some(Event::Html(r#"<div class="table-wrapper">"#.into())),
+             Some(event),
+         ),
+-        Event::End(TagEnd::Table) => (Some(event), Some(Event::Html(r#"</div>"#.into()))),
++        Event::End(Tag::Table(_)) => (Some(event), Some(Event::Html(r#"</div>"#.into()))),
+         _ => (Some(event), None),
+     }
+ }
+diff --git a/tests/dummy_book/src/conclusion.md b/tests/dummy_book/src/conclusion.md
+index 5c29ec7d..ba121c1f 100644
+--- a/tests/dummy_book/src/conclusion.md
++++ b/tests/dummy_book/src/conclusion.md
+@@ -18,7 +18,3 @@ css looks, like this {
+ }
+ */
+ </style>
+-
+-Sneaky inline event <script>alert("inline");</script>.
+-
+-But regular <b>inline</b> is indexed.
+diff --git a/tests/rendered_output.rs b/tests/rendered_output.rs
+index a01ce5f4..7626b9e8 100644
+--- a/tests/rendered_output.rs
++++ b/tests/rendered_output.rs
+@@ -375,7 +375,10 @@ fn able_to_include_playground_files_in_chapters() {
+ 
+     let second = temp.path().join("book/second.html");
+ 
+-    let playground_strings = &[r#"class="playground""#, r#"println!("Hello World!");"#];
++    let playground_strings = &[
++        r#"class="playground""#,
++        r#"println!(&quot;Hello World!&quot;);"#,
++    ];
+ 
+     assert_contains_strings(&second, playground_strings);
+     assert_doesnt_contain_strings(&second, &["{{#playground example.rs}}"]);
+@@ -742,7 +745,6 @@ mod search {
+         let index = read_book_index(temp.path());
+ 
+         let doc_urls = index["doc_urls"].as_array().unwrap();
+-        eprintln!("doc_urls={doc_urls:#?}",);
+         let get_doc_ref =
+             |url: &str| -> String { doc_urls.iter().position(|s| s == url).unwrap().to_string() };
+ 
+@@ -772,10 +774,7 @@ mod search {
+             docs[&summary]["breadcrumbs"],
+             "First Chapter » Includes » Summary"
+         );
+-        // See note about InlineHtml in search.rs. Ideally the `alert()` part
+-        // should not be in the index, but we don't have a way to scrub inline
+-        // html.
+-        assert_eq!(docs[&conclusion]["body"], "I put &lt;HTML&gt; in here! Sneaky inline event alert(\"inline\");. But regular inline is indexed.");
++        assert_eq!(docs[&conclusion]["body"], "I put &lt;HTML&gt; in here!");
+         assert_eq!(
+             docs[&no_headers]["breadcrumbs"],
+             "First Chapter » No Headers"
+diff --git a/tests/searchindex_fixture.json b/tests/searchindex_fixture.json
+index 06bfb2ab..85463028 100644
+--- a/tests/searchindex_fixture.json
++++ b/tests/searchindex_fixture.json
+@@ -145,7 +145,7 @@
+           "title": 1
+         },
+         "29": {
+-          "body": 10,
++          "body": 3,
+           "breadcrumbs": 2,
+           "title": 1
+         },
+@@ -319,7 +319,7 @@
+           "title": "Some section"
+         },
+         "29": {
+-          "body": "I put &lt;HTML&gt; in here! Sneaky inline event alert(\"inline\");. But regular inline is indexed.",
++          "body": "I put &lt;HTML&gt; in here!",
+           "breadcrumbs": "Conclusion » Conclusion",
+           "id": "29",
+           "title": "Conclusion"
+@@ -412,54 +412,6 @@
+             },
+             "df": 0,
+             "docs": {},
+-            "l": {
+-              "df": 0,
+-              "docs": {},
+-              "e": {
+-                "df": 0,
+-                "docs": {},
+-                "r": {
+-                  "df": 0,
+-                  "docs": {},
+-                  "t": {
+-                    "(": {
+-                      "\"": {
+-                        "df": 0,
+-                        "docs": {},
+-                        "i": {
+-                          "df": 0,
+-                          "docs": {},
+-                          "n": {
+-                            "df": 0,
+-                            "docs": {},
+-                            "l": {
+-                              "df": 0,
+-                              "docs": {},
+-                              "i": {
+-                                "df": 0,
+-                                "docs": {},
+-                                "n": {
+-                                  "df": 1,
+-                                  "docs": {
+-                                    "29": {
+-                                      "tf": 1.0
+-                                    }
+-                                  }
+-                                }
+-                              }
+-                            }
+-                          }
+-                        }
+-                      },
+-                      "df": 0,
+-                      "docs": {}
+-                    },
+-                    "df": 0,
+-                    "docs": {}
+-                  }
+-                }
+-              }
+-            },
+             "n": {
+               "c": {
+                 "df": 0,
+@@ -1260,14 +1212,6 @@
+                     "26": {
+                       "tf": 1.0
+                     }
+-                  },
+-                  "t": {
+-                    "df": 1,
+-                    "docs": {
+-                      "29": {
+-                        "tf": 1.0
+-                      }
+-                    }
+                   }
+                 }
+               }
+@@ -1740,13 +1684,10 @@
+                   "df": 0,
+                   "docs": {},
+                   "x": {
+-                    "df": 2,
++                    "df": 1,
+                     "docs": {
+                       "0": {
+                         "tf": 1.0
+-                      },
+-                      "29": {
+-                        "tf": 1.0
+                       }
+                     }
+                   }
+@@ -1754,22 +1695,6 @@
+               },
+               "df": 0,
+               "docs": {},
+-              "l": {
+-                "df": 0,
+-                "docs": {},
+-                "i": {
+-                  "df": 0,
+-                  "docs": {},
+-                  "n": {
+-                    "df": 1,
+-                    "docs": {
+-                      "29": {
+-                        "tf": 1.4142135623730951
+-                      }
+-                    }
+-                  }
+-                }
+-              },
+               "s": {
+                 "df": 0,
+                 "docs": {},
+@@ -2434,30 +2359,6 @@
+               },
+               "df": 0,
+               "docs": {},
+-              "g": {
+-                "df": 0,
+-                "docs": {},
+-                "u": {
+-                  "df": 0,
+-                  "docs": {},
+-                  "l": {
+-                    "a": {
+-                      "df": 0,
+-                      "docs": {},
+-                      "r": {
+-                        "df": 1,
+-                        "docs": {
+-                          "29": {
+-                            "tf": 1.0
+-                          }
+-                        }
+-                      }
+-                    },
+-                    "df": 0,
+-                    "docs": {}
+-                  }
+-                }
+-              },
+               "l": {
+                 "df": 1,
+                 "docs": {
+@@ -2689,26 +2590,6 @@
+             "n": {
+               "df": 0,
+               "docs": {},
+-              "e": {
+-                "a": {
+-                  "df": 0,
+-                  "docs": {},
+-                  "k": {
+-                    "df": 0,
+-                    "docs": {},
+-                    "i": {
+-                      "df": 1,
+-                      "docs": {
+-                        "29": {
+-                          "tf": 1.0
+-                        }
+-                      }
+-                    }
+-                  }
+-                },
+-                "df": 0,
+-                "docs": {}
+-              },
+               "i": {
+                 "df": 0,
+                 "docs": {},
+@@ -3371,54 +3252,6 @@
+             },
+             "df": 0,
+             "docs": {},
+-            "l": {
+-              "df": 0,
+-              "docs": {},
+-              "e": {
+-                "df": 0,
+-                "docs": {},
+-                "r": {
+-                  "df": 0,
+-                  "docs": {},
+-                  "t": {
+-                    "(": {
+-                      "\"": {
+-                        "df": 0,
+-                        "docs": {},
+-                        "i": {
+-                          "df": 0,
+-                          "docs": {},
+-                          "n": {
+-                            "df": 0,
+-                            "docs": {},
+-                            "l": {
+-                              "df": 0,
+-                              "docs": {},
+-                              "i": {
+-                                "df": 0,
+-                                "docs": {},
+-                                "n": {
+-                                  "df": 1,
+-                                  "docs": {
+-                                    "29": {
+-                                      "tf": 1.0
+-                                    }
+-                                  }
+-                                }
+-                              }
+-                            }
+-                          }
+-                        }
+-                      },
+-                      "df": 0,
+-                      "docs": {}
+-                    },
+-                    "df": 0,
+-                    "docs": {}
+-                  }
+-                }
+-              }
+-            },
+             "n": {
+               "c": {
+                 "df": 0,
+@@ -4297,14 +4130,6 @@
+                     "26": {
+                       "tf": 1.0
+                     }
+-                  },
+-                  "t": {
+-                    "df": 1,
+-                    "docs": {
+-                      "29": {
+-                        "tf": 1.0
+-                      }
+-                    }
+                   }
+                 }
+               }
+@@ -4840,13 +4665,10 @@
+                   "df": 0,
+                   "docs": {},
+                   "x": {
+-                    "df": 2,
++                    "df": 1,
+                     "docs": {
+                       "0": {
+                         "tf": 1.0
+-                      },
+-                      "29": {
+-                        "tf": 1.0
+                       }
+                     }
+                   }
+@@ -4854,22 +4676,6 @@
+               },
+               "df": 0,
+               "docs": {},
+-              "l": {
+-                "df": 0,
+-                "docs": {},
+-                "i": {
+-                  "df": 0,
+-                  "docs": {},
+-                  "n": {
+-                    "df": 1,
+-                    "docs": {
+-                      "29": {
+-                        "tf": 1.4142135623730951
+-                      }
+-                    }
+-                  }
+-                }
+-              },
+               "s": {
+                 "df": 0,
+                 "docs": {},
+@@ -5567,30 +5373,6 @@
+               },
+               "df": 0,
+               "docs": {},
+-              "g": {
+-                "df": 0,
+-                "docs": {},
+-                "u": {
+-                  "df": 0,
+-                  "docs": {},
+-                  "l": {
+-                    "a": {
+-                      "df": 0,
+-                      "docs": {},
+-                      "r": {
+-                        "df": 1,
+-                        "docs": {
+-                          "29": {
+-                            "tf": 1.0
+-                          }
+-                        }
+-                      }
+-                    },
+-                    "df": 0,
+-                    "docs": {}
+-                  }
+-                }
+-              },
+               "l": {
+                 "df": 1,
+                 "docs": {
+@@ -5828,26 +5610,6 @@
+             "n": {
+               "df": 0,
+               "docs": {},
+-              "e": {
+-                "a": {
+-                  "df": 0,
+-                  "docs": {},
+-                  "k": {
+-                    "df": 0,
+-                    "docs": {},
+-                    "i": {
+-                      "df": 1,
+-                      "docs": {
+-                        "29": {
+-                          "tf": 1.0
+-                        }
+-                      }
+-                    }
+-                  }
+-                },
+-                "df": 0,
+-                "docs": {}
+-              },
+               "i": {
+                 "df": 0,
+                 "docs": {},

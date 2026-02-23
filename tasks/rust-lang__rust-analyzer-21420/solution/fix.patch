@@ -1,0 +1,205 @@
+diff --git a/crates/ide/src/syntax_highlighting.rs b/crates/ide/src/syntax_highlighting.rs
+index e7c5f95a25..e64fd6488f 100644
+--- a/crates/ide/src/syntax_highlighting.rs
++++ b/crates/ide/src/syntax_highlighting.rs
+@@ -513,21 +513,21 @@ fn string_injections(
+             );
+ 
+             if !string.is_raw() {
+-                highlight_escape_string(hl, &string);
++                highlight_escape_string(hl, config, &string);
+             }
+         }
+     } else if let Some(byte_string) = ast::ByteString::cast(token.clone()) {
+         if !byte_string.is_raw() {
+-            highlight_escape_string(hl, &byte_string);
++            highlight_escape_string(hl, config, &byte_string);
+         }
+     } else if let Some(c_string) = ast::CString::cast(token.clone()) {
+         if !c_string.is_raw() {
+-            highlight_escape_string(hl, &c_string);
++            highlight_escape_string(hl, config, &c_string);
+         }
+     } else if let Some(char) = ast::Char::cast(token.clone()) {
+-        highlight_escape_char(hl, &char)
++        highlight_escape_char(hl, config, &char)
+     } else if let Some(byte) = ast::Byte::cast(token) {
+-        highlight_escape_byte(hl, &byte)
++        highlight_escape_byte(hl, config, &byte)
+     }
+     ControlFlow::Continue(())
+ }
+@@ -586,7 +586,11 @@ fn descend_token(
+ 
+ fn filter_by_config(highlight: &mut Highlight, config: &HighlightConfig<'_>) -> bool {
+     match &mut highlight.tag {
+-        HlTag::StringLiteral if !config.strings => return false,
++        HlTag::StringLiteral | HlTag::EscapeSequence | HlTag::InvalidEscapeSequence
++            if !config.strings =>
++        {
++            return false;
++        }
+         HlTag::Comment if !config.comments => return false,
+         // If punctuation is disabled, make the macro bang part of the macro call again.
+         tag @ HlTag::Punctuation(HlPunct::MacroBang) => {
+diff --git a/crates/ide/src/syntax_highlighting/escape.rs b/crates/ide/src/syntax_highlighting/escape.rs
+index 094f88f3a8..4da69cc43d 100644
+--- a/crates/ide/src/syntax_highlighting/escape.rs
++++ b/crates/ide/src/syntax_highlighting/escape.rs
+@@ -1,10 +1,14 @@
+ //! Syntax highlighting for escape sequences
+ use crate::syntax_highlighting::highlights::Highlights;
+-use crate::{HlRange, HlTag};
++use crate::{HighlightConfig, HlRange, HlTag};
+ use syntax::ast::{Byte, Char, IsString};
+ use syntax::{AstToken, TextRange, TextSize};
+ 
+-pub(super) fn highlight_escape_string<T: IsString>(stack: &mut Highlights, string: &T) {
++pub(super) fn highlight_escape_string<T: IsString>(
++    stack: &mut Highlights,
++    config: &HighlightConfig<'_>,
++    string: &T,
++) {
+     let text = string.text();
+     let start = string.syntax().text_range().start();
+     string.escaped_char_ranges(&mut |piece_range, char| {
+@@ -13,16 +17,23 @@ pub(super) fn highlight_escape_string<T: IsString>(stack: &mut Highlights, strin
+                 Ok(_) => HlTag::EscapeSequence,
+                 Err(_) => HlTag::InvalidEscapeSequence,
+             };
+-            stack.add(HlRange {
+-                range: piece_range + start,
+-                highlight: highlight.into(),
+-                binding_hash: None,
+-            });
++            stack.add_with(
++                config,
++                HlRange {
++                    range: piece_range + start,
++                    highlight: highlight.into(),
++                    binding_hash: None,
++                },
++            );
+         }
+     });
+ }
+ 
+-pub(super) fn highlight_escape_char(stack: &mut Highlights, char: &Char) {
++pub(super) fn highlight_escape_char(
++    stack: &mut Highlights,
++    config: &HighlightConfig<'_>,
++    char: &Char,
++) {
+     if char.value().is_err() {
+         // We do not emit invalid escapes highlighting here. The lexer would likely be in a bad
+         // state and this token contains junk, since `'` is not a reliable delimiter (consider
+@@ -43,10 +54,17 @@ pub(super) fn highlight_escape_char(stack: &mut Highlights, char: &Char) {
+         char.syntax().text_range().start() + TextSize::from(1),
+         TextSize::from(text.len() as u32),
+     );
+-    stack.add(HlRange { range, highlight: HlTag::EscapeSequence.into(), binding_hash: None })
++    stack.add_with(
++        config,
++        HlRange { range, highlight: HlTag::EscapeSequence.into(), binding_hash: None },
++    )
+ }
+ 
+-pub(super) fn highlight_escape_byte(stack: &mut Highlights, byte: &Byte) {
++pub(super) fn highlight_escape_byte(
++    stack: &mut Highlights,
++    config: &HighlightConfig<'_>,
++    byte: &Byte,
++) {
+     if byte.value().is_err() {
+         // See `highlight_escape_char` for why no error highlighting here.
+         return;
+@@ -65,5 +83,8 @@ pub(super) fn highlight_escape_byte(stack: &mut Highlights, byte: &Byte) {
+         byte.syntax().text_range().start() + TextSize::from(2),
+         TextSize::from(text.len() as u32),
+     );
+-    stack.add(HlRange { range, highlight: HlTag::EscapeSequence.into(), binding_hash: None })
++    stack.add_with(
++        config,
++        HlRange { range, highlight: HlTag::EscapeSequence.into(), binding_hash: None },
++    )
+ }
+diff --git a/crates/ide/src/syntax_highlighting/highlights.rs b/crates/ide/src/syntax_highlighting/highlights.rs
+index 340290eafe..6fe4d08443 100644
+--- a/crates/ide/src/syntax_highlighting/highlights.rs
++++ b/crates/ide/src/syntax_highlighting/highlights.rs
+@@ -4,7 +4,7 @@ use std::iter;
+ use stdx::equal_range_by;
+ use syntax::TextRange;
+ 
+-use crate::{HlRange, HlTag};
++use crate::{HighlightConfig, HlRange, HlTag};
+ 
+ pub(super) struct Highlights {
+     root: Node,
+@@ -26,6 +26,12 @@ impl Highlights {
+         self.root.add(hl_range);
+     }
+ 
++    pub(super) fn add_with(&mut self, config: &HighlightConfig<'_>, mut hl_range: HlRange) {
++        if super::filter_by_config(&mut hl_range.highlight, config) {
++            self.root.add(hl_range);
++        }
++    }
++
+     pub(super) fn to_vec(&self) -> Vec<HlRange> {
+         let mut res = Vec::new();
+         self.root.flatten(&mut res);
+diff --git a/crates/ide/src/syntax_highlighting/test_data/highlight_strings_disabled.html b/crates/ide/src/syntax_highlighting/test_data/highlight_strings_disabled.html
+new file mode 100644
+index 0000000000..344d0c2ff0
+--- /dev/null
++++ b/crates/ide/src/syntax_highlighting/test_data/highlight_strings_disabled.html
+@@ -0,0 +1,47 @@
++
++<style>
++body                { margin: 0; }
++pre                 { color: #DCDCCC; background: #3F3F3F; font-size: 22px; padding: 0.4em; }
++
++.lifetime           { color: #DFAF8F; font-style: italic; }
++.label              { color: #DFAF8F; font-style: italic; }
++.comment            { color: #7F9F7F; }
++.documentation      { color: #629755; }
++.intra_doc_link     { font-style: italic; }
++.injected           { opacity: 0.65 ; }
++.struct, .enum      { color: #7CB8BB; }
++.enum_variant       { color: #BDE0F3; }
++.string_literal     { color: #CC9393; }
++.field              { color: #94BFF3; }
++.function           { color: #93E0E3; }
++.parameter          { color: #94BFF3; }
++.text               { color: #DCDCCC; }
++.type               { color: #7CB8BB; }
++.builtin_type       { color: #8CD0D3; }
++.type_param         { color: #DFAF8F; }
++.attribute          { color: #94BFF3; }
++.numeric_literal    { color: #BFEBBF; }
++.bool_literal       { color: #BFE6EB; }
++.macro              { color: #94BFF3; }
++.proc_macro         { color: #94BFF3; text-decoration: underline; }
++.derive             { color: #94BFF3; font-style: italic; }
++.module             { color: #AFD8AF; }
++.value_param        { color: #DCDCCC; }
++.variable           { color: #DCDCCC; }
++.format_specifier   { color: #CC696B; }
++.mutable            { text-decoration: underline; }
++.escape_sequence    { color: #94BFF3; }
++.keyword            { color: #F0DFAF; font-weight: bold; }
++.control            { font-style: italic; }
++.reference          { font-style: italic; font-weight: bold; }
++.const              { font-weight: bolder; }
++.unsafe             { color: #BC8383; }
++.deprecated         { text-decoration: line-through; }
++
++.invalid_escape_sequence { color: #FC5555; text-decoration: wavy underline; }
++.unresolved_reference    { color: #FC5555; text-decoration: wavy underline; }
++</style>
++<pre><code><span class="keyword">fn</span> <span class="function declaration">main</span><span class="parenthesis">(</span><span class="parenthesis">)</span> <span class="brace">{</span>
++    <span class="macro default_library library">format_args</span><span class="macro_bang">!</span><span class="parenthesis">(</span>"foo\nbar"<span class="parenthesis">)</span><span class="semicolon">;</span>
++    <span class="macro default_library library">format_args</span><span class="macro_bang">!</span><span class="parenthesis">(</span>"foo\invalid"<span class="parenthesis">)</span><span class="semicolon">;</span>
++<span class="brace">}</span></code></pre>
+\ No newline at end of file

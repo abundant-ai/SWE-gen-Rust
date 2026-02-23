@@ -1,0 +1,220 @@
+diff --git a/tracing-attributes/src/attr.rs b/tracing-attributes/src/attr.rs
+index 34ca3d66..bde089fb 100644
+--- a/tracing-attributes/src/attr.rs
++++ b/tracing-attributes/src/attr.rs
+@@ -11,7 +11,6 @@ pub(crate) struct InstrumentArgs {
+     level: Option<Level>,
+     pub(crate) name: Option<LitStr>,
+     target: Option<LitStr>,
+-    pub(crate) parent: Option<Expr>,
+     pub(crate) skips: HashSet<Ident>,
+     pub(crate) fields: Option<Fields>,
+     pub(crate) err_mode: Option<FormatMode>,
+@@ -123,12 +122,6 @@ impl Parse for InstrumentArgs {
+                 }
+                 let target = input.parse::<StrArg<kw::target>>()?.value;
+                 args.target = Some(target);
+-            } else if lookahead.peek(kw::parent) {
+-                if args.target.is_some() {
+-                    return Err(input.error("expected only a single `parent` argument"));
+-                }
+-                let parent = input.parse::<ExprArg<kw::parent>>()?;
+-                args.parent = Some(parent.value);
+             } else if lookahead.peek(kw::level) {
+                 if args.level.is_some() {
+                     return Err(input.error("expected only a single `level` argument"));
+@@ -187,23 +180,6 @@ impl<T: Parse> Parse for StrArg<T> {
+     }
+ }
+ 
+-struct ExprArg<T> {
+-    value: Expr,
+-    _p: std::marker::PhantomData<T>,
+-}
+-
+-impl<T: Parse> Parse for ExprArg<T> {
+-    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+-        let _ = input.parse::<T>()?;
+-        let _ = input.parse::<Token![=]>()?;
+-        let value = input.parse()?;
+-        Ok(Self {
+-            value,
+-            _p: std::marker::PhantomData,
+-        })
+-    }
+-}
+-
+ struct Skips(HashSet<Ident>);
+ 
+ impl Parse for Skips {
+@@ -384,7 +360,6 @@ mod kw {
+     syn::custom_keyword!(skip);
+     syn::custom_keyword!(level);
+     syn::custom_keyword!(target);
+-    syn::custom_keyword!(parent);
+     syn::custom_keyword!(name);
+     syn::custom_keyword!(err);
+     syn::custom_keyword!(ret);
+diff --git a/tracing-attributes/src/expand.rs b/tracing-attributes/src/expand.rs
+index e2004e8e..5fe71fe2 100644
+--- a/tracing-attributes/src/expand.rs
++++ b/tracing-attributes/src/expand.rs
+@@ -135,8 +135,6 @@ fn gen_block<B: ToTokens>(
+ 
+         let target = args.target();
+ 
+-        let parent = args.parent.iter();
+-
+         // filter out skipped fields
+         let quoted_fields: Vec<_> = param_names
+             .iter()
+@@ -184,7 +182,6 @@ fn gen_block<B: ToTokens>(
+ 
+         quote!(tracing::span!(
+             target: #target,
+-            #(parent: #parent,)*
+             #level,
+             #span_name,
+             #(#quoted_fields,)*
+diff --git a/tracing-attributes/src/lib.rs b/tracing-attributes/src/lib.rs
+index 6ac07cef..335245fc 100644
+--- a/tracing-attributes/src/lib.rs
++++ b/tracing-attributes/src/lib.rs
+@@ -153,29 +153,6 @@ mod expand;
+ ///     // ...
+ /// }
+ /// ```
+-/// Overriding the generated span's parent:
+-/// ```
+-/// # use tracing_attributes::instrument;
+-/// #[instrument(parent = None)]
+-/// pub fn my_function() {
+-///     // ...
+-/// }
+-/// ```
+-/// ```
+-/// # use tracing_attributes::instrument;
+-/// // A struct which owns a span handle.
+-/// struct MyStruct
+-/// {
+-///     span: tracing::Span
+-/// }
+-///
+-/// impl MyStruct
+-/// {
+-///     // Use the struct's `span` field as the parent span
+-///     #[instrument(parent = &self.span, skip(self))]
+-///     fn my_method(&self) {}
+-/// }
+-/// ```
+ ///
+ /// To skip recording an argument, pass the argument's name to the `skip`:
+ ///
+diff --git a/tracing-attributes/tests/parents.rs b/tracing-attributes/tests/parents.rs
+deleted file mode 100644
+index c4d375f5..00000000
+--- a/tracing-attributes/tests/parents.rs
++++ /dev/null
+@@ -1,102 +0,0 @@
+-use tracing::{collect::with_default, Id, Level};
+-use tracing_attributes::instrument;
+-use tracing_mock::*;
+-
+-#[instrument]
+-fn with_default_parent() {}
+-
+-#[instrument(parent = parent_span, skip(parent_span))]
+-fn with_explicit_parent<P>(parent_span: P)
+-where
+-    P: Into<Option<Id>>,
+-{
+-}
+-
+-#[test]
+-fn default_parent_test() {
+-    let contextual_parent = span::mock().named("contextual_parent");
+-    let child = span::mock().named("with_default_parent");
+-
+-    let (collector, handle) = collector::mock()
+-        .new_span(
+-            contextual_parent
+-                .clone()
+-                .with_contextual_parent(None)
+-                .with_explicit_parent(None),
+-        )
+-        .new_span(
+-            child
+-                .clone()
+-                .with_contextual_parent(Some("contextual_parent"))
+-                .with_explicit_parent(None),
+-        )
+-        .enter(child.clone())
+-        .exit(child.clone())
+-        .enter(contextual_parent.clone())
+-        .new_span(
+-            child
+-                .clone()
+-                .with_contextual_parent(Some("contextual_parent"))
+-                .with_explicit_parent(None),
+-        )
+-        .enter(child.clone())
+-        .exit(child)
+-        .exit(contextual_parent)
+-        .done()
+-        .run_with_handle();
+-
+-    with_default(collector, || {
+-        let contextual_parent = tracing::span!(Level::TRACE, "contextual_parent");
+-
+-        with_default_parent();
+-
+-        contextual_parent.in_scope(|| {
+-            with_default_parent();
+-        });
+-    });
+-
+-    handle.assert_finished();
+-}
+-
+-#[test]
+-fn explicit_parent_test() {
+-    let contextual_parent = span::mock().named("contextual_parent");
+-    let explicit_parent = span::mock().named("explicit_parent");
+-    let child = span::mock().named("with_explicit_parent");
+-
+-    let (collector, handle) = collector::mock()
+-        .new_span(
+-            contextual_parent
+-                .clone()
+-                .with_contextual_parent(None)
+-                .with_explicit_parent(None),
+-        )
+-        .new_span(
+-            explicit_parent
+-                .with_contextual_parent(None)
+-                .with_explicit_parent(None),
+-        )
+-        .enter(contextual_parent.clone())
+-        .new_span(
+-            child
+-                .clone()
+-                .with_contextual_parent(Some("contextual_parent"))
+-                .with_explicit_parent(Some("explicit_parent")),
+-        )
+-        .enter(child.clone())
+-        .exit(child)
+-        .exit(contextual_parent)
+-        .done()
+-        .run_with_handle();
+-
+-    with_default(collector, || {
+-        let contextual_parent = tracing::span!(Level::INFO, "contextual_parent");
+-        let explicit_parent = tracing::span!(Level::INFO, "explicit_parent");
+-
+-        contextual_parent.in_scope(|| {
+-            with_explicit_parent(&explicit_parent);
+-        });
+-    });
+-
+-    handle.assert_finished();
+-}

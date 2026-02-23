@@ -17,8 +17,8 @@ RUN apt-get update && apt-get install -y \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust - using nightly (latest)
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly-2025-09-28
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # Install older nightly for axum-macros (which has rust-toolchain file requiring nightly-2024-03-13)
@@ -26,11 +26,11 @@ RUN rustup toolchain install nightly-2024-03-13
 
 WORKDIR /app
 
-# Clone repo at HEAD commit (with fix applied)
+# Clone repo at HEAD commit (using 1eff4e7 which has working dependencies)
 RUN git clone https://github.com/tokio-rs/axum.git src && \
     cd src && \
-    (git fetch --depth 1 origin f21e2994af6ea55ac5da94087203196942597253 || git fetch --depth 1 origin "+refs/pull/2073/head:refs/remotes/origin/pr/2073") && \
-    git checkout --detach FETCH_HEAD && \
+    (git fetch --depth 1 origin 1eff4e7021ba47a9986780657488fcf8b36c766b || git fetch --depth 50 origin main) && \
+    git checkout 1eff4e7021ba47a9986780657488fcf8b36c766b && \
     git submodule update --init --recursive
 
 WORKDIR /app/src
@@ -43,7 +43,7 @@ RUN cargo fetch
 # Build the project (build axum-macros which is needed for the tests)
 RUN cargo build -p axum-macros
 
-# If install/build steps touched tracked files, reset them so bug.patch applies cleanly,
+# Reset tracked files so bug.patch applies cleanly
 RUN git reset --hard
 
 # Apply bug.patch to revert to buggy state (BASE)

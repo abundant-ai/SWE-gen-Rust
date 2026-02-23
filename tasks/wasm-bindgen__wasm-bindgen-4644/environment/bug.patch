@@ -1,0 +1,606 @@
+diff --git a/.github/workflows/main.yml b/.github/workflows/main.yml
+index 60c26ebbd..66b7d09df 100644
+--- a/.github/workflows/main.yml
++++ b/.github/workflows/main.yml
+@@ -230,7 +230,7 @@ jobs:
+     - name: Check TypeScript output
+       run: tsc --noEmit --skipLibCheck --lib esnext,dom $(echo crates/cli/tests/reference/*.d.ts)
+     - name: Check JavaScript output
+-      run: tsc --noEmit --skipLibCheck --lib esnext,dom --module esnext --allowJs $(echo crates/cli/tests/reference/*.js | sed 's/ crates\/cli\/tests\/reference\/targets-[56]\.js//g')
++      run: tsc --noEmit --skipLibCheck --lib esnext,dom --module esnext --allowJs $(echo crates/cli/tests/reference/*.js | sed 's/ crates\/cli\/tests\/reference\/targets-5\.js//g')
+ 
+   test_native:
+     name: Run native tests
+diff --git a/crates/cli-support/src/js/binding.rs b/crates/cli-support/src/js/binding.rs
+index b51bee3c0..2ffe8f969 100644
+--- a/crates/cli-support/src/js/binding.rs
++++ b/crates/cli-support/src/js/binding.rs
+@@ -150,15 +150,6 @@ impl<'a, 'b> Builder<'a, 'b> {
+         let mut js = JsBuilder::new(self.cx, debug_name);
+         if let Some(consumes_self) = self.method {
+             let _ = params.next();
+-            if js.cx.config.generate_reset_state {
+-                js.prelude(
+-                    "
+-                    if (this.__wbg_inst !== undefined && this.__wbg_inst !== __wbg_instance_id) {
+-                        throw new Error('Invalid stale object from previous Wasm instance');
+-                    }
+-                    ",
+-                );
+-            }
+             if js.cx.config.debug {
+                 js.prelude(
+                     "if (this.__wbg_ptr == 0) throw new Error('Attempt to use a moved value');",
+@@ -688,26 +679,16 @@ impl<'a, 'b> JsBuilder<'a, 'b> {
+     }
+ 
+     fn assert_not_moved(&mut self, arg: &str) {
+-        if self.cx.config.generate_reset_state {
+-            // Under reset state, we need comprehensive validation
+-            self.prelude(&format!(
+-                "\
+-                if (({arg}).__wbg_inst !== undefined && ({arg}).__wbg_inst !== __wbg_instance_id) {{
+-                    throw new Error('Invalid stale object from previous Wasm instance');
+-                }}
+-                "
+-            ));
++        if !self.cx.config.debug {
++            return;
+         }
+-        if self.cx.config.debug {
+-            // Debug mode only checks for moved values
+-            self.prelude(&format!(
+-                "\
++        self.prelude(&format!(
++            "\
+                 if ({arg}.__wbg_ptr === 0) {{
+                     throw new Error('Attempt to use a moved value');
+                 }}
+-                ",
+-            ));
+-        }
++            ",
++        ));
+     }
+ 
+     fn string_to_memory(
+@@ -1322,27 +1303,10 @@ fn instruction(
+             let val = js.pop();
+             match constructor {
+                 Some(name) if name == class => {
+-                    let (ptr_assignment, register_data) = if js.cx.config.generate_reset_state {
+-                        (
+-                            format!(
+-                                "\
+-                                this.__wbg_ptr = {val} >>> 0;
+-                                this.__wbg_inst = __wbg_instance_id;
+-                                "
+-                            ),
+-                            format!("{{ ptr: {val} >>> 0, instance: __wbg_instance_id }}"),
+-                        )
+-                    } else {
+-                        (
+-                            format!("this.__wbg_ptr = {val} >>> 0;"),
+-                            "this.__wbg_ptr".to_string(),
+-                        )
+-                    };
+-
+                     js.prelude(&format!(
+                         "
+-                        {ptr_assignment}
+-                        {name}Finalization.register(this, {register_data}, this);
++                        this.__wbg_ptr = {val} >>> 0;
++                        {name}Finalization.register(this, this.__wbg_ptr, this);
+                         "
+                     ));
+                     js.push(String::from("this"));
+diff --git a/crates/cli-support/src/js/mod.rs b/crates/cli-support/src/js/mod.rs
+index 8a19e6ed7..560426c60 100644
+--- a/crates/cli-support/src/js/mod.rs
++++ b/crates/cli-support/src/js/mod.rs
+@@ -174,10 +174,6 @@ impl<'a> Context<'a> {
+         self.exposed_globals.as_mut().unwrap().insert(name.into())
+     }
+ 
+-    fn has_global(&self, name: &str) -> bool {
+-        self.exposed_globals.as_ref().unwrap().contains(name)
+-    }
+-
+     fn export(
+         &mut self,
+         export_name: &str,
+@@ -1097,25 +1093,13 @@ wasm = wasmInstance.exports;
+         }
+ 
+         if class.wrap_needed {
+-            let (ptr_assignment, register_data) = if self.config.generate_reset_state {
+-                (
+-                    "\
+-                    obj.__wbg_ptr = ptr;
+-                    obj.__wbg_inst = __wbg_instance_id;
+-                    ",
+-                    "{ ptr, instance: __wbg_instance_id }",
+-                )
+-            } else {
+-                ("obj.__wbg_ptr = ptr;", "obj.__wbg_ptr")
+-            };
+-
+             dst.push_str(&format!(
+                 "
+                 static __wrap(ptr) {{
+                     ptr = ptr >>> 0;
+                     const obj = Object.create({name}.prototype);
+-                    {ptr_assignment}
+-                    {name}Finalization.register(obj, {register_data}, obj);
++                    obj.__wbg_ptr = ptr;
++                    {name}Finalization.register(obj, obj.__wbg_ptr, obj);
+                     return obj;
+                 }}
+                 "
+@@ -1135,25 +1119,12 @@ wasm = wasmInstance.exports;
+             ));
+         }
+ 
+-        let finalization_callback = if self.config.generate_reset_state {
+-            format!(
+-                "({{ ptr, instance }}) => {{
+-                if (instance === __wbg_instance_id) wasm.{}(ptr >>> 0, 1);
+-            }}",
+-                wasm_bindgen_shared::free_function(name)
+-            )
+-        } else {
+-            format!(
+-                "ptr => wasm.{}(ptr >>> 0, 1)",
+-                wasm_bindgen_shared::free_function(name)
+-            )
+-        };
+-
+         self.global(&format!(
+             "
+             const {name}Finalization = (typeof FinalizationRegistry === 'undefined')
+                 ? {{ register: () => {{}}, unregister: () => {{}} }}
+-                : new FinalizationRegistry({finalization_callback});",
++                : new FinalizationRegistry(ptr => wasm.{}(ptr >>> 0, 1));",
++            wasm_bindgen_shared::free_function(name),
+         ));
+ 
+         // If the class is inspectable, generate `toJSON` and `toString`
+@@ -2514,25 +2485,11 @@ wasm = wasmInstance.exports;
+         // while we invoke it. If we finish and the closure wasn't
+         // destroyed, then we put back the pointer so a future
+         // invocation can succeed.
+-        let (state_init, instance_check) = if self.config.generate_reset_state {
+-            (
+-                "const state = { a: arg0, b: arg1, cnt: 1, dtor, instance: __wbg_instance_id };",
+-                "
+-                if (state.instance !== __wbg_instance_id) {
+-                    throw new Error('Cannot invoke closure from previous WASM instance');
+-                }
+-                ",
+-            )
+-        } else {
+-            ("const state = { a: arg0, b: arg1, cnt: 1, dtor };", "")
+-        };
+-
+         self.global(&format!(
+             "
+             function makeMutClosure(arg0, arg1, dtor, f) {{
+-                {state_init}
++                const state = {{ a: arg0, b: arg1, cnt: 1, dtor }};
+                 const real = (...args) => {{
+-                    {instance_check}
+                     // First up with a closure we increment the internal reference
+                     // count. This ensures that the Rust closure environment won't
+                     // be deallocated while we're invoking it.
+@@ -2554,7 +2511,7 @@ wasm = wasmInstance.exports;
+                 CLOSURE_DTORS.register(real, state, state);
+                 return real;
+             }}
+-            "
++            ",
+         ));
+ 
+         Ok(())
+@@ -2574,25 +2531,11 @@ wasm = wasmInstance.exports;
+         // executing the destructor, however, we clear out the
+         // `this.a` pointer to prevent it being used again the
+         // future.
+-        let (state_init, instance_check) = if self.config.generate_reset_state {
+-            (
+-                "const state = { a: arg0, b: arg1, cnt: 1, dtor, instance: __wbg_instance_id };",
+-                "
+-                if (state.instance !== __wbg_instance_id) {
+-                    throw new Error('Cannot invoke closure from previous WASM instance');
+-                }
+-                ",
+-            )
+-        } else {
+-            ("const state = { a: arg0, b: arg1, cnt: 1, dtor };", "")
+-        };
+-
+         self.global(&format!(
+             "
+             function makeClosure(arg0, arg1, dtor, f) {{
+-                {state_init}
++                const state = {{ a: arg0, b: arg1, cnt: 1, dtor }};
+                 const real = (...args) => {{
+-                    {instance_check}
+                     // First up with a closure we increment the internal reference
+                     // count. This ensures that the Rust closure environment won't
+                     // be deallocated while we're invoking it.
+@@ -2601,7 +2544,8 @@ wasm = wasmInstance.exports;
+                         return f(state.a, state.b, ...args);
+                     }} finally {{
+                         if (--state.cnt === 0) {{
+-                            wasm.{table}.get(state.dtor)(state.a, state.b); state.a = 0;
++                            wasm.{table}.get(state.dtor)(state.a, state.b);
++                            state.a = 0;
+                             CLOSURE_DTORS.unregister(state);
+                         }}
+                     }}
+@@ -2610,7 +2554,7 @@ wasm = wasmInstance.exports;
+                 CLOSURE_DTORS.register(real, state, state);
+                 return real;
+             }}
+-            "
++            ",
+         ));
+ 
+         Ok(())
+@@ -2621,119 +2565,18 @@ wasm = wasmInstance.exports;
+             return Ok(());
+         }
+         let table = self.export_function_table()?;
+-
+-        let finalization_callback = if self.config.generate_reset_state {
+-            format!(
+-                "
+-                state => {{
+-                    if (state.instance === __wbg_instance_id) {{
+-                        wasm.{table}.get(state.dtor)(state.a, state.b);
+-                    }}
+-                }}
+-                "
+-            )
+-        } else {
+-            format!(
+-                "
+-                state => {{
+-                    wasm.{table}.get(state.dtor)(state.a, state.b);
+-                }}
+-                "
+-            )
+-        };
+-
+         self.global(&format!(
+             "
+             const CLOSURE_DTORS = (typeof FinalizationRegistry === 'undefined')
+                 ? {{ register: () => {{}}, unregister: () => {{}} }}
+-                : new FinalizationRegistry({finalization_callback});
++                : new FinalizationRegistry(state => {{
++                    wasm.{table}.get(state.dtor)(state.a, state.b)
++                }});
+             "
+         ));
+ 
+         Ok(())
+     }
+-
+-    fn generate_reset_state(&mut self) -> Result<(), Error> {
+-        self.global("let __wbg_instance_id = 0;");
+-
+-        let mut reset_statements = Vec::new();
+-
+-        reset_statements.push("__wbg_instance_id++;".to_string());
+-
+-        for (num, kinds) in self.memories.values() {
+-            for kind in kinds {
+-                let memview_name = format!("get{}Memory", kind);
+-                if self.has_global(memview_name.as_str()) {
+-                    reset_statements.push(format!("cached{kind}Memory{num} = null;"));
+-                }
+-            }
+-        }
+-
+-        // Conditionally reset globals based on whether they were used
+-        if self.has_global("text_decoder") {
+-            reset_statements.push(
+-                "if (typeof numBytesDecoded !== 'undefined') numBytesDecoded = 0;".to_string(),
+-            );
+-        }
+-
+-        if self.has_global("wasm_vector_len") {
+-            reset_statements.push(
+-                "if (typeof WASM_VECTOR_LEN !== 'undefined') WASM_VECTOR_LEN = 0;".to_string(),
+-            );
+-        }
+-
+-        if self.has_global("heap") {
+-            let mut heap_reset = format!(
+-                "\
+-                    if (typeof heap !== 'undefined') {{
+-                        heap = new Array({INITIAL_HEAP_OFFSET}).fill(undefined);
+-                        heap = heap.concat([{}]);
+-                ",
+-                INITIAL_HEAP_VALUES.join(", ")
+-            );
+-
+-            if self.has_global("heap_next") {
+-                heap_reset.push_str(
+-                    "\
+-                        if (typeof heap_next !== 'undefined')
+-                            heap_next = heap.length;
+-                    ",
+-                );
+-            }
+-
+-            if self.has_global("stack_pointer") {
+-                heap_reset.push_str(&format!(
+-                    "\
+-                        if (typeof stack_pointer !== 'undefined')
+-                            stack_pointer = {INITIAL_HEAP_OFFSET};
+-                    "
+-                ));
+-            }
+-
+-            heap_reset.push('}');
+-            reset_statements.push(heap_reset);
+-        }
+-
+-        reset_statements.push(
+-            "\
+-                const wasmInstance = new WebAssembly.Instance(wasmModule, imports);
+-                wasm = wasmInstance.exports;
+-                wasm.__wbindgen_start();
+-            "
+-            .to_string(),
+-        );
+-
+-        let function_body = format!(" () {{\n{}}}", reset_statements.join("\n"));
+-
+-        self.export(
+-            "__wbg_reset_state",
+-            ExportJs::Function(&format!("function{function_body}")),
+-            None,
+-        )?;
+-
+-        Ok(())
+-    }
+-
+     fn global(&mut self, s: &str) {
+         let s = s.trim();
+ 
+@@ -2973,11 +2816,6 @@ wasm = wasmInstance.exports;
+ 
+         self.export_destructor();
+ 
+-        // Generate reset state function last, to ensure it knows about all other state.
+-        if self.config.generate_reset_state {
+-            self.generate_reset_state()?;
+-        }
+-
+         Ok(())
+     }
+ 
+diff --git a/crates/cli-support/src/lib.rs b/crates/cli-support/src/lib.rs
+index 1bdb88911..10d546b60 100755
+--- a/crates/cli-support/src/lib.rs
++++ b/crates/cli-support/src/lib.rs
+@@ -41,7 +41,6 @@ pub struct Bindgen {
+     encode_into: EncodeInto,
+     split_linked_modules: bool,
+     symbol_dispose: bool,
+-    generate_reset_state: bool,
+ }
+ 
+ pub struct Output {
+@@ -112,7 +111,6 @@ impl Bindgen {
+             omit_default_module_path: true,
+             split_linked_modules: false,
+             symbol_dispose,
+-            generate_reset_state: false,
+         }
+     }
+ 
+@@ -223,7 +221,7 @@ impl Bindgen {
+         Ok(self)
+     }
+ 
+-    pub fn module(&mut self, source_phase: bool) -> Result<&mut Bindgen, Error> {
++    pub fn source_phase(&mut self, source_phase: bool) -> Result<&mut Bindgen, Error> {
+         if source_phase {
+             self.switch_mode(OutputMode::Module, "--target module")?;
+         }
+@@ -298,11 +296,6 @@ impl Bindgen {
+         self
+     }
+ 
+-    pub fn reset_state_function(&mut self, generate_reset_state: bool) -> &mut Bindgen {
+-        self.generate_reset_state = generate_reset_state;
+-        self
+-    }
+-
+     pub fn generate<P: AsRef<Path>>(&mut self, path: P) -> Result<(), Error> {
+         self.generate_output()?.emit(path.as_ref())
+     }
+@@ -354,11 +347,6 @@ impl Bindgen {
+             bail!("exported symbol \"default\" not allowed for --target web")
+         }
+ 
+-        // Check that reset_state is only used with --target module
+-        if self.generate_reset_state && !matches!(self.mode, OutputMode::Module) {
+-            bail!("--experimental-reset-state-function is only supported for --target module")
+-        }
+-
+         let thread_count = transforms::threads::run(&mut module)
+             .with_context(|| "failed to prepare module for threading")?;
+ 
+diff --git a/crates/cli/src/bin/wasm-bindgen.rs b/crates/cli/src/bin/wasm-bindgen.rs
+index f2186b753..ce41d54f1 100644
+--- a/crates/cli/src/bin/wasm-bindgen.rs
++++ b/crates/cli/src/bin/wasm-bindgen.rs
+@@ -88,11 +88,6 @@ struct Args {
+                 If a bundler is used, it needs to be set up accordingly."
+     )]
+     split_linked_modules: bool,
+-    #[arg(
+-        long = "experimental-reset-state-function",
+-        help = "Generate __wbg_reset_state function for WASM reinitialization (experimental)"
+-    )]
+-    generate_reset_state: bool,
+     // The options below are deprecated. They're still parsed for backwards compatibility,
+     // but we don't want to show them in `--help` to avoid distracting users.
+     #[arg(long, hide = true)]
+@@ -137,7 +132,7 @@ fn rmain(args: &Args) -> Result<(), Error> {
+         Target::Nodejs => b.nodejs(true)?,
+         Target::Deno => b.deno(true)?,
+         Target::ExperimentalNodejsModule => b.nodejs_module(true)?,
+-        Target::Module => b.module(true)?,
++        Target::Module => b.source_phase(true)?,
+     };
+     #[allow(deprecated)]
+     b.input_path(&args.input)
+@@ -155,8 +150,7 @@ fn rmain(args: &Args) -> Result<(), Error> {
+         .omit_imports(args.omit_imports)
+         .omit_default_module_path(args.omit_default_module_path)
+         .split_linked_modules(args.split_linked_modules)
+-        .reference_types(args.reference_types)
+-        .reset_state_function(args.generate_reset_state);
++        .reference_types(args.reference_types);
+ 
+     if let Some(ref name) = args.no_modules_global {
+         b.no_modules_global(name)?;
+diff --git a/crates/cli/tests/reference/targets-6.d.ts b/crates/cli/tests/reference/targets-6.d.ts
+deleted file mode 100644
+index a01199843..000000000
+--- a/crates/cli/tests/reference/targets-6.d.ts
++++ /dev/null
+@@ -1,3 +0,0 @@
+-/* tslint:disable */
+-/* eslint-disable */
+-export function add_that_might_fail(a: number, b: number): number;
+diff --git a/crates/cli/tests/reference/targets-6.js b/crates/cli/tests/reference/targets-6.js
+deleted file mode 100644
+index 8e01ffdf0..000000000
+--- a/crates/cli/tests/reference/targets-6.js
++++ /dev/null
+@@ -1,47 +0,0 @@
+-import source wasmModule from "./reference_test_bg.wasm";
+-
+-let wasm;
+-/**
+- * @param {number} a
+- * @param {number} b
+- * @returns {number}
+- */
+-export function add_that_might_fail(a, b) {
+-    const ret = wasm.add_that_might_fail(a, b);
+-    return ret >>> 0;
+-}
+-
+-let __wbg_instance_id = 0;
+-
+-export function __wbg_reset_state () {
+-    __wbg_instance_id++;
+-    const wasmInstance = new WebAssembly.Instance(wasmModule, imports);
+-    wasm = wasmInstance.exports;
+-    wasm.__wbindgen_start();
+-}
+-
+-const imports = {
+-    __wbindgen_placeholder__: {
+-        __wbg_random_8be0a899673d8681: function() {
+-            const ret = Math.random();
+-            return ret;
+-        },
+-        __wbindgen_init_externref_table: function() {
+-            const table = wasm.__wbindgen_export_0;
+-            const offset = table.grow(4);
+-            table.set(0, undefined);
+-            table.set(offset + 0, undefined);
+-            table.set(offset + 1, null);
+-            table.set(offset + 2, true);
+-            table.set(offset + 3, false);
+-            ;
+-        },
+-    },
+-
+-};
+-
+-const wasmInstance = new WebAssembly.Instance(wasmModule, imports);
+-wasm = wasmInstance.exports;
+-
+-wasm.__wbindgen_start();
+-
+diff --git a/crates/cli/tests/reference/targets-6.wat b/crates/cli/tests/reference/targets-6.wat
+deleted file mode 100644
+index 90b15e75b..000000000
+--- a/crates/cli/tests/reference/targets-6.wat
++++ /dev/null
+@@ -1,15 +0,0 @@
+-(module $reference_test.wasm
+-  (type (;0;) (func))
+-  (type (;1;) (func (result f64)))
+-  (type (;2;) (func (param i32 i32) (result i32)))
+-  (import "__wbindgen_placeholder__" "__wbg_random_8be0a899673d8681" (func (;0;) (type 1)))
+-  (import "__wbindgen_placeholder__" "__wbindgen_init_externref_table" (func (;1;) (type 0)))
+-  (func $add_that_might_fail (;2;) (type 2) (param i32 i32) (result i32))
+-  (table (;0;) 128 externref)
+-  (memory (;0;) 17)
+-  (export "memory" (memory 0))
+-  (export "add_that_might_fail" (func $add_that_might_fail))
+-  (export "__wbindgen_export_0" (table 0))
+-  (export "__wbindgen_start" (func 1))
+-  (@custom "target_features" (after code) "\08+\0bbulk-memory+\0fbulk-memory-opt+\16call-indirect-overlong+\0amultivalue+\0fmutable-globals+\13nontrapping-fptoint+\0freference-types+\08sign-ext")
+-)
+diff --git a/crates/cli/tests/reference/targets.rs b/crates/cli/tests/reference/targets.rs
+index fc7642462..4184abbf9 100644
+--- a/crates/cli/tests/reference/targets.rs
++++ b/crates/cli/tests/reference/targets.rs
+@@ -4,7 +4,6 @@
+ // FLAGS: --target=nodejs
+ // FLAGS: --target=deno
+ // FLAGS: --target=module
+-// FLAGS: --target=module --experimental-reset-state-function
+ 
+ use wasm_bindgen::prelude::*;
+ 
+diff --git a/guide/src/reference/cli.md b/guide/src/reference/cli.md
+index 2692cf3a0..5a8a989ae 100644
+--- a/guide/src/reference/cli.md
++++ b/guide/src/reference/cli.md
+@@ -111,34 +111,3 @@ containing the JS shim.
+ On the no-modules target, `link_to!` won't work if used outside of a document,
+ e.g. inside a worker. This is because it's impossible to figure out what the
+ URL of the linked module is without a reference point like `import.meta.url`.
+-
+-### `--experimental-reset-state-function`
+-
+-Generates a `__wbg_reset_state()` function that allows reinitializing the
+-entire library state for environments that wish to reuse and reset the same
+-JavaScript execution context without reloading the entire library.
+-
+-This feature is currently only supported for `--target module`.
+-
+-When this flag is enabled, the generated code will also associate all objects
+-with execution instance identity that validates and throws for stale references,
+-carefully associating Wasm bindgen pointer and finalization references with
+-an instance id that is changed whenever this function is called.
+-
+-**Example usage:**
+-
+-```javascript
+-import { __wbg_reset_state, inc } from './wbg-lib.js';
+-
+-
+-console.log(inc()); // logs 1
+-console.log(inc()); // logs 2
+-
+-// fully reset the Wasm VM state
+-__wbg_reset_state();
+-
+-console.log(inc()); // logs 1
+-```
+-
+-**Note:** This feature adds overhead to the generated code and should only be 
+-enabled when needed for environment-specific requirements.

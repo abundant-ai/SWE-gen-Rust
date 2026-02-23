@@ -1,0 +1,410 @@
+diff --git a/.changes/cookies-for-url.md b/.changes/cookies-for-url.md
+deleted file mode 100644
+index 498cbc34d..000000000
+--- a/.changes/cookies-for-url.md
++++ /dev/null
+@@ -1,5 +0,0 @@
+----
+-"tauri": minor:feat
+----
+-
+-Added `Webview::cookies()`, `Webview::cookies_for_url()`, `WebviewWindow::cookies()` and `Webview::cookies_for_url()`.
+diff --git a/.changes/webview-cookies-runtime.md b/.changes/webview-cookies-runtime.md
+deleted file mode 100644
+index 8beadfbb9..000000000
+--- a/.changes/webview-cookies-runtime.md
++++ /dev/null
+@@ -1,6 +0,0 @@
+----
+-"tauri-runtime": minor:feat
+-"tauri-runtime-wry": minor:feat
+----
+-
+-Added `WebviewDispatch::cookies()` and `WebviewDispatch::cookies_for_url()`.
+diff --git a/Cargo.lock b/Cargo.lock
+index c04db0d67..28031d69f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -9391,7 +9391,6 @@ dependencies = [
+ name = "tauri-runtime"
+ version = "2.3.0"
+ dependencies = [
+- "cookie",
+  "dpi",
+  "gtk",
+  "http 1.2.0",
+diff --git a/crates/tauri-runtime-wry/src/lib.rs b/crates/tauri-runtime-wry/src/lib.rs
+index c07e48b0e..7e8013d6a 100644
+--- a/crates/tauri-runtime-wry/src/lib.rs
++++ b/crates/tauri-runtime-wry/src/lib.rs
+@@ -23,9 +23,9 @@ use tauri_runtime::{
+     CursorIcon, DetachedWindow, DetachedWindowWebview, DragDropEvent, PendingWindow, RawWindow,
+     WebviewEvent, WindowBuilder, WindowBuilderBase, WindowEvent, WindowId, WindowSizeConstraints,
+   },
+-  Cookie, DeviceEventFilter, Error, EventLoopProxy, ExitRequestedEventAction, Icon,
+-  ProgressBarState, ProgressBarStatus, Result, RunEvent, Runtime, RuntimeHandle, RuntimeInitArgs,
+-  UserAttentionType, UserEvent, WebviewDispatch, WebviewEventId, WindowDispatch, WindowEventId,
++  DeviceEventFilter, Error, EventLoopProxy, ExitRequestedEventAction, Icon, ProgressBarState,
++  ProgressBarStatus, Result, RunEvent, Runtime, RuntimeHandle, RuntimeInitArgs, UserAttentionType,
++  UserEvent, WebviewDispatch, WebviewEventId, WindowDispatch, WindowEventId,
+ };
+ 
+ #[cfg(any(target_os = "macos", target_os = "ios"))]
+@@ -1299,8 +1299,6 @@ pub enum WebviewMessage {
+   EvaluateScript(String),
+   #[cfg(all(feature = "tracing", not(target_os = "android")))]
+   EvaluateScript(String, Sender<()>, tracing::Span),
+-  CookiesForUrl(Url, Sender<Result<Vec<tauri_runtime::Cookie<'static>>>>),
+-  Cookies(Sender<Result<Vec<tauri_runtime::Cookie<'static>>>>),
+   WebviewEvent(WebviewEvent),
+   SynthesizedWindowEvent(SynthesizedWindowEvent),
+   Navigate(Url),
+@@ -1551,25 +1549,6 @@ impl<T: UserEvent> WebviewDispatch<T> for WryWebviewDispatcher<T> {
+     Ok(())
+   }
+ 
+-  fn cookies_for_url(&self, url: Url) -> Result<Vec<Cookie<'static>>> {
+-    let current_window_id = self.window_id.lock().unwrap();
+-    let (tx, rx) = channel();
+-    send_user_message(
+-      &self.context,
+-      Message::Webview(
+-        *current_window_id,
+-        self.webview_id,
+-        WebviewMessage::CookiesForUrl(url, tx),
+-      ),
+-    )?;
+-
+-    rx.recv().unwrap()
+-  }
+-
+-  fn cookies(&self) -> Result<Vec<Cookie<'static>>> {
+-    webview_getter!(self, WebviewMessage::Cookies)?
+-  }
+-
+   fn set_auto_resize(&self, auto_resize: bool) -> Result<()> {
+     send_user_message(
+       &self.context,
+@@ -3428,19 +3407,6 @@ fn handle_user_message<T: UserEvent>(
+             )
+             .unwrap();
+           }
+-
+-          WebviewMessage::Cookies(tx) => {
+-            tx.send(webview.cookies().map_err(|_| Error::FailedToSendMessage))
+-              .unwrap();
+-          }
+-
+-          WebviewMessage::CookiesForUrl(url, tx) => {
+-            let webview_cookies = webview
+-              .cookies_for_url(url.as_str())
+-              .map_err(|_| Error::FailedToSendMessage);
+-            tx.send(webview_cookies).unwrap();
+-          }
+-
+           WebviewMessage::Bounds(tx) => {
+             tx.send(
+               webview
+diff --git a/crates/tauri-runtime/Cargo.toml b/crates/tauri-runtime/Cargo.toml
+index f2698fe9d..0e2171b9c 100644
+--- a/crates/tauri-runtime/Cargo.toml
++++ b/crates/tauri-runtime/Cargo.toml
+@@ -34,8 +34,6 @@ http = "1"
+ raw-window-handle = "0.6"
+ url = { version = "2" }
+ dpi = { version = "0.1", features = ["serde"] }
+-# WARNING: cookie::Cookie is re-exported so bumping this is a breaking change, documented to be done as a minor bump
+-cookie = "0.18"
+ 
+ [target."cfg(windows)".dependencies.windows]
+ version = "0.58"
+diff --git a/crates/tauri-runtime/src/lib.rs b/crates/tauri-runtime/src/lib.rs
+index 3ed1be0b0..8c93a19a0 100644
+--- a/crates/tauri-runtime/src/lib.rs
++++ b/crates/tauri-runtime/src/lib.rs
+@@ -43,9 +43,6 @@ use http::{
+ /// UI scaling utilities.
+ pub use dpi;
+ 
+-/// Cookie extraction
+-pub use cookie::Cookie;
+-
+ pub type WindowEventId = u32;
+ pub type WebviewEventId = u32;
+ 
+@@ -519,22 +516,6 @@ pub trait WebviewDispatch<T: UserEvent>: Debug + Clone + Send + Sync + Sized + '
+   /// Moves the webview to the given window.
+   fn reparent(&self, window_id: WindowId) -> Result<()>;
+ 
+-  /// Get cookies for a particular url.
+-  ///
+-  /// # Stability
+-  ///
+-  /// The return value of this function leverages [`cookie::Cookie`] which re-exports the cookie crate.
+-  /// This dependency might receive updates in minor Tauri releases.
+-  fn cookies_for_url(&self, url: Url) -> Result<Vec<Cookie<'static>>>;
+-
+-  /// Return all cookies in the cookie store.
+-  ///
+-  /// # Stability
+-  ///
+-  /// The return value of this function leverages [`cookie::Cookie`] which re-exports the cookie crate.
+-  /// This dependency might receive updates in minor Tauri releases.
+-  fn cookies(&self) -> Result<Vec<Cookie<'static>>>;
+-
+   /// Sets whether the webview should automatically grow and shrink its size and position when the parent window resizes.
+   fn set_auto_resize(&self, auto_resize: bool) -> Result<()>;
+ 
+diff --git a/crates/tauri/src/test/mock_runtime.rs b/crates/tauri/src/test/mock_runtime.rs
+index 306879677..2d4579476 100644
+--- a/crates/tauri/src/test/mock_runtime.rs
++++ b/crates/tauri/src/test/mock_runtime.rs
+@@ -586,14 +586,6 @@ impl<T: UserEvent> WebviewDispatch<T> for MockWebviewDispatcher {
+     Ok(())
+   }
+ 
+-  fn cookies(&self) -> Result<Vec<tauri_runtime::Cookie<'static>>> {
+-    Ok(Vec::new())
+-  }
+-
+-  fn cookies_for_url(&self, url: Url) -> Result<Vec<tauri_runtime::Cookie<'static>>> {
+-    Ok(Vec::new())
+-  }
+-
+   fn set_auto_resize(&self, auto_resize: bool) -> Result<()> {
+     Ok(())
+   }
+diff --git a/crates/tauri/src/webview/mod.rs b/crates/tauri/src/webview/mod.rs
+index 9cd706ca9..5d1e8c875 100644
+--- a/crates/tauri/src/webview/mod.rs
++++ b/crates/tauri/src/webview/mod.rs
+@@ -13,7 +13,6 @@ use http::HeaderMap;
+ use serde::Serialize;
+ use tauri_macros::default_runtime;
+ pub use tauri_runtime::webview::PageLoadEvent;
+-pub use tauri_runtime::Cookie;
+ #[cfg(desktop)]
+ use tauri_runtime::{
+   dpi::{PhysicalPosition, PhysicalSize, Position, Size},
+@@ -247,8 +246,8 @@ impl<R: Runtime> WebviewBuilder<R> {
+   ///
+   /// # Known issues
+   ///
+-  /// On Windows, this function deadlocks when used in a synchronous command or event handlers, see [the Webview2 issue].
+-  /// You should use `async` commands and separate threads when creating webviews.
++  /// On Windows, this function deadlocks when used in a synchronous command, see [the Webview2 issue].
++  /// You should use `async` commands when creating windows.
+   ///
+   /// # Examples
+   ///
+@@ -323,8 +322,8 @@ async fn create_window(app: tauri::AppHandle) {
+   ///
+   /// # Known issues
+   ///
+-  /// On Windows, this function deadlocks when used in a synchronous command or event handlers, see [the Webview2 issue].
+-  /// You should use `async` commands and separate threads when creating webviews.
++  /// On Windows, this function deadlocks when used in a synchronous command, see [the Webview2 issue].
++  /// You should use `async` commands when creating webviews.
+   ///
+   /// # Examples
+   ///
+@@ -1704,56 +1703,6 @@ tauri::Builder::default()
+       .clear_all_browsing_data()
+       .map_err(Into::into)
+   }
+-
+-  /// Returns all cookies in the runtime's cookie store including HTTP-only and secure cookies.
+-  ///
+-  /// Note that cookies will only be returned for URLs with an http or https scheme.
+-  /// Cookies set through javascript for local files
+-  /// (such as those served from the tauri://) protocol are not currently supported.
+-  ///
+-  /// # Stability
+-  ///
+-  /// The return value of this function leverages [`tauri_runtime::Cookie`] which re-exports the cookie crate.
+-  /// This dependency might receive updates in minor Tauri releases.
+-  ///
+-  /// # Known issues
+-  ///
+-  /// On Windows, this function deadlocks when used in a synchronous command or event handlers, see [the Webview2 issue].
+-  /// You should use `async` commands and separate threads when reading cookies.
+-  ///
+-  /// [the Webview2 issue]: https://github.com/tauri-apps/wry/issues/583
+-  pub fn cookies_for_url(&self, url: Url) -> crate::Result<Vec<Cookie<'static>>> {
+-    self
+-      .webview
+-      .dispatcher
+-      .cookies_for_url(url)
+-      .map_err(Into::into)
+-  }
+-
+-  /// Returns all cookies in the runtime's cookie store for all URLs including HTTP-only and secure cookies.
+-  ///
+-  /// Note that cookies will only be returned for URLs with an http or https scheme.
+-  /// Cookies set through javascript for local files
+-  /// (such as those served from the tauri://) protocol are not currently supported.
+-  ///
+-  /// # Stability
+-  ///
+-  /// The return value of this function leverages [`tauri_runtime::Cookie`] which re-exports the cookie crate.
+-  /// This dependency might receive updates in minor Tauri releases.
+-  ///
+-  /// # Known issues
+-  ///
+-  /// On Windows, this function deadlocks when used in a synchronous command or event handlers, see [the Webview2 issue].
+-  /// You should use `async` commands and separate threads when reading cookies.
+-  ///
+-  /// ## Platform-specific
+-  ///
+-  /// - **Android**: Unsupported, always returns an empty [`Vec`].
+-  ///
+-  /// [the Webview2 issue]: https://github.com/tauri-apps/wry/issues/583
+-  pub fn cookies(&self) -> crate::Result<Vec<Cookie<'static>>> {
+-    self.webview.dispatcher.cookies().map_err(Into::into)
+-  }
+ }
+ 
+ impl<R: Runtime> Listener<R> for Webview<R> {
+diff --git a/crates/tauri/src/webview/webview_window.rs b/crates/tauri/src/webview/webview_window.rs
+index 95ca0117b..22a1e0b74 100644
+--- a/crates/tauri/src/webview/webview_window.rs
++++ b/crates/tauri/src/webview/webview_window.rs
+@@ -37,7 +37,8 @@ use crate::{
+   ipc::{CommandArg, CommandItem, InvokeError, OwnedInvokeResponder},
+   manager::AppManager,
+   sealed::{ManagerBase, RuntimeOrDispatch},
+-  webview::{Cookie, PageLoadPayload, WebviewBuilder},
++  webview::PageLoadPayload,
++  webview::WebviewBuilder,
+   window::WindowBuilder,
+   AppHandle, Event, EventId, Manager, Runtime, Webview, WindowEvent,
+ };
+@@ -60,8 +61,8 @@ impl<'a, R: Runtime, M: Manager<R>> WebviewWindowBuilder<'a, R, M> {
+   ///
+   /// # Known issues
+   ///
+-  /// On Windows, this function deadlocks when used in a synchronous command and event handlers, see [the Webview2 issue].
+-  /// You should use `async` commands and separate threads when creating windows.
++  /// On Windows, this function deadlocks when used in a synchronous command, see [the Webview2 issue].
++  /// You should use `async` commands when creating windows.
+   ///
+   /// # Examples
+   ///
+@@ -117,8 +118,8 @@ impl<'a, R: Runtime, M: Manager<R>> WebviewWindowBuilder<'a, R, M> {
+   ///
+   /// # Known issues
+   ///
+-  /// On Windows, this function deadlocks when used in a synchronous command or event handlers, see [the Webview2 issue].
+-  /// You should use `async` commands and separate threads when creating windows.
++  /// On Windows, this function deadlocks when used in a synchronous command, see [the Webview2 issue].
++  /// You should use `async` commands when creating windows.
+   ///
+   /// # Examples
+   ///
+@@ -2004,52 +2005,6 @@ impl<R: Runtime> WebviewWindow<R> {
+   pub fn clear_all_browsing_data(&self) -> crate::Result<()> {
+     self.webview.clear_all_browsing_data()
+   }
+-
+-  /// Returns all cookies in the runtime's cookie store including HTTP-only and secure cookies.
+-  ///
+-  /// Note that cookies will only be returned for URLs with an http or https scheme.
+-  /// Cookies set through javascript for local files
+-  /// (such as those served from the tauri://) protocol are not currently supported.
+-  ///
+-  /// # Stability
+-  ///
+-  /// The return value of this function leverages [`tauri_runtime::Cookie`] which re-exports the cookie crate.
+-  /// This dependency might receive updates in minor Tauri releases.
+-  ///
+-  /// # Known issues
+-  ///
+-  /// On Windows, this function deadlocks when used in a synchronous command or event handlers, see [the Webview2 issue].
+-  /// You should use `async` commands and separate threads when reading cookies.
+-  ///
+-  /// [the Webview2 issue]: https://github.com/tauri-apps/wry/issues/583
+-  pub fn cookies_for_url(&self, url: Url) -> crate::Result<Vec<Cookie<'static>>> {
+-    self.webview.cookies_for_url(url)
+-  }
+-
+-  /// Returns all cookies in the runtime's cookie store for all URLs including HTTP-only and secure cookies.
+-  ///
+-  /// Note that cookies will only be returned for URLs with an http or https scheme.
+-  /// Cookies set through javascript for local files
+-  /// (such as those served from the tauri://) protocol are not currently supported.
+-  ///
+-  /// # Stability
+-  ///
+-  /// The return value of this function leverages [`tauri_runtime::Cookie`] which re-exports the cookie crate.
+-  /// This dependency might receive updates in minor Tauri releases.
+-  ///
+-  /// # Known issues
+-  ///
+-  /// On Windows, this function deadlocks when used in a synchronous command or event handlers, see [the Webview2 issue].
+-  /// You should use `async` commands and separate threads when reading cookies.
+-  ///
+-  /// ## Platform-specific
+-  ///
+-  /// - **Android**: Unsupported, always returns an empty [`Vec`].
+-  ///
+-  /// [the Webview2 issue]: https://github.com/tauri-apps/wry/issues/583
+-  pub fn cookies(&self) -> crate::Result<Vec<Cookie<'static>>> {
+-    self.webview.cookies()
+-  }
+ }
+ 
+ impl<R: Runtime> Listener<R> for WebviewWindow<R> {
+diff --git a/crates/tauri/src/window/mod.rs b/crates/tauri/src/window/mod.rs
+index fbf10d9c8..bde970efb 100644
+--- a/crates/tauri/src/window/mod.rs
++++ b/crates/tauri/src/window/mod.rs
+@@ -140,8 +140,8 @@ impl<'a, R: Runtime, M: Manager<R>> WindowBuilder<'a, R, M> {
+   ///
+   /// # Known issues
+   ///
+-  /// On Windows, this function deadlocks when used in a synchronous command or event handlers, see [the Webview2 issue].
+-  /// You should use `async` commands and separate threads when creating windows.
++  /// On Windows, this function deadlocks when used in a synchronous command, see [the Webview2 issue].
++  /// You should use `async` commands when creating windows.
+   ///
+   /// # Examples
+   ///
+@@ -217,8 +217,8 @@ async fn create_window(app: tauri::AppHandle) {
+   ///
+   /// # Known issues
+   ///
+-  /// On Windows, this function deadlocks when used in a synchronous command or event handlers, see [the Webview2 issue].
+-  /// You should use `async` commands and separate threads when creating windows.
++  /// On Windows, this function deadlocks when used in a synchronous command, see [the Webview2 issue].
++  /// You should use `async` commands when creating windows.
+   ///
+   /// # Examples
+   ///
+diff --git a/examples/helloworld/main.rs b/examples/helloworld/main.rs
+index 91389db81..ee822803b 100644
+--- a/examples/helloworld/main.rs
++++ b/examples/helloworld/main.rs
+@@ -5,22 +5,13 @@
+ #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+ 
+ #[tauri::command]
+-fn greet(app: tauri::AppHandle, name: String) -> String {
+-  use tauri::Manager;
+-  println!("greet {name}");
+-  let w = app.get_webview_window("main").unwrap();
+-  println!("{:?}", w.get_webview_window("main").unwrap().cookies());
++fn greet(name: &str) -> String {
+   format!("Hello {name}, You have been greeted from Rust!")
+ }
+ 
+ fn main() {
+   tauri::Builder::default()
+     .invoke_handler(tauri::generate_handler![greet])
+-    .setup(|app| {
+-      use tauri::Manager;
+-      println!("{:?}", app.get_webview_window("main").unwrap().cookies());
+-      Ok(())
+-    })
+     .run(tauri::generate_context!(
+       "../../examples/helloworld/tauri.conf.json"
+     ))

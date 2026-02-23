@@ -1,0 +1,455 @@
+diff --git a/src/bin/cargo/commands/remove.rs b/src/bin/cargo/commands/remove.rs
+index db89768df..60979cae2 100644
+--- a/src/bin/cargo/commands/remove.rs
++++ b/src/bin/cargo/commands/remove.rs
+@@ -75,8 +75,7 @@ pub fn exec(gctx: &mut GlobalContext, args: &ArgMatches) -> CliResult {
+         0 => {
+             return Err(CliError::new(
+                 anyhow::format_err!(
+-                    "no package selected to modify
+-help: specify a package with `-p <PKGID>`"
++                    "no packages selected to modify.  Please specify one with `-p <PKGID>`"
+                 ),
+                 101,
+             ));
+@@ -86,9 +85,9 @@ help: specify a package with `-p <PKGID>`"
+             let names = packages.iter().map(|p| p.name()).collect::<Vec<_>>();
+             return Err(CliError::new(
+                 anyhow::format_err!(
+-                    "no package selected to modify
+-help: specify a package with `-p <PKGID>`
+-      available packages: {}",
++                    "`cargo remove` could not determine which package to modify. \
++                    Use the `--package` option to specify a package. \n\
++                    available packages: {}",
+                     names.join(", ")
+                 ),
+                 101,
+diff --git a/src/cargo/ops/cargo_add/mod.rs b/src/cargo/ops/cargo_add/mod.rs
+index 9b9021ae2..44c20df72 100644
+--- a/src/cargo/ops/cargo_add/mod.rs
++++ b/src/cargo/ops/cargo_add/mod.rs
+@@ -253,9 +253,7 @@ pub fn add(workspace: &Workspace<'_>, options: &AddOptions<'_>) -> CargoResult<(
+             if is_namespaced_features_supported {
+                 let dep_key = dep.toml_key();
+                 if !manifest.is_explicit_dep_activation(dep_key) {
+-                    let table = manifest
+-                        .get_table_mut(&[String::from("features")])
+-                        .expect("manifest validated");
++                    let table = manifest.get_table_mut(&[String::from("features")])?;
+                     let dep_name = dep.rename.as_deref().unwrap_or(&dep.name);
+                     let new_feature: toml_edit::Value =
+                         [format!("dep:{dep_name}")].iter().collect();
+@@ -273,6 +271,7 @@ pub fn add(workspace: &Workspace<'_>, options: &AddOptions<'_>) -> CargoResult<(
+     if was_sorted {
+         if let Some(table) = manifest
+             .get_table_mut(&dep_table)
++            .ok()
+             .and_then(TomlItem::as_table_like_mut)
+         {
+             table.sort_values();
+diff --git a/src/cargo/ops/cargo_remove.rs b/src/cargo/ops/cargo_remove.rs
+index 9b2877ee3..81d7b42e2 100644
+--- a/src/cargo/ops/cargo_remove.rs
++++ b/src/cargo/ops/cargo_remove.rs
+@@ -5,7 +5,6 @@ use crate::GlobalContext;
+ use crate::core::Package;
+ use crate::util::toml_mut::manifest::DepTable;
+ use crate::util::toml_mut::manifest::LocalManifest;
+-use crate::util::toml_mut::manifest::MissingDependencyError;
+ 
+ /// Remove a dependency from a Cargo.toml manifest file.
+ #[derive(Debug)]
+@@ -45,60 +44,7 @@ pub fn remove(options: &RemoveOptions<'_>) -> CargoResult<()> {
+             .shell()
+             .status("Removing", format!("{dep} from {section}"))?;
+ 
+-        manifest.remove_from_table(&dep_table, dep).map_err(
+-            |MissingDependencyError {
+-                 expected_name,
+-                 expected_path,
+-                 alt_name,
+-                 alt_path,
+-             }| {
+-                use std::fmt::Write as _;
+-
+-                let mut error = String::new();
+-                let path = expected_path.join(".");
+-                let _ = write!(
+-                    &mut error,
+-                    "the dependency `{expected_name}` could not be found in `{path}`"
+-                );
+-                if let Some(alt_path) = alt_path {
+-                    let mut flags = Vec::new();
+-                    match (
+-                        expected_path.last().unwrap().as_str(),
+-                        alt_path.last().unwrap().as_str(),
+-                    ) {
+-                        ("build-dependencies", "build-dependencies") => {}
+-                        ("dev-dependencies", "dev-dependencies") => {}
+-                        ("dependencies", "dependencies") => {}
+-                        (_, "build-dependencies") => flags.push("--build"),
+-                        (_, "dev-dependencies") => flags.push("--dev"),
+-                        (_, _) => {}
+-                    }
+-                    if expected_path[0] != "target" && alt_path[0] == "target" {
+-                        flags.push(&"--target");
+-                        flags.push(&alt_path[1]);
+-                    }
+-                    let alt_path = alt_path.join(".");
+-                    if !flags.is_empty() {
+-                        let flags = flags.join(" ");
+-                        let _ = write!(
+-                            &mut error,
+-                            "\n\nhelp: pass `{flags}` to remove `{expected_name}` from `{alt_path}`"
+-                        );
+-                    } else {
+-                        let _ = write!(
+-                            &mut error,
+-                            "\n\nhelp: a dependency with the same name exists in `{alt_path}`"
+-                        );
+-                    }
+-                } else if let Some(alt_name) = alt_name {
+-                    let _ = write!(
+-                        &mut error,
+-                        "\n\nhelp: a dependency with a similar name exists: `{alt_name}`"
+-                    );
+-                }
+-                anyhow::format_err!("{error}")
+-            },
+-        )?;
++        manifest.remove_from_table(&dep_table, dep)?;
+ 
+         // Now that we have removed the crate, if that was the last reference to that
+         // crate, then we need to drop any explicitly activated features on
+diff --git a/src/cargo/util/toml_mut/manifest.rs b/src/cargo/util/toml_mut/manifest.rs
+index 812bdad55..cb889b74d 100644
+--- a/src/cargo/util/toml_mut/manifest.rs
++++ b/src/cargo/util/toml_mut/manifest.rs
+@@ -99,19 +99,24 @@ impl Manifest {
+     }
+ 
+     /// Get the specified table from the manifest.
+-    pub fn get_table<'a>(&'a self, table_path: &[String]) -> Option<&'a toml_edit::Item> {
++    pub fn get_table<'a>(&'a self, table_path: &[String]) -> CargoResult<&'a toml_edit::Item> {
+         /// Descend into a manifest until the required table is found.
+-        fn descend<'a>(input: &'a toml_edit::Item, path: &[String]) -> Option<&'a toml_edit::Item> {
++        fn descend<'a>(
++            input: &'a toml_edit::Item,
++            path: &[String],
++        ) -> CargoResult<&'a toml_edit::Item> {
+             if let Some(segment) = path.get(0) {
+-                let value = input.get(&segment)?;
++                let value = input
++                    .get(&segment)
++                    .ok_or_else(|| non_existent_table_err(segment))?;
+ 
+                 if value.is_table_like() {
+                     descend(value, &path[1..])
+                 } else {
+-                    None
++                    Err(non_existent_table_err(segment))
+                 }
+             } else {
+-                Some(input)
++                Ok(input)
+             }
+         }
+ 
+@@ -122,12 +127,12 @@ impl Manifest {
+     pub fn get_table_mut<'a>(
+         &'a mut self,
+         table_path: &[String],
+-    ) -> Option<&'a mut toml_edit::Item> {
++    ) -> CargoResult<&'a mut toml_edit::Item> {
+         /// Descend into a manifest until the required table is found.
+         fn descend<'a>(
+             input: &'a mut toml_edit::Item,
+             path: &[String],
+-        ) -> Option<&'a mut toml_edit::Item> {
++        ) -> CargoResult<&'a mut toml_edit::Item> {
+             if let Some(segment) = path.get(0) {
+                 let mut default_table = toml_edit::Table::new();
+                 default_table.set_implicit(true);
+@@ -136,10 +141,10 @@ impl Manifest {
+                 if value.is_table_like() {
+                     descend(value, &path[1..])
+                 } else {
+-                    None
++                    Err(non_existent_table_err(segment))
+                 }
+             } else {
+-                Some(input)
++                Ok(input)
+             }
+         }
+ 
+@@ -369,9 +374,7 @@ impl LocalManifest {
+             .to_owned();
+         let dep_key = dep.toml_key();
+ 
+-        let table = self
+-            .get_table_mut(table_path)
+-            .expect("manifest validated, path should be to a table");
++        let table = self.get_table_mut(table_path)?;
+         if let Some((mut dep_key, dep_item)) = table
+             .as_table_like_mut()
+             .unwrap()
+@@ -401,14 +404,8 @@ impl LocalManifest {
+     }
+ 
+     /// Remove entry from a Cargo.toml.
+-    pub fn remove_from_table(
+-        &mut self,
+-        table_path: &[String],
+-        name: &str,
+-    ) -> Result<(), MissingDependencyError> {
+-        let parent_table = self
+-            .get_table_mut(table_path)
+-            .expect("manifest validated, path should be to a table");
++    pub fn remove_from_table(&mut self, table_path: &[String], name: &str) -> CargoResult<()> {
++        let parent_table = self.get_table_mut(table_path)?;
+ 
+         match parent_table.get_mut(name).filter(|t| !t.is_none()) {
+             Some(dep) => {
+@@ -433,15 +430,15 @@ impl LocalManifest {
+                 let found_table_path = sections.iter().find_map(|(t, i)| {
+                     let table_path: Vec<String> =
+                         t.to_table().iter().map(|s| s.to_string()).collect();
+-                    i.get(name).is_some().then(|| table_path)
++                    i.get(name).is_some().then(|| table_path.join("."))
+                 });
+ 
+-                return Err(MissingDependencyError {
+-                    expected_name: name.to_owned(),
+-                    expected_path: table_path.to_owned(),
+-                    alt_name: alt_name,
+-                    alt_path: found_table_path,
+-                });
++                return Err(non_existent_dependency_err(
++                    name,
++                    table_path.join("."),
++                    found_table_path,
++                    alt_name.as_deref(),
++                ));
+             }
+         }
+ 
+@@ -672,40 +669,29 @@ fn parse_manifest_err() -> anyhow::Error {
+     anyhow::format_err!("unable to parse external Cargo.toml")
+ }
+ 
+-#[derive(Debug)]
+-pub struct MissingDependencyError {
+-    pub expected_name: String,
+-    pub expected_path: Vec<String>,
+-    pub alt_path: Option<Vec<String>>,
+-    pub alt_name: Option<String>,
++fn non_existent_table_err(table: impl std::fmt::Display) -> anyhow::Error {
++    anyhow::format_err!("the table `{table}` could not be found.")
+ }
+ 
+-impl std::fmt::Display for MissingDependencyError {
+-    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+-        let expected_name = &self.expected_name;
+-        let expected_path = self.expected_path.join(".");
+-        write!(
+-            fmt,
+-            "the dependency `{expected_name}` could not be found in `{expected_path}`"
+-        )?;
+-        if let Some(alt_path) = &self.alt_path {
+-            let alt_path = alt_path.join(".");
+-            write!(
+-                fmt,
+-                "\n\nhelp: a dependency with the same name exists in `{alt_path}`"
+-            )?;
+-        } else if let Some(alt_name) = &self.alt_name {
+-            write!(
+-                fmt,
+-                "\n\nhelp: a dependency with a similar name exists: `{alt_name}`"
+-            )?;
+-        }
+-        Ok(())
+-    }
++fn non_existent_dependency_err(
++    name: impl std::fmt::Display,
++    search_table: impl std::fmt::Display,
++    found_table: Option<impl std::fmt::Display>,
++    alt_name: Option<&str>,
++) -> anyhow::Error {
++    let mut msg = format!("the dependency `{name}` could not be found in `{search_table}`");
++    if let Some(found_table) = found_table {
++        msg.push_str(&format!(
++            "\n\nhelp: a dependency with the same name exists in `{found_table}`"
++        ));
++    } else if let Some(alt_name) = alt_name {
++        msg.push_str(&format!(
++            "\n\nhelp: a dependency with a similar name exists: `{alt_name}`"
++        ));
++    }
++    anyhow::format_err!(msg)
+ }
+ 
+-impl std::error::Error for MissingDependencyError {}
+-
+ fn remove_array_index(array: &mut toml_edit::Array, index: usize) {
+     let value = array.remove(index);
+ 
+diff --git a/tests/testsuite/cargo_remove/invalid_package_multiple/stderr.term.svg b/tests/testsuite/cargo_remove/invalid_package_multiple/stderr.term.svg
+index 373bae6ef..b71403fa6 100644
+--- a/tests/testsuite/cargo_remove/invalid_package_multiple/stderr.term.svg
++++ b/tests/testsuite/cargo_remove/invalid_package_multiple/stderr.term.svg
+@@ -1,7 +1,7 @@
+-<svg width="740px" height="92px" xmlns="http://www.w3.org/2000/svg">
++<svg width="995px" height="74px" xmlns="http://www.w3.org/2000/svg">
+   <style>
+     .fg { fill: #AAAAAA }
+-    .bg { fill: #000000 }
++    .bg { background: #000000 }
+     .fg-bright-red { fill: #FF5555 }
+     .container {
+       padding: 0 10px;
+@@ -18,13 +18,11 @@
+   <rect width="100%" height="100%" y="0" rx="4.5" class="bg" />
+ 
+   <text xml:space="preserve" class="container fg">
+-    <tspan x="10px" y="28px"><tspan class="fg-bright-red bold">error</tspan><tspan>: no package selected to modify</tspan>
++    <tspan x="10px" y="28px"><tspan class="fg-bright-red bold">error</tspan><tspan>: `cargo remove` could not determine which package to modify. Use the `--package` option to specify a package. </tspan>
+ </tspan>
+-    <tspan x="10px" y="46px"><tspan>help: specify a package with `-p &lt;PKGID&gt;`</tspan>
++    <tspan x="10px" y="46px"><tspan>available packages: dep-a, dep-b</tspan>
+ </tspan>
+-    <tspan x="10px" y="64px"><tspan>      available packages: dep-a, dep-b</tspan>
+-</tspan>
+-    <tspan x="10px" y="82px">
++    <tspan x="10px" y="64px">
+ </tspan>
+   </text>
+ 
+diff --git a/tests/testsuite/cargo_remove/invalid_section_missing_flags/in/Cargo.toml b/tests/testsuite/cargo_remove/invalid_section_missing_flags/in/Cargo.toml
+deleted file mode 100644
+index 1e7327854..000000000
+--- a/tests/testsuite/cargo_remove/invalid_section_missing_flags/in/Cargo.toml
++++ /dev/null
+@@ -1,14 +0,0 @@
+-[package]
+-name = "cargo-remove-target-test-fixture"
+-version = "0.1.0"
+-edition = "2015"
+-
+-[[bin]]
+-name = "main"
+-path = "src/main.rs"
+-
+-[target.x86_64-unknown-freebsd.build-dependencies]
+-semver = "0.1.0"
+-
+-[target.wasm32-unknown-unknown.build-dependencies]
+-semver = "0.1.0"
+diff --git a/tests/testsuite/cargo_remove/invalid_section_missing_flags/mod.rs b/tests/testsuite/cargo_remove/invalid_section_missing_flags/mod.rs
+deleted file mode 100644
+index 5cf8f7b29..000000000
+--- a/tests/testsuite/cargo_remove/invalid_section_missing_flags/mod.rs
++++ /dev/null
+@@ -1,29 +0,0 @@
+-use crate::prelude::*;
+-use cargo_test_support::Project;
+-use cargo_test_support::compare::assert_ui;
+-use cargo_test_support::current_dir;
+-use cargo_test_support::file;
+-use cargo_test_support::str;
+-
+-#[cargo_test]
+-fn case() {
+-    cargo_test_support::registry::init();
+-    cargo_test_support::registry::Package::new("semver", "0.1.1")
+-        .feature("std", &[])
+-        .publish();
+-
+-    let project = Project::from_template(current_dir!().join("in"));
+-    let project_root = project.root();
+-    let cwd = &project_root;
+-
+-    snapbox::cmd::Command::cargo_ui()
+-        .arg("remove")
+-        .args(["semver"])
+-        .current_dir(cwd)
+-        .assert()
+-        .code(101)
+-        .stdout_eq(str![""])
+-        .stderr_eq(file!["stderr.term.svg"]);
+-
+-    assert_ui().subset_matches(current_dir!().join("out"), &project_root);
+-}
+diff --git a/tests/testsuite/cargo_remove/invalid_section_missing_flags/out/Cargo.toml b/tests/testsuite/cargo_remove/invalid_section_missing_flags/out/Cargo.toml
+deleted file mode 100644
+index 1e7327854..000000000
+--- a/tests/testsuite/cargo_remove/invalid_section_missing_flags/out/Cargo.toml
++++ /dev/null
+@@ -1,14 +0,0 @@
+-[package]
+-name = "cargo-remove-target-test-fixture"
+-version = "0.1.0"
+-edition = "2015"
+-
+-[[bin]]
+-name = "main"
+-path = "src/main.rs"
+-
+-[target.x86_64-unknown-freebsd.build-dependencies]
+-semver = "0.1.0"
+-
+-[target.wasm32-unknown-unknown.build-dependencies]
+-semver = "0.1.0"
+diff --git a/tests/testsuite/cargo_remove/invalid_section_missing_flags/stderr.term.svg b/tests/testsuite/cargo_remove/invalid_section_missing_flags/stderr.term.svg
+deleted file mode 100644
+index 3b22dd17e..000000000
+--- a/tests/testsuite/cargo_remove/invalid_section_missing_flags/stderr.term.svg
++++ /dev/null
+@@ -1,34 +0,0 @@
+-<svg width="1087px" height="110px" xmlns="http://www.w3.org/2000/svg">
+-  <style>
+-    .fg { fill: #AAAAAA }
+-    .bg { fill: #000000 }
+-    .fg-bright-green { fill: #55FF55 }
+-    .fg-bright-red { fill: #FF5555 }
+-    .container {
+-      padding: 0 10px;
+-      line-height: 18px;
+-    }
+-    .bold { font-weight: bold; }
+-    tspan {
+-      font: 14px SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace;
+-      white-space: pre;
+-      line-height: 18px;
+-    }
+-  </style>
+-
+-  <rect width="100%" height="100%" y="0" rx="4.5" class="bg" />
+-
+-  <text xml:space="preserve" class="container fg">
+-    <tspan x="10px" y="28px"><tspan class="fg-bright-green bold">    Removing</tspan><tspan> semver from dependencies</tspan>
+-</tspan>
+-    <tspan x="10px" y="46px"><tspan class="fg-bright-red bold">error</tspan><tspan>: the dependency `semver` could not be found in `dependencies`</tspan>
+-</tspan>
+-    <tspan x="10px" y="64px">
+-</tspan>
+-    <tspan x="10px" y="82px"><tspan>help: pass `--build --target x86_64-unknown-freebsd` to remove `semver` from `target.x86_64-unknown-freebsd.build-dependencies`</tspan>
+-</tspan>
+-    <tspan x="10px" y="100px">
+-</tspan>
+-  </text>
+-
+-</svg>
+diff --git a/tests/testsuite/cargo_remove/mod.rs b/tests/testsuite/cargo_remove/mod.rs
+index 42f9886b3..3510ece4b 100644
+--- a/tests/testsuite/cargo_remove/mod.rs
++++ b/tests/testsuite/cargo_remove/mod.rs
+@@ -13,7 +13,6 @@ mod invalid_package;
+ mod invalid_package_multiple;
+ mod invalid_section;
+ mod invalid_section_dep;
+-mod invalid_section_missing_flags;
+ mod invalid_target;
+ mod invalid_target_dep;
+ mod last_dep;

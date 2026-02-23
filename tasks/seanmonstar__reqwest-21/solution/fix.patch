@@ -1,0 +1,149 @@
+diff --git a/src/body.rs b/src/body.rs
+index 43fcfee..9bd9756 100644
+--- a/src/body.rs
++++ b/src/body.rs
+@@ -10,6 +10,17 @@ pub struct Body {
+ 
+ impl Body {
+     /// Instantiate a `Body` from a reader.
++    ///
++    /// # Note
++    ///
++    /// While allowing for many types to be used, these bodies do not have
++    /// a way to reset to the beginning and be reused. This means that when
++    /// encountering a 307 or 308 status code, instead of repeating the
++    /// request at the new location, the `Response` will be returned with
++    /// the redirect status code set.
++    ///
++    /// A `Body` constructed from a set of bytes, like `String` or `Vec<u8>`,
++    /// are stored differently and can be reused.
+     pub fn new<R: Read + 'static>(reader: R) -> Body {
+         Body {
+             reader: Kind::Reader(Box::new(reader), None),
+@@ -115,3 +126,10 @@ pub fn as_hyper_body<'a>(body: &'a mut Body) -> ::hyper::client::Body<'a> {
+         }
+     }
+ }
++
++pub fn can_reset(body: &Body) -> bool {
++    match body.reader {
++        Kind::Bytes(_) => true,
++        Kind::Reader(..) => false,
++    }
++}
+diff --git a/src/client.rs b/src/client.rs
+index 5fd0319..a6a93f4 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -198,57 +198,68 @@ impl<'a> RequestBuilder<'a> {
+ 
+                 try!(req.send())
+             };
+-            body.take();
+ 
+-            match res.status {
++            let should_redirect = match res.status {
+                 StatusCode::MovedPermanently |
+                 StatusCode::Found |
+                 StatusCode::SeeOther => {
+-
+-                    //TODO: turn this into self.redirect_policy.check()
+-                    if redirect_count > 10 {
+-                        return Err(::Error::TooManyRedirects);
+-                    }
+-                    redirect_count += 1;
+-
+-                    method = match method {
+-                        Method::Post | Method::Put => Method::Get,
+-                        m => m
+-                    };
+-
+-                    headers.set(Referer(url.to_string()));
+-
+-                    let loc = {
+-                        let loc = res.headers.get::<Location>().map(|loc| url.join(loc));
+-                        if let Some(loc) = loc {
+-                            loc
+-                        } else {
+-                            return Ok(Response {
+-                                inner: res
+-                            });
++                    body = None;
++                    match method {
++                        Method::Get | Method::Head => {},
++                        _ => {
++                            method = Method::Get;
+                         }
+-                    };
+-
+-                    url = match loc {
+-                        Ok(u) => u,
+-                        Err(e) => {
+-                            debug!("Location header had invalid URI: {:?}", e);
+-                            return Ok(Response {
+-                                inner: res
+-                            })
+-                        }
+-                    };
++                    }
++                    true
++                },
++                StatusCode::TemporaryRedirect |
++                StatusCode::PermanentRedirect => {
++                    if let Some(ref body) = body {
++                        body::can_reset(body)
++                    } else {
++                        true
++                    }
++                },
++                _ => false,
++            };
+ 
+-                    debug!("redirecting to '{}'", url);
++            if should_redirect {
++                //TODO: turn this into self.redirect_policy.check()
++                if redirect_count > 10 {
++                    return Err(::Error::TooManyRedirects);
++                }
++                redirect_count += 1;
++
++                headers.set(Referer(url.to_string()));
++
++                let loc = {
++                    let loc = res.headers.get::<Location>().map(|loc| url.join(loc));
++                    if let Some(loc) = loc {
++                        loc
++                    } else {
++                        return Ok(Response {
++                            inner: res
++                        });
++                    }
++                };
++
++                url = match loc {
++                    Ok(u) => u,
++                    Err(e) => {
++                        debug!("Location header had invalid URI: {:?}", e);
++                        return Ok(Response {
++                            inner: res
++                        })
++                    }
++                };
+ 
+-                    //TODO: removeSensitiveHeaders(&mut headers, &url);
++                debug!("redirecting to {:?} '{}'", method, url);
+ 
+-                },
+-                _ => {
+-                    return Ok(Response {
+-                        inner: res
+-                    });
+-                }
++                //TODO: removeSensitiveHeaders(&mut headers, &url);
++            } else {
++                return Ok(Response {
++                    inner: res
++                });
+             }
+         }
+     }

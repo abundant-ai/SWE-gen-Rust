@@ -1,0 +1,251 @@
+diff --git a/crates/hir-def/src/item_scope.rs b/crates/hir-def/src/item_scope.rs
+index a3278dd76c..9e7868b273 100644
+--- a/crates/hir-def/src/item_scope.rs
++++ b/crates/hir-def/src/item_scope.rs
+@@ -158,7 +158,7 @@ pub struct ItemScope {
+     /// declared.
+     declarations: ThinVec<ModuleDefId>,
+ 
+-    impls: ThinVec<(ImplId, /* trait impl */ bool)>,
++    impls: ThinVec<ImplId>,
+     builtin_derive_impls: ThinVec<BuiltinDeriveImplId>,
+     extern_blocks: ThinVec<ExternBlockId>,
+     unnamed_consts: ThinVec<ConstId>,
+@@ -327,15 +327,7 @@ impl ItemScope {
+     }
+ 
+     pub fn impls(&self) -> impl ExactSizeIterator<Item = ImplId> + '_ {
+-        self.impls.iter().map(|&(id, _)| id)
+-    }
+-
+-    pub fn trait_impls(&self) -> impl Iterator<Item = ImplId> + '_ {
+-        self.impls.iter().filter(|&&(_, is_trait_impl)| is_trait_impl).map(|&(id, _)| id)
+-    }
+-
+-    pub fn inherent_impls(&self) -> impl Iterator<Item = ImplId> + '_ {
+-        self.impls.iter().filter(|&&(_, is_trait_impl)| !is_trait_impl).map(|&(id, _)| id)
++        self.impls.iter().copied()
+     }
+ 
+     pub fn builtin_derive_impls(&self) -> impl ExactSizeIterator<Item = BuiltinDeriveImplId> + '_ {
+@@ -480,8 +472,8 @@ impl ItemScope {
+         self.legacy_macros.get(name).map(|it| &**it)
+     }
+ 
+-    pub(crate) fn define_impl(&mut self, imp: ImplId, is_trait_impl: bool) {
+-        self.impls.push((imp, is_trait_impl));
++    pub(crate) fn define_impl(&mut self, imp: ImplId) {
++        self.impls.push(imp);
+     }
+ 
+     pub(crate) fn define_builtin_derive_impl(&mut self, imp: BuiltinDeriveImplId) {
+diff --git a/crates/hir-def/src/item_tree.rs b/crates/hir-def/src/item_tree.rs
+index a1707f17be..2e838fad2e 100644
+--- a/crates/hir-def/src/item_tree.rs
++++ b/crates/hir-def/src/item_tree.rs
+@@ -614,9 +614,7 @@ pub struct Trait {
+ }
+ 
+ #[derive(Debug, Clone, Eq, PartialEq)]
+-pub struct Impl {
+-    pub is_trait_impl: bool,
+-}
++pub struct Impl {}
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct TypeAlias {
+diff --git a/crates/hir-def/src/item_tree/lower.rs b/crates/hir-def/src/item_tree/lower.rs
+index 3f19e00154..d8519f7393 100644
+--- a/crates/hir-def/src/item_tree/lower.rs
++++ b/crates/hir-def/src/item_tree/lower.rs
+@@ -271,7 +271,7 @@ impl<'a> Ctx<'a> {
+         let ast_id = self.source_ast_id_map.ast_id(impl_def);
+         // Note that trait impls don't get implicit `Self` unlike traits, because here they are a
+         // type alias rather than a type parameter, so this is handled by the resolver.
+-        let res = Impl { is_trait_impl: impl_def.trait_().is_some() };
++        let res = Impl {};
+         self.tree.small_data.insert(ast_id.upcast(), SmallModItem::Impl(res));
+         ast_id
+     }
+diff --git a/crates/hir-def/src/item_tree/pretty.rs b/crates/hir-def/src/item_tree/pretty.rs
+index 4113a778ea..c89299e6d8 100644
+--- a/crates/hir-def/src/item_tree/pretty.rs
++++ b/crates/hir-def/src/item_tree/pretty.rs
+@@ -258,7 +258,7 @@ impl Printer<'_> {
+                 w!(self, "trait {} {{ ... }}", name.display(self.db, self.edition));
+             }
+             ModItemId::Impl(ast_id) => {
+-                let Impl { is_trait_impl: _ } = &self.tree[ast_id];
++                let Impl {} = &self.tree[ast_id];
+                 self.print_ast_id(ast_id.erase());
+                 w!(self, "impl {{ ... }}");
+             }
+diff --git a/crates/hir-def/src/lang_item.rs b/crates/hir-def/src/lang_item.rs
+index d3f4480b20..41d69c1fd6 100644
+--- a/crates/hir-def/src/lang_item.rs
++++ b/crates/hir-def/src/lang_item.rs
+@@ -41,7 +41,7 @@ pub fn crate_lang_items(db: &dyn DefDatabase, krate: Crate) -> Option<Box<LangIt
+     let crate_def_map = crate_def_map(db, krate);
+ 
+     for (_, module_data) in crate_def_map.modules() {
+-        for impl_def in module_data.scope.inherent_impls() {
++        for impl_def in module_data.scope.impls() {
+             lang_items.collect_lang_item(db, impl_def);
+             for &(_, assoc) in impl_def.impl_items(db).items.iter() {
+                 match assoc {
+diff --git a/crates/hir-def/src/nameres/collector.rs b/crates/hir-def/src/nameres/collector.rs
+index 87ade06517..4740e3b99e 100644
+--- a/crates/hir-def/src/nameres/collector.rs
++++ b/crates/hir-def/src/nameres/collector.rs
+@@ -2028,9 +2028,7 @@ impl ModCollector<'_, '_> {
+                     let impl_id =
+                         ImplLoc { container: module_id, id: InFile::new(self.file_id(), imp) }
+                             .intern(db);
+-                    self.def_collector.def_map.modules[self.module_id]
+-                        .scope
+-                        .define_impl(impl_id, self.item_tree[imp].is_trait_impl)
++                    self.def_collector.def_map.modules[self.module_id].scope.define_impl(impl_id)
+                 }
+                 ModItemId::Function(id) => {
+                     let it = &self.item_tree[id];
+diff --git a/crates/hir-ty/src/method_resolution.rs b/crates/hir-ty/src/method_resolution.rs
+index e4681b464f..3d7cc4ffbf 100644
+--- a/crates/hir-ty/src/method_resolution.rs
++++ b/crates/hir-ty/src/method_resolution.rs
+@@ -609,7 +609,12 @@ impl InherentImpls {
+             map: &mut FxHashMap<SimplifiedType, Vec<ImplId>>,
+         ) {
+             for (_module_id, module_data) in def_map.modules() {
+-                for impl_id in module_data.scope.inherent_impls() {
++                for impl_id in module_data.scope.impls() {
++                    let data = db.impl_signature(impl_id);
++                    if data.target_trait.is_some() {
++                        continue;
++                    }
++
+                     let interner = DbInterner::new_no_crate(db);
+                     let self_ty = db.impl_self_ty(impl_id);
+                     let self_ty = self_ty.instantiate_identity();
+@@ -725,7 +730,7 @@ impl TraitImpls {
+             map: &mut FxHashMap<TraitId, OneTraitImplsBuilder>,
+         ) {
+             for (_module_id, module_data) in def_map.modules() {
+-                for impl_id in module_data.scope.trait_impls() {
++                for impl_id in module_data.scope.impls() {
+                     let trait_ref = match db.impl_trait(impl_id) {
+                         Some(tr) => tr.instantiate_identity(),
+                         None => continue,
+diff --git a/crates/hir-ty/src/tests/incremental.rs b/crates/hir-ty/src/tests/incremental.rs
+index 118f433a24..633ab43c4c 100644
+--- a/crates/hir-ty/src/tests/incremental.rs
++++ b/crates/hir-ty/src/tests/incremental.rs
+@@ -539,6 +539,12 @@ impl SomeStruct {
+                 "AttrFlags::query_",
+                 "AttrFlags::query_",
+                 "AttrFlags::query_",
++                "impl_trait_with_diagnostics_query",
++                "impl_signature_shim",
++                "impl_signature_with_source_map_shim",
++                "impl_self_ty_with_diagnostics_query",
++                "struct_signature_shim",
++                "struct_signature_with_source_map_shim",
+             ]
+         "#]],
+     );
+@@ -611,6 +617,7 @@ fn main() {
+                 "lang_items",
+                 "crate_lang_items",
+                 "AttrFlags::query_",
++                "AttrFlags::query_",
+                 "GenericPredicates::query_with_diagnostics_",
+                 "GenericPredicates::query_with_diagnostics_",
+                 "ImplTraits::return_type_impl_traits_",
+@@ -626,14 +633,13 @@ fn main() {
+                 "GenericPredicates::query_with_diagnostics_",
+                 "value_ty_query",
+                 "InherentImpls::for_crate_",
++                "impl_signature_shim",
++                "impl_signature_with_source_map_shim",
+                 "callable_item_signature_query",
+                 "TraitImpls::for_crate_and_deps_",
+                 "TraitImpls::for_crate_",
+                 "impl_trait_with_diagnostics_query",
+-                "impl_signature_shim",
+-                "impl_signature_with_source_map_shim",
+                 "impl_self_ty_with_diagnostics_query",
+-                "AttrFlags::query_",
+                 "GenericPredicates::query_with_diagnostics_",
+             ]
+         "#]],
+@@ -704,6 +710,7 @@ fn main() {
+                 "crate_lang_items",
+                 "AttrFlags::query_",
+                 "AttrFlags::query_",
++                "AttrFlags::query_",
+                 "GenericPredicates::query_with_diagnostics_",
+                 "GenericPredicates::query_with_diagnostics_",
+                 "ImplTraits::return_type_impl_traits_",
+@@ -715,13 +722,12 @@ fn main() {
+                 "struct_signature_with_source_map_shim",
+                 "GenericPredicates::query_with_diagnostics_",
+                 "InherentImpls::for_crate_",
+-                "callable_item_signature_query",
+-                "TraitImpls::for_crate_",
+                 "impl_signature_with_source_map_shim",
+                 "impl_signature_shim",
++                "callable_item_signature_query",
++                "TraitImpls::for_crate_",
+                 "impl_trait_with_diagnostics_query",
+                 "impl_self_ty_with_diagnostics_query",
+-                "AttrFlags::query_",
+                 "GenericPredicates::query_with_diagnostics_",
+             ]
+         "#]],
+diff --git a/crates/hir/src/lib.rs b/crates/hir/src/lib.rs
+index 527614d56a..1ab57c4489 100644
+--- a/crates/hir/src/lib.rs
++++ b/crates/hir/src/lib.rs
+@@ -803,21 +803,22 @@ impl Module {
+                 emit_def_diagnostic(db, acc, diag, edition, loc.container.krate(db));
+             }
+ 
+-            let trait_impl = impl_signature.target_trait.is_some();
+-            if !trait_impl && !is_inherent_impl_coherent(db, def_map, impl_id) {
++            if impl_signature.target_trait.is_none()
++                && !is_inherent_impl_coherent(db, def_map, impl_id)
++            {
+                 acc.push(IncoherentImpl { impl_: ast_id_map.get(loc.id.value), file_id }.into())
+             }
+ 
+-            if trait_impl && !impl_def.check_orphan_rules(db) {
++            if !impl_def.check_orphan_rules(db) {
+                 acc.push(TraitImplOrphan { impl_: ast_id_map.get(loc.id.value), file_id }.into())
+             }
+ 
+-            let trait_ = trait_impl.then(|| impl_def.trait_(db)).flatten();
++            let trait_ = impl_def.trait_(db);
+             let mut trait_is_unsafe = trait_.is_some_and(|t| t.is_unsafe(db));
+             let impl_is_negative = impl_def.is_negative(db);
+             let impl_is_unsafe = impl_def.is_unsafe(db);
+ 
+-            let trait_is_unresolved = trait_.is_none() && trait_impl;
++            let trait_is_unresolved = trait_.is_none() && impl_signature.target_trait.is_some();
+             if trait_is_unresolved {
+                 // Ignore trait safety errors when the trait is unresolved, as otherwise we'll treat it as safe,
+                 // which may not be correct.
+diff --git a/crates/ide-completion/src/tests/flyimport.rs b/crates/ide-completion/src/tests/flyimport.rs
+index 2912457da1..aad881f8ce 100644
+--- a/crates/ide-completion/src/tests/flyimport.rs
++++ b/crates/ide-completion/src/tests/flyimport.rs
+@@ -781,9 +781,9 @@ fn main() {
+ }
+ "#,
+         expect![[r#"
+-            me random_method(…) (use dep::test_mod::TestTrait) fn(&self) DEPRECATED
+-            ct SPECIAL_CONST (use dep::test_mod::TestTrait)           u8 DEPRECATED
+             fn weird_function() (use dep::test_mod::TestTrait)      fn() DEPRECATED
++            ct SPECIAL_CONST (use dep::test_mod::TestTrait)           u8 DEPRECATED
++            me random_method(…) (use dep::test_mod::TestTrait) fn(&self) DEPRECATED
+         "#]],
+     );
+ }

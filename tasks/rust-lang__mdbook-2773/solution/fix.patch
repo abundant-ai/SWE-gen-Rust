@@ -1,0 +1,701 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 10ec141e..9d692f39 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1315,6 +1315,7 @@ dependencies = [
+  "mdbook-renderer",
+  "mdbook-summary",
+  "regex",
++ "serde",
+  "serde_json",
+  "shlex",
+  "tempfile",
+diff --git a/crates/mdbook-core/src/config.rs b/crates/mdbook-core/src/config.rs
+index 9ab564c2..ef00b143 100644
+--- a/crates/mdbook-core/src/config.rs
++++ b/crates/mdbook-core/src/config.rs
+@@ -24,7 +24,7 @@
+ //! [build]
+ //! src = "out"
+ //!
+-//! [other-table.foo]
++//! [preprocessor.my-preprocessor]
+ //! bar = 123
+ //! "#;
+ //!
+@@ -32,24 +32,24 @@
+ //! let mut cfg = Config::from_str(src)?;
+ //!
+ //! // retrieve a nested value
+-//! let bar = cfg.get("other-table.foo.bar").cloned();
+-//! assert_eq!(bar, Some(Value::Integer(123)));
++//! let bar = cfg.get::<i32>("preprocessor.my-preprocessor.bar")?;
++//! assert_eq!(bar, Some(123));
+ //!
+ //! // Set the `output.html.theme` directory
+-//! assert!(cfg.get("output.html").is_none());
++//! assert!(cfg.get::<Value>("output.html")?.is_none());
+ //! cfg.set("output.html.theme", "./themes");
+ //!
+ //! // then load it again, automatically deserializing to a `PathBuf`.
+-//! let got: Option<PathBuf> = cfg.get_deserialized_opt("output.html.theme")?;
++//! let got = cfg.get("output.html.theme")?;
+ //! assert_eq!(got, Some(PathBuf::from("./themes")));
+ //! # Ok(())
+ //! # }
+ //! # run().unwrap()
+ //! ```
+ 
++use crate::utils::TomlExt;
+ use crate::utils::log_backtrace;
+-use crate::utils::toml_ext::TomlExt;
+-use anyhow::{Context, Error, Result, bail};
++use anyhow::{Context, Error, Result};
+ use log::{debug, trace, warn};
+ use serde::{Deserialize, Deserializer, Serialize, Serializer};
+ use std::collections::HashMap;
+@@ -154,18 +154,28 @@ impl Config {
+         }
+     }
+ 
+-    /// Fetch an arbitrary item from the `Config` as a `toml::Value`.
++    /// Get a value from the configuration.
+     ///
+-    /// You can use dotted indices to access nested items (e.g.
+-    /// `output.html.playground` will fetch the "playground" out of the html output
+-    /// table).
+-    pub fn get(&self, key: &str) -> Option<&Value> {
+-        self.rest.read(key)
+-    }
+-
+-    /// Fetch a value from the `Config` so you can mutate it.
+-    pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+-        self.rest.read_mut(key)
++    /// This fetches a value from the book configuration. The key can have
++    /// dotted indices to access nested items (e.g. `output.html.playground`
++    /// will fetch the "playground" out of the html output table).
++    ///
++    /// This does not have access to the [`Config::book`], [`Config::build`],
++    /// or [`Config::rust`] fields.
++    ///
++    /// Returns `Ok(None)` if the field is not set.
++    ///
++    /// Returns `Err` if it fails to deserialize.
++    pub fn get<'de, T: Deserialize<'de>>(&self, name: &str) -> Result<Option<T>> {
++        self.rest
++            .read(name)
++            .map(|value| {
++                value
++                    .clone()
++                    .try_into()
++                    .with_context(|| "Couldn't deserialize the value")
++            })
++            .transpose()
+     }
+ 
+     /// Convenience method for getting the html renderer's configuration.
+@@ -177,7 +187,7 @@ impl Config {
+     #[doc(hidden)]
+     pub fn html_config(&self) -> Option<HtmlConfig> {
+         match self
+-            .get_deserialized_opt("output.html")
++            .get("output.html")
+             .with_context(|| "Parsing configuration [output.html]")
+         {
+             Ok(Some(config)) => Some(config),
+@@ -189,35 +199,12 @@ impl Config {
+         }
+     }
+ 
+-    /// Deprecated, use get_deserialized_opt instead.
+-    #[deprecated = "use get_deserialized_opt instead"]
+-    pub fn get_deserialized<'de, T: Deserialize<'de>, S: AsRef<str>>(&self, name: S) -> Result<T> {
+-        let name = name.as_ref();
+-        match self.get_deserialized_opt(name)? {
+-            Some(value) => Ok(value),
+-            None => bail!("Key not found, {:?}", name),
+-        }
+-    }
+-
+-    /// Convenience function to fetch a value from the config and deserialize it
+-    /// into some arbitrary type.
+-    pub fn get_deserialized_opt<'de, T: Deserialize<'de>, S: AsRef<str>>(
+-        &self,
+-        name: S,
+-    ) -> Result<Option<T>> {
+-        let name = name.as_ref();
+-        self.get(name)
+-            .map(|value| {
+-                value
+-                    .clone()
+-                    .try_into()
+-                    .with_context(|| "Couldn't deserialize the value")
+-            })
+-            .transpose()
+-    }
+-
+     /// Set a config key, clobbering any existing values along the way.
+     ///
++    /// The key can have dotted indices for nested items (e.g.
++    /// `output.html.playground` will set the "playground" in the html output
++    /// table).
++    ///
+     /// The only way this can fail is if we can't serialize `value` into a
+     /// `toml::Value`.
+     pub fn set<S: Serialize, I: AsRef<str>>(&mut self, index: I, value: S) -> Result<()> {
+@@ -230,6 +217,8 @@ impl Config {
+             self.book.update_value(key, value);
+         } else if let Some(key) = index.strip_prefix("build.") {
+             self.build.update_value(key, value);
++        } else if let Some(key) = index.strip_prefix("rust.") {
++            self.rust.update_value(key, value);
+         } else {
+             self.rest.insert(index, value);
+         }
+@@ -237,18 +226,6 @@ impl Config {
+         Ok(())
+     }
+ 
+-    /// Get the table associated with a particular renderer.
+-    pub fn get_renderer<I: AsRef<str>>(&self, index: I) -> Option<&Table> {
+-        let key = format!("output.{}", index.as_ref());
+-        self.get(&key).and_then(Value::as_table)
+-    }
+-
+-    /// Get the table associated with a particular preprocessor.
+-    pub fn get_preprocessor<I: AsRef<str>>(&self, index: I) -> Option<&Table> {
+-        let key = format!("preprocessor.{}", index.as_ref());
+-        self.get(&key).and_then(Value::as_table)
+-    }
+-
+     fn from_legacy(mut table: Value) -> Config {
+         let mut cfg = Config::default();
+ 
+@@ -1019,32 +996,16 @@ mod tests {
+         };
+ 
+         let cfg = Config::from_str(src).unwrap();
+-        let got: RandomOutput = cfg.get_deserialized_opt("output.random").unwrap().unwrap();
++        let got: RandomOutput = cfg.get("output.random").unwrap().unwrap();
+ 
+         assert_eq!(got, should_be);
+ 
+-        let got_baz: Vec<bool> = cfg
+-            .get_deserialized_opt("output.random.baz")
+-            .unwrap()
+-            .unwrap();
++        let got_baz: Vec<bool> = cfg.get("output.random.baz").unwrap().unwrap();
+         let baz_should_be = vec![true, true, false];
+ 
+         assert_eq!(got_baz, baz_should_be);
+     }
+ 
+-    #[test]
+-    fn mutate_some_stuff() {
+-        // really this is just a sanity check to make sure the borrow checker
+-        // is happy...
+-        let src = COMPLEX_CONFIG;
+-        let mut config = Config::from_str(src).unwrap();
+-        let key = "output.html.playground.editable";
+-
+-        assert_eq!(config.get(key).unwrap(), &Value::Boolean(true));
+-        *config.get_mut(key).unwrap() = Value::Boolean(false);
+-        assert_eq!(config.get(key).unwrap(), &Value::Boolean(false));
+-    }
+-
+     /// The config file format has slightly changed (metadata stuff is now under
+     /// the `book` table instead of being at the top level) so we're adding a
+     /// **temporary** compatibility check. You should be able to still load the
+@@ -1104,13 +1065,29 @@ mod tests {
+         let key = "foo.bar.baz";
+         let value = "Something Interesting";
+ 
+-        assert!(cfg.get(key).is_none());
++        assert!(cfg.get::<i32>(key).unwrap().is_none());
+         cfg.set(key, value).unwrap();
+ 
+-        let got: String = cfg.get_deserialized_opt(key).unwrap().unwrap();
++        let got: String = cfg.get(key).unwrap().unwrap();
+         assert_eq!(got, value);
+     }
+ 
++    #[test]
++    fn set_special_tables() {
++        let mut cfg = Config::default();
++        assert_eq!(cfg.book.title, None);
++        cfg.set("book.title", "my title").unwrap();
++        assert_eq!(cfg.book.title, Some("my title".to_string()));
++
++        assert_eq!(&cfg.build.build_dir, Path::new("book"));
++        cfg.set("build.build-dir", "some-directory").unwrap();
++        assert_eq!(&cfg.build.build_dir, Path::new("some-directory"));
++
++        assert_eq!(cfg.rust.edition, None);
++        cfg.set("rust.edition", "2024").unwrap();
++        assert_eq!(cfg.rust.edition, Some(RustEdition::E2024));
++    }
++
+     #[test]
+     fn parse_env_vars() {
+         let inputs = vec![
+@@ -1141,7 +1118,7 @@ mod tests {
+         let key = "foo.bar";
+         let value = "baz";
+ 
+-        assert!(cfg.get(key).is_none());
++        assert!(cfg.get::<String>(key).unwrap().is_none());
+ 
+         let encoded_key = encode_env_var(key);
+         // TODO: This is unsafe, and should be rewritten to use a process.
+@@ -1149,10 +1126,7 @@ mod tests {
+ 
+         cfg.update_from_env();
+ 
+-        assert_eq!(
+-            cfg.get_deserialized_opt::<String, _>(key).unwrap().unwrap(),
+-            value
+-        );
++        assert_eq!(cfg.get::<String>(key).unwrap().unwrap(), value);
+     }
+ 
+     #[test]
+@@ -1162,7 +1136,7 @@ mod tests {
+         let value = json!({"array": [1, 2, 3], "number": 13.37});
+         let value_str = serde_json::to_string(&value).unwrap();
+ 
+-        assert!(cfg.get(key).is_none());
++        assert!(cfg.get::<serde_json::Value>(key).unwrap().is_none());
+ 
+         let encoded_key = encode_env_var(key);
+         // TODO: This is unsafe, and should be rewritten to use a process.
+@@ -1170,12 +1144,7 @@ mod tests {
+ 
+         cfg.update_from_env();
+ 
+-        assert_eq!(
+-            cfg.get_deserialized_opt::<serde_json::Value, _>(key)
+-                .unwrap()
+-                .unwrap(),
+-            value
+-        );
++        assert_eq!(cfg.get::<serde_json::Value>(key).unwrap().unwrap(), value);
+     }
+ 
+     #[test]
+diff --git a/crates/mdbook-core/src/utils/mod.rs b/crates/mdbook-core/src/utils/mod.rs
+index caca5dcd..99a8e543 100644
+--- a/crates/mdbook-core/src/utils/mod.rs
++++ b/crates/mdbook-core/src/utils/mod.rs
+@@ -9,7 +9,9 @@ use std::sync::LazyLock;
+ 
+ pub mod fs;
+ mod string;
+-pub mod toml_ext;
++mod toml_ext;
++
++pub(crate) use self::toml_ext::TomlExt;
+ 
+ pub use self::string::{
+     take_anchored_lines, take_lines, take_rustdoc_include_anchored_lines,
+diff --git a/crates/mdbook-core/src/utils/toml_ext.rs b/crates/mdbook-core/src/utils/toml_ext.rs
+index 7975ed57..51ed8435 100644
+--- a/crates/mdbook-core/src/utils/toml_ext.rs
++++ b/crates/mdbook-core/src/utils/toml_ext.rs
+@@ -3,11 +3,9 @@
+ use toml::value::{Table, Value};
+ 
+ /// Helper for working with toml types.
+-pub trait TomlExt {
++pub(crate) trait TomlExt {
+     /// Read a dotted key.
+     fn read(&self, key: &str) -> Option<&Value>;
+-    /// Read a dotted key for a mutable value.
+-    fn read_mut(&mut self, key: &str) -> Option<&mut Value>;
+     /// Insert with a dotted key.
+     fn insert(&mut self, key: &str, value: Value);
+     /// Delete a dotted key value.
+@@ -23,14 +21,6 @@ impl TomlExt for Value {
+         }
+     }
+ 
+-    fn read_mut(&mut self, key: &str) -> Option<&mut Value> {
+-        if let Some((head, tail)) = split(key) {
+-            self.get_mut(head)?.read_mut(tail)
+-        } else {
+-            self.get_mut(key)
+-        }
+-    }
+-
+     fn insert(&mut self, key: &str, value: Value) {
+         if !self.is_table() {
+             *self = Value::Table(Table::new());
+diff --git a/crates/mdbook-driver/Cargo.toml b/crates/mdbook-driver/Cargo.toml
+index 5e9b348e..f7edc053 100644
+--- a/crates/mdbook-driver/Cargo.toml
++++ b/crates/mdbook-driver/Cargo.toml
+@@ -17,6 +17,7 @@ mdbook-preprocessor.workspace = true
+ mdbook-renderer.workspace = true
+ mdbook-summary.workspace = true
+ regex.workspace = true
++serde.workspace = true
+ serde_json.workspace = true
+ shlex.workspace = true
+ tempfile.workspace = true
+diff --git a/crates/mdbook-driver/src/builtin_renderers/mod.rs b/crates/mdbook-driver/src/builtin_renderers/mod.rs
+index 0218a62d..6ac1ee24 100644
+--- a/crates/mdbook-driver/src/builtin_renderers/mod.rs
++++ b/crates/mdbook-driver/src/builtin_renderers/mod.rs
+@@ -10,7 +10,6 @@ use std::fs;
+ use std::io::{self, ErrorKind};
+ use std::path::{Path, PathBuf};
+ use std::process::{Command, Stdio};
+-use toml::Value;
+ 
+ pub use self::markdown_renderer::MarkdownRenderer;
+ 
+@@ -108,8 +107,9 @@ impl CmdRenderer {
+             let optional_key = format!("output.{}.optional", self.name);
+ 
+             let is_optional = match ctx.config.get(&optional_key) {
+-                Some(Value::Boolean(value)) => *value,
+-                _ => false,
++                Ok(Some(value)) => value,
++                Err(e) => bail!("expected bool for `{optional_key}`: {e}"),
++                Ok(None) => false,
+             };
+ 
+             if is_optional {
+diff --git a/crates/mdbook-driver/src/mdbook.rs b/crates/mdbook-driver/src/mdbook.rs
+index 701a0161..533a1d84 100644
+--- a/crates/mdbook-driver/src/mdbook.rs
++++ b/crates/mdbook-driver/src/mdbook.rs
+@@ -13,12 +13,13 @@ use mdbook_html::HtmlHandlebars;
+ use mdbook_preprocessor::{Preprocessor, PreprocessorContext};
+ use mdbook_renderer::{RenderContext, Renderer};
+ use mdbook_summary::Summary;
++use serde::Deserialize;
++use std::collections::HashMap;
+ use std::ffi::OsString;
+ use std::io::{IsTerminal, Write};
+ use std::path::{Path, PathBuf};
+ use std::process::Command;
+ use tempfile::Builder as TempFileBuilder;
+-use toml::Value;
+ use topological_sort::TopologicalSort;
+ 
+ #[cfg(test)]
+@@ -99,7 +100,7 @@ impl MDBook {
+         let src_dir = root.join(&config.book.src);
+         let book = load_book(src_dir, &config.build)?;
+ 
+-        let renderers = determine_renderers(&config);
++        let renderers = determine_renderers(&config)?;
+         let preprocessors = determine_preprocessors(&config)?;
+ 
+         Ok(MDBook {
+@@ -122,7 +123,7 @@ impl MDBook {
+         let src_dir = root.join(&config.book.src);
+         let book = load_book_from_disk(&summary, src_dir)?;
+ 
+-        let renderers = determine_renderers(&config);
++        let renderers = determine_renderers(&config)?;
+         let preprocessors = determine_preprocessors(&config)?;
+ 
+         Ok(MDBook {
+@@ -201,7 +202,7 @@ impl MDBook {
+         );
+         let mut preprocessed_book = self.book.clone();
+         for preprocessor in &self.preprocessors {
+-            if preprocessor_should_run(&**preprocessor, renderer, &self.config) {
++            if preprocessor_should_run(&**preprocessor, renderer, &self.config)? {
+                 debug!("Running the {} preprocessor.", preprocessor.name());
+                 preprocessed_book = preprocessor.run(&preprocess_ctx, preprocessed_book)?;
+             }
+@@ -420,20 +421,31 @@ impl MDBook {
+     }
+ }
+ 
++/// An `output` table.
++#[derive(Deserialize)]
++struct OutputConfig {
++    command: Option<String>,
++}
++
+ /// Look at the `Config` and try to figure out what renderers to use.
+-fn determine_renderers(config: &Config) -> Vec<Box<dyn Renderer>> {
++fn determine_renderers(config: &Config) -> Result<Vec<Box<dyn Renderer>>> {
+     let mut renderers = Vec::new();
+ 
+-    if let Some(output_table) = config.get("output").and_then(Value::as_table) {
+-        renderers.extend(output_table.iter().map(|(key, table)| {
+-            if key == "html" {
+-                Box::new(HtmlHandlebars::new()) as Box<dyn Renderer>
+-            } else if key == "markdown" {
+-                Box::new(MarkdownRenderer::new()) as Box<dyn Renderer>
+-            } else {
+-                interpret_custom_renderer(key, table)
+-            }
+-        }));
++    match config.get::<HashMap<String, OutputConfig>>("output") {
++        Ok(Some(output_table)) => {
++            renderers.extend(output_table.into_iter().map(|(key, table)| {
++                if key == "html" {
++                    Box::new(HtmlHandlebars::new()) as Box<dyn Renderer>
++                } else if key == "markdown" {
++                    Box::new(MarkdownRenderer::new()) as Box<dyn Renderer>
++                } else {
++                    let command = table.command.unwrap_or_else(|| format!("mdbook-{key}"));
++                    Box::new(CmdRenderer::new(key, command))
++                }
++            }));
++        }
++        Ok(None) => {}
++        Err(e) => bail!("failed to get output table config: {e}"),
+     }
+ 
+     // if we couldn't find anything, add the HTML renderer as a default
+@@ -441,7 +453,7 @@ fn determine_renderers(config: &Config) -> Vec<Box<dyn Renderer>> {
+         renderers.push(Box::new(HtmlHandlebars::new()));
+     }
+ 
+-    renderers
++    Ok(renderers)
+ }
+ 
+ const DEFAULT_PREPROCESSORS: &[&str] = &["links", "index"];
+@@ -451,6 +463,16 @@ fn is_default_preprocessor(pre: &dyn Preprocessor) -> bool {
+     name == LinkPreprocessor::NAME || name == IndexPreprocessor::NAME
+ }
+ 
++/// A `preprocessor` table.
++#[derive(Deserialize)]
++struct PreprocessorConfig {
++    command: Option<String>,
++    #[serde(default)]
++    before: Vec<String>,
++    #[serde(default)]
++    after: Vec<String>,
++}
++
+ /// Look at the `MDBook` and try to figure out what preprocessors to run.
+ fn determine_preprocessors(config: &Config) -> Result<Vec<Box<dyn Preprocessor>>> {
+     // Collect the names of all preprocessors intended to be run, and the order
+@@ -463,62 +485,43 @@ fn determine_preprocessors(config: &Config) -> Result<Vec<Box<dyn Preprocessor>>
+         }
+     }
+ 
+-    if let Some(preprocessor_table) = config.get("preprocessor").and_then(Value::as_table) {
+-        for (name, table) in preprocessor_table.iter() {
+-            preprocessor_names.insert(name.to_string());
++    let preprocessor_table = match config.get::<HashMap<String, PreprocessorConfig>>("preprocessor")
++    {
++        Ok(Some(preprocessor_table)) => preprocessor_table,
++        Ok(None) => HashMap::new(),
++        Err(e) => bail!("failed to get preprocessor table config: {e}"),
++    };
+ 
+-            let exists = |name| {
+-                (config.build.use_default_preprocessors && DEFAULT_PREPROCESSORS.contains(&name))
+-                    || preprocessor_table.contains_key(name)
+-            };
++    for (name, table) in preprocessor_table.iter() {
++        preprocessor_names.insert(name.to_string());
+ 
+-            if let Some(before) = table.get("before") {
+-                let before = before.as_array().ok_or_else(|| {
+-                    Error::msg(format!(
+-                        "Expected preprocessor.{name}.before to be an array"
+-                    ))
+-                })?;
+-                for after in before {
+-                    let after = after.as_str().ok_or_else(|| {
+-                        Error::msg(format!(
+-                            "Expected preprocessor.{name}.before to contain strings"
+-                        ))
+-                    })?;
+-
+-                    if !exists(after) {
+-                        // Only warn so that preprocessors can be toggled on and off (e.g. for
+-                        // troubleshooting) without having to worry about order too much.
+-                        warn!(
+-                            "preprocessor.{}.after contains \"{}\", which was not found",
+-                            name, after
+-                        );
+-                    } else {
+-                        preprocessor_names.add_dependency(name, after);
+-                    }
+-                }
++        let exists = |name| {
++            (config.build.use_default_preprocessors && DEFAULT_PREPROCESSORS.contains(&name))
++                || preprocessor_table.contains_key(name)
++        };
++
++        for after in &table.before {
++            if !exists(&after) {
++                // Only warn so that preprocessors can be toggled on and off (e.g. for
++                // troubleshooting) without having to worry about order too much.
++                warn!(
++                    "preprocessor.{}.after contains \"{}\", which was not found",
++                    name, after
++                );
++            } else {
++                preprocessor_names.add_dependency(name, after);
+             }
++        }
+ 
+-            if let Some(after) = table.get("after") {
+-                let after = after.as_array().ok_or_else(|| {
+-                    Error::msg(format!("Expected preprocessor.{name}.after to be an array"))
+-                })?;
+-                for before in after {
+-                    let before = before.as_str().ok_or_else(|| {
+-                        Error::msg(format!(
+-                            "Expected preprocessor.{name}.after to contain strings"
+-                        ))
+-                    })?;
+-
+-                    if !exists(before) {
+-                        // See equivalent warning above for rationale
+-                        warn!(
+-                            "preprocessor.{}.before contains \"{}\", which was not found",
+-                            name, before
+-                        );
+-                    } else {
+-                        preprocessor_names.add_dependency(before, name);
+-                    }
+-                }
++        for before in &table.after {
++            if !exists(&before) {
++                // See equivalent warning above for rationale
++                warn!(
++                    "preprocessor.{}.before contains \"{}\", which was not found",
++                    name, before
++                );
++            } else {
++                preprocessor_names.add_dependency(before, name);
+             }
+         }
+     }
+@@ -544,8 +547,11 @@ fn determine_preprocessors(config: &Config) -> Result<Vec<Box<dyn Preprocessor>>
+                 _ => {
+                     // The only way to request a custom preprocessor is through the `preprocessor`
+                     // table, so it must exist, be a table, and contain the key.
+-                    let table = &config.get("preprocessor").unwrap().as_table().unwrap()[&name];
+-                    let command = get_custom_preprocessor_cmd(&name, table);
++                    let table = &preprocessor_table[&name];
++                    let command = table
++                        .command
++                        .to_owned()
++                        .unwrap_or_else(|| format!("mdbook-{name}"));
+                     Box::new(CmdPreprocessor::new(name, command))
+                 }
+             };
+@@ -562,27 +568,6 @@ fn determine_preprocessors(config: &Config) -> Result<Vec<Box<dyn Preprocessor>>
+     }
+ }
+ 
+-fn get_custom_preprocessor_cmd(key: &str, table: &Value) -> String {
+-    table
+-        .get("command")
+-        .and_then(Value::as_str)
+-        .map(ToString::to_string)
+-        .unwrap_or_else(|| format!("mdbook-{key}"))
+-}
+-
+-fn interpret_custom_renderer(key: &str, table: &Value) -> Box<CmdRenderer> {
+-    // look for the `command` field, falling back to using the key
+-    // prepended by "mdbook-"
+-    let table_dot_command = table
+-        .get("command")
+-        .and_then(Value::as_str)
+-        .map(ToString::to_string);
+-
+-    let command = table_dot_command.unwrap_or_else(|| format!("mdbook-{key}"));
+-
+-    Box::new(CmdRenderer::new(key.to_string(), command))
+-}
+-
+ /// Check whether we should run a particular `Preprocessor` in combination
+ /// with the renderer, falling back to `Preprocessor::supports_renderer()`
+ /// method if the user doesn't say anything.
+@@ -593,21 +578,20 @@ fn preprocessor_should_run(
+     preprocessor: &dyn Preprocessor,
+     renderer: &dyn Renderer,
+     cfg: &Config,
+-) -> bool {
++) -> Result<bool> {
+     // default preprocessors should be run by default (if supported)
+     if cfg.build.use_default_preprocessors && is_default_preprocessor(preprocessor) {
+-        return preprocessor.supports_renderer(renderer.name());
++        return Ok(preprocessor.supports_renderer(renderer.name()));
+     }
+ 
+     let key = format!("preprocessor.{}.renderers", preprocessor.name());
+     let renderer_name = renderer.name();
+ 
+-    if let Some(Value::Array(explicit_renderers)) = cfg.get(&key) {
+-        return explicit_renderers
+-            .iter()
+-            .filter_map(Value::as_str)
+-            .any(|name| name == renderer_name);
++    match cfg.get::<Vec<String>>(&key) {
++        Ok(Some(explicit_renderers)) => {
++            Ok(explicit_renderers.iter().any(|name| name == renderer_name))
++        }
++        Ok(None) => Ok(preprocessor.supports_renderer(renderer_name)),
++        Err(e) => bail!("failed to get `{key}`: {e}"),
+     }
+-
+-    preprocessor.supports_renderer(renderer_name)
+ }
+diff --git a/examples/nop-preprocessor.rs b/examples/nop-preprocessor.rs
+index 1c599d6d..ffb19e1c 100644
+--- a/examples/nop-preprocessor.rs
++++ b/examples/nop-preprocessor.rs
+@@ -92,10 +92,13 @@ mod nop_lib {
+         fn run(&self, ctx: &PreprocessorContext, book: Book) -> Result<Book> {
+             // In testing we want to tell the preprocessor to blow up by setting a
+             // particular config value
+-            if let Some(nop_cfg) = ctx.config.get_preprocessor(self.name()) {
+-                if nop_cfg.contains_key("blow-up") {
+-                    anyhow::bail!("Boom!!1!");
+-                }
++            match ctx
++                .config
++                .get::<bool>("preprocessor.nop-preprocessor.blow-up")
++            {
++                Ok(Some(true)) => anyhow::bail!("Boom!!1!"),
++                Ok(_) => {}
++                Err(e) => anyhow::bail!("expect bool for blow-up: {e}"),
+             }
+ 
+             // we *are* a no-op preprocessor after all
+diff --git a/src/cmd/serve.rs b/src/cmd/serve.rs
+index d1f5d0e4..a8751c5a 100644
+--- a/src/cmd/serve.rs
++++ b/src/cmd/serve.rs
+@@ -2,7 +2,7 @@ use super::command_prelude::*;
+ #[cfg(feature = "watch")]
+ use super::watch;
+ use crate::{get_book_dir, open};
+-use anyhow::Result;
++use anyhow::{Result, bail};
+ use axum::Router;
+ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+ use axum::routing::get;
+@@ -76,11 +76,10 @@ pub fn execute(args: &ArgMatches) -> Result<()> {
+         .next()
+         .ok_or_else(|| anyhow::anyhow!("no address found for {}", address))?;
+     let build_dir = book.build_dir_for("html");
+-    let input_404 = book
+-        .config
+-        .get("output.html.input-404")
+-        .and_then(toml::Value::as_str)
+-        .map(ToString::to_string);
++    let input_404 = match book.config.get::<String>("output.html.input-404") {
++        Ok(v) => v,
++        Err(e) => bail!("expected string for output.html.input-404: {e}"),
++    };
+     let file_404 = get_404_output_file(&input_404);
+ 
+     // A channel used to broadcast to any websockets to reload when a file changes.

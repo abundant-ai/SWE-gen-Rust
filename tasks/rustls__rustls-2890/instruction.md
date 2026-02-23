@@ -1,7 +1,0 @@
-Calling the key-update secret APIs on a QUIC connection can currently hit a reachable `unreachable!()` path, causing a panic (surfacing as `Error::Unreachable`) in situations that are valid and should be handled gracefully.
-
-In particular, the methods `KernelConnection::update_traffic_secret()` and `KernelConnection::update_traffic_secrets()` are expected to return a normal `Result` error when they cannot perform a secret update (for example, when used in an invalid state, when secrets are not available yet/anymore, or when key update is not applicable for the current protocol/version). Instead, certain real call sequences can reach code that assumes the situation is impossible and triggers the internal `Error::Unreachable`.
-
-The behavior should be corrected so that these `KernelConnection::update_*_secret()` APIs never panic for reachable states. When the operation cannot be completed, they must return an appropriate `Err(rustls::Error::...)` describing the problem, rather than `Error::Unreachable` or a panic. The same should hold for any internal callers that route through these methods.
-
-Reproduction is via QUIC usage patterns that exercise traffic secret updates (including key updates) during or after handshake progression: invoking `KernelConnection::update_traffic_secret()` / `KernelConnection::update_traffic_secrets()` should either succeed or return a well-defined recoverable error, but must not panic and must not yield `Error::Unreachable` for states that can occur through the public API.

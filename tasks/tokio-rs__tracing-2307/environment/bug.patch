@@ -1,0 +1,237 @@
+diff --git a/tracing-attributes/src/expand.rs b/tracing-attributes/src/expand.rs
+index 0390a8c4..dc337bb7 100644
+--- a/tracing-attributes/src/expand.rs
++++ b/tracing-attributes/src/expand.rs
+@@ -11,7 +11,7 @@ use syn::{
+ 
+ use crate::{
+     attr::{Field, Fields, FormatMode, InstrumentArgs},
+-    MaybeItemFn, MaybeItemFnRef,
++    MaybeItemFnRef,
+ };
+ 
+ /// Given an existing function, generate an instrumented version of that function
+@@ -25,8 +25,7 @@ pub(crate) fn gen_function<'a, B: ToTokens + 'a>(
+     // isn't representable inside a quote!/quote_spanned! macro
+     // (Syn's ToTokens isn't implemented for ItemFn)
+     let MaybeItemFnRef {
+-        outer_attrs,
+-        inner_attrs,
++        attrs,
+         vis,
+         sig,
+         block,
+@@ -88,11 +87,10 @@ pub(crate) fn gen_function<'a, B: ToTokens + 'a>(
+     );
+ 
+     quote!(
+-        #(#outer_attrs) *
++        #(#attrs) *
+         #vis #constness #unsafety #asyncness #abi fn #ident<#gen_params>(#params) #output
+         #where_clause
+         {
+-            #(#inner_attrs) *
+             #warnings
+             #body
+         }
+@@ -659,7 +657,7 @@ impl<'block> AsyncInfo<'block> {
+         self,
+         args: InstrumentArgs,
+         instrumented_function_name: &str,
+-    ) -> Result<proc_macro::TokenStream, syn::Error> {
++    ) -> proc_macro::TokenStream {
+         // let's rewrite some statements!
+         let mut out_stmts: Vec<TokenStream> = self
+             .input
+@@ -680,15 +678,12 @@ impl<'block> AsyncInfo<'block> {
+             // instrument the future by rewriting the corresponding statement
+             out_stmts[iter] = match self.kind {
+                 // `Box::pin(immediately_invoked_async_fn())`
+-                AsyncKind::Function(fun) => {
+-                    let fun = MaybeItemFn::from(fun.clone());
+-                    gen_function(
+-                        fun.as_ref(),
+-                        args,
+-                        instrumented_function_name,
+-                        self.self_type.as_ref(),
+-                    )
+-                }
++                AsyncKind::Function(fun) => gen_function(
++                    fun.into(),
++                    args,
++                    instrumented_function_name,
++                    self.self_type.as_ref(),
++                ),
+                 // `async move { ... }`, optionally pinned
+                 AsyncKind::Async {
+                     async_expr,
+@@ -719,13 +714,13 @@ impl<'block> AsyncInfo<'block> {
+         let vis = &self.input.vis;
+         let sig = &self.input.sig;
+         let attrs = &self.input.attrs;
+-        Ok(quote!(
++        quote!(
+             #(#attrs) *
+             #vis #sig {
+                 #(#out_stmts) *
+             }
+         )
+-        .into())
++        .into()
+     }
+ }
+ 
+diff --git a/tracing-attributes/src/lib.rs b/tracing-attributes/src/lib.rs
+index 61658036..c7e81b32 100644
+--- a/tracing-attributes/src/lib.rs
++++ b/tracing-attributes/src/lib.rs
+@@ -83,7 +83,7 @@
+ use proc_macro2::TokenStream;
+ use quote::ToTokens;
+ use syn::parse::{Parse, ParseStream};
+-use syn::{Attribute, ItemFn, Signature, Visibility};
++use syn::{Attribute, Block, ItemFn, Signature, Visibility};
+ 
+ mod attr;
+ mod expand;
+@@ -388,13 +388,11 @@ fn instrument_precise(
+     // check for async_trait-like patterns in the block, and instrument
+     // the future instead of the wrapper
+     if let Some(async_like) = expand::AsyncInfo::from_fn(&input) {
+-        return async_like.gen_async(args, instrumented_function_name.as_str());
++        return Ok(async_like.gen_async(args, instrumented_function_name.as_str()));
+     }
+ 
+-    let input = MaybeItemFn::from(input);
+-
+     Ok(expand::gen_function(
+-        input.as_ref(),
++        (&input).into(),
+         args,
+         instrumented_function_name.as_str(),
+         None,
+@@ -406,8 +404,7 @@ fn instrument_precise(
+ /// which's block is just a `TokenStream` (it may contain invalid code).
+ #[derive(Debug, Clone)]
+ struct MaybeItemFn {
+-    outer_attrs: Vec<Attribute>,
+-    inner_attrs: Vec<Attribute>,
++    attrs: Vec<Attribute>,
+     vis: Visibility,
+     sig: Signature,
+     block: TokenStream,
+@@ -416,8 +413,7 @@ struct MaybeItemFn {
+ impl MaybeItemFn {
+     fn as_ref(&self) -> MaybeItemFnRef<'_, TokenStream> {
+         MaybeItemFnRef {
+-            outer_attrs: &self.outer_attrs,
+-            inner_attrs: &self.inner_attrs,
++            attrs: &self.attrs,
+             vis: &self.vis,
+             sig: &self.sig,
+             block: &self.block,
+@@ -429,40 +425,16 @@ impl MaybeItemFn {
+ /// (just like `ItemFn`, but skips parsing the body).
+ impl Parse for MaybeItemFn {
+     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+-        let outer_attrs = input.call(Attribute::parse_outer)?;
++        let attrs = input.call(syn::Attribute::parse_outer)?;
+         let vis: Visibility = input.parse()?;
+         let sig: Signature = input.parse()?;
+-        let inner_attrs = input.call(Attribute::parse_inner)?;
+         let block: TokenStream = input.parse()?;
+         Ok(Self {
+-            outer_attrs,
+-            inner_attrs,
+-            vis,
+-            sig,
+-            block,
+-        })
+-    }
+-}
+-
+-impl From<ItemFn> for MaybeItemFn {
+-    fn from(
+-        ItemFn {
+             attrs,
+             vis,
+             sig,
+             block,
+-        }: ItemFn,
+-    ) -> Self {
+-        let (outer_attrs, inner_attrs) = attrs
+-            .into_iter()
+-            .partition(|attr| attr.style == syn::AttrStyle::Outer);
+-        Self {
+-            outer_attrs,
+-            inner_attrs,
+-            vis,
+-            sig,
+-            block: block.to_token_stream(),
+-        }
++        })
+     }
+ }
+ 
+@@ -470,9 +442,19 @@ impl From<ItemFn> for MaybeItemFn {
+ /// that takes a generic block type `B` that implements `ToTokens` (eg. `TokenStream`, `Block`).
+ #[derive(Debug, Clone)]
+ struct MaybeItemFnRef<'a, B: ToTokens> {
+-    outer_attrs: &'a Vec<Attribute>,
+-    inner_attrs: &'a Vec<Attribute>,
++    attrs: &'a Vec<Attribute>,
+     vis: &'a Visibility,
+     sig: &'a Signature,
+     block: &'a B,
+ }
++
++impl<'a> From<&'a ItemFn> for MaybeItemFnRef<'a, Box<Block>> {
++    fn from(val: &'a ItemFn) -> Self {
++        MaybeItemFnRef {
++            attrs: &val.attrs,
++            vis: &val.vis,
++            sig: &val.sig,
++            block: &val.block,
++        }
++    }
++}
+diff --git a/tracing-attributes/tests/async_fn.rs b/tracing-attributes/tests/async_fn.rs
+index 16cc89b0..9d7c617e 100644
+--- a/tracing-attributes/tests/async_fn.rs
++++ b/tracing-attributes/tests/async_fn.rs
+@@ -32,15 +32,6 @@ async fn test_ret_impl_trait_err(n: i32) -> Result<impl Iterator<Item = i32>, &'
+ #[instrument]
+ async fn test_async_fn_empty() {}
+ 
+-// Reproduces a compile error when an instrumented function body contains inner
+-// attributes (https://github.com/tokio-rs/tracing/issues/2294).
+-#[deny(unused_variables)]
+-#[instrument]
+-async fn repro_async_2294() {
+-    #![allow(unused_variables)]
+-    let i = 42;
+-}
+-
+ // Reproduces https://github.com/tokio-rs/tracing/issues/1613
+ #[instrument]
+ // LOAD-BEARING `#[rustfmt::skip]`! This is necessary to reproduce the bug;
+diff --git a/tracing-attributes/tests/instrument.rs b/tracing-attributes/tests/instrument.rs
+index 15b258b2..5790d1d2 100644
+--- a/tracing-attributes/tests/instrument.rs
++++ b/tracing-attributes/tests/instrument.rs
+@@ -3,15 +3,6 @@ use tracing::Level;
+ use tracing_attributes::instrument;
+ use tracing_mock::*;
+ 
+-// Reproduces a compile error when an instrumented function body contains inner
+-// attributes (https://github.com/tokio-rs/tracing/issues/2294).
+-#[deny(unused_variables)]
+-#[instrument]
+-fn repro_2294() {
+-    #![allow(unused_variables)]
+-    let i = 42;
+-}
+-
+ #[test]
+ fn override_everything() {
+     #[instrument(target = "my_target", level = "debug")]

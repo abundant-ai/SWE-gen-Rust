@@ -1,0 +1,365 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 65bb8fd0..b83b1fcc 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -13,6 +13,7 @@ members = [
+     "tracing-mock",
+     "tracing-subscriber",
+     "tracing-serde",
++    "tracing-test",
+     "tracing-appender",
+     "tracing-journald",
+     "examples"
+diff --git a/tracing-attributes/Cargo.toml b/tracing-attributes/Cargo.toml
+index aa625ee3..33d988a5 100644
+--- a/tracing-attributes/Cargo.toml
++++ b/tracing-attributes/Cargo.toml
+@@ -35,14 +35,25 @@ proc-macro = true
+ 
+ [dependencies]
+ proc-macro2 = "1.0.60"
+-syn = { version = "2.0", default-features = false, features = ["full", "parsing", "printing", "visit-mut", "clone-impls", "extra-traits", "proc-macro"] }
++syn = { version = "2.0", default-features = false, features = [
++    "full",
++    "parsing",
++    "printing",
++    "visit-mut",
++    "clone-impls",
++    "extra-traits",
++    "proc-macro",
++] }
+ quote = "1.0.20"
+ 
+ [dev-dependencies]
+ tracing = { path = "../tracing", version = "0.2" }
+-tracing-mock = { path = "../tracing-mock", features = ["tokio-test"] }
++tracing-mock = { path = "../tracing-mock" }
+ tokio-test = "0.4.2"
+-tracing-subscriber = { path = "../tracing-subscriber", version = "0.3", features = ["env-filter"] }
++tracing-subscriber = { path = "../tracing-subscriber", version = "0.3", features = [
++    "env-filter",
++] }
++tracing-test = { path = "../tracing-test" }
+ async-trait = "0.1.67"
+ trybuild = "1.0.64"
+ rustversion = "1.0.9"
+diff --git a/tracing-futures/Cargo.toml b/tracing-futures/Cargo.toml
+index 9d77ac33..dc48f28e 100644
+--- a/tracing-futures/Cargo.toml
++++ b/tracing-futures/Cargo.toml
+@@ -43,7 +43,8 @@ mio = "0.6.23"
+ futures = "0.3.21"
+ tokio-test = "0.4.2"
+ tracing-core = { path = "../tracing-core", version = "0.2" }
+-tracing-mock = { path = "../tracing-mock", features = ["tokio-test"] }
++tracing-mock = { path = "../tracing-mock" }
++tracing-test = { path = "../tracing-test" }
+ 
+ [badges]
+ maintenance = { status = "actively-developed" }
+diff --git a/tracing-mock/Cargo.toml b/tracing-mock/Cargo.toml
+index 6cec7406..22689f3f 100644
+--- a/tracing-mock/Cargo.toml
++++ b/tracing-mock/Cargo.toml
+@@ -21,7 +21,6 @@ publish = false
+ tracing = { path = "../tracing", version = "0.2" }
+ tracing-core = { path = "../tracing-core", version = "0.2", default-features = false }
+ tracing-subscriber = { path = "../tracing-subscriber", version = "0.3", default-features = false, features = ["registry"], optional = true }
+-tokio-test = { version = "0.4.2", optional = true }
+ 
+ # Fix minimal-versions; tokio-test fails with otherwise acceptable 0.1.0
+ tokio-stream = "0.1.9"
+diff --git a/tracing-mock/src/lib.rs b/tracing-mock/src/lib.rs
+index 965b36a5..9fdeab58 100644
+--- a/tracing-mock/src/lib.rs
++++ b/tracing-mock/src/lib.rs
+@@ -1,9 +1,4 @@
+ #![doc = include_str!("../README.md")]
+-use std::{
+-    pin::Pin,
+-    task::{Context, Poll},
+-};
+-
+ pub mod collector;
+ pub mod event;
+ pub mod expect;
+@@ -22,12 +17,6 @@ pub enum Parent {
+     Explicit(String),
+ }
+ 
+-pub struct PollN<T, E> {
+-    and_return: Option<Result<T, E>>,
+-    finish_at: usize,
+-    polls: usize,
+-}
+-
+ impl Parent {
+     pub fn check_parent_name(
+         &self,
+@@ -104,57 +93,3 @@ impl Parent {
+         }
+     }
+ }
+-
+-impl<T, E> std::future::Future for PollN<T, E>
+-where
+-    T: Unpin,
+-    E: Unpin,
+-{
+-    type Output = Result<T, E>;
+-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+-        let this = self.get_mut();
+-
+-        this.polls += 1;
+-        if this.polls == this.finish_at {
+-            let value = this.and_return.take().expect("polled after ready");
+-
+-            Poll::Ready(value)
+-        } else {
+-            cx.waker().wake_by_ref();
+-            Poll::Pending
+-        }
+-    }
+-}
+-
+-impl PollN<(), ()> {
+-    pub fn new_ok(finish_at: usize) -> Self {
+-        Self {
+-            and_return: Some(Ok(())),
+-            finish_at,
+-            polls: 0,
+-        }
+-    }
+-
+-    pub fn new_err(finish_at: usize) -> Self {
+-        Self {
+-            and_return: Some(Err(())),
+-            finish_at,
+-            polls: 0,
+-        }
+-    }
+-}
+-
+-#[cfg(feature = "tokio-test")]
+-pub fn block_on_future<F>(future: F) -> F::Output
+-where
+-    F: std::future::Future,
+-{
+-    use tokio_test::task;
+-
+-    let mut task = task::spawn(future);
+-    loop {
+-        if let Poll::Ready(v) = task.poll() {
+-            break v;
+-        }
+-    }
+-}
+diff --git a/tracing-test/Cargo.toml b/tracing-test/Cargo.toml
+new file mode 100644
+index 00000000..40fd7c78
+--- /dev/null
++++ b/tracing-test/Cargo.toml
+@@ -0,0 +1,26 @@
++## BIG SCARY NOTE
++# This crate is internal and to be used for testing only. It should not
++# be published to crates.io ever. If the functionality is needed outside
++# the tracing project, it should be moved back to tracing-mock.
++
++[package]
++name = "tracing-test"
++version = "0.1.0"
++authors = [
++    "Eliza Weisman <eliza@buoyant.io>",
++    "Tokio Contributors <team@tokio.rs>",
++]
++license = "MIT"
++readme = "README.md"
++repository = "https://github.com/tokio-rs/tracing"
++homepage = "https://tokio.rs"
++edition = "2018"
++rust-version = "1.49.0"
++publish = false
++
++[dependencies]
++tokio-test = "0.4.2"
++
++[package.metadata.docs.rs]
++all-features = true
++rustdoc-args = ["--cfg", "docsrs"]
+diff --git a/tracing-test/LICENSE b/tracing-test/LICENSE
+new file mode 100644
+index 00000000..cdb28b4b
+--- /dev/null
++++ b/tracing-test/LICENSE
+@@ -0,0 +1,25 @@
++Copyright (c) 2019 Tokio Contributors
++
++Permission is hereby granted, free of charge, to any
++person obtaining a copy of this software and associated
++documentation files (the "Software"), to deal in the
++Software without restriction, including without
++limitation the rights to use, copy, modify, merge,
++publish, distribute, sublicense, and/or sell copies of
++the Software, and to permit persons to whom the Software
++is furnished to do so, subject to the following
++conditions:
++
++The above copyright notice and this permission notice
++shall be included in all copies or substantial portions
++of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
++ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
++TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
++PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
++SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
++CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
++OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
++IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
++DEALINGS IN THE SOFTWARE.
+diff --git a/tracing-test/README.md b/tracing-test/README.md
+new file mode 100644
+index 00000000..6cef11e9
+--- /dev/null
++++ b/tracing-test/README.md
+@@ -0,0 +1,58 @@
++![Tracing — Structured, application-level diagnostics][splash]
++
++[splash]: https://raw.githubusercontent.com/tokio-rs/tracing/master/assets/splash.svg
++
++# tracing-test
++
++Utilities for testing [`tracing`][tracing] and crates that uses it.
++
++[![Documentation (master)][docs-master-badge]][docs-master-url]
++[![MIT licensed][mit-badge]][mit-url]
++[![Build Status][actions-badge]][actions-url]
++[![Discord chat][discord-badge]][discord-url]
++
++[Documentation][docs-master-url] | [Chat][discord-url]
++
++[docs-master-badge]: https://img.shields.io/badge/docs-master-blue
++[docs-master-url]: https://tracing-rs.netlify.com/tracing_mock
++[mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
++[mit-url]: https://github.com/tokio-rs/tracing/blob/master/tracing-test/LICENSE
++[actions-badge]: https://github.com/tokio-rs/tracing/workflows/CI/badge.svg
++[actions-url]:https://github.com/tokio-rs/tracing/actions?query=workflow%3ACI
++[discord-badge]: https://img.shields.io/discord/500028886025895936?logo=discord&label=discord&logoColor=white
++[discord-url]: https://discord.gg/EeF3cQw
++
++## Overview
++
++[`tracing`] is a framework for instrumenting Rust programs to collect
++structured, event-based diagnostic information. `tracing-test` provides
++some reusable tools to aid in testing, but that are only intended for
++internal use. For mocks and expectations, see [`tracing-mock`].
++
++*Compiler support: [requires `rustc` 1.56+][msrv]*
++
++[msrv]: #supported-rust-versions
++
++## Supported Rust Versions
++
++Tracing is built against the latest stable release. The minimum supported
++version is 1.56. The current Tracing version is not guaranteed to build on Rust
++versions earlier than the minimum supported version.
++
++Tracing follows the same compiler support policies as the rest of the Tokio
++project. The current stable Rust compiler and the three most recent minor
++versions before it will always be supported. For example, if the current stable
++compiler version is 1.45, the minimum supported version will not be increased
++past 1.42, three minor versions prior. Increasing the minimum supported compiler
++version is not considered a semver breaking change as long as doing so complies
++with this policy.
++
++## License
++
++This project is licensed under the [MIT license][mit-url].
++
++### Contribution
++
++Unless you explicitly state otherwise, any contribution intentionally submitted
++for inclusion in Tracing by you, shall be licensed as MIT, without any additional
++terms or conditions.
+\ No newline at end of file
+diff --git a/tracing-test/src/lib.rs b/tracing-test/src/lib.rs
+new file mode 100644
+index 00000000..d89186a0
+--- /dev/null
++++ b/tracing-test/src/lib.rs
+@@ -0,0 +1,65 @@
++use std::{
++    pin::Pin,
++    task::{Context, Poll},
++};
++
++#[allow(missing_docs)]
++
++pub struct PollN<T, E> {
++    and_return: Option<Result<T, E>>,
++    finish_at: usize,
++    polls: usize,
++}
++
++impl<T, E> std::future::Future for PollN<T, E>
++where
++    T: Unpin,
++    E: Unpin,
++{
++    type Output = Result<T, E>;
++    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
++        let this = self.get_mut();
++
++        this.polls += 1;
++        if this.polls == this.finish_at {
++            let value = this.and_return.take().expect("polled after ready");
++
++            Poll::Ready(value)
++        } else {
++            cx.waker().wake_by_ref();
++            Poll::Pending
++        }
++    }
++}
++
++impl PollN<(), ()> {
++    pub fn new_ok(finish_at: usize) -> Self {
++        Self {
++            and_return: Some(Ok(())),
++            finish_at,
++            polls: 0,
++        }
++    }
++
++    pub fn new_err(finish_at: usize) -> Self {
++        Self {
++            and_return: Some(Err(())),
++            finish_at,
++            polls: 0,
++        }
++    }
++}
++
++pub fn block_on_future<F>(future: F) -> F::Output
++where
++    F: std::future::Future,
++{
++    use tokio_test::task;
++
++    let mut task = task::spawn(future);
++    loop {
++        if let Poll::Ready(v) = task.poll() {
++            break v;
++        }
++    }
++}
+diff --git a/tracing/test_static_max_level_features/Cargo.toml b/tracing/test_static_max_level_features/Cargo.toml
+index 89edfd50..44271a89 100644
+--- a/tracing/test_static_max_level_features/Cargo.toml
++++ b/tracing/test_static_max_level_features/Cargo.toml
+@@ -19,4 +19,4 @@ features = ["max_level_debug", "release_max_level_info"]
+ 
+ [dev-dependencies]
+ tokio-test = "0.2.0"
+-tracing-mock = { path = "../../tracing-mock", features = ["tokio-test"] }
++tracing-test = { path = "../../tracing-test" }

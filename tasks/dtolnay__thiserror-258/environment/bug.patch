@@ -1,0 +1,347 @@
+diff --git a/impl/src/expand.rs b/impl/src/expand.rs
+index 80a3978..a1fe0c7 100644
+--- a/impl/src/expand.rs
++++ b/impl/src/expand.rs
+@@ -23,14 +23,14 @@ fn impl_struct(input: Struct) -> TokenStream {
+     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+     let mut error_inferred_bounds = InferredBounds::new();
+ 
+-    let source_body = if let Some(transparent_attr) = &input.attrs.transparent {
++    let source_body = if input.attrs.transparent.is_some() {
+         let only_field = &input.fields[0];
+         if only_field.contains_generic {
+             error_inferred_bounds.insert(only_field.ty, quote!(std::error::Error));
+         }
+         let member = &only_field.member;
+-        Some(quote_spanned! {
+-            transparent_attr.span => std::error::Error::source(self.#member.as_dyn_error())
++        Some(quote! {
++            std::error::Error::source(self.#member.as_dyn_error())
+         })
+     } else if let Some(source_field) = input.source_field() {
+         let source = &source_field.member;
+@@ -43,8 +43,7 @@ fn impl_struct(input: Struct) -> TokenStream {
+         } else {
+             None
+         };
+-        let dyn_error =
+-            quote_spanned!(source_field.source_span() => self.#source #asref.as_dyn_error());
++        let dyn_error = quote_spanned!(source.span()=> self.#source #asref.as_dyn_error());
+         Some(quote! {
+             ::core::option::Option::Some(#dyn_error)
+         })
+@@ -194,13 +193,13 @@ fn impl_enum(input: Enum) -> TokenStream {
+     let source_method = if input.has_source() {
+         let arms = input.variants.iter().map(|variant| {
+             let ident = &variant.ident;
+-            if let Some(transparent_attr) = &variant.attrs.transparent {
++            if variant.attrs.transparent.is_some() {
+                 let only_field = &variant.fields[0];
+                 if only_field.contains_generic {
+                     error_inferred_bounds.insert(only_field.ty, quote!(std::error::Error));
+                 }
+                 let member = &only_field.member;
+-                let source = quote_spanned!(transparent_attr.span => std::error::Error::source(transparent.as_dyn_error()));
++                let source = quote!(std::error::Error::source(transparent.as_dyn_error()));
+                 quote! {
+                     #ty::#ident {#member: transparent} => #source,
+                 }
+@@ -216,7 +215,7 @@ fn impl_enum(input: Enum) -> TokenStream {
+                     None
+                 };
+                 let varsource = quote!(source);
+-                let dyn_error = quote_spanned!(source_field.source_span()=> #varsource #asref.as_dyn_error());
++                let dyn_error = quote_spanned!(source.span()=> #varsource #asref.as_dyn_error());
+                 quote! {
+                     #ty::#ident {#source: #varsource, ..} => ::core::option::Option::Some(#dyn_error),
+                 }
+diff --git a/impl/src/prop.rs b/impl/src/prop.rs
+index 62f269b..6d8a924 100644
+--- a/impl/src/prop.rs
++++ b/impl/src/prop.rs
+@@ -1,6 +1,5 @@
+ use crate::ast::{Enum, Field, Struct, Variant};
+-use proc_macro2::Span;
+-use syn::{spanned::Spanned, Member, Type};
++use syn::{Member, Type};
+ 
+ impl Struct<'_> {
+     pub(crate) fn from_field(&self) -> Option<&Field> {
+@@ -71,16 +70,6 @@ impl Field<'_> {
+     pub(crate) fn is_backtrace(&self) -> bool {
+         type_is_backtrace(self.ty)
+     }
+-
+-    pub(crate) fn source_span(&self) -> Span {
+-        if let Some(source_attr) = &self.attrs.source {
+-            source_attr.path().span()
+-        } else if let Some(from_attr) = &self.attrs.from {
+-            from_attr.path().span()
+-        } else {
+-            self.member.span()
+-        }
+-    }
+ }
+ 
+ fn from_field<'a, 'b>(fields: &'a [Field<'b>]) -> Option<&'a Field<'b>> {
+diff --git a/tests/ui/source-enum-unnamed-field-not-error.rs b/tests/ui/source-enum-unnamed-field-not-error.rs
+deleted file mode 100644
+index a877c2c..0000000
+--- a/tests/ui/source-enum-unnamed-field-not-error.rs
++++ /dev/null
+@@ -1,12 +0,0 @@
+-use thiserror::Error;
+-
+-#[derive(Debug)]
+-pub struct NotError;
+-
+-#[derive(Error, Debug)]
+-#[error("...")]
+-pub enum ErrorEnum {
+-    Broken(#[source] NotError),
+-}
+-
+-fn main() {}
+diff --git a/tests/ui/source-enum-unnamed-field-not-error.stderr b/tests/ui/source-enum-unnamed-field-not-error.stderr
+deleted file mode 100644
+index da6d225..0000000
+--- a/tests/ui/source-enum-unnamed-field-not-error.stderr
++++ /dev/null
+@@ -1,22 +0,0 @@
+-error[E0599]: the method `as_dyn_error` exists for reference `&NotError`, but its trait bounds were not satisfied
+- --> tests/ui/source-enum-unnamed-field-not-error.rs:9:14
+-  |
+-4 | pub struct NotError;
+-  | -------------------
+-  | |
+-  | doesn't satisfy `NotError: AsDynError<'_>`
+-  | doesn't satisfy `NotError: std::error::Error`
+-...
+-9 |     Broken(#[source] NotError),
+-  |              ^^^^^^ method cannot be called on `&NotError` due to unsatisfied trait bounds
+-  |
+-  = note: the following trait bounds were not satisfied:
+-          `NotError: std::error::Error`
+-          which is required by `NotError: AsDynError<'_>`
+-          `&NotError: std::error::Error`
+-          which is required by `&NotError: AsDynError<'_>`
+-note: the trait `std::error::Error` must be implemented
+- --> $RUST/core/src/error.rs
+-  |
+-  | pub trait Error: Debug + Display {
+-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+diff --git a/tests/ui/source-struct-unnamed-field-not-error.rs b/tests/ui/source-struct-unnamed-field-not-error.rs
+deleted file mode 100644
+index 160b6b2..0000000
+--- a/tests/ui/source-struct-unnamed-field-not-error.rs
++++ /dev/null
+@@ -1,10 +0,0 @@
+-use thiserror::Error;
+-
+-#[derive(Debug)]
+-struct NotError;
+-
+-#[derive(Error, Debug)]
+-#[error("...")]
+-pub struct ErrorStruct(#[source] NotError);
+-
+-fn main() {}
+diff --git a/tests/ui/source-struct-unnamed-field-not-error.stderr b/tests/ui/source-struct-unnamed-field-not-error.stderr
+deleted file mode 100644
+index a23f268..0000000
+--- a/tests/ui/source-struct-unnamed-field-not-error.stderr
++++ /dev/null
+@@ -1,21 +0,0 @@
+-error[E0599]: the method `as_dyn_error` exists for struct `NotError`, but its trait bounds were not satisfied
+- --> tests/ui/source-struct-unnamed-field-not-error.rs:8:26
+-  |
+-4 | struct NotError;
+-  | ---------------
+-  | |
+-  | method `as_dyn_error` not found for this struct
+-  | doesn't satisfy `NotError: AsDynError<'_>`
+-  | doesn't satisfy `NotError: std::error::Error`
+-...
+-8 | pub struct ErrorStruct(#[source] NotError);
+-  |                          ^^^^^^ method cannot be called on `NotError` due to unsatisfied trait bounds
+-  |
+-  = note: the following trait bounds were not satisfied:
+-          `NotError: std::error::Error`
+-          which is required by `NotError: AsDynError<'_>`
+-note: the trait `std::error::Error` must be implemented
+- --> $RUST/core/src/error.rs
+-  |
+-  | pub trait Error: Debug + Display {
+-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+diff --git a/tests/ui/transparent-enum-not-error.rs b/tests/ui/transparent-enum-not-error.rs
+deleted file mode 100644
+index 2ef7457..0000000
+--- a/tests/ui/transparent-enum-not-error.rs
++++ /dev/null
+@@ -1,11 +0,0 @@
+-use thiserror::Error;
+-
+-#[derive(Error, Debug)]
+-pub enum Error {
+-    #[error(transparent)]
+-    Other {
+-        message: String,
+-    }
+-}
+-
+-fn main() {}
+diff --git a/tests/ui/transparent-enum-not-error.stderr b/tests/ui/transparent-enum-not-error.stderr
+deleted file mode 100644
+index 9be5143..0000000
+--- a/tests/ui/transparent-enum-not-error.stderr
++++ /dev/null
+@@ -1,23 +0,0 @@
+-error[E0599]: the method `as_dyn_error` exists for reference `&String`, but its trait bounds were not satisfied
+- --> tests/ui/transparent-enum-not-error.rs:5:13
+-  |
+-5 |     #[error(transparent)]
+-  |             ^^^^^^^^^^^ method cannot be called on `&String` due to unsatisfied trait bounds
+-  |
+- ::: $RUST/alloc/src/string.rs
+-  |
+-  | pub struct String {
+-  | -----------------
+-  | |
+-  | doesn't satisfy `String: AsDynError<'_>`
+-  | doesn't satisfy `String: std::error::Error`
+-  |
+-  = note: the following trait bounds were not satisfied:
+-          `String: std::error::Error`
+-          which is required by `String: AsDynError<'_>`
+-          `&String: std::error::Error`
+-          which is required by `&String: AsDynError<'_>`
+-          `str: Sized`
+-          which is required by `str: AsDynError<'_>`
+-          `str: std::error::Error`
+-          which is required by `str: AsDynError<'_>`
+diff --git a/tests/ui/transparent-enum-unnamed-field-not-error.rs b/tests/ui/transparent-enum-unnamed-field-not-error.rs
+deleted file mode 100644
+index 87c32e0..0000000
+--- a/tests/ui/transparent-enum-unnamed-field-not-error.rs
++++ /dev/null
+@@ -1,9 +0,0 @@
+-use thiserror::Error;
+-
+-#[derive(Error, Debug)]
+-pub enum Error {
+-    #[error(transparent)]
+-    Other(String),
+-}
+-
+-fn main() {}
+diff --git a/tests/ui/transparent-enum-unnamed-field-not-error.stderr b/tests/ui/transparent-enum-unnamed-field-not-error.stderr
+deleted file mode 100644
+index 3d23c3a..0000000
+--- a/tests/ui/transparent-enum-unnamed-field-not-error.stderr
++++ /dev/null
+@@ -1,23 +0,0 @@
+-error[E0599]: the method `as_dyn_error` exists for reference `&String`, but its trait bounds were not satisfied
+- --> tests/ui/transparent-enum-unnamed-field-not-error.rs:5:13
+-  |
+-5 |     #[error(transparent)]
+-  |             ^^^^^^^^^^^ method cannot be called on `&String` due to unsatisfied trait bounds
+-  |
+- ::: $RUST/alloc/src/string.rs
+-  |
+-  | pub struct String {
+-  | -----------------
+-  | |
+-  | doesn't satisfy `String: AsDynError<'_>`
+-  | doesn't satisfy `String: std::error::Error`
+-  |
+-  = note: the following trait bounds were not satisfied:
+-          `String: std::error::Error`
+-          which is required by `String: AsDynError<'_>`
+-          `&String: std::error::Error`
+-          which is required by `&String: AsDynError<'_>`
+-          `str: Sized`
+-          which is required by `str: AsDynError<'_>`
+-          `str: std::error::Error`
+-          which is required by `str: AsDynError<'_>`
+diff --git a/tests/ui/transparent-struct-not-error.rs b/tests/ui/transparent-struct-not-error.rs
+deleted file mode 100644
+index 811ff53..0000000
+--- a/tests/ui/transparent-struct-not-error.rs
++++ /dev/null
+@@ -1,9 +0,0 @@
+-use thiserror::Error;
+-
+-#[derive(Error, Debug)]
+-#[error(transparent)]
+-pub struct Error {
+-    message: String,
+-}
+-
+-fn main() {}
+diff --git a/tests/ui/transparent-struct-not-error.stderr b/tests/ui/transparent-struct-not-error.stderr
+deleted file mode 100644
+index d67a694..0000000
+--- a/tests/ui/transparent-struct-not-error.stderr
++++ /dev/null
+@@ -1,21 +0,0 @@
+-error[E0599]: the method `as_dyn_error` exists for struct `String`, but its trait bounds were not satisfied
+- --> tests/ui/transparent-struct-not-error.rs:4:9
+-  |
+-4 | #[error(transparent)]
+-  |         ^^^^^^^^^^^ method cannot be called on `String` due to unsatisfied trait bounds
+-  |
+- ::: $RUST/alloc/src/string.rs
+-  |
+-  | pub struct String {
+-  | -----------------
+-  | |
+-  | doesn't satisfy `String: AsDynError<'_>`
+-  | doesn't satisfy `String: std::error::Error`
+-  |
+-  = note: the following trait bounds were not satisfied:
+-          `String: std::error::Error`
+-          which is required by `String: AsDynError<'_>`
+-          `str: Sized`
+-          which is required by `str: AsDynError<'_>`
+-          `str: std::error::Error`
+-          which is required by `str: AsDynError<'_>`
+diff --git a/tests/ui/transparent-struct-unnamed-field-not-error.rs b/tests/ui/transparent-struct-unnamed-field-not-error.rs
+deleted file mode 100644
+index b4f7fbb..0000000
+--- a/tests/ui/transparent-struct-unnamed-field-not-error.rs
++++ /dev/null
+@@ -1,7 +0,0 @@
+-use thiserror::Error;
+-
+-#[derive(Error, Debug)]
+-#[error(transparent)]
+-pub struct Error(String);
+-
+-fn main() {}
+diff --git a/tests/ui/transparent-struct-unnamed-field-not-error.stderr b/tests/ui/transparent-struct-unnamed-field-not-error.stderr
+deleted file mode 100644
+index f715a15..0000000
+--- a/tests/ui/transparent-struct-unnamed-field-not-error.stderr
++++ /dev/null
+@@ -1,21 +0,0 @@
+-error[E0599]: the method `as_dyn_error` exists for struct `String`, but its trait bounds were not satisfied
+- --> tests/ui/transparent-struct-unnamed-field-not-error.rs:4:9
+-  |
+-4 | #[error(transparent)]
+-  |         ^^^^^^^^^^^ method cannot be called on `String` due to unsatisfied trait bounds
+-  |
+- ::: $RUST/alloc/src/string.rs
+-  |
+-  | pub struct String {
+-  | -----------------
+-  | |
+-  | doesn't satisfy `String: AsDynError<'_>`
+-  | doesn't satisfy `String: std::error::Error`
+-  |
+-  = note: the following trait bounds were not satisfied:
+-          `String: std::error::Error`
+-          which is required by `String: AsDynError<'_>`
+-          `str: Sized`
+-          which is required by `str: AsDynError<'_>`
+-          `str: std::error::Error`
+-          which is required by `str: AsDynError<'_>`

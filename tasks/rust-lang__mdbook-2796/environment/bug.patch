@@ -1,0 +1,444 @@
+diff --git a/crates/mdbook-driver/src/builtin_preprocessors/cmd.rs b/crates/mdbook-driver/src/builtin_preprocessors/cmd.rs
+index 0241a081..e97c19e2 100644
+--- a/crates/mdbook-driver/src/builtin_preprocessors/cmd.rs
++++ b/crates/mdbook-driver/src/builtin_preprocessors/cmd.rs
+@@ -1,10 +1,10 @@
+-use anyhow::{Context, Result, ensure};
++use anyhow::{Context, Result, bail, ensure};
+ use log::{debug, trace, warn};
+ use mdbook_core::book::Book;
+ use mdbook_preprocessor::{Preprocessor, PreprocessorContext};
++use shlex::Shlex;
+ use std::io::{self, Write};
+-use std::path::PathBuf;
+-use std::process::{Child, Stdio};
++use std::process::{Child, Command, Stdio};
+ 
+ /// A custom preprocessor which will shell out to a 3rd-party program.
+ ///
+@@ -33,13 +33,12 @@ use std::process::{Child, Stdio};
+ pub struct CmdPreprocessor {
+     name: String,
+     cmd: String,
+-    root: PathBuf,
+ }
+ 
+ impl CmdPreprocessor {
+     /// Create a new `CmdPreprocessor`.
+-    pub fn new(name: String, cmd: String, root: PathBuf) -> CmdPreprocessor {
+-        CmdPreprocessor { name, cmd, root }
++    pub fn new(name: String, cmd: String) -> CmdPreprocessor {
++        CmdPreprocessor { name, cmd }
+     }
+ 
+     fn write_input_to_child(&self, child: &mut Child, book: &Book, ctx: &PreprocessorContext) {
+@@ -65,6 +64,22 @@ impl CmdPreprocessor {
+     pub fn cmd(&self) -> &str {
+         &self.cmd
+     }
++
++    fn command(&self) -> Result<Command> {
++        let mut words = Shlex::new(&self.cmd);
++        let executable = match words.next() {
++            Some(e) => e,
++            None => bail!("Command string was empty"),
++        };
++
++        let mut cmd = Command::new(executable);
++
++        for arg in words {
++            cmd.arg(arg);
++        }
++
++        Ok(cmd)
++    }
+ }
+ 
+ impl Preprocessor for CmdPreprocessor {
+@@ -73,13 +88,12 @@ impl Preprocessor for CmdPreprocessor {
+     }
+ 
+     fn run(&self, ctx: &PreprocessorContext, book: Book) -> Result<Book> {
+-        let mut cmd = crate::compose_command(&self.cmd, &ctx.root)?;
++        let mut cmd = self.command()?;
+ 
+         let mut child = cmd
+             .stdin(Stdio::piped())
+             .stdout(Stdio::piped())
+             .stderr(Stdio::inherit())
+-            .current_dir(&self.root)
+             .spawn()
+             .with_context(|| {
+                 format!(
+@@ -121,7 +135,7 @@ impl Preprocessor for CmdPreprocessor {
+             renderer
+         );
+ 
+-        let mut cmd = match crate::compose_command(&self.cmd, &self.root) {
++        let mut cmd = match self.command() {
+             Ok(c) => c,
+             Err(e) => {
+                 warn!(
+@@ -139,7 +153,6 @@ impl Preprocessor for CmdPreprocessor {
+             .stdin(Stdio::null())
+             .stdout(Stdio::inherit())
+             .stderr(Stdio::inherit())
+-            .current_dir(&self.root)
+             .status()
+             .map(|status| status.code() == Some(0));
+ 
+@@ -170,8 +183,8 @@ mod tests {
+ 
+     #[test]
+     fn round_trip_write_and_parse_input() {
++        let cmd = CmdPreprocessor::new("test".to_string(), "test".to_string());
+         let md = guide();
+-        let cmd = CmdPreprocessor::new("test".to_string(), "test".to_string(), md.root.clone());
+         let ctx = PreprocessorContext::new(
+             md.root.clone(),
+             md.config.clone(),
+diff --git a/crates/mdbook-driver/src/builtin_renderers/mod.rs b/crates/mdbook-driver/src/builtin_renderers/mod.rs
+index 615dedde..980c0a6f 100644
+--- a/crates/mdbook-driver/src/builtin_renderers/mod.rs
++++ b/crates/mdbook-driver/src/builtin_renderers/mod.rs
+@@ -5,9 +5,11 @@
+ use anyhow::{Context, Result, bail};
+ use log::{error, info, trace, warn};
+ use mdbook_renderer::{RenderContext, Renderer};
++use shlex::Shlex;
+ use std::fs;
+ use std::io::{self, ErrorKind};
+-use std::process::Stdio;
++use std::path::{Path, PathBuf};
++use std::process::{Command, Stdio};
+ 
+ pub use self::markdown_renderer::MarkdownRenderer;
+ 
+@@ -47,6 +49,30 @@ impl CmdRenderer {
+     pub fn new(name: String, cmd: String) -> CmdRenderer {
+         CmdRenderer { name, cmd }
+     }
++
++    fn compose_command(&self, root: &Path) -> Result<Command> {
++        let mut words = Shlex::new(&self.cmd);
++        let exe = match words.next() {
++            Some(e) => PathBuf::from(e),
++            None => bail!("Command string was empty"),
++        };
++
++        let exe = if exe.components().count() == 1 {
++            // Search PATH for the executable.
++            exe
++        } else {
++            // Relative path is relative to book root.
++            root.join(&exe)
++        };
++
++        let mut cmd = Command::new(exe);
++
++        for arg in words {
++            cmd.arg(arg);
++        }
++
++        Ok(cmd)
++    }
+ }
+ 
+ impl CmdRenderer {
+@@ -94,8 +120,8 @@ impl Renderer for CmdRenderer {
+ 
+         let _ = fs::create_dir_all(&ctx.destination);
+ 
+-        let mut cmd = crate::compose_command(&self.cmd, &ctx.root)?;
+-        let mut child = match cmd
++        let mut child = match self
++            .compose_command(&ctx.root)?
+             .stdin(Stdio::piped())
+             .stdout(Stdio::inherit())
+             .stderr(Stdio::inherit())
+diff --git a/crates/mdbook-driver/src/lib.rs b/crates/mdbook-driver/src/lib.rs
+index 8eb85c8b..470fa039 100644
+--- a/crates/mdbook-driver/src/lib.rs
++++ b/crates/mdbook-driver/src/lib.rs
+@@ -64,34 +64,5 @@ pub mod init;
+ mod load;
+ mod mdbook;
+ 
+-use anyhow::{Result, bail};
+ pub use mdbook::MDBook;
+ pub use mdbook_core::{book, config, errors};
+-use shlex::Shlex;
+-use std::path::{Path, PathBuf};
+-use std::process::Command;
+-
+-/// Creates a [`Command`] for command renderers and preprocessors.
+-fn compose_command(cmd: &str, root: &Path) -> Result<Command> {
+-    let mut words = Shlex::new(cmd);
+-    let exe = match words.next() {
+-        Some(e) => PathBuf::from(e),
+-        None => bail!("Command string was empty"),
+-    };
+-
+-    let exe = if exe.components().count() == 1 {
+-        // Search PATH for the executable.
+-        exe
+-    } else {
+-        // Relative path is relative to book root.
+-        root.join(&exe)
+-    };
+-
+-    let mut cmd = Command::new(exe);
+-
+-    for arg in words {
+-        cmd.arg(arg);
+-    }
+-
+-    Ok(cmd)
+-}
+diff --git a/crates/mdbook-driver/src/mdbook.rs b/crates/mdbook-driver/src/mdbook.rs
+index 54728bae..aec7d469 100644
+--- a/crates/mdbook-driver/src/mdbook.rs
++++ b/crates/mdbook-driver/src/mdbook.rs
+@@ -70,7 +70,7 @@ impl MDBook {
+         let book = load_book(src_dir, &config.build)?;
+ 
+         let renderers = determine_renderers(&config)?;
+-        let preprocessors = determine_preprocessors(&config, &root)?;
++        let preprocessors = determine_preprocessors(&config)?;
+ 
+         Ok(MDBook {
+             root,
+@@ -93,7 +93,7 @@ impl MDBook {
+         let book = load_book_from_disk(&summary, src_dir)?;
+ 
+         let renderers = determine_renderers(&config)?;
+-        let preprocessors = determine_preprocessors(&config, &root)?;
++        let preprocessors = determine_preprocessors(&config)?;
+ 
+         Ok(MDBook {
+             root,
+@@ -258,7 +258,7 @@ impl MDBook {
+ 
+         // Index Preprocessor is disabled so that chapter paths
+         // continue to point to the actual markdown files.
+-        self.preprocessors = determine_preprocessors(&self.config, &self.root)?
++        self.preprocessors = determine_preprocessors(&self.config)?
+             .into_iter()
+             .filter(|pre| pre.name() != IndexPreprocessor::NAME)
+             .collect();
+@@ -440,7 +440,7 @@ struct PreprocessorConfig {
+ }
+ 
+ /// Look at the `MDBook` and try to figure out what preprocessors to run.
+-fn determine_preprocessors(config: &Config, root: &Path) -> Result<Vec<Box<dyn Preprocessor>>> {
++fn determine_preprocessors(config: &Config) -> Result<Vec<Box<dyn Preprocessor>>> {
+     // Collect the names of all preprocessors intended to be run, and the order
+     // in which they should be run.
+     let mut preprocessor_names = TopologicalSort::<String>::new();
+@@ -513,7 +513,7 @@ fn determine_preprocessors(config: &Config, root: &Path) -> Result<Vec<Box<dyn P
+                         .command
+                         .to_owned()
+                         .unwrap_or_else(|| format!("mdbook-{name}"));
+-                    Box::new(CmdPreprocessor::new(name, command, root.to_owned()))
++                    Box::new(CmdPreprocessor::new(name, command))
+                 }
+             };
+             preprocessors.push(preprocessor);
+diff --git a/crates/mdbook-driver/src/mdbook/tests.rs b/crates/mdbook-driver/src/mdbook/tests.rs
+index 675bfc25..ba3a3c58 100644
+--- a/crates/mdbook-driver/src/mdbook/tests.rs
++++ b/crates/mdbook-driver/src/mdbook/tests.rs
+@@ -47,7 +47,7 @@ fn config_defaults_to_link_and_index_preprocessor_if_not_set() {
+     // make sure we haven't got anything in the `preprocessor` table
+     assert!(cfg.preprocessors::<toml::Value>().unwrap().is_empty());
+ 
+-    let got = determine_preprocessors(&cfg, Path::new(""));
++    let got = determine_preprocessors(&cfg);
+ 
+     assert!(got.is_ok());
+     assert_eq!(got.as_ref().unwrap().len(), 2);
+@@ -60,7 +60,7 @@ fn use_default_preprocessors_works() {
+     let mut cfg = Config::default();
+     cfg.build.use_default_preprocessors = false;
+ 
+-    let got = determine_preprocessors(&cfg, Path::new("")).unwrap();
++    let got = determine_preprocessors(&cfg).unwrap();
+ 
+     assert_eq!(got.len(), 0);
+ }
+@@ -83,7 +83,7 @@ fn can_determine_third_party_preprocessors() {
+     // make sure the `preprocessor.random` table exists
+     assert!(cfg.get::<Value>("preprocessor.random").unwrap().is_some());
+ 
+-    let got = determine_preprocessors(&cfg, Path::new("")).unwrap();
++    let got = determine_preprocessors(&cfg).unwrap();
+ 
+     assert!(got.into_iter().any(|p| p.name() == "random"));
+ }
+@@ -114,7 +114,7 @@ fn preprocessor_before_must_be_array() {
+ 
+     let cfg = Config::from_str(cfg_str).unwrap();
+ 
+-    assert!(determine_preprocessors(&cfg, Path::new("")).is_err());
++    assert!(determine_preprocessors(&cfg).is_err());
+ }
+ 
+ #[test]
+@@ -126,7 +126,7 @@ fn preprocessor_after_must_be_array() {
+ 
+     let cfg = Config::from_str(cfg_str).unwrap();
+ 
+-    assert!(determine_preprocessors(&cfg, Path::new("")).is_err());
++    assert!(determine_preprocessors(&cfg).is_err());
+ }
+ 
+ #[test]
+@@ -142,7 +142,7 @@ fn preprocessor_order_is_honored() {
+ 
+     let cfg = Config::from_str(cfg_str).unwrap();
+ 
+-    let preprocessors = determine_preprocessors(&cfg, Path::new("")).unwrap();
++    let preprocessors = determine_preprocessors(&cfg).unwrap();
+     let index = |name| {
+         preprocessors
+             .iter()
+@@ -179,7 +179,7 @@ fn cyclic_dependencies_are_detected() {
+ 
+     let cfg = Config::from_str(cfg_str).unwrap();
+ 
+-    assert!(determine_preprocessors(&cfg, Path::new("")).is_err());
++    assert!(determine_preprocessors(&cfg).is_err());
+ }
+ 
+ #[test]
+@@ -191,7 +191,7 @@ fn dependencies_dont_register_undefined_preprocessors() {
+ 
+     let cfg = Config::from_str(cfg_str).unwrap();
+ 
+-    let preprocessors = determine_preprocessors(&cfg, Path::new("")).unwrap();
++    let preprocessors = determine_preprocessors(&cfg).unwrap();
+ 
+     assert!(
+         !preprocessors
+@@ -212,7 +212,7 @@ fn dependencies_dont_register_builtin_preprocessors_if_disabled() {
+ 
+     let cfg = Config::from_str(cfg_str).unwrap();
+ 
+-    let preprocessors = determine_preprocessors(&cfg, Path::new("")).unwrap();
++    let preprocessors = determine_preprocessors(&cfg).unwrap();
+ 
+     assert!(
+         !preprocessors
+diff --git a/tests/testsuite/book_test.rs b/tests/testsuite/book_test.rs
+index 2f5e9d63..bbcc1906 100644
+--- a/tests/testsuite/book_test.rs
++++ b/tests/testsuite/book_test.rs
+@@ -247,26 +247,6 @@ impl BookTest {
+         self
+     }
+ 
+-    /// Removes a file or directory relative to the test root.
+-    pub fn rm_r(&mut self, path: impl AsRef<Path>) -> &mut Self {
+-        let path = self.dir.join(path.as_ref());
+-        let meta = match path.symlink_metadata() {
+-            Ok(meta) => meta,
+-            Err(e) => panic!("failed to remove {path:?}, could not read: {e:?}"),
+-        };
+-        // There is a race condition between fetching the metadata and
+-        // actually performing the removal, but we don't care all that much
+-        // for our tests.
+-        if meta.is_dir() {
+-            if let Err(e) = std::fs::remove_dir_all(&path) {
+-                panic!("failed to remove {path:?}: {e:?}");
+-            }
+-        } else if let Err(e) = std::fs::remove_file(&path) {
+-            panic!("failed to remove {path:?}: {e:?}")
+-        }
+-        self
+-    }
+-
+     /// Builds a Rust program with the given src.
+     ///
+     /// The given path should be the path where to output the executable in
+@@ -339,12 +319,6 @@ impl BookCommand {
+         self
+     }
+ 
+-    /// Sets the directory used for running the command.
+-    pub fn current_dir<S: AsRef<std::path::Path>>(&mut self, path: S) -> &mut Self {
+-        self.dir = self.dir.join(path.as_ref());
+-        self
+-    }
+-
+     /// Use this to debug a command.
+     ///
+     /// Pass the value that you would normally pass to `RUST_LOG`, and this
+diff --git a/tests/testsuite/preprocessor.rs b/tests/testsuite/preprocessor.rs
+index 17f20876..428c9d08 100644
+--- a/tests/testsuite/preprocessor.rs
++++ b/tests/testsuite/preprocessor.rs
+@@ -75,7 +75,6 @@ fn example() -> CmdPreprocessor {
+     CmdPreprocessor::new(
+         "nop-preprocessor".to_string(),
+         "cargo run --quiet --example nop-preprocessor --".to_string(),
+-        std::env::current_dir().unwrap(),
+     )
+ }
+ 
+@@ -96,56 +95,3 @@ fn example_doesnt_support_not_supported() {
+ 
+     assert_eq!(got, false);
+ }
+-
+-// Checks the behavior of a relative path to a preprocessor.
+-#[test]
+-fn relative_command_path() {
+-    let mut test = BookTest::init(|_| {});
+-    test.rust_program(
+-        "preprocessors/my-preprocessor",
+-        r#"
+-        fn main() {
+-            let mut args = std::env::args().skip(1);
+-            if args.next().as_deref() == Some("supports") {
+-                std::fs::write("support-check", args.next().unwrap()).unwrap();
+-                return;
+-            }
+-            use std::io::Read;
+-            let mut s = String::new();
+-            std::io::stdin().read_to_string(&mut s).unwrap();
+-            std::fs::write("preprocessor-ran", "test").unwrap();
+-            println!("{{\"sections\": []}}");
+-        }
+-        "#,
+-    )
+-    .change_file(
+-        "book.toml",
+-        "[preprocessor.my-preprocessor]\n\
+-         command = 'preprocessors/my-preprocessor'\n",
+-    )
+-    .run("build", |cmd| {
+-        cmd.expect_stdout(str![""]).expect_stderr(str![[r#"
+-[TIMESTAMP] [INFO] (mdbook_driver::mdbook): Book building has started
+-[TIMESTAMP] [INFO] (mdbook_driver::mdbook): Running the html backend
+-[TIMESTAMP] [INFO] (mdbook_html::html_handlebars::hbs_renderer): HTML book written to `[ROOT]/book`
+-
+-"#]]);
+-    })
+-    .check_file("support-check", "html")
+-    .check_file("preprocessor-ran", "test")
+-    // Try again, but outside of the book root to check relative path behavior.
+-    .rm_r("support-check")
+-    .rm_r("preprocessor-ran")
+-    .run("build ..", |cmd| {
+-        cmd.current_dir(cmd.dir.join("src"))
+-            .expect_stdout(str![""])
+-            .expect_stderr(str![[r#"
+-[TIMESTAMP] [INFO] (mdbook_driver::mdbook): Book building has started
+-[TIMESTAMP] [INFO] (mdbook_driver::mdbook): Running the html backend
+-[TIMESTAMP] [INFO] (mdbook_html::html_handlebars::hbs_renderer): HTML book written to `[ROOT]/src/../book`
+-
+-"#]]);
+-    })
+-    .check_file("support-check", "html")
+-    .check_file("preprocessor-ran", "test");
+-}

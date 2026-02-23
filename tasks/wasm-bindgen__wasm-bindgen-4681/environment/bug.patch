@@ -1,0 +1,1942 @@
+diff --git a/crates/cli-support/src/externref.rs b/crates/cli-support/src/externref.rs
+index 7b186c0d0..19e6b1a3a 100644
+--- a/crates/cli-support/src/externref.rs
++++ b/crates/cli-support/src/externref.rs
+@@ -37,8 +37,11 @@ pub fn process(module: &mut Module) -> Result<()> {
+                 &mut adapter.params,
+                 &mut adapter.results,
+             );
+-        } else {
+-            export_xform(&mut cfg, instructions);
++            continue;
++        }
++        if let Some(id) = find_call_export(instructions) {
++            export_xform(&mut cfg, id, instructions);
++            continue;
+         }
+     }
+ 
+@@ -110,6 +113,30 @@ pub fn process(module: &mut Module) -> Result<()> {
+     Ok(())
+ }
+ 
++fn find_call_export(instrs: &[InstructionData]) -> Option<Export> {
++    instrs
++        .iter()
++        .enumerate()
++        .find_map(|(i, instr)| match instr.instr {
++            Instruction::CallExport(e) => Some(Export::Export(e)),
++            Instruction::CallTableElement(e) => Some(Export::TableElement {
++                idx: e,
++                call_idx: i,
++            }),
++            _ => None,
++        })
++}
++
++enum Export {
++    Export(walrus::ExportId),
++    TableElement {
++        /// Table element that we're calling
++        idx: u32,
++        /// Index in the instruction stream where the call instruction is found
++        call_idx: usize,
++    },
++}
++
+ /// Adapts the `instrs` given which are an implementation of the import of `id`.
+ ///
+ /// This function will pattern match outgoing arguments and update the
+@@ -206,7 +233,7 @@ fn import_xform(
+ /// pattern matched below to pass off to the externref transformation pass. The
+ /// signature of the adapter doesn't change (it remains as externref-aware) but the
+ /// signature of the export we're calling will change during the transformation.
+-fn export_xform(cx: &mut Context, instrs: &mut Vec<InstructionData>) {
++fn export_xform(cx: &mut Context, export: Export, instrs: &mut Vec<InstructionData>) {
+     let mut to_delete = Vec::new();
+     let mut iter = instrs.iter().enumerate();
+     let mut args = Vec::new();
+@@ -218,38 +245,34 @@ fn export_xform(cx: &mut Context, instrs: &mut Vec<InstructionData>) {
+     //
+     // Note that we're going to delete the `I32FromExternref*` instructions, so we
+     // also maintain indices of the instructions to delete.
+-    let export = iter
+-        .by_ref()
+-        .find_map(|(i, instr)| {
+-            match instr.instr {
+-                Instruction::CallExport(export) => return Some(export),
+-                Instruction::I32FromExternrefOwned => {
+-                    args.pop();
+-                    args.push(Some(true));
+-                    to_delete.push(i);
+-                }
+-                Instruction::I32FromExternrefBorrow => {
+-                    args.pop();
+-                    args.push(Some(false));
+-                    to_delete.push(i);
+-                }
+-                _ => match instr.stack_change {
+-                    StackChange::Modified { pushed, popped } => {
+-                        for _ in 0..popped {
+-                            args.pop();
+-                        }
+-                        for _ in 0..pushed {
+-                            args.push(None);
+-                        }
++    for (i, instr) in iter.by_ref() {
++        match instr.instr {
++            Instruction::CallExport(_) | Instruction::CallTableElement(_) => break,
++            Instruction::I32FromExternrefOwned => {
++                args.pop();
++                args.push(Some(true));
++                to_delete.push(i);
++            }
++            Instruction::I32FromExternrefBorrow => {
++                args.pop();
++                args.push(Some(false));
++                to_delete.push(i);
++            }
++            _ => match instr.stack_change {
++                StackChange::Modified { pushed, popped } => {
++                    for _ in 0..popped {
++                        args.pop();
+                     }
+-                    StackChange::Unknown => {
+-                        panic!("must have stack change data");
++                    for _ in 0..pushed {
++                        args.push(None);
+                     }
+-                },
+-            }
+-            None
+-        })
+-        .expect("must call an export");
++                }
++                StackChange::Unknown => {
++                    panic!("must have stack change data");
++                }
++            },
++        }
++    }
+ 
+     // If one of the instructions after the call is an `ExternrefLoadOwned`,
+     // and a retptr isn't used, the function must return an externref.
+@@ -278,7 +301,16 @@ fn export_xform(cx: &mut Context, instrs: &mut Vec<InstructionData>) {
+ 
+     // ... and register this entire transformation with the externref
+     // transformation pass.
+-    cx.export_xform(export, &args, ret_externref);
++    match export {
++        Export::Export(id) => {
++            cx.export_xform(id, &args, ret_externref);
++        }
++        Export::TableElement { idx, call_idx } => {
++            if let Some(new_idx) = cx.table_element_xform(idx, &args, ret_externref) {
++                instrs[call_idx].instr = Instruction::CallTableElement(new_idx);
++            }
++        }
++    }
+ 
+     // Delete all unnecessary externref management instructions. We're going to
+     // sink these instructions into the Wasm module itself.
+diff --git a/crates/cli-support/src/js/binding.rs b/crates/cli-support/src/js/binding.rs
+index 689d19c1f..b51bee3c0 100644
+--- a/crates/cli-support/src/js/binding.rs
++++ b/crates/cli-support/src/js/binding.rs
+@@ -784,6 +784,7 @@ fn instruction(
+ 
+         Instruction::CallExport(_)
+         | Instruction::CallAdapter(_)
++        | Instruction::CallTableElement(_)
+         | Instruction::DeferFree { .. } => {
+             let invoc = Invocation::from(instr, js.cx.module)?;
+             let (mut params, results) = invoc.params_results(js.cx);
+@@ -1394,7 +1395,7 @@ fn instruction(
+             adapter,
+             nargs,
+             mutable,
+-            dtor_if_persistent,
++            dtor_idx_if_persistent,
+         } => {
+             let b = js.pop();
+             let a = js.pop();
+@@ -1403,7 +1404,7 @@ fn instruction(
+             // TODO: further merge the heap and stack closure handling as
+             // they're almost identical (by nature) except for ownership
+             // integration.
+-            if let Some(dtor) = dtor_if_persistent {
++            if let Some(dtor) = dtor_idx_if_persistent {
+                 let make_closure = if *mutable {
+                     js.cx.expose_make_mut_closure()?;
+                     "makeMutClosure"
+@@ -1412,9 +1413,7 @@ fn instruction(
+                     "makeClosure"
+                 };
+ 
+-                let dtor = &js.cx.module.exports.get(*dtor).name;
+-
+-                js.push(format!("{make_closure}({a}, {b}, wasm.{dtor}, {wrapper})"));
++                js.push(format!("{make_closure}({a}, {b}, {dtor}, {wrapper})"));
+             } else {
+                 let i = js.tmp();
+                 js.prelude(&format!("var state{i} = {{a: {a}, b: {b}}};"));
+@@ -1588,6 +1587,13 @@ impl Invocation {
+                 _ => panic!("can only call exported function"),
+             },
+ 
++            // The function table never changes right now, so we can statically
++            // look up the desired function.
++            CallTableElement(idx) => {
++                let id = crate::wasm_conventions::get_function_table_entry(module, *idx)?;
++                Invocation::Core { id, defer: false }
++            }
++
+             CallAdapter(id) => Invocation::Adapter(*id),
+ 
+             // this function is only called for the above instructions
+diff --git a/crates/cli-support/src/js/mod.rs b/crates/cli-support/src/js/mod.rs
+index cb75db37a..fcd6bf9a5 100644
+--- a/crates/cli-support/src/js/mod.rs
++++ b/crates/cli-support/src/js/mod.rs
+@@ -18,7 +18,7 @@ use std::fmt::Write;
+ use std::fs;
+ use std::path::{Path, PathBuf};
+ use walrus::{FunctionId, ImportId, MemoryId, Module, TableId, ValType};
+-use wasm_bindgen_shared::identifier::{is_valid_ident, to_valid_ident};
++use wasm_bindgen_shared::identifier::is_valid_ident;
+ 
+ mod binding;
+ 
+@@ -2367,6 +2367,8 @@ wasm = wasmInstance.exports;
+             return Ok(());
+         }
+ 
++        let table = self.export_function_table()?;
++
+         self.expose_closure_finalization()?;
+ 
+         // For mutable closures they can't be invoked recursively.
+@@ -2403,7 +2405,7 @@ wasm = wasmInstance.exports;
+                         return f(a, state.b, ...args);
+                     }} finally {{
+                         if (--state.cnt === 0) {{
+-                            state.dtor(a, state.b);
++                            wasm.{table}.get(state.dtor)(a, state.b);
+                             CLOSURE_DTORS.unregister(state);
+                         }} else {{
+                             state.a = a;
+@@ -2425,6 +2427,8 @@ wasm = wasmInstance.exports;
+             return Ok(());
+         }
+ 
++        let table = self.export_function_table()?;
++
+         self.expose_closure_finalization()?;
+ 
+         // For shared closures they can be invoked recursively so we
+@@ -2459,7 +2463,7 @@ wasm = wasmInstance.exports;
+                         return f(state.a, state.b, ...args);
+                     }} finally {{
+                         if (--state.cnt === 0) {{
+-                            state.dtor(state.a, state.b); state.a = 0;
++                            wasm.{table}.get(state.dtor)(state.a, state.b); state.a = 0;
+                             CLOSURE_DTORS.unregister(state);
+                         }}
+                     }}
+@@ -2478,18 +2482,26 @@ wasm = wasmInstance.exports;
+         if !self.should_write_global("closure_finalization") {
+             return Ok(());
+         }
++        let table = self.export_function_table()?;
+ 
+         let finalization_callback = if self.config.generate_reset_state {
+-            "
+-            state => {{
+-                if (state.instance === __wbg_instance_id) {{
+-                    state.dtor(state.a, state.b);
++            format!(
++                "
++                state => {{
++                    if (state.instance === __wbg_instance_id) {{
++                        wasm.{table}.get(state.dtor)(state.a, state.b);
++                    }}
+                 }}
+-            }}
+-            "
+-            .to_owned()
++                "
++            )
+         } else {
+-            "state => state.dtor(state.a, state.b)".to_owned()
++            format!(
++                "
++                state => {{
++                    wasm.{table}.get(state.dtor)(state.a, state.b);
++                }}
++                "
++            )
+         };
+ 
+         self.global(&format!(
+@@ -3126,7 +3138,7 @@ wasm = wasmInstance.exports;
+                         call = Some(id);
+                     }
+                 }
+-                Instruction::CallExport(_) => return Ok(false),
++                Instruction::CallExport(_) | Instruction::CallTableElement(_) => return Ok(false),
+                 _ => {}
+             }
+         }
+@@ -4225,7 +4237,7 @@ wasm = wasmInstance.exports;
+             }
+             walrus::ExportItem::Function(f) => match &self.module.funcs.get(f).name {
+                 Some(s) => {
+-                    let mut name = to_valid_ident(s);
++                    let mut name = to_js_identifier(s);
+ 
+                     // Account for duplicate export names.
+                     // See https://github.com/wasm-bindgen/wasm-bindgen/issues/4371.
+@@ -4240,7 +4252,20 @@ wasm = wasmInstance.exports;
+             _ => default_name,
+         };
+         self.module.exports.add(&name, id);
+-        name
++        return name;
++
++        // Not really an exhaustive list, but works for our purposes.
++        fn to_js_identifier(name: &str) -> String {
++            name.chars()
++                .map(|c| {
++                    if c.is_ascii() && (c.is_alphabetic() || c.is_numeric()) {
++                        c
++                    } else {
++                        '_'
++                    }
++                })
++                .collect()
++        }
+     }
+ 
+     fn adapter_name(&self, id: AdapterId) -> String {
+diff --git a/crates/cli-support/src/multivalue.rs b/crates/cli-support/src/multivalue.rs
+index f512831bf..8dad49c66 100644
+--- a/crates/cli-support/src/multivalue.rs
++++ b/crates/cli-support/src/multivalue.rs
+@@ -3,7 +3,8 @@ use crate::wasm_conventions;
+ use crate::wit::{Adapter, NonstandardWitSection};
+ use crate::wit::{AdapterKind, Instruction, WasmBindgenAux};
+ use anyhow::{anyhow, Error};
+-use walrus::Module;
++use walrus::ir::Value;
++use walrus::{ConstExpr, FunctionId, Module};
+ 
+ pub fn run(module: &mut Module) -> Result<(), Error> {
+     let mut adapters = module
+@@ -11,10 +12,10 @@ pub fn run(module: &mut Module) -> Result<(), Error> {
+         .delete_typed::<NonstandardWitSection>()
+         .unwrap();
+     let mut to_xform = Vec::new();
+-    let mut exports = Vec::new();
++    let mut slots = Vec::new();
+ 
+     for adapter in adapters.adapters.values_mut() {
+-        extract_xform(module, adapter, &mut to_xform, &mut exports);
++        extract_xform(module, adapter, &mut to_xform, &mut slots);
+     }
+     if to_xform.is_empty() {
+         // Early exit to avoid failing if we don't have a memory or stack
+@@ -33,8 +34,11 @@ pub fn run(module: &mut Module) -> Result<(), Error> {
+     let memory = wasm_conventions::get_memory(module)?;
+     let wrappers = multi_value_xform::run(module, memory, stack_pointer, &to_xform)?;
+ 
+-    for (export, id) in exports.into_iter().zip(wrappers) {
+-        module.exports.get_mut(export).item = id.into();
++    for (slot, id) in slots.into_iter().zip(wrappers) {
++        match slot {
++            Slot::Export(e) => module.exports.get_mut(e).item = id.into(),
++            Slot::TableElement(index) => set_table_entry(module, index, id),
++        }
+     }
+ 
+     module.customs.add(*adapters);
+@@ -42,11 +46,16 @@ pub fn run(module: &mut Module) -> Result<(), Error> {
+     Ok(())
+ }
+ 
++enum Slot {
++    Export(walrus::ExportId),
++    TableElement(u32),
++}
++
+ fn extract_xform(
+     module: &Module,
+     adapter: &mut Adapter,
+     to_xform: &mut Vec<(walrus::FunctionId, usize, Vec<walrus::ValType>)>,
+-    exports: &mut Vec<walrus::ExportId>,
++    slots: &mut Vec<Slot>,
+ ) {
+     let instructions = match &mut adapter.kind {
+         AdapterKind::Local { instructions } => instructions,
+@@ -66,22 +75,26 @@ fn extract_xform(
+             }
+             _ => true,
+         });
+-        let export = instructions
++        let slot = instructions
+             .iter_mut()
+-            .find_map(|i| match i.instr {
+-                Instruction::CallExport(e) => Some(e),
++            .find_map(|i| match &mut i.instr {
++                Instruction::CallExport(e) => Some(Slot::Export(*e)),
++                Instruction::CallTableElement(index) => Some(Slot::TableElement(*index)),
+                 _ => None,
+             })
+             .expect("adapter never calls the underlying function");
+ 
+         // LLVM currently always uses the first parameter for the return
+         // pointer. We hard code that here, since we have no better option.
+-        let id = match module.exports.get(export).item {
+-            walrus::ExportItem::Function(f) => f,
+-            _ => panic!("found call to non-function export"),
++        let id = match &slot {
++            Slot::Export(e) => match module.exports.get(*e).item {
++                walrus::ExportItem::Function(f) => f,
++                _ => panic!("found call to non-function export"),
++            },
++            Slot::TableElement(func_index) => resolve_table_entry(module, *func_index),
+         };
+         to_xform.push((id, 0, types));
+-        exports.push(export);
++        slots.push(slot);
+     }
+ 
+     // If the last instruction is a `StoreRetptr`, then this must be an adapter
+@@ -90,3 +103,96 @@ fn extract_xform(
+     // FIXME(#1872) handle this
+     // if let Some(Instruction::StoreRetptr { .. }) = instructions.last() {}
+ }
++
++/// Resolves an index in the function table to a function ID.
++fn resolve_table_entry(module: &Module, func_index: u32) -> FunctionId {
++    let table_id = module
++        .tables
++        .main_function_table()
++        .ok()
++        .flatten()
++        .expect("there should only be one function table");
++    module
++        .tables
++        .get(table_id)
++        .elem_segments
++        .iter()
++        .find_map(|&id| {
++            let elem = module.elements.get(id);
++            let offset = match elem.kind {
++                walrus::ElementKind::Active { offset, .. } => match offset {
++                    ConstExpr::Value(Value::I32(value)) => value as u32,
++                    _ => panic!("table offset was not an i32 value"),
++                },
++                _ => panic!("found non-active element section for function table"),
++            };
++
++            let find = |(i, func_id): (usize, Option<&FunctionId>)| {
++                let table_index = i as u32 + offset;
++                if table_index == func_index {
++                    func_id.cloned()
++                } else {
++                    None
++                }
++            };
++            match &elem.items {
++                walrus::ElementItems::Functions(items) => {
++                    items.iter().map(Some).enumerate().find_map(find)
++                }
++                walrus::ElementItems::Expressions(_, items) => items
++                    .iter()
++                    .map(|expr| {
++                        if let ConstExpr::RefFunc(id) = expr {
++                            Some(id)
++                        } else {
++                            None
++                        }
++                    })
++                    .enumerate()
++                    .find_map(find),
++            }
++        })
++        .expect("function in function table is not initialized")
++}
++
++/// Changes the function ID at an index in the function table.
++fn set_table_entry(module: &mut Module, func_index: u32, new_id: FunctionId) {
++    let table_id = module
++        .tables
++        .main_function_table()
++        .ok()
++        .flatten()
++        .expect("there should only be one function table");
++    for &id in module.tables.get(table_id).elem_segments.iter() {
++        let elem = module.elements.get_mut(id);
++        let offset = match elem.kind {
++            walrus::ElementKind::Active { offset, .. } => match offset {
++                ConstExpr::Value(Value::I32(value)) => value as u32,
++                _ => panic!("table offset was not an i32 value"),
++            },
++            _ => panic!("found non-active element section for function table"),
++        };
++        match &mut elem.items {
++            walrus::ElementItems::Functions(items) => {
++                items.iter_mut().enumerate().for_each(|(i, func_id)| {
++                    let table_index = i as u32 + offset;
++                    if table_index == func_index {
++                        *func_id = new_id;
++                    }
++                })
++            }
++            walrus::ElementItems::Expressions(_, items) => {
++                items.iter_mut().enumerate().for_each(|(i, func_id)| {
++                    let table_index = i as u32 + offset;
++                    if table_index == func_index {
++                        assert!(
++                            matches!(func_id, ConstExpr::RefFunc(_)),
++                            "didn't find a function at the expected position"
++                        );
++                        *func_id = ConstExpr::RefFunc(new_id);
++                    }
++                })
++            }
++        }
++    }
++}
+diff --git a/crates/cli-support/src/transforms/externref/mod.rs b/crates/cli-support/src/transforms/externref/mod.rs
+index bb58a98eb..d0f2e10b9 100644
+--- a/crates/cli-support/src/transforms/externref/mod.rs
++++ b/crates/cli-support/src/transforms/externref/mod.rs
+@@ -177,6 +177,21 @@ impl Context {
+         self
+     }
+ 
++    /// Store information about a function pointer that needs to be transformed.
++    /// The actual transformation happens later during `run`. Returns an index
++    /// that the new wrapped function pointer will be injected at.
++    pub fn table_element_xform(
++        &mut self,
++        idx: u32,
++        externref: &[(usize, bool)],
++        ret_externref: bool,
++    ) -> Option<u32> {
++        self.function(externref, ret_externref).map(|f| {
++            self.new_elements.push((idx, f));
++            self.new_elements.len() as u32 + self.new_element_offset - 1
++        })
++    }
++
+     fn function(&self, externref: &[(usize, bool)], ret_externref: bool) -> Option<Function> {
+         if !ret_externref && externref.is_empty() {
+             return None;
+diff --git a/crates/cli-support/src/transforms/externref/tests/mod.rs b/crates/cli-support/src/transforms/externref/tests/mod.rs
+index d385eaf23..fc617c583 100644
+--- a/crates/cli-support/src/transforms/externref/tests/mod.rs
++++ b/crates/cli-support/src/transforms/externref/tests/mod.rs
+@@ -37,6 +37,9 @@ fn runtest(test: &Test) -> Result<String> {
+                     .ok_or_else(|| anyhow!("failed to find export"))?;
+                 cx.import_xform(import.id(), &directive.args, directive.ret_externref);
+             }
++            DirectiveKind::Table(idx) => {
++                cx.table_element_xform(*idx, &directive.args, directive.ret_externref);
++            }
+         }
+     }
+     cx.run(&mut walrus)?;
+@@ -71,6 +74,7 @@ struct Directive {
+ enum DirectiveKind {
+     Import(String, String),
+     Export(String),
++    Table(u32),
+ }
+ 
+ impl Test {
+@@ -160,9 +164,12 @@ impl<'a> Parse<'a> for Directive {
+         let kind = if parser.peek::<kw::import>()? {
+             parser.parse::<kw::import>()?;
+             DirectiveKind::Import(parser.parse()?, parser.parse()?)
+-        } else {
++        } else if parser.peek::<kw::export>()? {
+             parser.parse::<kw::export>()?;
+             DirectiveKind::Export(parser.parse()?)
++        } else {
++            parser.parse::<kw::table>()?;
++            DirectiveKind::Table(parser.parse()?)
+         };
+         let mut args = Vec::new();
+         parser.parens(|p| {
+diff --git a/crates/cli-support/src/transforms/externref/tests/table.wat b/crates/cli-support/src/transforms/externref/tests/table.wat
+new file mode 100644
+index 000000000..3f651ddb8
+--- /dev/null
++++ b/crates/cli-support/src/transforms/externref/tests/table.wat
+@@ -0,0 +1,37 @@
++;; @xform table 0 (externref_owned)
++
++(module
++  (func $foo (param i32))
++  (table (export "func") 0 funcref)
++  (elem (i32.const 0) 0)
++  (func $alloc (export "__externref_table_alloc") (result i32)
++    i32.const 0)
++  (func $dealloc (export "__externref_table_dealloc") (param i32))
++)
++
++(; CHECK-ALL:
++(module
++  (type (;0;) (func (result i32)))
++  (type (;1;) (func (param i32)))
++  (type (;2;) (func (param externref)))
++  (func $"closure0 externref shim" (;0;) (type 2) (param externref)
++    (local i32)
++    call $alloc
++    local.tee 1
++    local.get 0
++    table.set 1
++    local.get 1
++    call $foo
++  )
++  (func $alloc (;1;) (type 0) (result i32)
++    i32.const 0
++  )
++  (func $foo (;2;) (type 1) (param i32))
++  (table (;0;) 2 funcref)
++  (table (;1;) 128 externref)
++  (export "func" (table 0))
++  (elem (;0;) (i32.const 0) func $foo)
++  (elem (;1;) (i32.const 1) funcref (ref.func $"closure0 externref shim"))
++  (@custom "target_features" (after code) "\01+\0freference-types")
++)
++;)
+diff --git a/crates/cli-support/src/wit/mod.rs b/crates/cli-support/src/wit/mod.rs
+index 664848e60..b623b6e8a 100644
+--- a/crates/cli-support/src/wit/mod.rs
++++ b/crates/cli-support/src/wit/mod.rs
+@@ -4,7 +4,7 @@ use crate::descriptors::WasmBindgenDescriptorsSection;
+ use crate::intrinsic::Intrinsic;
+ use crate::transforms::threads::ThreadCount;
+ use crate::{decode, wasm_conventions, Bindgen, PLACEHOLDER_MODULE};
+-use anyhow::{anyhow, bail, ensure, Error};
++use anyhow::{anyhow, bail, Error};
+ use std::collections::{BTreeSet, HashMap};
+ use std::hash::{DefaultHasher, Hash, Hasher};
+ use std::str;
+@@ -28,6 +28,8 @@ struct Context<'a> {
+     function_exports: HashMap<String, (ExportId, FunctionId)>,
+     /// All of the Wasm module's imported functions.
+     function_imports: HashMap<String, (ImportId, FunctionId)>,
++    /// A map from the signature of a function in the function table to its adapter, if we've already created it.
++    table_adapters: HashMap<Function, AdapterId>,
+     memory: Option<MemoryId>,
+     vendor_prefixes: HashMap<String, Vec<String>>,
+     unique_crate_identifier: &'a str,
+@@ -57,6 +59,7 @@ pub fn process(
+         aux: Default::default(),
+         function_exports: Default::default(),
+         function_imports: Default::default(),
++        table_adapters: Default::default(),
+         vendor_prefixes: Default::default(),
+         descriptors: Default::default(),
+         unique_crate_identifier: "",
+@@ -163,6 +166,10 @@ impl<'a> Context<'a> {
+             // access to them while processing programs.
+             self.descriptors.extend(descriptors);
+ 
++            // If any closures exist we need to prevent the function table from
++            // getting gc'd
++            self.aux.function_table = self.module.tables.main_function_table()?;
++
+             for (descriptor, orig_func_ids) in cast_imports {
+                 let signature = descriptor.unwrap_function();
+                 let [arg] = &signature.arguments[..] else {
+@@ -1218,14 +1225,16 @@ impl<'a> Context<'a> {
+             bail!("import map is larger than the number of imports");
+         }
+ 
+-        // Make sure all entries in the export map have an adapter.
+-        // The adapter may not be in the statically known exports list if it's
+-        // generated by us from a closure table entry.
+-        for id in self.aux.export_map.keys() {
+-            ensure!(
+-                self.adapters.adapters.contains_key(id),
+-                "export map has an entry that the adapters map does not"
+-            );
++        // Make sure the export map and export adapters map contain the same
++        // number of entries.
++        for (_, id) in self.adapters.exports.iter() {
++            if !self.aux.export_map.contains_key(id) {
++                bail!("adapters map has an entry that the export map does not");
++            }
++        }
++
++        if self.adapters.exports.len() != self.aux.export_map.len() {
++            bail!("export map and export adapters map have different sizes");
+         }
+ 
+         Ok(())
+@@ -1336,6 +1345,53 @@ impl<'a> Context<'a> {
+         Ok(id)
+     }
+ 
++    fn table_element_adapter(
++        &mut self,
++        idx: u32,
++        mut signature: Function,
++    ) -> Result<AdapterId, Error> {
++        fn strip_externref_names(descriptor: &mut Descriptor) {
++            match descriptor {
++                Descriptor::NamedExternref(_) => *descriptor = Descriptor::Externref,
++
++                Descriptor::Function(function) => strip_function_externref_names(function),
++                Descriptor::Closure(closure) => {
++                    strip_function_externref_names(&mut closure.function)
++                }
++                Descriptor::Ref(descriptor)
++                | Descriptor::RefMut(descriptor)
++                | Descriptor::Slice(descriptor)
++                | Descriptor::Vector(descriptor)
++                | Descriptor::Option(descriptor)
++                | Descriptor::Result(descriptor) => strip_externref_names(descriptor),
++
++                _ => {}
++            }
++        }
++
++        fn strip_function_externref_names(descriptor: &mut Function) {
++            descriptor
++                .arguments
++                .iter_mut()
++                .for_each(strip_externref_names);
++            strip_externref_names(&mut descriptor.ret);
++            descriptor.inner_ret.as_mut().map(strip_externref_names);
++        }
++
++        // We don't care about the names of externrefs here; we only care whether
++        // the compiler will actually keep them as separate functions.
++        strip_function_externref_names(&mut signature);
++
++        if let Some(&id) = self.table_adapters.get(&signature) {
++            return Ok(id);
++        }
++        let call = Instruction::CallTableElement(idx);
++        // like above, largely just defer the work elsewhere
++        let id = self.register_export_adapter(call, signature.clone())?;
++        self.table_adapters.insert(signature, id);
++        Ok(id)
++    }
++
+     fn register_export_adapter(
+         &mut self,
+         call: Instruction,
+diff --git a/crates/cli-support/src/wit/outgoing.rs b/crates/cli-support/src/wit/outgoing.rs
+index 40c624142..479eec804 100644
+--- a/crates/cli-support/src/wit/outgoing.rs
++++ b/crates/cli-support/src/wit/outgoing.rs
+@@ -1,10 +1,8 @@
+ use crate::descriptor::{Descriptor, Function};
+-use crate::wasm_conventions::get_function_table_entry;
+ use crate::wit::{AdapterType, Instruction, InstructionBuilder};
+ use crate::wit::{InstructionData, StackChange};
+ use anyhow::{bail, format_err, Error};
+-use walrus::{ExportId, ValType};
+-use wasm_bindgen_shared::identifier::to_valid_ident;
++use walrus::ValType;
+ 
+ impl InstructionBuilder<'_, '_> {
+     /// Processes one more `Descriptor` as an argument to a JS function that
+@@ -238,30 +236,11 @@ impl InstructionBuilder<'_, '_> {
+         Ok(())
+     }
+ 
+-    // The function table never changes right now, so we can statically
+-    // look up the desired function.
+-    fn export_table_element(&mut self, idx: u32) -> ExportId {
+-        let module = &mut *self.cx.module;
+-        let func_id = get_function_table_entry(module, idx).unwrap();
+-        if let Some(export) = module
+-            .exports
+-            .iter()
+-            .find(|e| matches!(e.item, walrus::ExportItem::Function(id) if id == func_id))
+-        {
+-            return export.id();
+-        }
+-        let name = match &module.funcs.get(func_id).name {
+-            Some(name) => to_valid_ident(name),
+-            None => format!("__wasm_bindgen_func_elem_{}", func_id.index()),
+-        };
+-        module.exports.add(&name, func_id)
+-    }
+-
+     fn outgoing_function(
+         &mut self,
+         mutable: bool,
+         descriptor: &Function,
+-        dtor_if_persistent: Option<u32>,
++        dtor_idx_if_persistent: Option<u32>,
+     ) -> Result<(), Error> {
+         let mut descriptor = descriptor.clone();
+         // synthesize the a/b arguments that aren't present in the
+@@ -269,16 +248,16 @@ impl InstructionBuilder<'_, '_> {
+         let nargs = descriptor.arguments.len();
+         descriptor.arguments.insert(0, Descriptor::I32);
+         descriptor.arguments.insert(0, Descriptor::I32);
+-        let shim = self.export_table_element(descriptor.shim_idx);
+-        let dtor_if_persistent = dtor_if_persistent.map(|i| self.export_table_element(i));
+-        let adapter = self.cx.export_adapter(shim, descriptor)?;
++        let adapter = self
++            .cx
++            .table_element_adapter(descriptor.shim_idx, descriptor)?;
+         self.instruction(
+             &[AdapterType::I32, AdapterType::I32],
+             Instruction::Closure {
+                 adapter,
+                 nargs,
+                 mutable,
+-                dtor_if_persistent,
++                dtor_idx_if_persistent,
+             },
+             &[AdapterType::Function],
+         );
+diff --git a/crates/cli-support/src/wit/standard.rs b/crates/cli-support/src/wit/standard.rs
+index 60fffc0c8..35a28581a 100644
+--- a/crates/cli-support/src/wit/standard.rs
++++ b/crates/cli-support/src/wit/standard.rs
+@@ -108,6 +108,8 @@ pub enum Instruction {
+     CallAdapter(AdapterId),
+     /// Call an exported function in the core module
+     CallExport(walrus::ExportId),
++    /// Call an element in the function table of the core module
++    CallTableElement(u32),
+ 
+     /// Gets an argument by its index.
+     ArgGet(u32),
+@@ -331,7 +333,7 @@ pub enum Instruction {
+         adapter: AdapterId,
+         nargs: usize,
+         mutable: bool,
+-        dtor_if_persistent: Option<walrus::ExportId>,
++        dtor_idx_if_persistent: Option<u32>,
+     },
+     /// pops two i32 data pointers, pushes a vector view
+     View {
+diff --git a/crates/cli/tests/reference/async-number.js b/crates/cli/tests/reference/async-number.js
+index 1fbbed171..93193e6ce 100644
+--- a/crates/cli/tests/reference/async-number.js
++++ b/crates/cli/tests/reference/async-number.js
+@@ -183,7 +183,11 @@ function getDataViewMemory0() {
+ 
+ const CLOSURE_DTORS = (typeof FinalizationRegistry === 'undefined')
+     ? { register: () => {}, unregister: () => {} }
+-    : new FinalizationRegistry(state => state.dtor(state.a, state.b));
++    : new FinalizationRegistry(
++state => {
++    wasm.__wbindgen_export_5.get(state.dtor)(state.a, state.b);
++}
++);
+ 
+ function makeMutClosure(arg0, arg1, dtor, f) {
+     const state = { a: arg0, b: arg1, cnt: 1, dtor };
+@@ -199,7 +203,7 @@ function makeMutClosure(arg0, arg1, dtor, f) {
+             return f(a, state.b, ...args);
+         } finally {
+             if (--state.cnt === 0) {
+-                state.dtor(a, state.b);
++                wasm.__wbindgen_export_5.get(state.dtor)(a, state.b);
+                 CLOSURE_DTORS.unregister(state);
+             } else {
+                 state.a = a;
+@@ -218,32 +222,32 @@ export function foo() {
+     return ret;
+ }
+ 
+-function __wbg_adapter_22(arg0, arg1, arg2) {
+-    wasm.wasm_bindgen__convert__closures_____invoke__h0000000000000000(arg0, arg1, arg2);
++function __wbg_adapter_21(arg0, arg1, arg2) {
++    wasm.closure19_externref_shim(arg0, arg1, arg2);
+ }
+ 
+-function __wbg_adapter_23(arg0, arg1, arg2, arg3) {
+-    wasm.wasm_bindgen__convert__closures_____invoke__h0000000000000001(arg0, arg1, arg2, arg3);
++function __wbg_adapter_22(arg0, arg1, arg2, arg3) {
++    wasm.closure20_externref_shim(arg0, arg1, arg2, arg3);
+ }
+ 
+-export function __wbg_call_0000000000000002() { return handleError(function (arg0, arg1) {
++export function __wbg_call_0000000000000000() { return handleError(function (arg0, arg1) {
+     const ret = arg0.call(arg1);
+     return ret;
+ }, arguments) };
+ 
+-export function __wbg_call_0000000000000003() { return handleError(function (arg0, arg1, arg2) {
++export function __wbg_call_0000000000000001() { return handleError(function (arg0, arg1, arg2) {
+     const ret = arg0.call(arg1, arg2);
+     return ret;
+ }, arguments) };
+ 
+-export function __wbg_new_0000000000000004(arg0, arg1) {
++export function __wbg_new_0000000000000002(arg0, arg1) {
+     try {
+         var state0 = {a: arg0, b: arg1};
+         var cb0 = (arg0, arg1) => {
+             const a = state0.a;
+             state0.a = 0;
+             try {
+-                return __wbg_adapter_23(a, state0.b, arg0, arg1);
++                return __wbg_adapter_22(a, state0.b, arg0, arg1);
+             } finally {
+                 state0.a = a;
+             }
+@@ -255,51 +259,51 @@ export function __wbg_new_0000000000000004(arg0, arg1) {
+     }
+ };
+ 
+-export function __wbg_newnoargs_0000000000000005(arg0, arg1) {
++export function __wbg_newnoargs_0000000000000003(arg0, arg1) {
+     const ret = new Function(getStringFromWasm0(arg0, arg1));
+     return ret;
+ };
+ 
+-export function __wbg_queueMicrotask_0000000000000006(arg0) {
++export function __wbg_queueMicrotask_0000000000000004(arg0) {
+     queueMicrotask(arg0);
+ };
+ 
+-export function __wbg_queueMicrotask_0000000000000007(arg0) {
++export function __wbg_queueMicrotask_0000000000000005(arg0) {
+     const ret = arg0.queueMicrotask;
+     return ret;
+ };
+ 
+-export function __wbg_resolve_0000000000000008(arg0) {
++export function __wbg_resolve_0000000000000006(arg0) {
+     const ret = Promise.resolve(arg0);
+     return ret;
+ };
+ 
+-export function __wbg_static_accessor_GLOBAL_0000000000000009() {
++export function __wbg_static_accessor_GLOBAL_0000000000000007() {
+     const ret = typeof global === 'undefined' ? null : global;
+     return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+ };
+ 
+-export function __wbg_static_accessor_GLOBAL_THIS_000000000000000a() {
++export function __wbg_static_accessor_GLOBAL_THIS_0000000000000008() {
+     const ret = typeof globalThis === 'undefined' ? null : globalThis;
+     return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+ };
+ 
+-export function __wbg_static_accessor_SELF_000000000000000b() {
++export function __wbg_static_accessor_SELF_0000000000000009() {
+     const ret = typeof self === 'undefined' ? null : self;
+     return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+ };
+ 
+-export function __wbg_static_accessor_WINDOW_000000000000000c() {
++export function __wbg_static_accessor_WINDOW_000000000000000a() {
+     const ret = typeof window === 'undefined' ? null : window;
+     return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+ };
+ 
+-export function __wbg_then_000000000000000d(arg0, arg1) {
++export function __wbg_then_000000000000000b(arg0, arg1) {
+     const ret = arg0.then(arg1);
+     return ret;
+ };
+ 
+-export function __wbg_wbindgencbdrop_000000000000000e(arg0) {
++export function __wbg_wbindgencbdrop_000000000000000c(arg0) {
+     const obj = arg0.original;
+     if (obj.cnt-- == 1) {
+         obj.a = 0;
+@@ -309,7 +313,7 @@ export function __wbg_wbindgencbdrop_000000000000000e(arg0) {
+     return ret;
+ };
+ 
+-export function __wbg_wbindgendebugstring_000000000000000f(arg0, arg1) {
++export function __wbg_wbindgendebugstring_000000000000000d(arg0, arg1) {
+     const ret = debugString(arg1);
+     const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+     const len1 = WASM_VECTOR_LEN;
+@@ -317,27 +321,27 @@ export function __wbg_wbindgendebugstring_000000000000000f(arg0, arg1) {
+     getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+ };
+ 
+-export function __wbg_wbindgenisfunction_0000000000000010(arg0) {
++export function __wbg_wbindgenisfunction_000000000000000e(arg0) {
+     const ret = typeof(arg0) === 'function';
+     return ret;
+ };
+ 
+-export function __wbg_wbindgenisundefined_0000000000000011(arg0) {
++export function __wbg_wbindgenisundefined_000000000000000f(arg0) {
+     const ret = arg0 === undefined;
+     return ret;
+ };
+ 
+-export function __wbg_wbindgenthrow_0000000000000012(arg0, arg1) {
++export function __wbg_wbindgenthrow_0000000000000010(arg0, arg1) {
+     throw new Error(getStringFromWasm0(arg0, arg1));
+ };
+ 
+-export function __wbindgen_cast_0000000000000013(arg0, arg1) {
+-    // Cast intrinsic for `Closure(Closure { dtor_idx: 24, function: Function { arguments: [Externref], shim_idx: 25, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+-    const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h0000000000000014, __wbg_adapter_22);
++export function __wbindgen_cast_0000000000000011(arg0, arg1) {
++    // Cast intrinsic for `Closure(Closure { dtor_idx: 23, function: Function { arguments: [Externref], shim_idx: 24, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
++    const ret = makeMutClosure(arg0, arg1, 25, __wbg_adapter_21);
+     return ret;
+ };
+ 
+-export function __wbindgen_cast_0000000000000015(arg0) {
++export function __wbindgen_cast_0000000000000012(arg0) {
+     // Cast intrinsic for `F64 -> Externref`.
+     const ret = arg0;
+     return ret;
+diff --git a/crates/cli/tests/reference/async-number.wat b/crates/cli/tests/reference/async-number.wat
+index cc40231c8..ebd45526a 100644
+--- a/crates/cli/tests/reference/async-number.wat
++++ b/crates/cli/tests/reference/async-number.wat
+@@ -16,46 +16,46 @@
+   (type (;14;) (func (param externref) (result externref)))
+   (type (;15;) (func (param externref externref) (result externref)))
+   (type (;16;) (func (param externref externref externref) (result externref)))
+-  (import "./reference_test_bg.js" "__wbg_call_0000000000000002" (func (;0;) (type 15)))
+-  (import "./reference_test_bg.js" "__wbg_call_0000000000000003" (func (;1;) (type 16)))
+-  (import "./reference_test_bg.js" "__wbg_new_0000000000000004" (func (;2;) (type 6)))
+-  (import "./reference_test_bg.js" "__wbg_newnoargs_0000000000000005" (func (;3;) (type 6)))
+-  (import "./reference_test_bg.js" "__wbg_queueMicrotask_0000000000000006" (func (;4;) (type 12)))
+-  (import "./reference_test_bg.js" "__wbg_queueMicrotask_0000000000000007" (func (;5;) (type 14)))
+-  (import "./reference_test_bg.js" "__wbg_resolve_0000000000000008" (func (;6;) (type 14)))
+-  (import "./reference_test_bg.js" "__wbg_static_accessor_GLOBAL_0000000000000009" (func (;7;) (type 1)))
+-  (import "./reference_test_bg.js" "__wbg_static_accessor_GLOBAL_THIS_000000000000000a" (func (;8;) (type 1)))
+-  (import "./reference_test_bg.js" "__wbg_static_accessor_SELF_000000000000000b" (func (;9;) (type 1)))
+-  (import "./reference_test_bg.js" "__wbg_static_accessor_WINDOW_000000000000000c" (func (;10;) (type 1)))
+-  (import "./reference_test_bg.js" "__wbg_then_000000000000000d" (func (;11;) (type 15)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgencbdrop_000000000000000e" (func (;12;) (type 13)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgendebugstring_000000000000000f" (func (;13;) (type 10)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgenisfunction_0000000000000010" (func (;14;) (type 13)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgenisundefined_0000000000000011" (func (;15;) (type 13)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgenthrow_0000000000000012" (func (;16;) (type 4)))
+-  (import "./reference_test_bg.js" "__wbindgen_cast_0000000000000013" (func (;17;) (type 6)))
+-  (import "./reference_test_bg.js" "__wbindgen_cast_0000000000000015" (func (;18;) (type 11)))
++  (import "./reference_test_bg.js" "__wbg_call_0000000000000000" (func (;0;) (type 15)))
++  (import "./reference_test_bg.js" "__wbg_call_0000000000000001" (func (;1;) (type 16)))
++  (import "./reference_test_bg.js" "__wbg_new_0000000000000002" (func (;2;) (type 6)))
++  (import "./reference_test_bg.js" "__wbg_newnoargs_0000000000000003" (func (;3;) (type 6)))
++  (import "./reference_test_bg.js" "__wbg_queueMicrotask_0000000000000004" (func (;4;) (type 12)))
++  (import "./reference_test_bg.js" "__wbg_queueMicrotask_0000000000000005" (func (;5;) (type 14)))
++  (import "./reference_test_bg.js" "__wbg_resolve_0000000000000006" (func (;6;) (type 14)))
++  (import "./reference_test_bg.js" "__wbg_static_accessor_GLOBAL_0000000000000007" (func (;7;) (type 1)))
++  (import "./reference_test_bg.js" "__wbg_static_accessor_GLOBAL_THIS_0000000000000008" (func (;8;) (type 1)))
++  (import "./reference_test_bg.js" "__wbg_static_accessor_SELF_0000000000000009" (func (;9;) (type 1)))
++  (import "./reference_test_bg.js" "__wbg_static_accessor_WINDOW_000000000000000a" (func (;10;) (type 1)))
++  (import "./reference_test_bg.js" "__wbg_then_000000000000000b" (func (;11;) (type 15)))
++  (import "./reference_test_bg.js" "__wbg_wbindgencbdrop_000000000000000c" (func (;12;) (type 13)))
++  (import "./reference_test_bg.js" "__wbg_wbindgendebugstring_000000000000000d" (func (;13;) (type 10)))
++  (import "./reference_test_bg.js" "__wbg_wbindgenisfunction_000000000000000e" (func (;14;) (type 13)))
++  (import "./reference_test_bg.js" "__wbg_wbindgenisundefined_000000000000000f" (func (;15;) (type 13)))
++  (import "./reference_test_bg.js" "__wbg_wbindgenthrow_0000000000000010" (func (;16;) (type 4)))
++  (import "./reference_test_bg.js" "__wbindgen_cast_0000000000000011" (func (;17;) (type 6)))
++  (import "./reference_test_bg.js" "__wbindgen_cast_0000000000000012" (func (;18;) (type 11)))
+   (import "./reference_test_bg.js" "__wbindgen_init_externref_table" (func (;19;) (type 0)))
+   (func $"foo externref shim" (;20;) (type 2) (result externref))
+-  (func $"wasm_bindgen__convert__closures_____invoke__h0000000000000000 externref shim" (;21;) (type 8) (param i32 i32 externref))
+-  (func $wasm_bindgen::closure::destroy::h0000000000000014 (;22;) (type 4) (param i32 i32))
+-  (func $"wasm_bindgen__convert__closures_____invoke__h0000000000000001 externref shim" (;23;) (type 9) (param i32 i32 externref externref))
+-  (func $__wbindgen_exn_store (;24;) (type 3) (param i32))
+-  (func $__externref_table_alloc (;25;) (type 1) (result i32))
+-  (func $__wbindgen_malloc (;26;) (type 5) (param i32 i32) (result i32))
+-  (func $__wbindgen_realloc (;27;) (type 7) (param i32 i32 i32 i32) (result i32))
+-  (table (;0;) 128 externref)
++  (func $__wbindgen_exn_store (;21;) (type 3) (param i32))
++  (func $__externref_table_alloc (;22;) (type 1) (result i32))
++  (func $__wbindgen_malloc (;23;) (type 5) (param i32 i32) (result i32))
++  (func $__wbindgen_realloc (;24;) (type 7) (param i32 i32 i32 i32) (result i32))
++  (func $"closure19 externref shim" (;25;) (type 8) (param i32 i32 externref))
++  (func $"closure20 externref shim" (;26;) (type 9) (param i32 i32 externref externref))
++  (table (;0;) 0 funcref)
++  (table (;1;) 128 externref)
+   (memory (;0;) 17)
+   (export "memory" (memory 0))
+   (export "foo" (func $"foo externref shim"))
+-  (export "wasm_bindgen__convert__closures_____invoke__h0000000000000000" (func $"wasm_bindgen__convert__closures_____invoke__h0000000000000000 externref shim"))
+-  (export "wasm_bindgen__closure__destroy__h0000000000000014" (func $wasm_bindgen::closure::destroy::h0000000000000014))
+-  (export "wasm_bindgen__convert__closures_____invoke__h0000000000000001" (func $"wasm_bindgen__convert__closures_____invoke__h0000000000000001 externref shim"))
+   (export "__wbindgen_exn_store" (func $__wbindgen_exn_store))
+   (export "__externref_table_alloc" (func $__externref_table_alloc))
+-  (export "__wbindgen_export_2" (table 0))
++  (export "__wbindgen_export_2" (table 1))
+   (export "__wbindgen_malloc" (func $__wbindgen_malloc))
+   (export "__wbindgen_realloc" (func $__wbindgen_realloc))
++  (export "__wbindgen_export_5" (table 0))
++  (export "closure19_externref_shim" (func $"closure19 externref shim"))
++  (export "closure20_externref_shim" (func $"closure20 externref shim"))
+   (export "__wbindgen_start" (func 19))
+   (@custom "target_features" (after code) "\08+\0bbulk-memory+\0fbulk-memory-opt+\16call-indirect-overlong+\0amultivalue+\0fmutable-globals+\13nontrapping-fptoint+\0freference-types+\08sign-ext")
+ )
+diff --git a/crates/cli/tests/reference/async-void.js b/crates/cli/tests/reference/async-void.js
+index 1a7c7c1a1..0456449c7 100644
+--- a/crates/cli/tests/reference/async-void.js
++++ b/crates/cli/tests/reference/async-void.js
+@@ -183,7 +183,11 @@ function getDataViewMemory0() {
+ 
+ const CLOSURE_DTORS = (typeof FinalizationRegistry === 'undefined')
+     ? { register: () => {}, unregister: () => {} }
+-    : new FinalizationRegistry(state => state.dtor(state.a, state.b));
++    : new FinalizationRegistry(
++state => {
++    wasm.__wbindgen_export_5.get(state.dtor)(state.a, state.b);
++}
++);
+ 
+ function makeMutClosure(arg0, arg1, dtor, f) {
+     const state = { a: arg0, b: arg1, cnt: 1, dtor };
+@@ -199,7 +203,7 @@ function makeMutClosure(arg0, arg1, dtor, f) {
+             return f(a, state.b, ...args);
+         } finally {
+             if (--state.cnt === 0) {
+-                state.dtor(a, state.b);
++                wasm.__wbindgen_export_5.get(state.dtor)(a, state.b);
+                 CLOSURE_DTORS.unregister(state);
+             } else {
+                 state.a = a;
+@@ -218,32 +222,32 @@ export function foo() {
+     return ret;
+ }
+ 
+-function __wbg_adapter_21(arg0, arg1, arg2) {
+-    wasm.wasm_bindgen__convert__closures_____invoke__h0000000000000000(arg0, arg1, arg2);
++function __wbg_adapter_20(arg0, arg1, arg2) {
++    wasm.closure18_externref_shim(arg0, arg1, arg2);
+ }
+ 
+-function __wbg_adapter_22(arg0, arg1, arg2, arg3) {
+-    wasm.wasm_bindgen__convert__closures_____invoke__h0000000000000001(arg0, arg1, arg2, arg3);
++function __wbg_adapter_21(arg0, arg1, arg2, arg3) {
++    wasm.closure19_externref_shim(arg0, arg1, arg2, arg3);
+ }
+ 
+-export function __wbg_call_0000000000000002() { return handleError(function (arg0, arg1) {
++export function __wbg_call_0000000000000000() { return handleError(function (arg0, arg1) {
+     const ret = arg0.call(arg1);
+     return ret;
+ }, arguments) };
+ 
+-export function __wbg_call_0000000000000003() { return handleError(function (arg0, arg1, arg2) {
++export function __wbg_call_0000000000000001() { return handleError(function (arg0, arg1, arg2) {
+     const ret = arg0.call(arg1, arg2);
+     return ret;
+ }, arguments) };
+ 
+-export function __wbg_new_0000000000000004(arg0, arg1) {
++export function __wbg_new_0000000000000002(arg0, arg1) {
+     try {
+         var state0 = {a: arg0, b: arg1};
+         var cb0 = (arg0, arg1) => {
+             const a = state0.a;
+             state0.a = 0;
+             try {
+-                return __wbg_adapter_22(a, state0.b, arg0, arg1);
++                return __wbg_adapter_21(a, state0.b, arg0, arg1);
+             } finally {
+                 state0.a = a;
+             }
+@@ -255,51 +259,51 @@ export function __wbg_new_0000000000000004(arg0, arg1) {
+     }
+ };
+ 
+-export function __wbg_newnoargs_0000000000000005(arg0, arg1) {
++export function __wbg_newnoargs_0000000000000003(arg0, arg1) {
+     const ret = new Function(getStringFromWasm0(arg0, arg1));
+     return ret;
+ };
+ 
+-export function __wbg_queueMicrotask_0000000000000006(arg0) {
++export function __wbg_queueMicrotask_0000000000000004(arg0) {
+     queueMicrotask(arg0);
+ };
+ 
+-export function __wbg_queueMicrotask_0000000000000007(arg0) {
++export function __wbg_queueMicrotask_0000000000000005(arg0) {
+     const ret = arg0.queueMicrotask;
+     return ret;
+ };
+ 
+-export function __wbg_resolve_0000000000000008(arg0) {
++export function __wbg_resolve_0000000000000006(arg0) {
+     const ret = Promise.resolve(arg0);
+     return ret;
+ };
+ 
+-export function __wbg_static_accessor_GLOBAL_0000000000000009() {
++export function __wbg_static_accessor_GLOBAL_0000000000000007() {
+     const ret = typeof global === 'undefined' ? null : global;
+     return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+ };
+ 
+-export function __wbg_static_accessor_GLOBAL_THIS_000000000000000a() {
++export function __wbg_static_accessor_GLOBAL_THIS_0000000000000008() {
+     const ret = typeof globalThis === 'undefined' ? null : globalThis;
+     return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+ };
+ 
+-export function __wbg_static_accessor_SELF_000000000000000b() {
++export function __wbg_static_accessor_SELF_0000000000000009() {
+     const ret = typeof self === 'undefined' ? null : self;
+     return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+ };
+ 
+-export function __wbg_static_accessor_WINDOW_000000000000000c() {
++export function __wbg_static_accessor_WINDOW_000000000000000a() {
+     const ret = typeof window === 'undefined' ? null : window;
+     return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+ };
+ 
+-export function __wbg_then_000000000000000d(arg0, arg1) {
++export function __wbg_then_000000000000000b(arg0, arg1) {
+     const ret = arg0.then(arg1);
+     return ret;
+ };
+ 
+-export function __wbg_wbindgencbdrop_000000000000000e(arg0) {
++export function __wbg_wbindgencbdrop_000000000000000c(arg0) {
+     const obj = arg0.original;
+     if (obj.cnt-- == 1) {
+         obj.a = 0;
+@@ -309,7 +313,7 @@ export function __wbg_wbindgencbdrop_000000000000000e(arg0) {
+     return ret;
+ };
+ 
+-export function __wbg_wbindgendebugstring_000000000000000f(arg0, arg1) {
++export function __wbg_wbindgendebugstring_000000000000000d(arg0, arg1) {
+     const ret = debugString(arg1);
+     const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+     const len1 = WASM_VECTOR_LEN;
+@@ -317,23 +321,23 @@ export function __wbg_wbindgendebugstring_000000000000000f(arg0, arg1) {
+     getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+ };
+ 
+-export function __wbg_wbindgenisfunction_0000000000000010(arg0) {
++export function __wbg_wbindgenisfunction_000000000000000e(arg0) {
+     const ret = typeof(arg0) === 'function';
+     return ret;
+ };
+ 
+-export function __wbg_wbindgenisundefined_0000000000000011(arg0) {
++export function __wbg_wbindgenisundefined_000000000000000f(arg0) {
+     const ret = arg0 === undefined;
+     return ret;
+ };
+ 
+-export function __wbg_wbindgenthrow_0000000000000012(arg0, arg1) {
++export function __wbg_wbindgenthrow_0000000000000010(arg0, arg1) {
+     throw new Error(getStringFromWasm0(arg0, arg1));
+ };
+ 
+-export function __wbindgen_cast_0000000000000013(arg0, arg1) {
+-    // Cast intrinsic for `Closure(Closure { dtor_idx: 23, function: Function { arguments: [Externref], shim_idx: 24, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+-    const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h0000000000000014, __wbg_adapter_21);
++export function __wbindgen_cast_0000000000000011(arg0, arg1) {
++    // Cast intrinsic for `Closure(Closure { dtor_idx: 22, function: Function { arguments: [Externref], shim_idx: 23, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
++    const ret = makeMutClosure(arg0, arg1, 24, __wbg_adapter_20);
+     return ret;
+ };
+ 
+diff --git a/crates/cli/tests/reference/async-void.wat b/crates/cli/tests/reference/async-void.wat
+index b16e6c8fa..3ba9b7e88 100644
+--- a/crates/cli/tests/reference/async-void.wat
++++ b/crates/cli/tests/reference/async-void.wat
+@@ -15,45 +15,45 @@
+   (type (;13;) (func (param externref) (result externref)))
+   (type (;14;) (func (param externref externref) (result externref)))
+   (type (;15;) (func (param externref externref externref) (result externref)))
+-  (import "./reference_test_bg.js" "__wbg_call_0000000000000002" (func (;0;) (type 14)))
+-  (import "./reference_test_bg.js" "__wbg_call_0000000000000003" (func (;1;) (type 15)))
+-  (import "./reference_test_bg.js" "__wbg_new_0000000000000004" (func (;2;) (type 6)))
+-  (import "./reference_test_bg.js" "__wbg_newnoargs_0000000000000005" (func (;3;) (type 6)))
+-  (import "./reference_test_bg.js" "__wbg_queueMicrotask_0000000000000006" (func (;4;) (type 11)))
+-  (import "./reference_test_bg.js" "__wbg_queueMicrotask_0000000000000007" (func (;5;) (type 13)))
+-  (import "./reference_test_bg.js" "__wbg_resolve_0000000000000008" (func (;6;) (type 13)))
+-  (import "./reference_test_bg.js" "__wbg_static_accessor_GLOBAL_0000000000000009" (func (;7;) (type 1)))
+-  (import "./reference_test_bg.js" "__wbg_static_accessor_GLOBAL_THIS_000000000000000a" (func (;8;) (type 1)))
+-  (import "./reference_test_bg.js" "__wbg_static_accessor_SELF_000000000000000b" (func (;9;) (type 1)))
+-  (import "./reference_test_bg.js" "__wbg_static_accessor_WINDOW_000000000000000c" (func (;10;) (type 1)))
+-  (import "./reference_test_bg.js" "__wbg_then_000000000000000d" (func (;11;) (type 14)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgencbdrop_000000000000000e" (func (;12;) (type 12)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgendebugstring_000000000000000f" (func (;13;) (type 10)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgenisfunction_0000000000000010" (func (;14;) (type 12)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgenisundefined_0000000000000011" (func (;15;) (type 12)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgenthrow_0000000000000012" (func (;16;) (type 4)))
+-  (import "./reference_test_bg.js" "__wbindgen_cast_0000000000000013" (func (;17;) (type 6)))
++  (import "./reference_test_bg.js" "__wbg_call_0000000000000000" (func (;0;) (type 14)))
++  (import "./reference_test_bg.js" "__wbg_call_0000000000000001" (func (;1;) (type 15)))
++  (import "./reference_test_bg.js" "__wbg_new_0000000000000002" (func (;2;) (type 6)))
++  (import "./reference_test_bg.js" "__wbg_newnoargs_0000000000000003" (func (;3;) (type 6)))
++  (import "./reference_test_bg.js" "__wbg_queueMicrotask_0000000000000004" (func (;4;) (type 11)))
++  (import "./reference_test_bg.js" "__wbg_queueMicrotask_0000000000000005" (func (;5;) (type 13)))
++  (import "./reference_test_bg.js" "__wbg_resolve_0000000000000006" (func (;6;) (type 13)))
++  (import "./reference_test_bg.js" "__wbg_static_accessor_GLOBAL_0000000000000007" (func (;7;) (type 1)))
++  (import "./reference_test_bg.js" "__wbg_static_accessor_GLOBAL_THIS_0000000000000008" (func (;8;) (type 1)))
++  (import "./reference_test_bg.js" "__wbg_static_accessor_SELF_0000000000000009" (func (;9;) (type 1)))
++  (import "./reference_test_bg.js" "__wbg_static_accessor_WINDOW_000000000000000a" (func (;10;) (type 1)))
++  (import "./reference_test_bg.js" "__wbg_then_000000000000000b" (func (;11;) (type 14)))
++  (import "./reference_test_bg.js" "__wbg_wbindgencbdrop_000000000000000c" (func (;12;) (type 12)))
++  (import "./reference_test_bg.js" "__wbg_wbindgendebugstring_000000000000000d" (func (;13;) (type 10)))
++  (import "./reference_test_bg.js" "__wbg_wbindgenisfunction_000000000000000e" (func (;14;) (type 12)))
++  (import "./reference_test_bg.js" "__wbg_wbindgenisundefined_000000000000000f" (func (;15;) (type 12)))
++  (import "./reference_test_bg.js" "__wbg_wbindgenthrow_0000000000000010" (func (;16;) (type 4)))
++  (import "./reference_test_bg.js" "__wbindgen_cast_0000000000000011" (func (;17;) (type 6)))
+   (import "./reference_test_bg.js" "__wbindgen_init_externref_table" (func (;18;) (type 0)))
+   (func $"foo externref shim" (;19;) (type 2) (result externref))
+-  (func $"wasm_bindgen__convert__closures_____invoke__h0000000000000000 externref shim" (;20;) (type 8) (param i32 i32 externref))
+-  (func $wasm_bindgen::closure::destroy::h0000000000000014 (;21;) (type 4) (param i32 i32))
+-  (func $"wasm_bindgen__convert__closures_____invoke__h0000000000000001 externref shim" (;22;) (type 9) (param i32 i32 externref externref))
+-  (func $__wbindgen_exn_store (;23;) (type 3) (param i32))
+-  (func $__externref_table_alloc (;24;) (type 1) (result i32))
+-  (func $__wbindgen_malloc (;25;) (type 5) (param i32 i32) (result i32))
+-  (func $__wbindgen_realloc (;26;) (type 7) (param i32 i32 i32 i32) (result i32))
+-  (table (;0;) 128 externref)
++  (func $__wbindgen_exn_store (;20;) (type 3) (param i32))
++  (func $__externref_table_alloc (;21;) (type 1) (result i32))
++  (func $__wbindgen_malloc (;22;) (type 5) (param i32 i32) (result i32))
++  (func $__wbindgen_realloc (;23;) (type 7) (param i32 i32 i32 i32) (result i32))
++  (func $"closure18 externref shim" (;24;) (type 8) (param i32 i32 externref))
++  (func $"closure19 externref shim" (;25;) (type 9) (param i32 i32 externref externref))
++  (table (;0;) 0 funcref)
++  (table (;1;) 128 externref)
+   (memory (;0;) 17)
+   (export "memory" (memory 0))
+   (export "foo" (func $"foo externref shim"))
+-  (export "wasm_bindgen__convert__closures_____invoke__h0000000000000000" (func $"wasm_bindgen__convert__closures_____invoke__h0000000000000000 externref shim"))
+-  (export "wasm_bindgen__closure__destroy__h0000000000000014" (func $wasm_bindgen::closure::destroy::h0000000000000014))
+-  (export "wasm_bindgen__convert__closures_____invoke__h0000000000000001" (func $"wasm_bindgen__convert__closures_____invoke__h0000000000000001 externref shim"))
+   (export "__wbindgen_exn_store" (func $__wbindgen_exn_store))
+   (export "__externref_table_alloc" (func $__externref_table_alloc))
+-  (export "__wbindgen_export_2" (table 0))
++  (export "__wbindgen_export_2" (table 1))
+   (export "__wbindgen_malloc" (func $__wbindgen_malloc))
+   (export "__wbindgen_realloc" (func $__wbindgen_realloc))
++  (export "__wbindgen_export_5" (table 0))
++  (export "closure18_externref_shim" (func $"closure18 externref shim"))
++  (export "closure19_externref_shim" (func $"closure19 externref shim"))
+   (export "__wbindgen_start" (func 18))
+   (@custom "target_features" (after code) "\08+\0bbulk-memory+\0fbulk-memory-opt+\16call-indirect-overlong+\0amultivalue+\0fmutable-globals+\13nontrapping-fptoint+\0freference-types+\08sign-ext")
+ )
+diff --git a/crates/cli/tests/reference/closures.js b/crates/cli/tests/reference/closures.js
+index 0a3882b5c..650182d37 100644
+--- a/crates/cli/tests/reference/closures.js
++++ b/crates/cli/tests/reference/closures.js
+@@ -55,7 +55,11 @@ function isLikeNone(x) {
+ 
+ const CLOSURE_DTORS = (typeof FinalizationRegistry === 'undefined')
+     ? { register: () => {}, unregister: () => {} }
+-    : new FinalizationRegistry(state => state.dtor(state.a, state.b));
++    : new FinalizationRegistry(
++state => {
++    wasm.__wbindgen_export_3.get(state.dtor)(state.a, state.b);
++}
++);
+ 
+ function makeMutClosure(arg0, arg1, dtor, f) {
+     const state = { a: arg0, b: arg1, cnt: 1, dtor };
+@@ -71,7 +75,7 @@ function makeMutClosure(arg0, arg1, dtor, f) {
+             return f(a, state.b, ...args);
+         } finally {
+             if (--state.cnt === 0) {
+-                state.dtor(a, state.b);
++                wasm.__wbindgen_export_3.get(state.dtor)(a, state.b);
+                 CLOSURE_DTORS.unregister(state);
+             } else {
+                 state.a = a;
+@@ -102,27 +106,27 @@ export function delayed_callback() {
+     }
+ }
+ 
+-function __wbg_adapter_18(arg0, arg1) {
++function __wbg_adapter_17(arg0, arg1) {
+     wasm.wasm_bindgen__convert__closures_____invoke__h0000000000000000(arg0, arg1);
+ }
+ 
+-function __wbg_adapter_19(arg0, arg1, arg2, arg3, arg4) {
+-    wasm.wasm_bindgen__convert__closures_____invoke__h0000000000000001(arg0, arg1, arg2, arg3, arg4);
++function __wbg_adapter_18(arg0, arg1, arg2, arg3, arg4) {
++    wasm.closure16_externref_shim(arg0, arg1, arg2, arg3, arg4);
+ }
+ 
+-export function __wbg_call_0000000000000002() { return handleError(function (arg0, arg1) {
++export function __wbg_call_0000000000000001() { return handleError(function (arg0, arg1) {
+     const ret = arg0.call(arg1);
+     return ret;
+ }, arguments) };
+ 
+-export function __wbg_forEach_0000000000000003(arg0, arg1, arg2) {
++export function __wbg_forEach_0000000000000002(arg0, arg1, arg2) {
+     try {
+         var state0 = {a: arg1, b: arg2};
+         var cb0 = (arg0, arg1, arg2) => {
+             const a = state0.a;
+             state0.a = 0;
+             try {
+-                return __wbg_adapter_19(a, state0.b, arg0, arg1, arg2);
++                return __wbg_adapter_18(a, state0.b, arg0, arg1, arg2);
+             } finally {
+                 state0.a = a;
+             }
+@@ -133,7 +137,7 @@ export function __wbg_forEach_0000000000000003(arg0, arg1, arg2) {
+     }
+ };
+ 
+-export function __wbg_instanceof_Window_0000000000000004(arg0) {
++export function __wbg_instanceof_Window_0000000000000003(arg0) {
+     let result;
+     try {
+         result = arg0 instanceof Window;
+@@ -144,41 +148,41 @@ export function __wbg_instanceof_Window_0000000000000004(arg0) {
+     return ret;
+ };
+ 
+-export function __wbg_log_0000000000000005(arg0) {
++export function __wbg_log_0000000000000004(arg0) {
+     console.log(arg0);
+ };
+ 
+-export function __wbg_newnoargs_0000000000000006(arg0, arg1) {
++export function __wbg_newnoargs_0000000000000005(arg0, arg1) {
+     const ret = new Function(getStringFromWasm0(arg0, arg1));
+     return ret;
+ };
+ 
+-export function __wbg_setTimeout_0000000000000007() { return handleError(function (arg0, arg1) {
++export function __wbg_setTimeout_0000000000000006() { return handleError(function (arg0, arg1) {
+     const ret = arg0.setTimeout(arg1);
+     return ret;
+ }, arguments) };
+ 
+-export function __wbg_static_accessor_GLOBAL_0000000000000008() {
++export function __wbg_static_accessor_GLOBAL_0000000000000007() {
+     const ret = typeof global === 'undefined' ? null : global;
+     return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+ };
+ 
+-export function __wbg_static_accessor_GLOBAL_THIS_0000000000000009() {
++export function __wbg_static_accessor_GLOBAL_THIS_0000000000000008() {
+     const ret = typeof globalThis === 'undefined' ? null : globalThis;
+     return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+ };
+ 
+-export function __wbg_static_accessor_SELF_000000000000000a() {
++export function __wbg_static_accessor_SELF_0000000000000009() {
+     const ret = typeof self === 'undefined' ? null : self;
+     return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+ };
+ 
+-export function __wbg_static_accessor_WINDOW_000000000000000b() {
++export function __wbg_static_accessor_WINDOW_000000000000000a() {
+     const ret = typeof window === 'undefined' ? null : window;
+     return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+ };
+ 
+-export function __wbg_wbindgencbdrop_000000000000000c(arg0) {
++export function __wbg_wbindgencbdrop_000000000000000b(arg0) {
+     const obj = arg0.original;
+     if (obj.cnt-- == 1) {
+         obj.a = 0;
+@@ -188,24 +192,24 @@ export function __wbg_wbindgencbdrop_000000000000000c(arg0) {
+     return ret;
+ };
+ 
+-export function __wbg_wbindgenisundefined_000000000000000d(arg0) {
++export function __wbg_wbindgenisundefined_000000000000000c(arg0) {
+     const ret = arg0 === undefined;
+     return ret;
+ };
+ 
+-export function __wbg_wbindgenthrow_000000000000000e(arg0, arg1) {
++export function __wbg_wbindgenthrow_000000000000000d(arg0, arg1) {
+     throw new Error(getStringFromWasm0(arg0, arg1));
+ };
+ 
+-export function __wbindgen_cast_000000000000000f(arg0, arg1) {
++export function __wbindgen_cast_000000000000000e(arg0, arg1) {
+     // Cast intrinsic for `Ref(String) -> Externref`.
+     const ret = getStringFromWasm0(arg0, arg1);
+     return ret;
+ };
+ 
+-export function __wbindgen_cast_0000000000000010(arg0, arg1) {
+-    // Cast intrinsic for `Closure(Closure { dtor_idx: 20, function: Function { arguments: [], shim_idx: 21, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+-    const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h0000000000000011, __wbg_adapter_18);
++export function __wbindgen_cast_000000000000000f(arg0, arg1) {
++    // Cast intrinsic for `Closure(Closure { dtor_idx: 19, function: Function { arguments: [], shim_idx: 20, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
++    const ret = makeMutClosure(arg0, arg1, 21, __wbg_adapter_17);
+     return ret;
+ };
+ 
+diff --git a/crates/cli/tests/reference/closures.wat b/crates/cli/tests/reference/closures.wat
+index 65e0c489f..baaed6697 100644
+--- a/crates/cli/tests/reference/closures.wat
++++ b/crates/cli/tests/reference/closures.wat
+@@ -11,42 +11,42 @@
+   (type (;9;) (func (param externref i32 i32)))
+   (type (;10;) (func (param externref externref) (result i32)))
+   (type (;11;) (func (param externref externref) (result externref)))
+-  (import "./reference_test_bg.js" "__wbg_call_0000000000000002" (func (;0;) (type 11)))
+-  (import "./reference_test_bg.js" "__wbg_forEach_0000000000000003" (func (;1;) (type 9)))
+-  (import "./reference_test_bg.js" "__wbg_instanceof_Window_0000000000000004" (func (;2;) (type 8)))
+-  (import "./reference_test_bg.js" "__wbg_log_0000000000000005" (func (;3;) (type 7)))
+-  (import "./reference_test_bg.js" "__wbg_newnoargs_0000000000000006" (func (;4;) (type 5)))
+-  (import "./reference_test_bg.js" "__wbg_setTimeout_0000000000000007" (func (;5;) (type 10)))
+-  (import "./reference_test_bg.js" "__wbg_static_accessor_GLOBAL_0000000000000008" (func (;6;) (type 1)))
+-  (import "./reference_test_bg.js" "__wbg_static_accessor_GLOBAL_THIS_0000000000000009" (func (;7;) (type 1)))
+-  (import "./reference_test_bg.js" "__wbg_static_accessor_SELF_000000000000000a" (func (;8;) (type 1)))
+-  (import "./reference_test_bg.js" "__wbg_static_accessor_WINDOW_000000000000000b" (func (;9;) (type 1)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgencbdrop_000000000000000c" (func (;10;) (type 8)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgenisundefined_000000000000000d" (func (;11;) (type 8)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgenthrow_000000000000000e" (func (;12;) (type 4)))
+-  (import "./reference_test_bg.js" "__wbindgen_cast_000000000000000f" (func (;13;) (type 5)))
+-  (import "./reference_test_bg.js" "__wbindgen_cast_0000000000000010" (func (;14;) (type 5)))
++  (import "./reference_test_bg.js" "__wbg_call_0000000000000001" (func (;0;) (type 11)))
++  (import "./reference_test_bg.js" "__wbg_forEach_0000000000000002" (func (;1;) (type 9)))
++  (import "./reference_test_bg.js" "__wbg_instanceof_Window_0000000000000003" (func (;2;) (type 8)))
++  (import "./reference_test_bg.js" "__wbg_log_0000000000000004" (func (;3;) (type 7)))
++  (import "./reference_test_bg.js" "__wbg_newnoargs_0000000000000005" (func (;4;) (type 5)))
++  (import "./reference_test_bg.js" "__wbg_setTimeout_0000000000000006" (func (;5;) (type 10)))
++  (import "./reference_test_bg.js" "__wbg_static_accessor_GLOBAL_0000000000000007" (func (;6;) (type 1)))
++  (import "./reference_test_bg.js" "__wbg_static_accessor_GLOBAL_THIS_0000000000000008" (func (;7;) (type 1)))
++  (import "./reference_test_bg.js" "__wbg_static_accessor_SELF_0000000000000009" (func (;8;) (type 1)))
++  (import "./reference_test_bg.js" "__wbg_static_accessor_WINDOW_000000000000000a" (func (;9;) (type 1)))
++  (import "./reference_test_bg.js" "__wbg_wbindgencbdrop_000000000000000b" (func (;10;) (type 8)))
++  (import "./reference_test_bg.js" "__wbg_wbindgenisundefined_000000000000000c" (func (;11;) (type 8)))
++  (import "./reference_test_bg.js" "__wbg_wbindgenthrow_000000000000000d" (func (;12;) (type 4)))
++  (import "./reference_test_bg.js" "__wbindgen_cast_000000000000000e" (func (;13;) (type 5)))
++  (import "./reference_test_bg.js" "__wbindgen_cast_000000000000000f" (func (;14;) (type 5)))
+   (import "./reference_test_bg.js" "__wbindgen_init_externref_table" (func (;15;) (type 0)))
+   (func $"use_stack_callback externref shim" (;16;) (type 7) (param externref))
+   (func $"delayed_callback multivalue shim" (;17;) (type 2) (result i32 i32))
+-  (func $wasm_bindgen::convert::closures::_::invoke::h0000000000000000 (;18;) (type 4) (param i32 i32))
+-  (func $wasm_bindgen::closure::destroy::h0000000000000011 (;19;) (type 4) (param i32 i32))
+-  (func $"wasm_bindgen__convert__closures_____invoke__h0000000000000001 externref shim" (;20;) (type 6) (param i32 i32 externref i32 externref))
+-  (func $__wbindgen_exn_store (;21;) (type 3) (param i32))
+-  (func $__externref_table_alloc (;22;) (type 1) (result i32))
+-  (func $__externref_table_dealloc (;23;) (type 3) (param i32))
+-  (table (;0;) 128 externref)
++  (func $__wbindgen_exn_store (;18;) (type 3) (param i32))
++  (func $__externref_table_alloc (;19;) (type 1) (result i32))
++  (func $__externref_table_dealloc (;20;) (type 3) (param i32))
++  (func $wasm_bindgen::convert::closures::_::invoke::h0000000000000000 (;21;) (type 4) (param i32 i32))
++  (func $"closure16 externref shim" (;22;) (type 6) (param i32 i32 externref i32 externref))
++  (table (;0;) 0 funcref)
++  (table (;1;) 128 externref)
+   (memory (;0;) 17)
+   (export "memory" (memory 0))
+   (export "use_stack_callback" (func $"use_stack_callback externref shim"))
+   (export "delayed_callback" (func $"delayed_callback multivalue shim"))
+-  (export "wasm_bindgen__convert__closures_____invoke__h0000000000000000" (func $wasm_bindgen::convert::closures::_::invoke::h0000000000000000))
+-  (export "wasm_bindgen__closure__destroy__h0000000000000011" (func $wasm_bindgen::closure::destroy::h0000000000000011))
+-  (export "wasm_bindgen__convert__closures_____invoke__h0000000000000001" (func $"wasm_bindgen__convert__closures_____invoke__h0000000000000001 externref shim"))
+   (export "__wbindgen_exn_store" (func $__wbindgen_exn_store))
+   (export "__externref_table_alloc" (func $__externref_table_alloc))
+-  (export "__wbindgen_export_2" (table 0))
++  (export "__wbindgen_export_2" (table 1))
++  (export "__wbindgen_export_3" (table 0))
+   (export "__externref_table_dealloc" (func $__externref_table_dealloc))
++  (export "wasm_bindgen__convert__closures_____invoke__h0000000000000000" (func $wasm_bindgen::convert::closures::_::invoke::h0000000000000000))
++  (export "closure16_externref_shim" (func $"closure16 externref shim"))
+   (export "__wbindgen_start" (func 15))
+   (@custom "target_features" (after code) "\08+\0bbulk-memory+\0fbulk-memory-opt+\16call-indirect-overlong+\0amultivalue+\0fmutable-globals+\13nontrapping-fptoint+\0freference-types+\08sign-ext")
+ )
+diff --git a/crates/cli/tests/reference/function-attrs.js b/crates/cli/tests/reference/function-attrs.js
+index d676200da..8ed60d7a5 100644
+--- a/crates/cli/tests/reference/function-attrs.js
++++ b/crates/cli/tests/reference/function-attrs.js
+@@ -183,7 +183,11 @@ function getDataViewMemory0() {
+ 
+ const CLOSURE_DTORS = (typeof FinalizationRegistry === 'undefined')
+     ? { register: () => {}, unregister: () => {} }
+-    : new FinalizationRegistry(state => state.dtor(state.a, state.b));
++    : new FinalizationRegistry(
++state => {
++    wasm.__wbindgen_export_5.get(state.dtor)(state.a, state.b);
++}
++);
+ 
+ function makeMutClosure(arg0, arg1, dtor, f) {
+     const state = { a: arg0, b: arg1, cnt: 1, dtor };
+@@ -199,7 +203,7 @@ function makeMutClosure(arg0, arg1, dtor, f) {
+             return f(a, state.b, ...args);
+         } finally {
+             if (--state.cnt === 0) {
+-                state.dtor(a, state.b);
++                wasm.__wbindgen_export_5.get(state.dtor)(a, state.b);
+                 CLOSURE_DTORS.unregister(state);
+             } else {
+                 state.a = a;
+@@ -221,12 +225,12 @@ export function fn_with_attr(firstArg, secondArg) {
+     return ret;
+ }
+ 
+-function __wbg_adapter_23(arg0, arg1, arg2) {
+-    wasm.wasm_bindgen__convert__closures_____invoke__h0000000000000000(arg0, arg1, arg2);
++function __wbg_adapter_22(arg0, arg1, arg2) {
++    wasm.closure20_externref_shim(arg0, arg1, arg2);
+ }
+ 
+-function __wbg_adapter_24(arg0, arg1, arg2, arg3) {
+-    wasm.wasm_bindgen__convert__closures_____invoke__h0000000000000001(arg0, arg1, arg2, arg3);
++function __wbg_adapter_23(arg0, arg1, arg2, arg3) {
++    wasm.closure21_externref_shim(arg0, arg1, arg2, arg3);
+ }
+ 
+ const HoldsNumberFinalization = (typeof FinalizationRegistry === 'undefined')
+@@ -287,24 +291,24 @@ export class HoldsNumber {
+ }
+ if (Symbol.dispose) HoldsNumber.prototype[Symbol.dispose] = HoldsNumber.prototype.free;
+ 
+-export function __wbg_call_0000000000000002() { return handleError(function (arg0, arg1) {
++export function __wbg_call_0000000000000000() { return handleError(function (arg0, arg1) {
+     const ret = arg0.call(arg1);
+     return ret;
+ }, arguments) };
+ 
+-export function __wbg_call_0000000000000003() { return handleError(function (arg0, arg1, arg2) {
++export function __wbg_call_0000000000000001() { return handleError(function (arg0, arg1, arg2) {
+     const ret = arg0.call(arg1, arg2);
+     return ret;
+ }, arguments) };
+ 
+-export function __wbg_new_0000000000000004(arg0, arg1) {
++export function __wbg_new_0000000000000002(arg0, arg1) {
+     try {
+         var state0 = {a: arg0, b: arg1};
+         var cb0 = (arg0, arg1) => {
+             const a = state0.a;
+             state0.a = 0;
+             try {
+-                return __wbg_adapter_24(a, state0.b, arg0, arg1);
++                return __wbg_adapter_23(a, state0.b, arg0, arg1);
+             } finally {
+                 state0.a = a;
+             }
+@@ -316,51 +320,51 @@ export function __wbg_new_0000000000000004(arg0, arg1) {
+     }
+ };
+ 
+-export function __wbg_newnoargs_0000000000000005(arg0, arg1) {
++export function __wbg_newnoargs_0000000000000003(arg0, arg1) {
+     const ret = new Function(getStringFromWasm0(arg0, arg1));
+     return ret;
+ };
+ 
+-export function __wbg_queueMicrotask_0000000000000006(arg0) {
++export function __wbg_queueMicrotask_0000000000000004(arg0) {
+     queueMicrotask(arg0);
+ };
+ 
+-export function __wbg_queueMicrotask_0000000000000007(arg0) {
++export function __wbg_queueMicrotask_0000000000000005(arg0) {
+     const ret = arg0.queueMicrotask;
+     return ret;
+ };
+ 
+-export function __wbg_resolve_0000000000000008(arg0) {
++export function __wbg_resolve_0000000000000006(arg0) {
+     const ret = Promise.resolve(arg0);
+     return ret;
+ };
+ 
+-export function __wbg_static_accessor_GLOBAL_0000000000000009() {
++export function __wbg_static_accessor_GLOBAL_0000000000000007() {
+     const ret = typeof global === 'undefined' ? null : global;
+     return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+ };
+ 
+-export function __wbg_static_accessor_GLOBAL_THIS_000000000000000a() {
++export function __wbg_static_accessor_GLOBAL_THIS_0000000000000008() {
+     const ret = typeof globalThis === 'undefined' ? null : globalThis;
+     return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+ };
+ 
+-export function __wbg_static_accessor_SELF_000000000000000b() {
++export function __wbg_static_accessor_SELF_0000000000000009() {
+     const ret = typeof self === 'undefined' ? null : self;
+     return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+ };
+ 
+-export function __wbg_static_accessor_WINDOW_000000000000000c() {
++export function __wbg_static_accessor_WINDOW_000000000000000a() {
+     const ret = typeof window === 'undefined' ? null : window;
+     return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+ };
+ 
+-export function __wbg_then_000000000000000d(arg0, arg1) {
++export function __wbg_then_000000000000000b(arg0, arg1) {
+     const ret = arg0.then(arg1);
+     return ret;
+ };
+ 
+-export function __wbg_wbindgencbdrop_000000000000000e(arg0) {
++export function __wbg_wbindgencbdrop_000000000000000c(arg0) {
+     const obj = arg0.original;
+     if (obj.cnt-- == 1) {
+         obj.a = 0;
+@@ -370,7 +374,7 @@ export function __wbg_wbindgencbdrop_000000000000000e(arg0) {
+     return ret;
+ };
+ 
+-export function __wbg_wbindgendebugstring_000000000000000f(arg0, arg1) {
++export function __wbg_wbindgendebugstring_000000000000000d(arg0, arg1) {
+     const ret = debugString(arg1);
+     const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+     const len1 = WASM_VECTOR_LEN;
+@@ -378,32 +382,32 @@ export function __wbg_wbindgendebugstring_000000000000000f(arg0, arg1) {
+     getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+ };
+ 
+-export function __wbg_wbindgenisfalsy_0000000000000010(arg0) {
++export function __wbg_wbindgenisfalsy_000000000000000e(arg0) {
+     const ret = !arg0;
+     return ret;
+ };
+ 
+-export function __wbg_wbindgenisfunction_0000000000000011(arg0) {
++export function __wbg_wbindgenisfunction_000000000000000f(arg0) {
+     const ret = typeof(arg0) === 'function';
+     return ret;
+ };
+ 
+-export function __wbg_wbindgenisundefined_0000000000000012(arg0) {
++export function __wbg_wbindgenisundefined_0000000000000010(arg0) {
+     const ret = arg0 === undefined;
+     return ret;
+ };
+ 
+-export function __wbg_wbindgenthrow_0000000000000013(arg0, arg1) {
++export function __wbg_wbindgenthrow_0000000000000011(arg0, arg1) {
+     throw new Error(getStringFromWasm0(arg0, arg1));
+ };
+ 
+-export function __wbindgen_cast_0000000000000014(arg0, arg1) {
+-    // Cast intrinsic for `Closure(Closure { dtor_idx: 25, function: Function { arguments: [Externref], shim_idx: 26, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+-    const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h0000000000000015, __wbg_adapter_23);
++export function __wbindgen_cast_0000000000000012(arg0, arg1) {
++    // Cast intrinsic for `Closure(Closure { dtor_idx: 24, function: Function { arguments: [Externref], shim_idx: 25, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
++    const ret = makeMutClosure(arg0, arg1, 26, __wbg_adapter_22);
+     return ret;
+ };
+ 
+-export function __wbindgen_cast_0000000000000016(arg0) {
++export function __wbindgen_cast_0000000000000013(arg0) {
+     // Cast intrinsic for `F64 -> Externref`.
+     const ret = arg0;
+     return ret;
+diff --git a/crates/cli/tests/reference/function-attrs.wat b/crates/cli/tests/reference/function-attrs.wat
+index 807f27dab..c76e2ba4c 100644
+--- a/crates/cli/tests/reference/function-attrs.wat
++++ b/crates/cli/tests/reference/function-attrs.wat
+@@ -19,40 +19,40 @@
+   (type (;17;) (func (param externref) (result externref)))
+   (type (;18;) (func (param externref externref) (result externref)))
+   (type (;19;) (func (param externref externref externref) (result externref)))
+-  (import "./reference_test_bg.js" "__wbg_call_0000000000000002" (func (;0;) (type 18)))
+-  (import "./reference_test_bg.js" "__wbg_call_0000000000000003" (func (;1;) (type 19)))
+-  (import "./reference_test_bg.js" "__wbg_new_0000000000000004" (func (;2;) (type 6)))
+-  (import "./reference_test_bg.js" "__wbg_newnoargs_0000000000000005" (func (;3;) (type 6)))
+-  (import "./reference_test_bg.js" "__wbg_queueMicrotask_0000000000000006" (func (;4;) (type 15)))
+-  (import "./reference_test_bg.js" "__wbg_queueMicrotask_0000000000000007" (func (;5;) (type 17)))
+-  (import "./reference_test_bg.js" "__wbg_resolve_0000000000000008" (func (;6;) (type 17)))
+-  (import "./reference_test_bg.js" "__wbg_static_accessor_GLOBAL_0000000000000009" (func (;7;) (type 1)))
+-  (import "./reference_test_bg.js" "__wbg_static_accessor_GLOBAL_THIS_000000000000000a" (func (;8;) (type 1)))
+-  (import "./reference_test_bg.js" "__wbg_static_accessor_SELF_000000000000000b" (func (;9;) (type 1)))
+-  (import "./reference_test_bg.js" "__wbg_static_accessor_WINDOW_000000000000000c" (func (;10;) (type 1)))
+-  (import "./reference_test_bg.js" "__wbg_then_000000000000000d" (func (;11;) (type 18)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgencbdrop_000000000000000e" (func (;12;) (type 16)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgendebugstring_000000000000000f" (func (;13;) (type 11)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgenisfalsy_0000000000000010" (func (;14;) (type 16)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgenisfunction_0000000000000011" (func (;15;) (type 16)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgenisundefined_0000000000000012" (func (;16;) (type 16)))
+-  (import "./reference_test_bg.js" "__wbg_wbindgenthrow_0000000000000013" (func (;17;) (type 4)))
+-  (import "./reference_test_bg.js" "__wbindgen_cast_0000000000000014" (func (;18;) (type 6)))
+-  (import "./reference_test_bg.js" "__wbindgen_cast_0000000000000016" (func (;19;) (type 14)))
++  (import "./reference_test_bg.js" "__wbg_call_0000000000000000" (func (;0;) (type 18)))
++  (import "./reference_test_bg.js" "__wbg_call_0000000000000001" (func (;1;) (type 19)))
++  (import "./reference_test_bg.js" "__wbg_new_0000000000000002" (func (;2;) (type 6)))
++  (import "./reference_test_bg.js" "__wbg_newnoargs_0000000000000003" (func (;3;) (type 6)))
++  (import "./reference_test_bg.js" "__wbg_queueMicrotask_0000000000000004" (func (;4;) (type 15)))
++  (import "./reference_test_bg.js" "__wbg_queueMicrotask_0000000000000005" (func (;5;) (type 17)))
++  (import "./reference_test_bg.js" "__wbg_resolve_0000000000000006" (func (;6;) (type 17)))
++  (import "./reference_test_bg.js" "__wbg_static_accessor_GLOBAL_0000000000000007" (func (;7;) (type 1)))
++  (import "./reference_test_bg.js" "__wbg_static_accessor_GLOBAL_THIS_0000000000000008" (func (;8;) (type 1)))
++  (import "./reference_test_bg.js" "__wbg_static_accessor_SELF_0000000000000009" (func (;9;) (type 1)))
++  (import "./reference_test_bg.js" "__wbg_static_accessor_WINDOW_000000000000000a" (func (;10;) (type 1)))
++  (import "./reference_test_bg.js" "__wbg_then_000000000000000b" (func (;11;) (type 18)))
++  (import "./reference_test_bg.js" "__wbg_wbindgencbdrop_000000000000000c" (func (;12;) (type 16)))
++  (import "./reference_test_bg.js" "__wbg_wbindgendebugstring_000000000000000d" (func (;13;) (type 11)))
++  (import "./reference_test_bg.js" "__wbg_wbindgenisfalsy_000000000000000e" (func (;14;) (type 16)))
++  (import "./reference_test_bg.js" "__wbg_wbindgenisfunction_000000000000000f" (func (;15;) (type 16)))
++  (import "./reference_test_bg.js" "__wbg_wbindgenisundefined_0000000000000010" (func (;16;) (type 16)))
++  (import "./reference_test_bg.js" "__wbg_wbindgenthrow_0000000000000011" (func (;17;) (type 4)))
++  (import "./reference_test_bg.js" "__wbindgen_cast_0000000000000012" (func (;18;) (type 6)))
++  (import "./reference_test_bg.js" "__wbindgen_cast_0000000000000013" (func (;19;) (type 14)))
+   (import "./reference_test_bg.js" "__wbindgen_init_externref_table" (func (;20;) (type 0)))
+   (func $"fn_with_attr externref shim" (;21;) (type 13) (param i32 externref) (result externref))
+   (func $__wbg_holdsnumber_free (;22;) (type 4) (param i32 i32))
+   (func $"holdsnumber_get_inner externref shim" (;23;) (type 3) (param i32) (result externref))
+   (func $"holdsnumber_static_fn_with_attr externref shim" (;24;) (type 12) (param i32 externref) (result i32))
+   (func $"holdsnumber_method_with_attr externref shim" (;25;) (type 9) (param i32 i32 externref) (result externref))
+-  (func $"wasm_bindgen__convert__closures_____invoke__h0000000000000000 externref shim" (;26;) (type 8) (param i32 i32 externref))
+-  (func $wasm_bindgen::closure::destroy::h0000000000000015 (;27;) (type 4) (param i32 i32))
+-  (func $"wasm_bindgen__convert__closures_____invoke__h0000000000000001 externref shim" (;28;) (type 10) (param i32 i32 externref externref))
+-  (func $__wbindgen_exn_store (;29;) (type 2) (param i32))
+-  (func $__externref_table_alloc (;30;) (type 1) (result i32))
+-  (func $__wbindgen_malloc (;31;) (type 5) (param i32 i32) (result i32))
+-  (func $__wbindgen_realloc (;32;) (type 7) (param i32 i32 i32 i32) (result i32))
+-  (table (;0;) 128 externref)
++  (func $__wbindgen_exn_store (;26;) (type 2) (param i32))
++  (func $__externref_table_alloc (;27;) (type 1) (result i32))
++  (func $__wbindgen_malloc (;28;) (type 5) (param i32 i32) (result i32))
++  (func $__wbindgen_realloc (;29;) (type 7) (param i32 i32 i32 i32) (result i32))
++  (func $"closure20 externref shim" (;30;) (type 8) (param i32 i32 externref))
++  (func $"closure21 externref shim" (;31;) (type 10) (param i32 i32 externref externref))
++  (table (;0;) 0 funcref)
++  (table (;1;) 128 externref)
+   (memory (;0;) 17)
+   (export "memory" (memory 0))
+   (export "fn_with_attr" (func $"fn_with_attr externref shim"))
+@@ -60,14 +60,14 @@
+   (export "holdsnumber_get_inner" (func $"holdsnumber_get_inner externref shim"))
+   (export "holdsnumber_static_fn_with_attr" (func $"holdsnumber_static_fn_with_attr externref shim"))
+   (export "holdsnumber_method_with_attr" (func $"holdsnumber_method_with_attr externref shim"))
+-  (export "wasm_bindgen__convert__closures_____invoke__h0000000000000000" (func $"wasm_bindgen__convert__closures_____invoke__h0000000000000000 externref shim"))
+-  (export "wasm_bindgen__closure__destroy__h0000000000000015" (func $wasm_bindgen::closure::destroy::h0000000000000015))
+-  (export "wasm_bindgen__convert__closures_____invoke__h0000000000000001" (func $"wasm_bindgen__convert__closures_____invoke__h0000000000000001 externref shim"))
+   (export "__wbindgen_exn_store" (func $__wbindgen_exn_store))
+   (export "__externref_table_alloc" (func $__externref_table_alloc))
+-  (export "__wbindgen_export_2" (table 0))
++  (export "__wbindgen_export_2" (table 1))
+   (export "__wbindgen_malloc" (func $__wbindgen_malloc))
+   (export "__wbindgen_realloc" (func $__wbindgen_realloc))
++  (export "__wbindgen_export_5" (table 0))
++  (export "closure20_externref_shim" (func $"closure20 externref shim"))
++  (export "closure21_externref_shim" (func $"closure21 externref shim"))
+   (export "__wbindgen_start" (func 20))
+   (@custom "target_features" (after code) "\08+\0bbulk-memory+\0fbulk-memory-opt+\16call-indirect-overlong+\0amultivalue+\0fmutable-globals+\13nontrapping-fptoint+\0freference-types+\08sign-ext")
+ )
+diff --git a/crates/shared/src/identifier.rs b/crates/shared/src/identifier.rs
+index 8b3179641..51ebcc81f 100644
+--- a/crates/shared/src/identifier.rs
++++ b/crates/shared/src/identifier.rs
+@@ -1,6 +1,4 @@
+-use alloc::string::String;
+-
+-/// Returns whether a character is a valid JS identifier start character.
++/// Returns whether a character has the Unicode `ID_Start` properly.
+ ///
+ /// This is only ever-so-slightly different from `XID_Start` in a few edge
+ /// cases, so we handle those edge cases manually and delegate everything else
+@@ -11,12 +9,11 @@ fn is_id_start(c: char) -> bool {
+         | '\u{FC5F}' | '\u{FC60}' | '\u{FC61}' | '\u{FC62}' | '\u{FC63}' | '\u{FDFA}'
+         | '\u{FDFB}' | '\u{FE70}' | '\u{FE72}' | '\u{FE74}' | '\u{FE76}' | '\u{FE78}'
+         | '\u{FE7A}' | '\u{FE7C}' | '\u{FE7E}' | '\u{FF9E}' | '\u{FF9F}' => true,
+-        '$' | '_' => true,
+         _ => unicode_ident::is_xid_start(c),
+     }
+ }
+ 
+-/// Returns whether a character is a valid JS identifier continue character.
++/// Returns whether a character has the Unicode `ID_Continue` properly.
+ ///
+ /// This is only ever-so-slightly different from `XID_Continue` in a few edge
+ /// cases, so we handle those edge cases manually and delegate everything else
+@@ -27,35 +24,19 @@ fn is_id_continue(c: char) -> bool {
+         | '\u{FC61}' | '\u{FC62}' | '\u{FC63}' | '\u{FDFA}' | '\u{FDFB}' | '\u{FE70}'
+         | '\u{FE72}' | '\u{FE74}' | '\u{FE76}' | '\u{FE78}' | '\u{FE7A}' | '\u{FE7C}'
+         | '\u{FE7E}' => true,
+-        '$' | '\u{200C}' | '\u{200D}' => true,
+         _ => unicode_ident::is_xid_continue(c),
+     }
+ }
+ 
+-fn maybe_valid_chars(name: &str) -> impl Iterator<Item = Option<char>> + '_ {
+-    let mut chars = name.chars();
+-    // Always emit at least one `None` item - that way `is_valid_ident` can fail without
+-    // a separate check for empty strings, and `to_valid_ident` will always produce at least
+-    // one underscore.
+-    core::iter::once(chars.next().filter(|&c| is_id_start(c))).chain(chars.map(|c| {
+-        if is_id_continue(c) {
+-            Some(c)
+-        } else {
+-            None
+-        }
+-    }))
+-}
+-
+ /// Returns whether a string is a valid JavaScript identifier.
+ /// Defined at https://tc39.es/ecma262/#prod-IdentifierName.
+ pub fn is_valid_ident(name: &str) -> bool {
+-    maybe_valid_chars(name).all(|opt| opt.is_some())
+-}
+-
+-/// Converts a string to a valid JavaScript identifier by replacing invalid
+-/// characters with underscores.
+-pub fn to_valid_ident(name: &str) -> String {
+-    maybe_valid_chars(name)
+-        .map(|opt| opt.unwrap_or('_'))
+-        .collect()
++    !name.is_empty()
++        && name.chars().enumerate().all(|(i, char)| {
++            if i == 0 {
++                is_id_start(char) || char == '$' || char == '_'
++            } else {
++                is_id_continue(char) || char == '$' || char == '\u{200C}' || char == '\u{200D}'
++            }
++        })
+ }
+diff --git a/src/closure.rs b/src/closure.rs
+index e9660371b..40354d264 100644
+--- a/src/closure.rs
++++ b/src/closure.rs
+@@ -396,18 +396,6 @@ struct OwnedClosure<T: ?Sized> {
+     inner: ManuallyDrop<Box<T>>,
+ }
+ 
+-unsafe extern "C" fn destroy<T: ?Sized>(a: usize, b: usize) {
+-    // This can be called by the JS glue in erroneous situations
+-    // such as when the closure has already been destroyed. If
+-    // that's the case let's not make things worse by
+-    // segfaulting and/or asserting, so just ignore null
+-    // pointers.
+-    if a == 0 {
+-        return;
+-    }
+-    drop(mem::transmute_copy::<_, Box<T>>(&(a, b)));
+-}
+-
+ impl<T> WasmDescribe for &OwnedClosure<T>
+ where
+     T: WasmClosure + ?Sized,
+@@ -415,7 +403,20 @@ where
+     #[cfg_attr(wasm_bindgen_unstable_test_coverage, coverage(off))]
+     fn describe() {
+         inform(CLOSURE);
++
++        unsafe extern "C" fn destroy<T: ?Sized>(a: usize, b: usize) {
++            // This can be called by the JS glue in erroneous situations
++            // such as when the closure has already been destroyed. If
++            // that's the case let's not make things worse by
++            // segfaulting and/or asserting, so just ignore null
++            // pointers.
++            if a == 0 {
++                return;
++            }
++            drop(mem::transmute_copy::<_, Box<T>>(&(a, b)));
++        }
+         inform(destroy::<T> as usize as u32);
++
+         inform(T::IS_MUT as u32);
+         T::describe();
+     }

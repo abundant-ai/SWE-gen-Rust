@@ -1,0 +1,908 @@
+diff --git a/src/cargo/core/compiler/build_context/target_info.rs b/src/cargo/core/compiler/build_context/target_info.rs
+index f52d06770..170a67658 100644
+--- a/src/cargo/core/compiler/build_context/target_info.rs
++++ b/src/cargo/core/compiler/build_context/target_info.rs
+@@ -200,7 +200,9 @@ impl TargetInfo {
+                 process.inherit_jobserver(client);
+             }
+ 
+-            kind.add_target_arg(&mut process);
++            if let CompileKind::Target(target) = kind {
++                process.arg("--target").arg(target.rustc_target());
++            }
+ 
+             let crate_type_process = process.clone();
+             const KNOWN_CRATE_TYPES: &[CrateType] = &[
+@@ -329,7 +331,11 @@ impl TargetInfo {
+                     .args(&rustflags)
+                     .env_remove("RUSTC_LOG");
+ 
+-                kind.add_target_arg(&mut target_spec_process);
++                if let CompileKind::Target(target) = kind {
++                    target_spec_process
++                        .arg("--target")
++                        .arg(target.rustc_target());
++                }
+ 
+                 #[derive(Deserialize)]
+                 struct Metadata {
+@@ -959,7 +965,7 @@ impl<'gctx> RustcTargetData<'gctx> {
+         let mut target_config = HashMap::new();
+         let mut target_info = HashMap::new();
+         let target_applies_to_host = gctx.target_applies_to_host()?;
+-        let host_target = CompileTarget::new(&rustc.host, gctx.cli_unstable().json_target_spec)?;
++        let host_target = CompileTarget::new(&rustc.host)?;
+         let host_info = TargetInfo::new(gctx, requested_kinds, &rustc, CompileKind::Host)?;
+ 
+         // This config is used for link overrides and choosing a linker.
+diff --git a/src/cargo/core/compiler/compile_kind.rs b/src/cargo/core/compiler/compile_kind.rs
+index f9e53950a..100ae1682 100644
+--- a/src/cargo/core/compiler/compile_kind.rs
++++ b/src/cargo/core/compiler/compile_kind.rs
+@@ -5,8 +5,6 @@ use crate::util::errors::CargoResult;
+ use crate::util::interning::InternedString;
+ use crate::util::{GlobalContext, StableHasher, try_canonicalize};
+ use anyhow::Context as _;
+-use anyhow::bail;
+-use cargo_util::ProcessBuilder;
+ use serde::Serialize;
+ use std::collections::BTreeSet;
+ use std::fs;
+@@ -94,15 +92,9 @@ impl CompileKind {
+ 
+                     if value.as_str() == "host-tuple" {
+                         let host_triple = env!("RUST_HOST_TARGET");
+-                        Ok(CompileKind::Target(CompileTarget::new(
+-                            host_triple,
+-                            gctx.cli_unstable().json_target_spec,
+-                        )?))
++                        Ok(CompileKind::Target(CompileTarget::new(host_triple)?))
+                     } else {
+-                        Ok(CompileKind::Target(CompileTarget::new(
+-                            value.as_str(),
+-                            gctx.cli_unstable().json_target_spec,
+-                        )?))
++                        Ok(CompileKind::Target(CompileTarget::new(value.as_str())?))
+                     }
+                 })
+                 // First collect into a set to deduplicate any `--target` passed
+@@ -140,17 +132,6 @@ impl CompileKind {
+             CompileKind::Target(target) => target.fingerprint_hash(),
+         }
+     }
+-
+-    /// Adds the `--target` flag to the given [`ProcessBuilder`] if this is a
+-    /// non-host build.
+-    pub fn add_target_arg(&self, builder: &mut ProcessBuilder) {
+-        if let CompileKind::Target(target) = self {
+-            builder.arg("--target").arg(target.rustc_target());
+-            if matches!(target, CompileTarget::Json { .. }) {
+-                builder.arg("-Zunstable-options");
+-            }
+-        }
+-    }
+ }
+ 
+ impl serde::ser::Serialize for CompileKind {
+@@ -160,7 +141,7 @@ impl serde::ser::Serialize for CompileKind {
+     {
+         match self {
+             CompileKind::Host => None::<&str>.serialize(s),
+-            CompileKind::Target(t) => Some(t.rustc_target()).serialize(s),
++            CompileKind::Target(t) => Some(t.name).serialize(s),
+         }
+     }
+ }
+@@ -183,39 +164,31 @@ impl serde::ser::Serialize for CompileKind {
+ /// file stem of JSON target files. For built-in rustc targets this is just an
+ /// uninterpreted string basically.
+ #[derive(PartialEq, Eq, Hash, Debug, Clone, Copy, PartialOrd, Ord, Serialize)]
+-pub enum CompileTarget {
+-    Tuple(InternedString),
+-    Json {
+-        short: InternedString,
+-        path: InternedString,
+-    },
++pub struct CompileTarget {
++    name: InternedString,
+ }
+ 
+ impl CompileTarget {
+-    pub fn new(name: &str, unstable_json: bool) -> CargoResult<CompileTarget> {
++    pub fn new(name: &str) -> CargoResult<CompileTarget> {
+         let name = name.trim();
+         if name.is_empty() {
+-            bail!("target was empty");
++            anyhow::bail!("target was empty");
+         }
+         if !name.ends_with(".json") {
+-            return Ok(CompileTarget::Tuple(name.into()));
+-        }
+-
+-        if !unstable_json {
+-            bail!("`.json` target specs require -Zjson-target-spec");
++            return Ok(CompileTarget { name: name.into() });
+         }
+ 
+         // If `name` ends in `.json` then it's likely a custom target
+         // specification. Canonicalize the path to ensure that different builds
+         // with different paths always produce the same result.
+-        let p = try_canonicalize(Path::new(name))
+-            .with_context(|| format!("target path `{name}` is not a valid file"))?;
+-        let path = p
+-            .to_str()
+-            .ok_or_else(|| anyhow::format_err!("target path `{name}` is not valid unicode"))?
+-            .into();
+-        let short = p.file_stem().unwrap().to_str().unwrap().into();
+-        Ok(CompileTarget::Json { short, path })
++        let path = try_canonicalize(Path::new(name))
++            .with_context(|| format!("target path {:?} is not a valid file", name))?;
++
++        let name = path
++            .into_os_string()
++            .into_string()
++            .map_err(|_| anyhow::format_err!("target path is not valid unicode"))?;
++        Ok(CompileTarget { name: name.into() })
+     }
+ 
+     /// Returns the full unqualified name of this target, suitable for passing
+@@ -225,10 +198,7 @@ impl CompileTarget {
+     /// of JSON target files this will be a full canonicalized path name for the
+     /// current filesystem.
+     pub fn rustc_target(&self) -> InternedString {
+-        match self {
+-            CompileTarget::Tuple(name) => *name,
+-            CompileTarget::Json { path, .. } => *path,
+-        }
++        self.name
+     }
+ 
+     /// Returns a "short" version of the target name suitable for usage within
+@@ -238,25 +208,34 @@ impl CompileTarget {
+     /// JSON target files this returns just the file stem (e.g. `foo` out of
+     /// `foo.json`) instead of the full path.
+     pub fn short_name(&self) -> &str {
+-        match self {
+-            CompileTarget::Tuple(name) => name,
+-            CompileTarget::Json { short, .. } => short,
++        // Flexible target specifications often point at json files, so if it
++        // looks like we've got one of those just use the file stem (the file
++        // name without ".json") as a short name for this target. Note that the
++        // `unwrap()` here should never trigger since we have a nonempty name
++        // and it starts as utf-8 so it's always utf-8
++        if self.name.ends_with(".json") {
++            Path::new(&self.name).file_stem().unwrap().to_str().unwrap()
++        } else {
++            &self.name
+         }
+     }
+ 
+     /// See [`CompileKind::fingerprint_hash`].
+     pub fn fingerprint_hash(&self) -> u64 {
+         let mut hasher = StableHasher::new();
+-        match self {
+-            CompileTarget::Tuple(name) => name.hash(&mut hasher),
+-            CompileTarget::Json { path, .. } => {
++        match self
++            .name
++            .ends_with(".json")
++            .then(|| fs::read_to_string(self.name))
++        {
++            Some(Ok(contents)) => {
+                 // This may have some performance concerns, since it is called
+                 // fairly often. If that ever seems worth fixing, consider
+                 // embedding this in `CompileTarget`.
+-                match fs::read_to_string(path) {
+-                    Ok(contents) => contents.hash(&mut hasher),
+-                    Err(_) => path.hash(&mut hasher),
+-                }
++                contents.hash(&mut hasher);
++            }
++            _ => {
++                self.name.hash(&mut hasher);
+             }
+         }
+         Hasher::finish(&hasher)
+diff --git a/src/cargo/core/compiler/mod.rs b/src/cargo/core/compiler/mod.rs
+index 34cab04b1..e8b25e8ad 100644
+--- a/src/cargo/core/compiler/mod.rs
++++ b/src/cargo/core/compiler/mod.rs
+@@ -864,7 +864,9 @@ fn prepare_rustdoc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResu
+     add_path_args(bcx.ws, unit, &mut rustdoc);
+     add_cap_lints(bcx, unit, &mut rustdoc);
+ 
+-    unit.kind.add_target_arg(&mut rustdoc);
++    if let CompileKind::Target(target) = unit.kind {
++        rustdoc.arg("--target").arg(target.rustc_target());
++    }
+     let doc_dir = build_runner.files().out_dir(unit);
+     rustdoc.arg("-o").arg(&doc_dir);
+     rustdoc.args(&features_args(unit));
+@@ -1412,7 +1414,9 @@ fn build_base_args(
+         }
+     }
+ 
+-    unit.kind.add_target_arg(cmd);
++    if let CompileKind::Target(n) = unit.kind {
++        cmd.arg("--target").arg(n.rustc_target());
++    }
+ 
+     opt(
+         cmd,
+diff --git a/src/cargo/core/dependency.rs b/src/cargo/core/dependency.rs
+index db421dd0c..38377e8fa 100644
+--- a/src/cargo/core/dependency.rs
++++ b/src/cargo/core/dependency.rs
+@@ -496,7 +496,6 @@ impl Artifact {
+         artifacts: &[impl AsRef<str>],
+         is_lib: bool,
+         target: Option<&str>,
+-        unstable_json: bool,
+     ) -> CargoResult<Self> {
+         let kinds = ArtifactKind::validate(
+             artifacts
+@@ -507,9 +506,7 @@ impl Artifact {
+         Ok(Artifact {
+             inner: Arc::new(kinds),
+             is_lib,
+-            target: target
+-                .map(|name| ArtifactTarget::parse(name, unstable_json))
+-                .transpose()?,
++            target: target.map(ArtifactTarget::parse).transpose()?,
+         })
+     }
+ 
+@@ -539,10 +536,10 @@ pub enum ArtifactTarget {
+ }
+ 
+ impl ArtifactTarget {
+-    pub fn parse(target: &str, unstable_json: bool) -> CargoResult<ArtifactTarget> {
++    pub fn parse(target: &str) -> CargoResult<ArtifactTarget> {
+         Ok(match target {
+             "target" => ArtifactTarget::BuildDependencyAssumeTarget,
+-            name => ArtifactTarget::Force(CompileTarget::new(name, unstable_json)?),
++            name => ArtifactTarget::Force(CompileTarget::new(name)?),
+         })
+     }
+ 
+diff --git a/src/cargo/core/features.rs b/src/cargo/core/features.rs
+index 0a4835ccd..d2f59ea86 100644
+--- a/src/cargo/core/features.rs
++++ b/src/cargo/core/features.rs
+@@ -870,7 +870,6 @@ unstable_cli_options!(
+     #[serde(deserialize_with = "deserialize_gitoxide_features")]
+     gitoxide: Option<GitoxideFeatures> = ("Use gitoxide for the given git interactions, or all of them if no argument is given"),
+     host_config: bool = ("Enable the `[host]` section in the .cargo/config.toml file"),
+-    json_target_spec: bool = ("Enable `.json` target spec files"),
+     lockfile_path: bool = ("Enable the `resolver.lockfile-path` config option"),
+     minimal_versions: bool = ("Resolve minimal dependency versions instead of maximum"),
+     msrv_policy: bool = ("Enable rust-version aware policy within cargo"),
+@@ -1410,7 +1409,6 @@ impl CliUnstable {
+                 )?
+             }
+             "host-config" => self.host_config = parse_empty(k, v)?,
+-            "json-target-spec" => self.json_target_spec = parse_empty(k, v)?,
+             "lockfile-path" => self.lockfile_path = parse_empty(k, v)?,
+             "next-lockfile-bump" => self.next_lockfile_bump = parse_empty(k, v)?,
+             "minimal-versions" => self.minimal_versions = parse_empty(k, v)?,
+diff --git a/src/cargo/core/resolver/features.rs b/src/cargo/core/resolver/features.rs
+index 6d45edc66..2d554b6e9 100644
+--- a/src/cargo/core/resolver/features.rs
++++ b/src/cargo/core/resolver/features.rs
+@@ -811,7 +811,6 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
+             pkg_id: PackageId,
+             dep: &Dependency,
+             lib_fk: FeaturesFor,
+-            unstable_json_spec: bool,
+         ) -> CargoResult<Vec<FeaturesFor>> {
+             let Some(artifact) = dep.artifact() else {
+                 return Ok(vec![lib_fk]);
+@@ -845,9 +844,7 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
+                     ArtifactTarget::BuildDependencyAssumeTarget => {
+                         for kind in this.requested_targets {
+                             let target = match kind {
+-                                CompileKind::Host => {
+-                                    CompileTarget::new(&host_triple, unstable_json_spec).unwrap()
+-                                }
++                                CompileKind::Host => CompileTarget::new(&host_triple).unwrap(),
+                                 CompileKind::Target(target) => *target,
+                             };
+                             activate_target(target)?;
+@@ -862,7 +859,6 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
+             Ok(result)
+         }
+ 
+-        let unstable_json_spec = self.ws.gctx().cli_unstable().json_target_spec;
+         self.resolve
+             .deps(pkg_id)
+             .map(|(dep_id, deps)| {
+@@ -919,8 +915,7 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
+                             fk
+                         };
+ 
+-                        let dep_fks =
+-                            artifact_features_for(self, pkg_id, dep, lib_fk, unstable_json_spec)?;
++                        let dep_fks = artifact_features_for(self, pkg_id, dep, lib_fk)?;
+                         Ok(dep_fks.into_iter().map(move |dep_fk| (dep, dep_fk)))
+                     })
+                     .flatten_ok()
+diff --git a/src/cargo/ops/cargo_compile/mod.rs b/src/cargo/ops/cargo_compile/mod.rs
+index f0540891a..bd5c80bb7 100644
+--- a/src/cargo/ops/cargo_compile/mod.rs
++++ b/src/cargo/ops/cargo_compile/mod.rs
+@@ -221,7 +221,9 @@ pub fn print<'a>(
+         if let Some(args) = target_rustc_args {
+             process.args(args);
+         }
+-        kind.add_target_arg(&mut process);
++        if let CompileKind::Target(t) = kind {
++            process.arg("--target").arg(t.rustc_target());
++        }
+         process.arg("--print").arg(print_opt_value);
+         process.exec()?;
+     }
+@@ -398,10 +400,7 @@ pub fn create_bcx<'a, 'gctx>(
+     // If `--target` has not been specified, then the unit graph is built
+     // assuming `--target $HOST` was specified. See
+     // `rebuild_unit_graph_shared` for more on why this is done.
+-    let explicit_host_kind = CompileKind::Target(CompileTarget::new(
+-        &target_data.rustc.host,
+-        gctx.cli_unstable().json_target_spec,
+-    )?);
++    let explicit_host_kind = CompileKind::Target(CompileTarget::new(&target_data.rustc.host)?);
+     let explicit_host_kinds: Vec<_> = build_config
+         .requested_kinds
+         .iter()
+diff --git a/src/cargo/ops/cargo_test.rs b/src/cargo/ops/cargo_test.rs
+index 532ca50a5..9ea6231ef 100644
+--- a/src/cargo/ops/cargo_test.rs
++++ b/src/cargo/ops/cargo_test.rs
+@@ -1,4 +1,4 @@
+-use crate::core::compiler::{Compilation, Doctest, Unit, UnitHash, UnitOutput};
++use crate::core::compiler::{Compilation, CompileKind, Doctest, Unit, UnitHash, UnitOutput};
+ use crate::core::profiles::PanicStrategy;
+ use crate::core::shell::ColorChoice;
+ use crate::core::shell::Verbosity;
+@@ -211,7 +211,10 @@ fn run_doc_tests(
+         add_path_args(ws, unit, &mut p);
+         p.arg("--test-run-directory").arg(unit.pkg.root());
+ 
+-        unit.kind.add_target_arg(&mut p);
++        if let CompileKind::Target(target) = unit.kind {
++            // use `rustc_target()` to properly handle JSON target paths
++            p.arg("--target").arg(target.rustc_target());
++        }
+ 
+         if let Some((runtool, runtool_args)) = compilation.target_runner(unit.kind) {
+             p.arg("--test-runtool").arg(runtool);
+diff --git a/src/cargo/sources/registry/index/mod.rs b/src/cargo/sources/registry/index/mod.rs
+index e8f7e4fae..db77bcab4 100644
+--- a/src/cargo/sources/registry/index/mod.rs
++++ b/src/cargo/sources/registry/index/mod.rs
+@@ -20,8 +20,8 @@
+ //!
+ //! To learn the rationale behind this multi-layer index metadata loading,
+ //! see [the documentation of the on-disk index cache](cache).
++use crate::core::Dependency;
+ use crate::core::dependency::{Artifact, DepKind};
+-use crate::core::{CliUnstable, Dependency};
+ use crate::core::{PackageId, SourceId, Summary};
+ use crate::sources::registry::{LoadResponse, RegistryData};
+ use crate::util::IntoUrl;
+@@ -195,18 +195,14 @@ impl IndexSummary {
+     }
+ }
+ 
+-fn index_package_to_summary(
+-    pkg: &IndexPackage<'_>,
+-    source_id: SourceId,
+-    cli_unstable: &CliUnstable,
+-) -> CargoResult<Summary> {
++fn index_package_to_summary(pkg: &IndexPackage<'_>, source_id: SourceId) -> CargoResult<Summary> {
+     // ****CAUTION**** Please be extremely careful with returning errors, see
+     // `IndexSummary::parse` for details
+     let pkgid = PackageId::new(pkg.name.as_ref().into(), pkg.vers.clone(), source_id);
+     let deps = pkg
+         .deps
+         .iter()
+-        .map(|dep| registry_dependency_into_dep(dep.clone(), source_id, cli_unstable))
++        .map(|dep| registry_dependency_into_dep(dep.clone(), source_id))
+         .collect::<CargoResult<Vec<_>>>()?;
+     let mut features = pkg.features.clone();
+     if let Some(features2) = pkg.features2.clone() {
+@@ -293,7 +289,7 @@ impl<'gctx> RegistryIndex<'gctx> {
+     where
+         'a: 'b,
+     {
+-        let cli_unstable = self.gctx.cli_unstable();
++        let bindeps = self.gctx.cli_unstable().bindeps;
+ 
+         let source_id = self.source_id;
+ 
+@@ -312,7 +308,7 @@ impl<'gctx> RegistryIndex<'gctx> {
+             .iter_mut()
+             .filter_map(move |(k, v)| if req.matches(k) { Some(v) } else { None })
+             .filter_map(move |maybe| {
+-                match maybe.parse(raw_data, source_id, cli_unstable) {
++                match maybe.parse(raw_data, source_id, bindeps) {
+                     Ok(sum) => Some(sum),
+                     Err(e) => {
+                         info!("failed to parse `{}` registry package: {}", name, e);
+@@ -358,7 +354,7 @@ impl<'gctx> RegistryIndex<'gctx> {
+             &name,
+             self.source_id,
+             load,
+-            self.gctx.cli_unstable(),
++            self.gctx.cli_unstable().bindeps,
+             &self.cache_manager,
+         ))?
+         .unwrap_or_default();
+@@ -478,7 +474,7 @@ impl Summaries {
+         name: &str,
+         source_id: SourceId,
+         load: &mut dyn RegistryData,
+-        cli_unstable: &CliUnstable,
++        bindeps: bool,
+         cache_manager: &CacheManager<'_>,
+     ) -> Poll<CargoResult<Option<Summaries>>> {
+         // This is the file we're loading from cache or the index data.
+@@ -528,7 +524,7 @@ impl Summaries {
+                     // allow future cargo implementations to break the
+                     // interpretation of each line here and older cargo will simply
+                     // ignore the new lines.
+-                    let summary = match IndexSummary::parse(line, source_id, cli_unstable) {
++                    let summary = match IndexSummary::parse(line, source_id, bindeps) {
+                         Ok(summary) => summary,
+                         Err(e) => {
+                             // This should only happen when there is an index
+@@ -615,13 +611,13 @@ impl MaybeIndexSummary {
+         &mut self,
+         raw_data: &[u8],
+         source_id: SourceId,
+-        cli_unstable: &CliUnstable,
++        bindeps: bool,
+     ) -> CargoResult<&IndexSummary> {
+         let (start, end) = match self {
+             MaybeIndexSummary::Unparsed { start, end } => (*start, *end),
+             MaybeIndexSummary::Parsed(summary) => return Ok(summary),
+         };
+-        let summary = IndexSummary::parse(&raw_data[start..end], source_id, cli_unstable)?;
++        let summary = IndexSummary::parse(&raw_data[start..end], source_id, bindeps)?;
+         *self = MaybeIndexSummary::Parsed(summary);
+         match self {
+             MaybeIndexSummary::Unparsed { .. } => unreachable!(),
+@@ -642,11 +638,7 @@ impl IndexSummary {
+     ///
+     /// The `line` provided is expected to be valid JSON. It is supposed to be
+     /// a [`IndexPackage`].
+-    fn parse(
+-        line: &[u8],
+-        source_id: SourceId,
+-        cli_unstable: &CliUnstable,
+-    ) -> CargoResult<IndexSummary> {
++    fn parse(line: &[u8], source_id: SourceId, bindeps: bool) -> CargoResult<IndexSummary> {
+         // ****CAUTION**** Please be extremely careful with returning errors
+         // from this function. Entries that error are not included in the
+         // index cache, and can cause cargo to get confused when switching
+@@ -655,7 +647,7 @@ impl IndexSummary {
+         // values carefully when making changes here.
+         let index_summary = (|| {
+             let index = serde_json::from_slice::<IndexPackage<'_>>(line)?;
+-            let summary = index_package_to_summary(&index, source_id, cli_unstable)?;
++            let summary = index_package_to_summary(&index, source_id)?;
+             Ok((index, summary))
+         })();
+         let (index, summary, valid) = match index_summary {
+@@ -687,14 +679,14 @@ impl IndexSummary {
+                     links: Default::default(),
+                     pubtime: Default::default(),
+                 };
+-                let summary = index_package_to_summary(&index, source_id, cli_unstable)?;
++                let summary = index_package_to_summary(&index, source_id)?;
+                 (index, summary, false)
+             }
+         };
+         let v = index.v.unwrap_or(1);
+         tracing::trace!("json parsed registry {}/{}", index.name, index.vers);
+ 
+-        let v_max = if cli_unstable.bindeps {
++        let v_max = if bindeps {
+             INDEX_V_MAX + 1
+         } else {
+             INDEX_V_MAX
+@@ -716,7 +708,6 @@ impl IndexSummary {
+ fn registry_dependency_into_dep(
+     dep: RegistryDependency<'_>,
+     default: SourceId,
+-    cli_unstable: &CliUnstable,
+ ) -> CargoResult<Dependency> {
+     let RegistryDependency {
+         name,
+@@ -773,12 +764,7 @@ fn registry_dependency_into_dep(
+     }
+ 
+     if let Some(artifacts) = artifact {
+-        let artifact = Artifact::parse(
+-            &artifacts,
+-            lib,
+-            bindep_target.as_deref(),
+-            cli_unstable.json_target_spec,
+-        )?;
++        let artifact = Artifact::parse(&artifacts, lib, bindep_target.as_deref())?;
+         dep.set_artifact(artifact);
+     }
+ 
+diff --git a/src/cargo/util/toml/mod.rs b/src/cargo/util/toml/mod.rs
+index c31faf1ae..a20b43129 100644
+--- a/src/cargo/util/toml/mod.rs
++++ b/src/cargo/util/toml/mod.rs
+@@ -1792,13 +1792,13 @@ note: only a feature named `default` will be enabled by default"
+     let default_kind = normalized_package
+         .default_target
+         .as_ref()
+-        .map(|t| CompileTarget::new(&*t, gctx.cli_unstable().json_target_spec))
++        .map(|t| CompileTarget::new(&*t))
+         .transpose()?
+         .map(CompileKind::Target);
+     let forced_kind = normalized_package
+         .forced_target
+         .as_ref()
+-        .map(|t| CompileTarget::new(&*t, gctx.cli_unstable().json_target_spec))
++        .map(|t| CompileTarget::new(&*t))
+         .transpose()?
+         .map(CompileKind::Target);
+     let include = normalized_package
+@@ -2311,12 +2311,7 @@ fn dep_to_dependency<P: ResolveToPath + Clone>(
+         orig.target.as_deref(),
+     ) {
+         if manifest_ctx.gctx.cli_unstable().bindeps {
+-            let artifact = Artifact::parse(
+-                &artifact.0,
+-                is_lib,
+-                target,
+-                manifest_ctx.gctx.cli_unstable().json_target_spec,
+-            )?;
++            let artifact = Artifact::parse(&artifact.0, is_lib, target)?;
+             if dep.kind() != DepKind::Build
+                 && artifact.target() == Some(ArtifactTarget::BuildDependencyAssumeTarget)
+             {
+diff --git a/src/doc/src/reference/unstable.md b/src/doc/src/reference/unstable.md
+index 6ca6f1080..76e595281 100644
+--- a/src/doc/src/reference/unstable.md
++++ b/src/doc/src/reference/unstable.md
+@@ -100,7 +100,6 @@ Each new feature described below should explain how to use it.
+     * [panic-immediate-abort](#panic-immediate-abort) --- Passes `-Cpanic=immediate-abort` to the compiler.
+     * [compile-time-deps](#compile-time-deps) --- Perma-unstable feature for rust-analyzer
+     * [fine-grain-locking](#fine-grain-locking) --- Use fine grain locking instead of locking the entire build cache
+-    * [target-spec-json](#target-spec-json) --- Allows the use of `.json` custom target specs.
+ * rustdoc
+     * [rustdoc-map](#rustdoc-map) --- Provides mappings for documentation to link to external sites like [docs.rs](https://docs.rs/).
+     * [scrape-examples](#scrape-examples) --- Shows examples within documentation.
+@@ -2029,7 +2028,7 @@ cargo +nightly build --compile-time-deps -Z unstable-options
+ cargo +nightly check --compile-time-deps --all-targets -Z unstable-options
+ ```
+ 
+-## `rustc-unicode`
++# `rustc-unicode`
+ * Tracking Issue: [rust#148607](https://github.com/rust-lang/rust/issues/148607)
+ 
+ Enable `rustc`'s unicode error format in Cargo's error messages
+@@ -2046,17 +2045,6 @@ so that `cargo doc` can merge cross-crate information
+ from separate output directories,
+ and run `rustdoc` in parallel.
+ 
+-## target-spec-json
+-* Tracking Issue: [rust-lang/rust#151528](https://github.com/rust-lang/rust/issues/151528)
+-
+-The `-Z target-spec-json` CLI flag enables the ability to use [custom target spec JSON files](https://doc.rust-lang.org/nightly/rustc/targets/custom.html) as a target.
+-
+-```console
+-cargo +nightly build --target my-target.json -Z target-spec-json
+-```
+-
+-This usually must be combined with [build-std](#build-std).
+-
+ # Stabilized and removed features
+ 
+ ## Compile progress
+diff --git a/tests/build-std/main.rs b/tests/build-std/main.rs
+index 96968c1b3..314912f20 100644
+--- a/tests/build-std/main.rs
++++ b/tests/build-std/main.rs
+@@ -312,8 +312,7 @@ fn cross_custom() {
+         .file("custom-target.json", target_spec_json())
+         .build();
+ 
+-    p.cargo("build --target custom-target.json -v -Zjson-target-spec")
+-        .masquerade_as_nightly_cargo(&["json_target_spec"])
++    p.cargo("build --target custom-target.json -v")
+         .build_std_arg("core")
+         .run();
+ }
+@@ -353,8 +352,7 @@ fn custom_test_framework() {
+     paths.insert(0, sysroot_bin);
+     let new_path = env::join_paths(paths).unwrap();
+ 
+-    p.cargo("test --target target.json --no-run -v -Zjson-target-spec")
+-        .masquerade_as_nightly_cargo(&["json_target_spec"])
++    p.cargo("test --target target.json --no-run -v")
+         .env("PATH", new_path)
+         .build_std_arg("core")
+         .run();
+diff --git a/tests/testsuite/cargo/z_help/stdout.term.svg b/tests/testsuite/cargo/z_help/stdout.term.svg
+index e4f2d6ba0..694cf8d00 100644
+--- a/tests/testsuite/cargo/z_help/stdout.term.svg
++++ b/tests/testsuite/cargo/z_help/stdout.term.svg
+@@ -1,4 +1,4 @@
+-<svg width="1255px" height="1010px" xmlns="http://www.w3.org/2000/svg">
++<svg width="1255px" height="992px" xmlns="http://www.w3.org/2000/svg">
+   <style>
+     .fg { fill: #AAAAAA }
+     .bg { fill: #000000 }
+@@ -64,67 +64,65 @@
+ </tspan>
+     <tspan x="10px" y="442px"><tspan>    -Z host-config                 Enable the `[host]` section in the .cargo/config.toml file</tspan>
+ </tspan>
+-    <tspan x="10px" y="460px"><tspan>    -Z json-target-spec            Enable `.json` target spec files</tspan>
++    <tspan x="10px" y="460px"><tspan>    -Z lockfile-path               Enable the `resolver.lockfile-path` config option</tspan>
+ </tspan>
+-    <tspan x="10px" y="478px"><tspan>    -Z lockfile-path               Enable the `resolver.lockfile-path` config option</tspan>
++    <tspan x="10px" y="478px"><tspan>    -Z minimal-versions            Resolve minimal dependency versions instead of maximum</tspan>
+ </tspan>
+-    <tspan x="10px" y="496px"><tspan>    -Z minimal-versions            Resolve minimal dependency versions instead of maximum</tspan>
++    <tspan x="10px" y="496px"><tspan>    -Z msrv-policy                 Enable rust-version aware policy within cargo</tspan>
+ </tspan>
+-    <tspan x="10px" y="514px"><tspan>    -Z msrv-policy                 Enable rust-version aware policy within cargo</tspan>
++    <tspan x="10px" y="514px"><tspan>    -Z mtime-on-use                Configure Cargo to update the mtime of used files</tspan>
+ </tspan>
+-    <tspan x="10px" y="532px"><tspan>    -Z mtime-on-use                Configure Cargo to update the mtime of used files</tspan>
++    <tspan x="10px" y="532px"><tspan>    -Z no-embed-metadata           Avoid embedding metadata in library artifacts</tspan>
+ </tspan>
+-    <tspan x="10px" y="550px"><tspan>    -Z no-embed-metadata           Avoid embedding metadata in library artifacts</tspan>
++    <tspan x="10px" y="550px"><tspan>    -Z no-index-update             Do not update the registry index even if the cache is outdated</tspan>
+ </tspan>
+-    <tspan x="10px" y="568px"><tspan>    -Z no-index-update             Do not update the registry index even if the cache is outdated</tspan>
++    <tspan x="10px" y="568px"><tspan>    -Z panic-abort-tests           Enable support to run tests with -Cpanic=abort</tspan>
+ </tspan>
+-    <tspan x="10px" y="586px"><tspan>    -Z panic-abort-tests           Enable support to run tests with -Cpanic=abort</tspan>
++    <tspan x="10px" y="586px"><tspan>    -Z panic-immediate-abort       Enable setting `panic = "immediate-abort"` in profiles</tspan>
+ </tspan>
+-    <tspan x="10px" y="604px"><tspan>    -Z panic-immediate-abort       Enable setting `panic = "immediate-abort"` in profiles</tspan>
++    <tspan x="10px" y="604px"><tspan>    -Z profile-hint-mostly-unused  Enable the `hint-mostly-unused` setting in profiles to mark a crate as mostly unused.</tspan>
+ </tspan>
+-    <tspan x="10px" y="622px"><tspan>    -Z profile-hint-mostly-unused  Enable the `hint-mostly-unused` setting in profiles to mark a crate as mostly unused.</tspan>
++    <tspan x="10px" y="622px"><tspan>    -Z profile-rustflags           Enable the `rustflags` option in profiles in .cargo/config.toml file</tspan>
+ </tspan>
+-    <tspan x="10px" y="640px"><tspan>    -Z profile-rustflags           Enable the `rustflags` option in profiles in .cargo/config.toml file</tspan>
++    <tspan x="10px" y="640px"><tspan>    -Z public-dependency           Respect a dependency's `public` field in Cargo.toml to control public/private dependencies</tspan>
+ </tspan>
+-    <tspan x="10px" y="658px"><tspan>    -Z public-dependency           Respect a dependency's `public` field in Cargo.toml to control public/private dependencies</tspan>
++    <tspan x="10px" y="658px"><tspan>    -Z publish-timeout             Enable the `publish.timeout` key in .cargo/config.toml file</tspan>
+ </tspan>
+-    <tspan x="10px" y="676px"><tspan>    -Z publish-timeout             Enable the `publish.timeout` key in .cargo/config.toml file</tspan>
++    <tspan x="10px" y="676px"><tspan>    -Z root-dir                    Set the root directory relative to which paths are printed (defaults to workspace root)</tspan>
+ </tspan>
+-    <tspan x="10px" y="694px"><tspan>    -Z root-dir                    Set the root directory relative to which paths are printed (defaults to workspace root)</tspan>
++    <tspan x="10px" y="694px"><tspan>    -Z rustc-unicode               Enable `rustc`'s unicode error format in Cargo's error messages</tspan>
+ </tspan>
+-    <tspan x="10px" y="712px"><tspan>    -Z rustc-unicode               Enable `rustc`'s unicode error format in Cargo's error messages</tspan>
++    <tspan x="10px" y="712px"><tspan>    -Z rustdoc-depinfo             Use dep-info files in rustdoc rebuild detection</tspan>
+ </tspan>
+-    <tspan x="10px" y="730px"><tspan>    -Z rustdoc-depinfo             Use dep-info files in rustdoc rebuild detection</tspan>
++    <tspan x="10px" y="730px"><tspan>    -Z rustdoc-map                 Allow passing external documentation mappings to rustdoc</tspan>
+ </tspan>
+-    <tspan x="10px" y="748px"><tspan>    -Z rustdoc-map                 Allow passing external documentation mappings to rustdoc</tspan>
++    <tspan x="10px" y="748px"><tspan>    -Z rustdoc-mergeable-info      Use rustdoc mergeable cross-crate-info files</tspan>
+ </tspan>
+-    <tspan x="10px" y="766px"><tspan>    -Z rustdoc-mergeable-info      Use rustdoc mergeable cross-crate-info files</tspan>
++    <tspan x="10px" y="766px"><tspan>    -Z rustdoc-scrape-examples     Allows Rustdoc to scrape code examples from reverse-dependencies</tspan>
+ </tspan>
+-    <tspan x="10px" y="784px"><tspan>    -Z rustdoc-scrape-examples     Allows Rustdoc to scrape code examples from reverse-dependencies</tspan>
++    <tspan x="10px" y="784px"><tspan>    -Z sbom                        Enable the `sbom` option in build config in .cargo/config.toml file</tspan>
+ </tspan>
+-    <tspan x="10px" y="802px"><tspan>    -Z sbom                        Enable the `sbom` option in build config in .cargo/config.toml file</tspan>
++    <tspan x="10px" y="802px"><tspan>    -Z script                      Enable support for single-file, `.rs` packages</tspan>
+ </tspan>
+-    <tspan x="10px" y="820px"><tspan>    -Z script                      Enable support for single-file, `.rs` packages</tspan>
++    <tspan x="10px" y="820px"><tspan>    -Z section-timings             Enable support for extended compilation sections in --timings output</tspan>
+ </tspan>
+-    <tspan x="10px" y="838px"><tspan>    -Z section-timings             Enable support for extended compilation sections in --timings output</tspan>
++    <tspan x="10px" y="838px"><tspan>    -Z target-applies-to-host      Enable the `target-applies-to-host` key in the .cargo/config.toml file</tspan>
+ </tspan>
+-    <tspan x="10px" y="856px"><tspan>    -Z target-applies-to-host      Enable the `target-applies-to-host` key in the .cargo/config.toml file</tspan>
++    <tspan x="10px" y="856px"><tspan>    -Z trim-paths                  Enable the `trim-paths` option in profiles</tspan>
+ </tspan>
+-    <tspan x="10px" y="874px"><tspan>    -Z trim-paths                  Enable the `trim-paths` option in profiles</tspan>
++    <tspan x="10px" y="874px"><tspan>    -Z unstable-options            Allow the usage of unstable options</tspan>
+ </tspan>
+-    <tspan x="10px" y="892px"><tspan>    -Z unstable-options            Allow the usage of unstable options</tspan>
++    <tspan x="10px" y="892px"><tspan>    -Z warnings                    Allow use of the build.warnings config key</tspan>
+ </tspan>
+-    <tspan x="10px" y="910px"><tspan>    -Z warnings                    Allow use of the build.warnings config key</tspan>
++    <tspan x="10px" y="910px">
+ </tspan>
+-    <tspan x="10px" y="928px">
++    <tspan x="10px" y="928px"><tspan>Run with `cargo -Z [FLAG] [COMMAND]`</tspan>
+ </tspan>
+-    <tspan x="10px" y="946px"><tspan>Run with `cargo -Z [FLAG] [COMMAND]`</tspan>
++    <tspan x="10px" y="946px">
+ </tspan>
+-    <tspan x="10px" y="964px">
++    <tspan x="10px" y="964px"><tspan>See https://doc.rust-lang.org/nightly/cargo/reference/unstable.html for more information about these flags.</tspan>
+ </tspan>
+-    <tspan x="10px" y="982px"><tspan>See https://doc.rust-lang.org/nightly/cargo/reference/unstable.html for more information about these flags.</tspan>
+-</tspan>
+-    <tspan x="10px" y="1000px">
++    <tspan x="10px" y="982px">
+ </tspan>
+   </text>
+ 
+diff --git a/tests/testsuite/custom_target.rs b/tests/testsuite/custom_target.rs
+index 21628e297..83e1cf069 100644
+--- a/tests/testsuite/custom_target.rs
++++ b/tests/testsuite/custom_target.rs
+@@ -34,57 +34,6 @@ pub trait Copy {
+ }
+ "#;
+ 
+-#[cargo_test]
+-fn custom_target_gated() {
+-    // Checks that .json targets require the -Z option.
+-    let p = project()
+-        .file("src/lib.rs", "")
+-        .file("bar/Cargo.toml", &basic_manifest("bar", "0.0.0"))
+-        .file("bar/src/main.rs", "fn main() {}")
+-        .build();
+-    p.cargo("build --target custom-target.json")
+-        .with_status(101)
+-        .with_stderr_data(str![[r#"
+-[ERROR] `.json` target specs require -Zjson-target-spec
+-
+-"#]])
+-        .run();
+-
+-    // Same with config settings.
+-    p.cargo("build")
+-        .env("CARGO_BUILD_TARGET", "custom-target.json")
+-        .with_status(101)
+-        .with_stderr_data(str![[r#"
+-[ERROR] `.json` target specs require -Zjson-target-spec
+-
+-"#]])
+-        .run();
+-
+-    // And artifact dependencies.
+-    p.change_file(
+-        "Cargo.toml",
+-        r#"
+-            [package]
+-            name = "foo"
+-            edition = "2015"
+-
+-            [dependencies]
+-            bar = { path = "bar/", artifact = "bin", target = "custom-target.json" }
+-        "#,
+-    );
+-    p.cargo("build -Z bindeps")
+-        .masquerade_as_nightly_cargo(&["bindeps"])
+-        .with_status(101)
+-        .with_stderr_data(str![[r#"
+-[ERROR] failed to parse manifest at `[ROOT]/foo/Cargo.toml`
+-
+-Caused by:
+-  `.json` target specs require -Zjson-target-spec
+-
+-"#]])
+-        .run();
+-}
+-
+ #[cargo_test(nightly, reason = "requires features no_core, lang_items")]
+ fn custom_target_minimal() {
+     let p = project()
+@@ -102,16 +51,13 @@ fn custom_target_minimal() {
+         .file("custom-target.json", target_spec_json())
+         .build();
+ 
+-    p.cargo("build --lib --target custom-target.json -v -Zjson-target-spec")
+-        .masquerade_as_nightly_cargo(&["json_target_spec"])
+-        .run();
+-    p.cargo("build --lib --target src/../custom-target.json -v -Zjson-target-spec")
+-        .masquerade_as_nightly_cargo(&["json_target_spec"])
++    p.cargo("build --lib --target custom-target.json -v").run();
++    p.cargo("build --lib --target src/../custom-target.json -v")
+         .run();
+ 
+     // Ensure that the correct style of flag is passed to --target with doc tests.
+-    p.cargo("test --doc --target src/../custom-target.json -v -Zjson-target-spec")
+-        .masquerade_as_nightly_cargo(&["no_core", "lang_items", "json-target-spec"])
++    p.cargo("test --doc --target src/../custom-target.json -v")
++        .masquerade_as_nightly_cargo(&["no_core", "lang_items"])
+         .with_stderr_data(str![[r#"
+ [FRESH] foo v0.0.1 ([ROOT]/foo)
+ [FINISHED] `test` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+@@ -173,9 +119,7 @@ fn custom_target_dependency() {
+         .file("custom-target.json", target_spec_json())
+         .build();
+ 
+-    p.cargo("build --lib --target custom-target.json -v -Zjson-target-spec")
+-        .masquerade_as_nightly_cargo(&["json_target_spec"])
+-        .run();
++    p.cargo("build --lib --target custom-target.json -v").run();
+ }
+ 
+ #[cargo_test(nightly, reason = "requires features no_core, lang_items")]
+@@ -194,9 +138,7 @@ fn custom_bin_target() {
+         .file("custom-bin-target.json", target_spec_json())
+         .build();
+ 
+-    p.cargo("build --target custom-bin-target.json -v -Zjson-target-spec")
+-        .masquerade_as_nightly_cargo(&["json_target_spec"])
+-        .run();
++    p.cargo("build --target custom-bin-target.json -v").run();
+ }
+ 
+ #[cargo_test(nightly, reason = "requires features no_core, lang_items")]
+@@ -217,11 +159,8 @@ fn changing_spec_rebuilds() {
+         .file("custom-target.json", target_spec_json())
+         .build();
+ 
+-    p.cargo("build --lib --target custom-target.json -v -Zjson-target-spec")
+-        .masquerade_as_nightly_cargo(&["json_target_spec"])
+-        .run();
+-    p.cargo("build --lib --target custom-target.json -v -Zjson-target-spec")
+-        .masquerade_as_nightly_cargo(&["json_target_spec"])
++    p.cargo("build --lib --target custom-target.json -v").run();
++    p.cargo("build --lib --target custom-target.json -v")
+         .with_stderr_data(str![[r#"
+ [FRESH] foo v0.0.1 ([ROOT]/foo)
+ [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+@@ -233,8 +172,7 @@ fn changing_spec_rebuilds() {
+     // Some arbitrary change that I hope is safe.
+     let spec = spec.replace('{', "{\n\"vendor\": \"unknown\",\n");
+     fs::write(&spec_path, spec).unwrap();
+-    p.cargo("build --lib --target custom-target.json -v -Zjson-target-spec")
+-        .masquerade_as_nightly_cargo(&["json_target_spec"])
++    p.cargo("build --lib --target custom-target.json -v")
+         .with_stderr_data(str![[r#"
+ [COMPILING] foo v0.0.1 ([ROOT]/foo)
+ [RUNNING] `rustc --crate-name foo --edition=2015 src/lib.rs [..]
+@@ -266,8 +204,7 @@ fn changing_spec_relearns_crate_types() {
+         .file("custom-target.json", target_spec_json())
+         .build();
+ 
+-    p.cargo("build --lib --target custom-target.json -v -Zjson-target-spec")
+-        .masquerade_as_nightly_cargo(&["json_target_spec"])
++    p.cargo("build --lib --target custom-target.json -v")
+         .with_status(101)
+         .with_stderr_data(str![[r#"
+ [ERROR] cannot produce cdylib for `foo v0.1.0 ([ROOT]/foo)` [..]
+@@ -281,8 +218,7 @@ fn changing_spec_relearns_crate_types() {
+     let spec = spec.replace('{', "{\n\"dynamic-linking\": true,\n");
+     fs::write(&spec_path, spec).unwrap();
+ 
+-    p.cargo("build --lib --target custom-target.json -v -Zjson-target-spec")
+-        .masquerade_as_nightly_cargo(&["json_target_spec"])
++    p.cargo("build --lib --target custom-target.json -v")
+         .with_stderr_data(str![[r#"
+ [COMPILING] foo v0.1.0 ([ROOT]/foo)
+ [RUNNING] `rustc --crate-name foo --edition=2015 src/lib.rs [..]
+@@ -312,8 +248,7 @@ fn custom_target_ignores_filepath() {
+         .build();
+ 
+     // Should build the library the first time.
+-    p.cargo("build --lib --target a/custom-target.json -Zjson-target-spec")
+-        .masquerade_as_nightly_cargo(&["json_target_spec"])
++    p.cargo("build --lib --target a/custom-target.json")
+         .with_stderr_data(str![[r#"
+ [COMPILING] foo v0.0.1 ([ROOT]/foo)
+ [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+@@ -322,8 +257,7 @@ fn custom_target_ignores_filepath() {
+         .run();
+ 
+     // But not the second time, even though the path to the custom target is different.
+-    p.cargo("build --lib --target b/custom-target.json -Zjson-target-spec")
+-        .masquerade_as_nightly_cargo(&["json_target_spec"])
++    p.cargo("build --lib --target b/custom-target.json")
+         .with_stderr_data(str![[r#"
+ [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+ 

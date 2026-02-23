@@ -1,0 +1,341 @@
+diff --git a/src/cargo/core/workspace.rs b/src/cargo/core/workspace.rs
+index d7d0170e1..c024075ce 100644
+--- a/src/cargo/core/workspace.rs
++++ b/src/cargo/core/workspace.rs
+@@ -33,7 +33,6 @@ use crate::lints::rules::non_snake_case_packages;
+ use crate::lints::rules::redundant_homepage;
+ use crate::lints::rules::redundant_readme;
+ use crate::lints::rules::unused_workspace_dependencies;
+-use crate::lints::rules::unused_workspace_package_fields;
+ use crate::ops;
+ use crate::ops::lockfile::LOCKFILE_NAME;
+ use crate::sources::{CRATES_IO_INDEX, CRATES_IO_REGISTRY, PathSource, SourceConfigMap};
+@@ -1463,14 +1462,6 @@ impl<'gctx> Workspace<'gctx> {
+                 bail!("encountered {verify_error_count} error{plural} while verifying lints")
+             }
+ 
+-            unused_workspace_package_fields(
+-                self,
+-                self.root_maybe(),
+-                self.root_manifest(),
+-                &cargo_lints,
+-                &mut run_error_count,
+-                self.gctx,
+-            )?;
+             unused_workspace_dependencies(
+                 self,
+                 self.root_maybe(),
+diff --git a/src/cargo/lints/rules/mod.rs b/src/cargo/lints/rules/mod.rs
+index 731354524..880b5a884 100644
+--- a/src/cargo/lints/rules/mod.rs
++++ b/src/cargo/lints/rules/mod.rs
+@@ -10,7 +10,6 @@ mod redundant_homepage;
+ mod redundant_readme;
+ mod unknown_lints;
+ mod unused_workspace_dependencies;
+-mod unused_workspace_package_fields;
+ 
+ pub use blanket_hint_mostly_unused::blanket_hint_mostly_unused;
+ pub use im_a_teapot::check_im_a_teapot;
+@@ -24,7 +23,6 @@ pub use redundant_homepage::redundant_homepage;
+ pub use redundant_readme::redundant_readme;
+ pub use unknown_lints::output_unknown_lints;
+ pub use unused_workspace_dependencies::unused_workspace_dependencies;
+-pub use unused_workspace_package_fields::unused_workspace_package_fields;
+ 
+ pub const LINTS: &[crate::lints::Lint] = &[
+     blanket_hint_mostly_unused::LINT,
+@@ -39,5 +37,4 @@ pub const LINTS: &[crate::lints::Lint] = &[
+     redundant_readme::LINT,
+     unknown_lints::LINT,
+     unused_workspace_dependencies::LINT,
+-    unused_workspace_package_fields::LINT,
+ ];
+diff --git a/src/cargo/lints/rules/unused_workspace_package_fields.rs b/src/cargo/lints/rules/unused_workspace_package_fields.rs
+deleted file mode 100644
+index 57ba1b8e1..000000000
+--- a/src/cargo/lints/rules/unused_workspace_package_fields.rs
++++ /dev/null
+@@ -1,147 +0,0 @@
+-use std::path::Path;
+-
+-use annotate_snippets::AnnotationKind;
+-use annotate_snippets::Group;
+-use annotate_snippets::Level;
+-use annotate_snippets::Origin;
+-use annotate_snippets::Patch;
+-use annotate_snippets::Snippet;
+-use cargo_util_schemas::manifest::TomlToolLints;
+-use indexmap::IndexSet;
+-
+-use crate::CargoResult;
+-use crate::GlobalContext;
+-use crate::core::MaybePackage;
+-use crate::core::Workspace;
+-use crate::lints::Lint;
+-use crate::lints::LintLevel;
+-use crate::lints::SUSPICIOUS;
+-use crate::lints::get_key_value_span;
+-use crate::lints::rel_cwd_manifest_path;
+-
+-pub const LINT: Lint = Lint {
+-    name: "unused_workspace_package_fields",
+-    desc: "unused field in `workspace.package`",
+-    primary_group: &SUSPICIOUS,
+-    edition_lint_opts: None,
+-    feature_gate: None,
+-    docs: Some(
+-        r#"
+-### What it does
+-Checks for any fields in `[workspace.package]` that has not been inherited
+-
+-### Why it is bad
+-They can give the false impression that these fields are used
+-
+-### Example
+-```toml
+-[workspace.package]
+-edition = "2024"
+-
+-[package]
+-name = "foo"
+-```
+-"#,
+-    ),
+-};
+-
+-pub fn unused_workspace_package_fields(
+-    ws: &Workspace<'_>,
+-    maybe_pkg: &MaybePackage,
+-    manifest_path: &Path,
+-    cargo_lints: &TomlToolLints,
+-    error_count: &mut usize,
+-    gctx: &GlobalContext,
+-) -> CargoResult<()> {
+-    let (lint_level, reason) = LINT.level(
+-        cargo_lints,
+-        maybe_pkg.edition(),
+-        maybe_pkg.unstable_features(),
+-    );
+-    if lint_level == LintLevel::Allow {
+-        return Ok(());
+-    }
+-
+-    let workspace_package_fields: IndexSet<_> = maybe_pkg
+-        .document()
+-        .and_then(|d| d.get_ref().get("workspace"))
+-        .and_then(|w| w.get_ref().get("package"))
+-        .and_then(|p| p.get_ref().as_table())
+-        .iter()
+-        .flat_map(|d| d.keys())
+-        .collect();
+-
+-    let mut inherited_fields = IndexSet::new();
+-    for member in ws.members() {
+-        inherited_fields.extend(
+-            member
+-                .manifest()
+-                .document()
+-                .and_then(|w| w.get_ref().get("package"))
+-                .and_then(|p| p.get_ref().as_table())
+-                .iter()
+-                .flat_map(|d| {
+-                    d.iter()
+-                        .filter(|(_, v)| {
+-                            v.get_ref()
+-                                .get("workspace")
+-                                .and_then(|w| w.get_ref().as_bool())
+-                                == Some(true)
+-                        })
+-                        .map(|(k, _)| k)
+-                }),
+-        );
+-    }
+-
+-    for (i, unused) in workspace_package_fields
+-        .difference(&inherited_fields)
+-        .enumerate()
+-    {
+-        let document = maybe_pkg.document();
+-        let contents = maybe_pkg.contents();
+-        let level = lint_level.to_diagnostic_level();
+-        let manifest_path = rel_cwd_manifest_path(manifest_path, gctx);
+-        let emitted_source = LINT.emitted_source(lint_level, reason);
+-
+-        let mut primary = Group::with_title(level.primary_title(LINT.desc));
+-        if let Some(document) = document
+-            && let Some(contents) = contents
+-        {
+-            let mut snippet = Snippet::source(contents).path(&manifest_path);
+-            if let Some(span) =
+-                get_key_value_span(document, &["workspace", "package", unused.as_ref()])
+-            {
+-                snippet = snippet.annotation(AnnotationKind::Primary.span(span.key));
+-            }
+-            primary = primary.element(snippet);
+-        } else {
+-            primary = primary.element(Origin::path(&manifest_path));
+-        }
+-        if i == 0 {
+-            primary = primary.element(Level::NOTE.message(emitted_source));
+-        }
+-        let mut report = vec![primary];
+-        if let Some(document) = document
+-            && let Some(contents) = contents
+-        {
+-            let mut help = Group::with_title(
+-                Level::HELP.secondary_title("consider removing the unused field"),
+-            );
+-            let mut snippet = Snippet::source(contents).path(&manifest_path);
+-            if let Some(span) =
+-                get_key_value_span(document, &["workspace", "package", unused.as_ref()])
+-            {
+-                snippet = snippet.patch(Patch::new(span.key.start..span.value.end, ""));
+-            }
+-            help = help.element(snippet);
+-            report.push(help);
+-        }
+-
+-        if lint_level.is_error() {
+-            *error_count += 1;
+-        }
+-        gctx.shell().print_report(&report, lint_level.force())?;
+-    }
+-
+-    Ok(())
+-}
+diff --git a/src/doc/src/reference/lints.md b/src/doc/src/reference/lints.md
+index fff50e379..4ccaef9a6 100644
+--- a/src/doc/src/reference/lints.md
++++ b/src/doc/src/reference/lints.md
+@@ -34,7 +34,6 @@ These lints are all set to the 'warn' level by default.
+ - [`redundant_readme`](#redundant_readme)
+ - [`unknown_lints`](#unknown_lints)
+ - [`unused_workspace_dependencies`](#unused_workspace_dependencies)
+-- [`unused_workspace_package_fields`](#unused_workspace_package_fields)
+ 
+ ## `blanket_hint_mostly_unused`
+ Group: `suspicious`
+@@ -392,24 +391,3 @@ regex = "1"
+ ```
+ 
+ 
+-## `unused_workspace_package_fields`
+-Group: `suspicious`
+-
+-Level: `warn`
+-
+-### What it does
+-Checks for any fields in `[workspace.package]` that has not been inherited
+-
+-### Why it is bad
+-They can give the false impression that these fields are used
+-
+-### Example
+-```toml
+-[workspace.package]
+-edition = "2024"
+-
+-[package]
+-name = "foo"
+-```
+-
+-
+diff --git a/tests/testsuite/lints/mod.rs b/tests/testsuite/lints/mod.rs
+index 25b657960..dade630d0 100644
+--- a/tests/testsuite/lints/mod.rs
++++ b/tests/testsuite/lints/mod.rs
+@@ -16,7 +16,6 @@ mod redundant_homepage;
+ mod redundant_readme;
+ mod unknown_lints;
+ mod unused_workspace_dependencies;
+-mod unused_workspace_package_fields;
+ mod warning;
+ 
+ #[cargo_test]
+diff --git a/tests/testsuite/lints/unused_workspace_package_fields.rs b/tests/testsuite/lints/unused_workspace_package_fields.rs
+deleted file mode 100644
+index 94a017790..000000000
+--- a/tests/testsuite/lints/unused_workspace_package_fields.rs
++++ /dev/null
+@@ -1,80 +0,0 @@
+-use crate::prelude::*;
+-use cargo_test_support::project;
+-use cargo_test_support::str;
+-
+-#[cargo_test]
+-fn unused() {
+-    let p = project()
+-        .file(
+-            "Cargo.toml",
+-            r#"
+-[workspace]
+-members = ["bar"]
+-
+-[workspace.package]
+-documentation = "docs.rs/foo"
+-homepage = "bar.rs"
+-rust-version = "1.0"
+-unknown = "foo"
+-
+-[workspace.lints.cargo]
+-unused_workspace_package_fields = "warn"
+-
+-[package]
+-name = "foo"
+-version = "0.0.1"
+-edition = "2015"
+-documentation.workspace = true
+-
+-[lints]
+-workspace = true
+-"#,
+-        )
+-        .file("src/main.rs", "fn main() {}")
+-        .file(
+-            "bar/Cargo.toml",
+-            r#"
+-[package]
+-name = "bar"
+-version = "0.0.1"
+-edition = "2015"
+-homepage.workspace = true
+-
+-[lints]
+-workspace = true
+-"#,
+-        )
+-        .file("bar/src/main.rs", "fn main() {}")
+-        .build();
+-
+-    p.cargo("check -Zcargo-lints")
+-        .masquerade_as_nightly_cargo(&["cargo-lints"])
+-        .with_stderr_data(str![[r#"
+-[WARNING] unused field in `workspace.package`
+- --> Cargo.toml:8:1
+-  |
+-8 | rust-version = "1.0"
+-  | ^^^^^^^^^^^^
+-  |
+-  = [NOTE] `cargo::unused_workspace_package_fields` is set to `warn` by default
+-[HELP] consider removing the unused field
+-  |
+-8 - rust-version = "1.0"
+-  |
+-[WARNING] unused field in `workspace.package`
+- --> Cargo.toml:9:1
+-  |
+-9 | unknown = "foo"
+-  | ^^^^^^^
+-  |
+-[HELP] consider removing the unused field
+-  |
+-9 - unknown = "foo"
+-  |
+-[WARNING] [ROOT]/foo/Cargo.toml: unused manifest key: workspace.package.unknown
+-[CHECKING] foo v0.0.1 ([ROOT]/foo)
+-[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+-
+-"#]])
+-        .run();
+-}

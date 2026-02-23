@@ -1,0 +1,155 @@
+diff --git a/crates/hir-ty/src/method_resolution/probe.rs b/crates/hir-ty/src/method_resolution/probe.rs
+index fc2bd87ee4..fdd501723f 100644
+--- a/crates/hir-ty/src/method_resolution/probe.rs
++++ b/crates/hir-ty/src/method_resolution/probe.rs
+@@ -285,15 +285,11 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
+                 let infcx = self.infcx;
+                 let (self_ty, var_values) = infcx.instantiate_canonical(&query_input);
+                 debug!(?self_ty, ?query_input, "probe_op: Mode::Path");
+-                let prev_opaque_entries =
+-                    self.infcx.inner.borrow_mut().opaque_types().num_entries();
+                 MethodAutoderefStepsResult {
+                     steps: smallvec![CandidateStep {
+-                        self_ty: self.infcx.make_query_response_ignoring_pending_obligations(
+-                            var_values,
+-                            self_ty,
+-                            prev_opaque_entries
+-                        ),
++                        self_ty: self
++                            .infcx
++                            .make_query_response_ignoring_pending_obligations(var_values, self_ty),
+                         self_ty_is_opaque: false,
+                         autoderefs: 0,
+                         from_unsafe_deref: false,
+@@ -380,8 +376,6 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
+             // infer var is not an opaque.
+             let infcx = self.infcx;
+             let (self_ty, inference_vars) = infcx.instantiate_canonical(self_ty);
+-            let prev_opaque_entries = infcx.inner.borrow_mut().opaque_types().num_entries();
+-
+             let self_ty_is_opaque = |ty: Ty<'_>| {
+                 if let TyKind::Infer(InferTy::TyVar(vid)) = ty.kind() {
+                     infcx.has_opaques_with_sub_unified_hidden_type(vid)
+@@ -420,7 +414,6 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
+                             self_ty: infcx.make_query_response_ignoring_pending_obligations(
+                                 inference_vars,
+                                 ty,
+-                                prev_opaque_entries,
+                             ),
+                             self_ty_is_opaque: self_ty_is_opaque(ty),
+                             autoderefs: d,
+@@ -444,7 +437,6 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
+                             self_ty: infcx.make_query_response_ignoring_pending_obligations(
+                                 inference_vars,
+                                 ty,
+-                                prev_opaque_entries,
+                             ),
+                             self_ty_is_opaque: self_ty_is_opaque(ty),
+                             autoderefs: d,
+@@ -469,17 +461,13 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
+                         ty: infcx.make_query_response_ignoring_pending_obligations(
+                             inference_vars,
+                             final_ty,
+-                            prev_opaque_entries,
+                         ),
+                     })
+                 }
+                 TyKind::Error(_) => Some(MethodAutoderefBadTy {
+                     reached_raw_pointer,
+-                    ty: infcx.make_query_response_ignoring_pending_obligations(
+-                        inference_vars,
+-                        final_ty,
+-                        prev_opaque_entries,
+-                    ),
++                    ty: infcx
++                        .make_query_response_ignoring_pending_obligations(inference_vars, final_ty),
+                 }),
+                 TyKind::Array(elem_ty, _) => {
+                     let autoderefs = steps.iter().filter(|s| s.reachable_via_deref).count() - 1;
+@@ -487,7 +475,6 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
+                         self_ty: infcx.make_query_response_ignoring_pending_obligations(
+                             inference_vars,
+                             Ty::new_slice(infcx.interner, elem_ty),
+-                            prev_opaque_entries,
+                         ),
+                         self_ty_is_opaque: false,
+                         autoderefs,
+diff --git a/crates/hir-ty/src/next_solver/infer/canonical/instantiate.rs b/crates/hir-ty/src/next_solver/infer/canonical/instantiate.rs
+index 61d1e97746..b758042e85 100644
+--- a/crates/hir-ty/src/next_solver/infer/canonical/instantiate.rs
++++ b/crates/hir-ty/src/next_solver/infer/canonical/instantiate.rs
+@@ -15,7 +15,6 @@ use crate::next_solver::{
+     infer::{
+         InferCtxt, InferOk, InferResult,
+         canonical::{QueryRegionConstraints, QueryResponse, canonicalizer::OriginalQueryValues},
+-        opaque_types::table::OpaqueTypeStorageEntries,
+         traits::{ObligationCause, PredicateObligations},
+     },
+ };
+@@ -195,7 +194,6 @@ impl<'db> InferCtxt<'db> {
+         &self,
+         inference_vars: CanonicalVarValues<'db>,
+         answer: T,
+-        prev_entries: OpaqueTypeStorageEntries,
+     ) -> Canonical<'db, QueryResponse<'db, T>>
+     where
+         T: TypeFoldable<DbInterner<'db>>,
+@@ -211,7 +209,7 @@ impl<'db> InferCtxt<'db> {
+             .inner
+             .borrow_mut()
+             .opaque_type_storage
+-            .opaque_types_added_since(prev_entries)
++            .iter_opaque_types()
+             .map(|(k, v)| (k, v.ty))
+             .collect();
+ 
+diff --git a/crates/hir-ty/src/tests/opaque_types.rs b/crates/hir-ty/src/tests/opaque_types.rs
+index 21d830ed51..ca986336ff 100644
+--- a/crates/hir-ty/src/tests/opaque_types.rs
++++ b/crates/hir-ty/src/tests/opaque_types.rs
+@@ -1,7 +1,5 @@
+ use expect_test::expect;
+ 
+-use crate::tests::check_infer;
+-
+ use super::{check_infer_with_mismatches, check_no_mismatches, check_types};
+ 
+ #[test]
+@@ -178,37 +176,3 @@ fn main() {
+         "#,
+     );
+ }
+-
+-#[test]
+-fn regression_21455() {
+-    check_infer(
+-        r#"
+-//- minicore: copy
+-
+-struct Vec<T>(T);
+-impl<T> Vec<T> {
+-    pub fn new() -> Self { loop {} }
+-}
+-
+-pub struct Miku {}
+-
+-impl Miku {
+-    pub fn all_paths_to(&self) -> impl Copy {
+-        Miku {
+-            full_paths: Vec::new(),
+-        }
+-    }
+-}
+-    "#,
+-        expect![[r#"
+-            61..72 '{ loop {} }': Vec<T>
+-            63..70 'loop {}': !
+-            68..70 '{}': ()
+-            133..137 'self': &'? Miku
+-            152..220 '{     ...     }': Miku
+-            162..214 'Miku {...     }': Miku
+-            193..201 'Vec::new': fn new<{unknown}>() -> Vec<{unknown}>
+-            193..203 'Vec::new()': Vec<{unknown}>
+-        "#]],
+-    );
+-}

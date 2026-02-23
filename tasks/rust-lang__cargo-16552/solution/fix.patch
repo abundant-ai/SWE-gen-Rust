@@ -1,0 +1,282 @@
+diff --git a/src/cargo/core/workspace.rs b/src/cargo/core/workspace.rs
+index 2a1b8e285..8e5afc799 100644
+--- a/src/cargo/core/workspace.rs
++++ b/src/cargo/core/workspace.rs
+@@ -26,6 +26,7 @@ use crate::lints::rules::blanket_hint_mostly_unused;
+ use crate::lints::rules::check_im_a_teapot;
+ use crate::lints::rules::implicit_minimum_version_req;
+ use crate::lints::rules::non_kebab_case_bin;
++use crate::lints::rules::redundant_readme;
+ use crate::ops;
+ use crate::ops::lockfile::LOCKFILE_NAME;
+ use crate::sources::{CRATES_IO_INDEX, CRATES_IO_REGISTRY, PathSource, SourceConfigMap};
+@@ -1363,6 +1364,13 @@ impl<'gctx> Workspace<'gctx> {
+                 &mut run_error_count,
+                 self.gctx,
+             )?;
++            redundant_readme(
++                pkg.into(),
++                &path,
++                &cargo_lints,
++                &mut run_error_count,
++                self.gctx,
++            )?;
+ 
+             if run_error_count > 0 {
+                 let plural = if run_error_count == 1 { "" } else { "s" };
+diff --git a/src/cargo/lints/rules/mod.rs b/src/cargo/lints/rules/mod.rs
+index ebcbea8bf..2d00aa258 100644
+--- a/src/cargo/lints/rules/mod.rs
++++ b/src/cargo/lints/rules/mod.rs
+@@ -2,12 +2,14 @@ mod blanket_hint_mostly_unused;
+ mod im_a_teapot;
+ mod implicit_minimum_version_req;
+ mod non_kebab_case_bin;
++mod redundant_readme;
+ mod unknown_lints;
+ 
+ pub use blanket_hint_mostly_unused::blanket_hint_mostly_unused;
+ pub use im_a_teapot::check_im_a_teapot;
+ pub use implicit_minimum_version_req::implicit_minimum_version_req;
+ pub use non_kebab_case_bin::non_kebab_case_bin;
++pub use redundant_readme::redundant_readme;
+ pub use unknown_lints::output_unknown_lints;
+ 
+ pub const LINTS: &[crate::lints::Lint] = &[
+@@ -15,5 +17,6 @@ pub const LINTS: &[crate::lints::Lint] = &[
+     implicit_minimum_version_req::LINT,
+     im_a_teapot::LINT,
+     non_kebab_case_bin::LINT,
++    redundant_readme::LINT,
+     unknown_lints::LINT,
+ ];
+diff --git a/src/cargo/lints/rules/redundant_readme.rs b/src/cargo/lints/rules/redundant_readme.rs
+new file mode 100644
+index 000000000..663acdee3
+--- /dev/null
++++ b/src/cargo/lints/rules/redundant_readme.rs
+@@ -0,0 +1,157 @@
++use std::path::Path;
++
++use annotate_snippets::AnnotationKind;
++use annotate_snippets::Group;
++use annotate_snippets::Level;
++use annotate_snippets::Origin;
++use annotate_snippets::Patch;
++use annotate_snippets::Snippet;
++use cargo_util_schemas::manifest::InheritableField;
++use cargo_util_schemas::manifest::StringOrBool;
++use cargo_util_schemas::manifest::TomlToolLints;
++
++use crate::CargoResult;
++use crate::GlobalContext;
++use crate::core::Package;
++use crate::lints::Lint;
++use crate::lints::LintLevel;
++use crate::lints::LintLevelReason;
++use crate::lints::STYLE;
++use crate::lints::get_key_value_span;
++use crate::lints::rel_cwd_manifest_path;
++use crate::util::toml::DEFAULT_README_FILES;
++
++pub const LINT: Lint = Lint {
++    name: "redundant_readme",
++    desc: "explicit `package.readme` can be inferred",
++    primary_group: &STYLE,
++    edition_lint_opts: None,
++    feature_gate: None,
++    docs: Some(
++        r#"
++### What it does
++
++Checks for `package.readme` fields that can be inferred.
++
++See also [`package.readme` reference documentation](manifest.md#the-readme-field).
++
++### Why it is bad
++
++Adds boilerplate.
++
++### Drawbacks
++
++It might not be obvious if they named their file correctly.
++
++### Example
++
++```toml
++[package]
++name = "foo"
++readme = "README.md"
++```
++
++Should be written as:
++
++```toml
++[package]
++name = "foo"
++```
++"#,
++    ),
++};
++
++pub fn redundant_readme(
++    pkg: &Package,
++    manifest_path: &Path,
++    cargo_lints: &TomlToolLints,
++    error_count: &mut usize,
++    gctx: &GlobalContext,
++) -> CargoResult<()> {
++    let (lint_level, reason) = LINT.level(
++        cargo_lints,
++        pkg.manifest().edition(),
++        pkg.manifest().unstable_features(),
++    );
++
++    if lint_level == LintLevel::Allow {
++        return Ok(());
++    }
++
++    let manifest_path = rel_cwd_manifest_path(manifest_path, gctx);
++
++    lint_package(pkg, &manifest_path, lint_level, reason, error_count, gctx)
++}
++
++pub fn lint_package(
++    pkg: &Package,
++    manifest_path: &str,
++    lint_level: LintLevel,
++    reason: LintLevelReason,
++    error_count: &mut usize,
++    gctx: &GlobalContext,
++) -> CargoResult<()> {
++    let manifest = pkg.manifest();
++
++    let Some(original_toml) = manifest.original_toml() else {
++        return Ok(());
++    };
++    let Some(original_pkg) = &original_toml.package else {
++        return Ok(());
++    };
++    let Some(readme) = &original_pkg.readme else {
++        return Ok(());
++    };
++    let InheritableField::Value(readme) = readme else {
++        return Ok(());
++    };
++    let StringOrBool::String(readme) = readme else {
++        return Ok(());
++    };
++    if !DEFAULT_README_FILES.contains(&readme.as_str()) {
++        return Ok(());
++    }
++
++    let document = manifest.document();
++    let contents = manifest.contents();
++    let level = lint_level.to_diagnostic_level();
++    let emitted_source = LINT.emitted_source(lint_level, reason);
++
++    let mut primary = Group::with_title(level.primary_title(LINT.desc));
++    if let Some(document) = document
++        && let Some(contents) = contents
++        && let Some(span) = get_key_value_span(document, &["package", "readme"])
++    {
++        let span = span.key.start..span.value.end;
++        primary = primary.element(
++            Snippet::source(contents)
++                .path(manifest_path)
++                .annotation(AnnotationKind::Primary.span(span)),
++        );
++    } else {
++        primary = primary.element(Origin::path(manifest_path));
++    }
++    primary = primary.element(Level::NOTE.message(emitted_source));
++    let mut report = vec![primary];
++    if let Some(document) = document
++        && let Some(contents) = contents
++        && let Some(span) = get_key_value_span(document, &["package", "readme"])
++    {
++        let mut help =
++            Group::with_title(Level::HELP.secondary_title("consider removing `package.readme`"));
++        let span = span.key.start..span.value.end;
++        help = help.element(
++            Snippet::source(contents)
++                .path(manifest_path)
++                .patch(Patch::new(span, "")),
++        );
++        report.push(help);
++    }
++
++    if lint_level.is_error() {
++        *error_count += 1;
++    }
++    gctx.shell().print_report(&report, lint_level.force())?;
++
++    Ok(())
++}
+diff --git a/src/cargo/util/toml/mod.rs b/src/cargo/util/toml/mod.rs
+index 023a5b5c1..a20b43129 100644
+--- a/src/cargo/util/toml/mod.rs
++++ b/src/cargo/util/toml/mod.rs
+@@ -845,7 +845,7 @@ fn normalize_package_readme(
+     }
+ }
+ 
+-const DEFAULT_README_FILES: [&str; 3] = ["README.md", "README.txt", "README"];
++pub const DEFAULT_README_FILES: [&str; 3] = ["README.md", "README.txt", "README"];
+ 
+ /// Checks if a file with any of the default README file names exists in the package root.
+ /// If so, returns a `String` representing that name.
+diff --git a/src/doc/src/reference/lints.md b/src/doc/src/reference/lints.md
+index 4ba5fe0a5..df948106e 100644
+--- a/src/doc/src/reference/lints.md
++++ b/src/doc/src/reference/lints.md
+@@ -26,6 +26,7 @@ These lints are all set to the 'allow' level by default.
+ These lints are all set to the 'warn' level by default.
+ - [`blanket_hint_mostly_unused`](#blanket_hint_mostly_unused)
+ - [`non_kebab_case_bin`](#non_kebab_case_bin)
++- [`redundant_readme`](#redundant_readme)
+ - [`unknown_lints`](#unknown_lints)
+ 
+ ## `blanket_hint_mostly_unused`
+@@ -145,6 +146,41 @@ name = "foo-bar"
+ ```
+ 
+ 
++## `redundant_readme`
++Group: `style`
++
++Level: `warn`
++
++### What it does
++
++Checks for `package.readme` fields that can be inferred.
++
++See also [`package.readme` reference documentation](manifest.md#the-readme-field).
++
++### Why it is bad
++
++Adds boilerplate.
++
++### Drawbacks
++
++It might not be obvious if they named their file correctly.
++
++### Example
++
++```toml
++[package]
++name = "foo"
++readme = "README.md"
++```
++
++Should be written as:
++
++```toml
++[package]
++name = "foo"
++```
++
++
+ ## `unknown_lints`
+ Group: `suspicious`
+ 

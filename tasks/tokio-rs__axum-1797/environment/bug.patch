@@ -1,0 +1,257 @@
+diff --git a/axum-macros/CHANGELOG.md b/axum-macros/CHANGELOG.md
+index f9b7799b..6bd23d1a 100644
+--- a/axum-macros/CHANGELOG.md
++++ b/axum-macros/CHANGELOG.md
+@@ -7,10 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ # Unreleased
+ 
+-- **fixed:** In `#[debug_handler]` provide specific errors about `FromRequest`
+-  extractors not being the last argument ([#1797])
+-
+-[#1797]: https://github.com/tokio-rs/axum/pull/1797
++- None.
+ 
+ # 0.3.4 (12. February, 2022)
+ 
+diff --git a/axum-macros/src/debug_handler.rs b/axum-macros/src/debug_handler.rs
+index 23116a16..67fd8747 100644
+--- a/axum-macros/src/debug_handler.rs
++++ b/axum-macros/src/debug_handler.rs
+@@ -47,22 +47,13 @@ pub(crate) fn expand(attr: Attrs, item_fn: ItemFn) -> TokenStream {
+         err.unwrap_or_else(|| {
+             let state_ty = state_ty.unwrap_or_else(|| syn::parse_quote!(()));
+ 
+-            let check_input_order = check_input_order(&item_fn);
++            let check_inputs_impls_from_request =
++                check_inputs_impls_from_request(&item_fn, &body_ty, state_ty);
+             let check_future_send = check_future_send(&item_fn);
+ 
+-            if let Some(check_input_order) = check_input_order {
+-                quote! {
+-                    #check_input_order
+-                    #check_future_send
+-                }
+-            } else {
+-                let check_inputs_impls_from_request =
+-                    check_inputs_impls_from_request(&item_fn, &body_ty, state_ty);
+-
+-                quote! {
+-                    #check_inputs_impls_from_request
+-                    #check_future_send
+-                }
++            quote! {
++                #check_inputs_impls_from_request
++                #check_future_send
+             }
+         })
+     } else {
+@@ -287,103 +278,6 @@ fn check_inputs_impls_from_request(
+         .collect::<TokenStream>()
+ }
+ 
+-fn check_input_order(item_fn: &ItemFn) -> Option<TokenStream> {
+-    let types_that_consume_the_request = item_fn
+-        .sig
+-        .inputs
+-        .iter()
+-        .enumerate()
+-        .filter_map(|(idx, arg)| {
+-            let ty = match arg {
+-                FnArg::Typed(pat_type) => &*pat_type.ty,
+-                FnArg::Receiver(_) => return None,
+-            };
+-            let span = ty.span();
+-
+-            let path = match ty {
+-                Type::Path(type_path) => &type_path.path,
+-                _ => return None,
+-            };
+-
+-            let ident = match path.segments.last() {
+-                Some(path_segment) => &path_segment.ident,
+-                None => return None,
+-            };
+-
+-            let type_name = match &*ident.to_string() {
+-                "Json" => "Json<_>",
+-                "BodyStream" => "BodyStream",
+-                "RawBody" => "RawBody<_>",
+-                "RawForm" => "RawForm",
+-                "Multipart" => "Multipart",
+-                "Protobuf" => "Protobuf",
+-                "JsonLines" => "JsonLines<_>",
+-                "Form" => "Form<_>",
+-                "Request" => "Request<_>",
+-                "Bytes" => "Bytes",
+-                "String" => "String",
+-                "Parts" => "Parts",
+-                _ => return None,
+-            };
+-
+-            Some((idx, type_name, span))
+-        })
+-        .collect::<Vec<_>>();
+-
+-    if types_that_consume_the_request.is_empty() {
+-        return None;
+-    };
+-
+-    // exactly one type that consumes the request
+-    if types_that_consume_the_request.len() == 1 {
+-        // and that is not the last
+-        if types_that_consume_the_request[0].0 != item_fn.sig.inputs.len() - 1 {
+-            let (_idx, type_name, span) = &types_that_consume_the_request[0];
+-            let error = format!(
+-                "`{type_name}` consumes the request body and thus must be \
+-            the last argument to the handler function"
+-            );
+-            return Some(quote_spanned! {*span=>
+-                compile_error!(#error);
+-            });
+-        } else {
+-            return None;
+-        }
+-    }
+-
+-    if types_that_consume_the_request.len() == 2 {
+-        let (_, first, _) = &types_that_consume_the_request[0];
+-        let (_, second, _) = &types_that_consume_the_request[1];
+-        let error = format!(
+-            "Can't have two extractors that consume the request body. \
+-            `{first}` and `{second}` both do that.",
+-        );
+-        let span = item_fn.sig.inputs.span();
+-        Some(quote_spanned! {span=>
+-            compile_error!(#error);
+-        })
+-    } else {
+-        let types = WithPosition::new(types_that_consume_the_request.into_iter())
+-            .map(|pos| match pos {
+-                Position::First((_, type_name, _)) | Position::Middle((_, type_name, _)) => {
+-                    format!("`{type_name}`, ")
+-                }
+-                Position::Last((_, type_name, _)) => format!("and `{type_name}`"),
+-                Position::Only(_) => unreachable!(),
+-            })
+-            .collect::<String>();
+-
+-        let error = format!(
+-            "Can't have more than one extractor that consume the request body. \
+-            {types} all do that.",
+-        );
+-        let span = item_fn.sig.inputs.span();
+-        Some(quote_spanned! {span=>
+-            compile_error!(#error);
+-        })
+-    }
+-}
+-
+ fn check_output_impls_into_response(item_fn: &ItemFn) -> TokenStream {
+     let ty = match &item_fn.sig.output {
+         syn::ReturnType::Default => return quote! {},
+diff --git a/axum-macros/tests/debug_handler/fail/doesnt_implement_from_request_parts.rs b/axum-macros/tests/debug_handler/fail/doesnt_implement_from_request_parts.rs
+new file mode 100644
+index 00000000..e4700c2a
+--- /dev/null
++++ b/axum-macros/tests/debug_handler/fail/doesnt_implement_from_request_parts.rs
+@@ -0,0 +1,7 @@
++use axum_macros::debug_handler;
++use axum::http::Method;
++
++#[debug_handler]
++async fn handler(_: String, _: Method) {}
++
++fn main() {}
+diff --git a/axum-macros/tests/debug_handler/fail/doesnt_implement_from_request_parts.stderr b/axum-macros/tests/debug_handler/fail/doesnt_implement_from_request_parts.stderr
+new file mode 100644
+index 00000000..70a9be7a
+--- /dev/null
++++ b/axum-macros/tests/debug_handler/fail/doesnt_implement_from_request_parts.stderr
+@@ -0,0 +1,20 @@
++error[E0277]: the trait bound `String: FromRequestParts<()>` is not satisfied
++ --> tests/debug_handler/fail/doesnt_implement_from_request_parts.rs:5:21
++  |
++5 | async fn handler(_: String, _: Method) {}
++  |                     ^^^^^^ the trait `FromRequestParts<()>` is not implemented for `String`
++  |
++  = note: Function argument is not a valid axum extractor.
++          See `https://docs.rs/axum/latest/axum/extract/index.html` for details
++  = help: the following other types implement trait `FromRequestParts<S>`:
++            <() as FromRequestParts<S>>
++            <(T1, T2) as FromRequestParts<S>>
++            <(T1, T2, T3) as FromRequestParts<S>>
++            <(T1, T2, T3, T4) as FromRequestParts<S>>
++            <(T1, T2, T3, T4, T5) as FromRequestParts<S>>
++            <(T1, T2, T3, T4, T5, T6) as FromRequestParts<S>>
++            <(T1, T2, T3, T4, T5, T6, T7) as FromRequestParts<S>>
++            <(T1, T2, T3, T4, T5, T6, T7, T8) as FromRequestParts<S>>
++          and 26 others
++  = help: see issue #48214
++  = help: add `#![feature(trivial_bounds)]` to the crate attributes to enable
+diff --git a/axum-macros/tests/debug_handler/fail/multiple_request_consumers.rs b/axum-macros/tests/debug_handler/fail/multiple_request_consumers.rs
+deleted file mode 100644
+index 4c86ceae..00000000
+--- a/axum-macros/tests/debug_handler/fail/multiple_request_consumers.rs
++++ /dev/null
+@@ -1,10 +0,0 @@
+-use axum_macros::debug_handler;
+-use axum::{Json, body::Bytes, http::{Method, Uri}};
+-
+-#[debug_handler]
+-async fn one(_: Json<()>, _: String, _: Uri) {}
+-
+-#[debug_handler]
+-async fn two(_: Json<()>, _: Method, _: Bytes, _: Uri, _: String) {}
+-
+-fn main() {}
+diff --git a/axum-macros/tests/debug_handler/fail/multiple_request_consumers.stderr b/axum-macros/tests/debug_handler/fail/multiple_request_consumers.stderr
+deleted file mode 100644
+index ba2ff7ad..00000000
+--- a/axum-macros/tests/debug_handler/fail/multiple_request_consumers.stderr
++++ /dev/null
+@@ -1,11 +0,0 @@
+-error: Can't have two extractors that consume the request body. `Json<_>` and `String` both do that.
+- --> tests/debug_handler/fail/multiple_request_consumers.rs:5:14
+-  |
+-5 | async fn one(_: Json<()>, _: String, _: Uri) {}
+-  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+-
+-error: Can't have more than one extractor that consume the request body. `Json<_>`, `Bytes`, and `String` all do that.
+- --> tests/debug_handler/fail/multiple_request_consumers.rs:8:14
+-  |
+-8 | async fn two(_: Json<()>, _: Method, _: Bytes, _: Uri, _: String) {}
+-  |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+diff --git a/axum-macros/tests/debug_handler/fail/wrong_order.rs b/axum-macros/tests/debug_handler/fail/wrong_order.rs
+deleted file mode 100644
+index 7d22bf52..00000000
+--- a/axum-macros/tests/debug_handler/fail/wrong_order.rs
++++ /dev/null
+@@ -1,10 +0,0 @@
+-use axum_macros::debug_handler;
+-use axum::{Json, http::Uri};
+-
+-#[debug_handler]
+-async fn one(_: Json<()>, _: Uri) {}
+-
+-#[debug_handler]
+-async fn two(_: String, _: Uri) {}
+-
+-fn main() {}
+diff --git a/axum-macros/tests/debug_handler/fail/wrong_order.stderr b/axum-macros/tests/debug_handler/fail/wrong_order.stderr
+deleted file mode 100644
+index 9c5970ae..00000000
+--- a/axum-macros/tests/debug_handler/fail/wrong_order.stderr
++++ /dev/null
+@@ -1,11 +0,0 @@
+-error: `Json<_>` consumes the request body and thus must be the last argument to the handler function
+- --> tests/debug_handler/fail/wrong_order.rs:5:17
+-  |
+-5 | async fn one(_: Json<()>, _: Uri) {}
+-  |                 ^^^^^^^^
+-
+-error: `String` consumes the request body and thus must be the last argument to the handler function
+- --> tests/debug_handler/fail/wrong_order.rs:8:17
+-  |
+-8 | async fn two(_: String, _: Uri) {}
+-  |                 ^^^^^^

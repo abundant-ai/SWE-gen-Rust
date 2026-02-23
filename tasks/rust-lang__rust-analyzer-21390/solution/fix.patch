@@ -1,0 +1,149 @@
+diff --git a/crates/hir-ty/src/lower.rs b/crates/hir-ty/src/lower.rs
+index 9307868f39..e45ef113a0 100644
+--- a/crates/hir-ty/src/lower.rs
++++ b/crates/hir-ty/src/lower.rs
+@@ -1319,7 +1319,7 @@ fn type_for_struct_constructor(
+     db: &dyn HirDatabase,
+     def: StructId,
+ ) -> Option<StoredEarlyBinder<StoredTy>> {
+-    let struct_data = def.fields(db);
++    let struct_data = db.struct_signature(def);
+     match struct_data.shape {
+         FieldsShape::Record => None,
+         FieldsShape::Unit => Some(type_for_adt(db, def.into())),
+diff --git a/crates/hir-ty/src/method_resolution.rs b/crates/hir-ty/src/method_resolution.rs
+index 50dbd87d69..3d7cc4ffbf 100644
+--- a/crates/hir-ty/src/method_resolution.rs
++++ b/crates/hir-ty/src/method_resolution.rs
+@@ -731,6 +731,10 @@ impl TraitImpls {
+         ) {
+             for (_module_id, module_data) in def_map.modules() {
+                 for impl_id in module_data.scope.impls() {
++                    let trait_ref = match db.impl_trait(impl_id) {
++                        Some(tr) => tr.instantiate_identity(),
++                        None => continue,
++                    };
+                     // Reservation impls should be ignored during trait resolution, so we never need
+                     // them during type analysis. See rust-lang/rust#64631 for details.
+                     //
+@@ -742,10 +746,6 @@ impl TraitImpls {
+                     {
+                         continue;
+                     }
+-                    let trait_ref = match db.impl_trait(impl_id) {
+-                        Some(tr) => tr.instantiate_identity(),
+-                        None => continue,
+-                    };
+                     let self_ty = trait_ref.self_ty();
+                     let interner = DbInterner::new_no_crate(db);
+                     let entry = map.entry(trait_ref.def_id.0).or_default();
+diff --git a/crates/hir-ty/src/next_solver/infer/mod.rs b/crates/hir-ty/src/next_solver/infer/mod.rs
+index 2926dc30de..7d291f7ddb 100644
+--- a/crates/hir-ty/src/next_solver/infer/mod.rs
++++ b/crates/hir-ty/src/next_solver/infer/mod.rs
+@@ -878,9 +878,11 @@ impl<'db> InferCtxt<'db> {
+         self.tainted_by_errors.set(Some(e));
+     }
+ 
+-    #[instrument(level = "debug", skip(self), ret)]
+-    pub fn take_opaque_types(&self) -> Vec<(OpaqueTypeKey<'db>, OpaqueHiddenType<'db>)> {
+-        self.inner.borrow_mut().opaque_type_storage.take_opaque_types().collect()
++    #[instrument(level = "debug", skip(self))]
++    pub fn take_opaque_types(
++        &self,
++    ) -> impl IntoIterator<Item = (OpaqueTypeKey<'db>, OpaqueHiddenType<'db>)> + use<'db> {
++        self.inner.borrow_mut().opaque_type_storage.take_opaque_types()
+     }
+ 
+     #[instrument(level = "debug", skip(self), ret)]
+diff --git a/crates/hir-ty/src/next_solver/infer/opaque_types/table.rs b/crates/hir-ty/src/next_solver/infer/opaque_types/table.rs
+index 00177d21ac..894fe5eb7b 100644
+--- a/crates/hir-ty/src/next_solver/infer/opaque_types/table.rs
++++ b/crates/hir-ty/src/next_solver/infer/opaque_types/table.rs
+@@ -61,7 +61,7 @@ impl<'db> OpaqueTypeStorage<'db> {
+ 
+     pub(crate) fn take_opaque_types(
+         &mut self,
+-    ) -> impl Iterator<Item = (OpaqueTypeKey<'db>, OpaqueHiddenType<'db>)> {
++    ) -> impl IntoIterator<Item = (OpaqueTypeKey<'db>, OpaqueHiddenType<'db>)> + use<'db> {
+         let OpaqueTypeStorage { opaque_types, duplicate_entries } = self;
+         std::mem::take(opaque_types).into_iter().chain(std::mem::take(duplicate_entries))
+     }
+diff --git a/crates/hir-ty/src/variance.rs b/crates/hir-ty/src/variance.rs
+index e5cfe85573..6f415a5289 100644
+--- a/crates/hir-ty/src/variance.rs
++++ b/crates/hir-ty/src/variance.rs
+@@ -41,7 +41,6 @@ pub(crate) fn variances_of(db: &dyn HirDatabase, def: GenericDefId) -> Variances
+ )]
+ fn variances_of_query(db: &dyn HirDatabase, def: GenericDefId) -> StoredVariancesOf {
+     tracing::debug!("variances_of(def={:?})", def);
+-    let interner = DbInterner::new_no_crate(db);
+     match def {
+         GenericDefId::FunctionId(_) => (),
+         GenericDefId::AdtId(adt) => {
+@@ -55,15 +54,17 @@ fn variances_of_query(db: &dyn HirDatabase, def: GenericDefId) -> StoredVariance
+                 }
+             }
+         }
+-        _ => return VariancesOf::empty(interner).store(),
++        _ => return VariancesOf::empty(DbInterner::new_no_crate(db)).store(),
+     }
+ 
+     let generics = generics(db, def);
+     let count = generics.len();
+     if count == 0 {
+-        return VariancesOf::empty(interner).store();
++        return VariancesOf::empty(DbInterner::new_no_crate(db)).store();
+     }
+-    let variances = Context { generics, variances: vec![Variance::Bivariant; count], db }.solve();
++    let variances =
++        Context { generics, variances: vec![Variance::Bivariant; count].into_boxed_slice(), db }
++            .solve();
+ 
+     VariancesOf::new_from_slice(&variances).store()
+ }
+@@ -113,11 +114,11 @@ pub(crate) fn variances_of_cycle_initial(
+ struct Context<'db> {
+     db: &'db dyn HirDatabase,
+     generics: Generics,
+-    variances: Vec<Variance>,
++    variances: Box<[Variance]>,
+ }
+ 
+ impl<'db> Context<'db> {
+-    fn solve(mut self) -> Vec<Variance> {
++    fn solve(mut self) -> Box<[Variance]> {
+         tracing::debug!("solve(generics={:?})", self.generics);
+         match self.generics.def() {
+             GenericDefId::AdtId(adt) => {
+diff --git a/crates/intern/src/intern.rs b/crates/intern/src/intern.rs
+index b7acd6624b..a96dfcfa9f 100644
+--- a/crates/intern/src/intern.rs
++++ b/crates/intern/src/intern.rs
+@@ -334,7 +334,7 @@ impl<T: ?Sized> InternStorage<T> {
+ 
+ impl<T: Internable + ?Sized> InternStorage<T> {
+     pub(crate) fn get(&self) -> &InternMap<T> {
+-        self.map.get_or_init(DashMap::default)
++        self.map.get_or_init(|| DashMap::with_capacity_and_hasher(1024, Default::default()))
+     }
+ }
+ 
+diff --git a/crates/intern/src/intern_slice.rs b/crates/intern/src/intern_slice.rs
+index 58de6e17bd..8857771d2e 100644
+--- a/crates/intern/src/intern_slice.rs
++++ b/crates/intern/src/intern_slice.rs
+@@ -292,7 +292,12 @@ impl<T: SliceInternable> InternSliceStorage<T> {
+ 
+ impl<T: SliceInternable> InternSliceStorage<T> {
+     pub(crate) fn get(&self) -> &InternMap<T> {
+-        self.map.get_or_init(DashMap::default)
++        self.map.get_or_init(|| {
++            DashMap::with_capacity_and_hasher(
++                (64 * 1024) / std::mem::size_of::<T::SliceType>(),
++                Default::default(),
++            )
++        })
+     }
+ }
+ 

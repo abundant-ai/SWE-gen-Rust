@@ -1,0 +1,1801 @@
+diff --git a/tracing-subscriber/src/filter/env/builder.rs b/tracing-subscriber/src/filter/env/builder.rs
+new file mode 100644
+index 00000000..128b1868
+--- /dev/null
++++ b/tracing-subscriber/src/filter/env/builder.rs
+@@ -0,0 +1,318 @@
++use super::{
++    directive::{self, Directive},
++    EnvFilter, FromEnvError,
++};
++use crate::sync::RwLock;
++use std::env;
++use thread_local::ThreadLocal;
++use tracing::level_filters::STATIC_MAX_LEVEL;
++
++/// A [builder] for constructing new [`EnvFilter`]s.
++///
++/// [builder]: https://rust-unofficial.github.io/patterns/patterns/creational/builder.html
++#[derive(Debug, Clone)]
++pub struct Builder {
++    regex: bool,
++    env: Option<String>,
++    default_directive: Option<Directive>,
++}
++
++impl Builder {
++    /// Sets whether span field values can be matched with regular expressions.
++    ///
++    /// If this is `true`, field filter directives will be interpreted as
++    /// regular expressions if they are not able to be interpreted as a `bool`,
++    /// `i64`, `u64`, or `f64` literal. If this is `false,` those field values
++    /// will be interpreted as literal [`std::fmt::Debug`] output instead.
++    ///
++    /// By default, regular expressions are enabled.
++    ///
++    /// **Note**: when [`EnvFilter`]s are constructed from untrusted inputs,
++    /// disabling regular expressions is strongly encouraged.
++    pub fn with_regex(self, regex: bool) -> Self {
++        Self { regex, ..self }
++    }
++
++    /// Sets a default [filtering directive] that will be added to the filter if
++    /// the parsed string or environment variable contains no filter directives.
++    ///
++    /// By default, there is no default directive.
++    ///
++    /// # Examples
++    ///
++    /// If [`parse`], [`parse_lossy`], [`from_env`], or [`from_env_lossy`] are
++    /// called with an empty string or environment variable, the default
++    /// directive is used instead:
++    ///
++    /// ```rust
++    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
++    /// use tracing_subscriber::filter::{EnvFilter, LevelFilter};
++    ///
++    /// let filter = EnvFilter::builder()
++    ///     .with_default_directive(LevelFilter::INFO.into())
++    ///     .parse("")?;
++    ///
++    /// assert_eq!(format!("{}", filter), "info");
++    /// # Ok(()) }
++    /// ```
++    ///
++    /// Note that the `lossy` variants ([`parse_lossy`] and [`from_env_lossy`])
++    /// will ignore any invalid directives. If all directives in a filter
++    /// string or environment variable are invalid, those methods will also use
++    /// the default directive:
++    ///
++    /// ```rust
++    /// use tracing_subscriber::filter::{EnvFilter, LevelFilter};
++    ///
++    /// let filter = EnvFilter::builder()
++    ///     .with_default_directive(LevelFilter::INFO.into())
++    ///     .parse_lossy("some_target=fake level,foo::bar=lolwut");
++    ///
++    /// assert_eq!(format!("{}", filter), "info");
++    /// ```
++    ///
++    ///
++    /// If the string or environment variable contains valid filtering
++    /// directives, the default directive is not used:
++    ///
++    /// ```rust
++    /// use tracing_subscriber::filter::{EnvFilter, LevelFilter};
++    ///
++    /// let filter = EnvFilter::builder()
++    ///     .with_default_directive(LevelFilter::INFO.into())
++    ///     .parse_lossy("foo=trace");
++    ///
++    /// // The default directive is *not* used:
++    /// assert_eq!(format!("{}", filter), "foo=trace");
++    /// ```
++    ///
++    /// Parsing a more complex default directive from a string:
++    ///
++    /// ```rust
++    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
++    /// use tracing_subscriber::filter::{EnvFilter, LevelFilter};
++    ///
++    /// let default = "myapp=debug".parse()
++    ///     .expect("hard-coded default directive should be valid");
++    ///
++    /// let filter = EnvFilter::builder()
++    ///     .with_default_directive(default)
++    ///     .parse("")?;
++    ///
++    /// assert_eq!(format!("{}", filter), "myapp=debug");
++    /// # Ok(()) }
++    /// ```
++    ///
++    /// [`parse_lossy`]: Self::parse_lossy
++    /// [`from_env_lossy`]: Self::from_env_lossy
++    /// [`parse`]: Self::parse
++    /// [`from_env`]: Self::from_env
++    pub fn with_default_directive(self, default_directive: Directive) -> Self {
++        Self {
++            default_directive: Some(default_directive),
++            ..self
++        }
++    }
++
++    /// Sets the name of the environment variable used by the [`from_env`],
++    /// [`from_env_lossy`], and [`try_from_env`] methods.
++    ///
++    /// By default, this is the value of [`EnvFilter::DEFAULT_ENV`]
++    /// (`RUST_LOG`).
++    ///
++    /// [`from_env`]: Self::from_env
++    /// [`from_env_lossy`]: Self::from_env_lossy
++    /// [`try_from_env`]: Self::try_from_env
++    pub fn with_env_var(self, var: impl ToString) -> Self {
++        Self {
++            env: Some(var.to_string()),
++            ..self
++        }
++    }
++
++    /// Returns a new [`EnvFilter`] from the directives in the given string,
++    /// *ignoring* any that are invalid.
++    pub fn parse_lossy<S: AsRef<str>>(&self, dirs: S) -> EnvFilter {
++        let directives =
++            dirs.as_ref()
++                .split(',')
++                .filter_map(|s| match Directive::parse(s, self.regex) {
++                    Ok(d) => Some(d),
++                    Err(err) => {
++                        eprintln!("ignoring `{}`: {}", s, err);
++                        None
++                    }
++                });
++        self.from_directives(directives)
++    }
++
++    /// Returns a new [`EnvFilter`] from the directives in the given string,
++    /// or an error if any are invalid.
++    pub fn parse<S: AsRef<str>>(&self, dirs: S) -> Result<EnvFilter, directive::ParseError> {
++        let dirs = dirs.as_ref();
++        if dirs.is_empty() {
++            return Ok(self.from_directives(std::iter::empty()));
++        }
++        let directives = dirs
++            .split(',')
++            .map(|s| Directive::parse(s, self.regex))
++            .collect::<Result<Vec<_>, _>>()?;
++        Ok(self.from_directives(directives))
++    }
++
++    /// Returns a new [`EnvFilter`] from the directives in the configured
++    /// environment variable, ignoring any directives that are invalid.
++    pub fn from_env_lossy(&self) -> EnvFilter {
++        let var = env::var(self.env_var_name()).unwrap_or_default();
++        self.parse_lossy(var)
++    }
++
++    /// Returns a new [`EnvFilter`] from the directives in the in the configured
++    /// environment variable, or an error if the environment variable is not set
++    /// or contains invalid directives.
++    pub fn from_env(&self) -> Result<EnvFilter, FromEnvError> {
++        let var = env::var(self.env_var_name()).unwrap_or_default();
++        self.parse(var).map_err(Into::into)
++    }
++
++    /// Returns a new [`EnvFilter`] from the directives in the in the configured
++    /// environment variable, or an error if the environment variable is not set
++    /// or contains invalid directives.
++    pub fn try_from_env(&self) -> Result<EnvFilter, FromEnvError> {
++        let var = env::var(self.env_var_name())?;
++        self.parse(var).map_err(Into::into)
++    }
++
++    // TODO(eliza): consider making this a public API?
++    pub(super) fn from_directives(
++        &self,
++        directives: impl IntoIterator<Item = Directive>,
++    ) -> EnvFilter {
++        use tracing::Level;
++
++        let mut directives: Vec<_> = directives.into_iter().collect();
++        let mut disabled = Vec::new();
++        for directive in &mut directives {
++            if directive.level > STATIC_MAX_LEVEL {
++                disabled.push(directive.clone());
++            }
++            if !self.regex {
++                directive.deregexify();
++            }
++        }
++
++        if !disabled.is_empty() {
++            #[cfg(feature = "ansi_term")]
++            use ansi_term::{Color, Style};
++            // NOTE: We can't use a configured `MakeWriter` because the EnvFilter
++            // has no knowledge of any underlying subscriber or collector, which
++            // may or may not use a `MakeWriter`.
++            let warn = |msg: &str| {
++                #[cfg(not(feature = "ansi_term"))]
++                let msg = format!("warning: {}", msg);
++                #[cfg(feature = "ansi_term")]
++                let msg = {
++                    let bold = Style::new().bold();
++                    let mut warning = Color::Yellow.paint("warning");
++                    warning.style_ref_mut().is_bold = true;
++                    format!("{}{} {}", warning, bold.paint(":"), bold.paint(msg))
++                };
++                eprintln!("{}", msg);
++            };
++            let ctx_prefixed = |prefix: &str, msg: &str| {
++                #[cfg(not(feature = "ansi_term"))]
++                let msg = format!("{} {}", prefix, msg);
++                #[cfg(feature = "ansi_term")]
++                let msg = {
++                    let mut equal = Color::Fixed(21).paint("="); // dark blue
++                    equal.style_ref_mut().is_bold = true;
++                    format!(" {} {} {}", equal, Style::new().bold().paint(prefix), msg)
++                };
++                eprintln!("{}", msg);
++            };
++            let ctx_help = |msg| ctx_prefixed("help:", msg);
++            let ctx_note = |msg| ctx_prefixed("note:", msg);
++            let ctx = |msg: &str| {
++                #[cfg(not(feature = "ansi_term"))]
++                let msg = format!("note: {}", msg);
++                #[cfg(feature = "ansi_term")]
++                let msg = {
++                    let mut pipe = Color::Fixed(21).paint("|");
++                    pipe.style_ref_mut().is_bold = true;
++                    format!(" {} {}", pipe, msg)
++                };
++                eprintln!("{}", msg);
++            };
++            warn("some trace filter directives would enable traces that are disabled statically");
++            for directive in disabled {
++                let target = if let Some(target) = &directive.target {
++                    format!("the `{}` target", target)
++                } else {
++                    "all targets".into()
++                };
++                let level = directive
++                    .level
++                    .into_level()
++                    .expect("=off would not have enabled any filters");
++                ctx(&format!(
++                    "`{}` would enable the {} level for {}",
++                    directive, level, target
++                ));
++            }
++            ctx_note(&format!("the static max level is `{}`", STATIC_MAX_LEVEL));
++            let help_msg = || {
++                let (feature, filter) = match STATIC_MAX_LEVEL.into_level() {
++                    Some(Level::TRACE) => unreachable!(
++                        "if the max level is trace, no static filtering features are enabled"
++                    ),
++                    Some(Level::DEBUG) => ("max_level_debug", Level::TRACE),
++                    Some(Level::INFO) => ("max_level_info", Level::DEBUG),
++                    Some(Level::WARN) => ("max_level_warn", Level::INFO),
++                    Some(Level::ERROR) => ("max_level_error", Level::WARN),
++                    None => return ("max_level_off", String::new()),
++                };
++                (feature, format!("{} ", filter))
++            };
++            let (feature, earlier_level) = help_msg();
++            ctx_help(&format!(
++                "to enable {}logging, remove the `{}` feature",
++                earlier_level, feature
++            ));
++        }
++
++        let (dynamics, statics) = Directive::make_tables(directives);
++        let has_dynamics = !dynamics.is_empty();
++
++        let mut filter = EnvFilter {
++            statics,
++            dynamics,
++            has_dynamics,
++            by_id: RwLock::new(Default::default()),
++            by_cs: RwLock::new(Default::default()),
++            scope: ThreadLocal::new(),
++            regex: self.regex,
++        };
++
++        if !has_dynamics && filter.statics.is_empty() {
++            if let Some(ref default) = self.default_directive {
++                filter = filter.add_directive(default.clone());
++            }
++        }
++
++        filter
++    }
++
++    fn env_var_name(&self) -> &str {
++        self.env.as_deref().unwrap_or(EnvFilter::DEFAULT_ENV)
++    }
++}
++
++impl Default for Builder {
++    fn default() -> Self {
++        Self {
++            regex: true,
++            env: None,
++            default_directive: None,
++        }
++    }
++}
+diff --git a/tracing-subscriber/src/filter/env/directive.rs b/tracing-subscriber/src/filter/env/directive.rs
+index 66ca23dc..3e993f6c 100644
+--- a/tracing-subscriber/src/filter/env/directive.rs
++++ b/tracing-subscriber/src/filter/env/directive.rs
+@@ -11,7 +11,7 @@ use tracing_core::{span, Level, Metadata};
+ 
+ /// A single filtering directive.
+ // TODO(eliza): add a builder for programmatically constructing directives?
+-#[derive(Debug, Eq, PartialEq)]
++#[derive(Clone, Debug, Eq, PartialEq)]
+ #[cfg_attr(docsrs, doc(cfg(feature = "env-filter")))]
+ pub struct Directive {
+     in_span: Option<String>,
+@@ -107,45 +107,19 @@ impl Directive {
+             .collect();
+         (Dynamics::from_iter(dyns), statics)
+     }
+-}
+-
+-impl Match for Directive {
+-    fn cares_about(&self, meta: &Metadata<'_>) -> bool {
+-        // Does this directive have a target filter, and does it match the
+-        // metadata's target?
+-        if let Some(ref target) = self.target {
+-            if !meta.target().starts_with(&target[..]) {
+-                return false;
+-            }
+-        }
+ 
+-        // Do we have a name filter, and does it match the metadata's name?
+-        // TODO(eliza): put name globbing here?
+-        if let Some(ref name) = self.in_span {
+-            if name != meta.name() {
+-                return false;
+-            }
+-        }
+-
+-        // Does the metadata define all the fields that this directive cares about?
+-        let fields = meta.fields();
+-        for field in &self.fields {
+-            if fields.field(&field.name).is_none() {
+-                return false;
++    pub(super) fn deregexify(&mut self) {
++        for field in &mut self.fields {
++            field.value = match field.value.take() {
++                Some(field::ValueMatch::Pat(pat)) => {
++                    Some(field::ValueMatch::Debug(pat.into_debug_match()))
++                }
++                x => x,
+             }
+         }
+-
+-        true
+     }
+ 
+-    fn level(&self) -> &LevelFilter {
+-        &self.level
+-    }
+-}
+-
+-impl FromStr for Directive {
+-    type Err = ParseError;
+-    fn from_str(from: &str) -> Result<Self, Self::Err> {
++    pub(super) fn parse(from: &str, regex: bool) -> Result<Self, ParseError> {
+         lazy_static! {
+             static ref DIRECTIVE_RE: Regex = Regex::new(
+                 r"(?x)
+@@ -214,7 +188,7 @@ impl FromStr for Directive {
+                     .map(|c| {
+                         FIELD_FILTER_RE
+                             .find_iter(c.as_str())
+-                            .map(|c| c.as_str().parse())
++                            .map(|c| field::Match::parse(c.as_str(), regex))
+                             .collect::<Result<Vec<_>, _>>()
+                     })
+                     .unwrap_or_else(|| Ok(Vec::new()));
+@@ -228,7 +202,7 @@ impl FromStr for Directive {
+             // Setting the target without the level enables every level for that target
+             .unwrap_or(LevelFilter::TRACE);
+ 
+-        Ok(Directive {
++        Ok(Self {
+             level,
+             target,
+             in_span,
+@@ -237,6 +211,48 @@ impl FromStr for Directive {
+     }
+ }
+ 
++impl Match for Directive {
++    fn cares_about(&self, meta: &Metadata<'_>) -> bool {
++        // Does this directive have a target filter, and does it match the
++        // metadata's target?
++        if let Some(ref target) = self.target {
++            if !meta.target().starts_with(&target[..]) {
++                return false;
++            }
++        }
++
++        // Do we have a name filter, and does it match the metadata's name?
++        // TODO(eliza): put name globbing here?
++        if let Some(ref name) = self.in_span {
++            if name != meta.name() {
++                return false;
++            }
++        }
++
++        // Does the metadata define all the fields that this directive cares about?
++        let actual_fields = meta.fields();
++        for expected_field in &self.fields {
++            // Does the actual field set (from the metadata) contain this field?
++            if actual_fields.field(&expected_field.name).is_none() {
++                return false;
++            }
++        }
++
++        true
++    }
++
++    fn level(&self) -> &LevelFilter {
++        &self.level
++    }
++}
++
++impl FromStr for Directive {
++    type Err = ParseError;
++    fn from_str(from: &str) -> Result<Self, Self::Err> {
++        Directive::parse(from, true)
++    }
++}
++
+ impl Default for Directive {
+     fn default() -> Self {
+         Directive {
+diff --git a/tracing-subscriber/src/filter/env/field.rs b/tracing-subscriber/src/filter/env/field.rs
+index 970850f9..1394fd04 100644
+--- a/tracing-subscriber/src/filter/env/field.rs
++++ b/tracing-subscriber/src/filter/env/field.rs
+@@ -2,7 +2,7 @@ use matchers::Pattern;
+ use std::{
+     cmp::Ordering,
+     error::Error,
+-    fmt,
++    fmt::{self, Write},
+     str::FromStr,
+     sync::{
+         atomic::{AtomicBool, Ordering::*},
+@@ -13,7 +13,7 @@ use std::{
+ use super::{FieldMap, LevelFilter};
+ use tracing_core::field::{Field, Visit};
+ 
+-#[derive(Debug, Eq, PartialEq)]
++#[derive(Clone, Debug, Eq, PartialEq)]
+ pub(crate) struct Match {
+     pub(crate) name: String, // TODO: allow match patterns for names?
+     pub(crate) value: Option<ValueMatch>,
+@@ -38,11 +38,20 @@ pub(crate) struct MatchVisitor<'a> {
+ 
+ #[derive(Debug, Clone)]
+ pub(crate) enum ValueMatch {
++    /// Matches a specific `bool` value.
+     Bool(bool),
++    /// Matches a specific `f64` value.
+     F64(f64),
++    /// Matches a specific `u64` value.
+     U64(u64),
++    /// Matches a specific `i64` value.
+     I64(i64),
++    /// Matches any `NaN` `f64` value.
+     NaN,
++    /// Matches any field whose `fmt::Debug` output is equal to a fixed string.
++    Debug(MatchDebug),
++    /// Matches any field whose `fmt::Debug` output matches a regular expression
++    /// pattern.
+     Pat(Box<MatchPattern>),
+ }
+ 
+@@ -97,6 +106,9 @@ impl Ord for ValueMatch {
+ 
+             (Pat(this), Pat(that)) => this.cmp(that),
+             (Pat(_), _) => Ordering::Greater,
++
++            (Debug(this), Debug(that)) => this.cmp(that),
++            (Debug(_), _) => Ordering::Greater,
+         }
+     }
+ }
+@@ -107,12 +119,25 @@ impl PartialOrd for ValueMatch {
+     }
+ }
+ 
++/// Matches a field's `fmt::Debug` output against a regular expression pattern.
++///
++/// This is used for matching all non-literal field value filters when regular
++/// expressions are enabled.
+ #[derive(Debug, Clone)]
+ pub(crate) struct MatchPattern {
+     pub(crate) matcher: Pattern,
+     pattern: Arc<str>,
+ }
+ 
++/// Matches a field's `fmt::Debug` output against a fixed string pattern.
++///
++/// This is used for matching all non-literal field value filters when regular
++/// expressions are disabled.
++#[derive(Debug, Clone)]
++pub(crate) struct MatchDebug {
++    pattern: Arc<str>,
++}
++
+ /// Indicates that a field name specified in a filter directive was invalid.
+ #[derive(Clone, Debug)]
+ #[cfg_attr(docsrs, doc(cfg(feature = "env-filter")))]
+@@ -122,9 +147,17 @@ pub struct BadName {
+ 
+ // === impl Match ===
+ 
+-impl FromStr for Match {
+-    type Err = Box<dyn Error + Send + Sync>;
+-    fn from_str(s: &str) -> Result<Self, Self::Err> {
++impl Match {
++    pub(crate) fn has_value(&self) -> bool {
++        self.value.is_some()
++    }
++
++    // TODO: reference count these strings?
++    pub(crate) fn name(&self) -> String {
++        self.name.clone()
++    }
++
++    pub(crate) fn parse(s: &str, regex: bool) -> Result<Self, Box<dyn Error + Send + Sync>> {
+         let mut parts = s.split('=');
+         let name = parts
+             .next()
+@@ -133,22 +166,17 @@ impl FromStr for Match {
+             })?
+             // TODO: validate field name
+             .to_string();
+-        let value = parts.next().map(ValueMatch::from_str).transpose()?;
++        let value = parts
++            .next()
++            .map(|part| match regex {
++                true => ValueMatch::parse_regex(part),
++                false => Ok(ValueMatch::parse_non_regex(part)),
++            })
++            .transpose()?;
+         Ok(Match { name, value })
+     }
+ }
+ 
+-impl Match {
+-    pub(crate) fn has_value(&self) -> bool {
+-        self.value.is_some()
+-    }
+-
+-    // TODO: reference count these strings?
+-    pub(crate) fn name(&self) -> String {
+-        self.name.clone()
+-    }
+-}
+-
+ impl fmt::Display for Match {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         fmt::Display::fmt(&self.name, f)?;
+@@ -199,9 +227,14 @@ fn value_match_f64(v: f64) -> ValueMatch {
+     }
+ }
+ 
+-impl FromStr for ValueMatch {
+-    type Err = matchers::Error;
+-    fn from_str(s: &str) -> Result<Self, Self::Err> {
++impl ValueMatch {
++    /// Parse a `ValueMatch` that will match `fmt::Debug` fields using regular
++    /// expressions.
++    ///
++    /// This returns an error if the string didn't contain a valid `bool`,
++    /// `u64`, `i64`, or `f64` literal, and couldn't be parsed as a regular
++    /// expression.
++    fn parse_regex(s: &str) -> Result<Self, matchers::Error> {
+         s.parse::<bool>()
+             .map(ValueMatch::Bool)
+             .or_else(|_| s.parse::<u64>().map(ValueMatch::U64))
+@@ -212,6 +245,21 @@ impl FromStr for ValueMatch {
+                     .map(|p| ValueMatch::Pat(Box::new(p)))
+             })
+     }
++
++    /// Parse a `ValueMatch` that will match `fmt::Debug` against a fixed
++    /// string.
++    ///
++    /// This does *not* return an error, because any string that isn't a valid
++    /// `bool`, `u64`, `i64`, or `f64` literal is treated as expected
++    /// `fmt::Debug` output.
++    fn parse_non_regex(s: &str) -> Self {
++        s.parse::<bool>()
++            .map(ValueMatch::Bool)
++            .or_else(|_| s.parse::<u64>().map(ValueMatch::U64))
++            .or_else(|_| s.parse::<i64>().map(ValueMatch::I64))
++            .or_else(|_| s.parse::<f64>().map(value_match_f64))
++            .unwrap_or_else(|_| ValueMatch::Debug(MatchDebug::new(s)))
++    }
+ }
+ 
+ impl fmt::Display for ValueMatch {
+@@ -222,6 +270,7 @@ impl fmt::Display for ValueMatch {
+             ValueMatch::NaN => fmt::Display::fmt(&std::f64::NAN, f),
+             ValueMatch::I64(ref inner) => fmt::Display::fmt(inner, f),
+             ValueMatch::U64(ref inner) => fmt::Display::fmt(inner, f),
++            ValueMatch::Debug(ref inner) => fmt::Display::fmt(inner, f),
+             ValueMatch::Pat(ref inner) => fmt::Display::fmt(inner, f),
+         }
+     }
+@@ -264,6 +313,12 @@ impl MatchPattern {
+     fn debug_matches(&self, d: &impl fmt::Debug) -> bool {
+         self.matcher.debug_matches(d)
+     }
++
++    pub(super) fn into_debug_match(self) -> MatchDebug {
++        MatchDebug {
++            pattern: self.pattern,
++        }
++    }
+ }
+ 
+ impl PartialEq for MatchPattern {
+@@ -289,6 +344,102 @@ impl Ord for MatchPattern {
+     }
+ }
+ 
++// === impl MatchDebug ===
++
++impl MatchDebug {
++    fn new(s: &str) -> Self {
++        Self {
++            pattern: s.to_owned().into(),
++        }
++    }
++
++    #[inline]
++    fn debug_matches(&self, d: &impl fmt::Debug) -> bool {
++        // Naively, we would probably match a value's `fmt::Debug` output by
++        // formatting it to a string, and then checking if the string is equal
++        // to the expected pattern. However, this would require allocating every
++        // time we want to match a field value against a `Debug` matcher, which
++        // can be avoided.
++        //
++        // Instead, we implement `fmt::Write` for a type that, rather than
++        // actually _writing_ the strings to something, matches them against the
++        // expected pattern, and returns an error if the pattern does not match.
++        struct Matcher<'a> {
++            pattern: &'a str,
++        }
++
++        impl fmt::Write for Matcher<'_> {
++            fn write_str(&mut self, s: &str) -> fmt::Result {
++                // If the string is longer than the remaining expected string,
++                // we know it won't match, so bail.
++                if s.len() > self.pattern.len() {
++                    return Err(fmt::Error);
++                }
++
++                // If the expected string begins with the string that was
++                // written, we are still potentially a match. Advance the
++                // position in the expected pattern to chop off the matched
++                // output, and continue.
++                if self.pattern.starts_with(s) {
++                    self.pattern = &self.pattern[s.len()..];
++                    return Ok(());
++                }
++
++                // Otherwise, the expected string doesn't include the string
++                // that was written at the current position, so the `fmt::Debug`
++                // output doesn't match! Return an error signalling that this
++                // doesn't match.
++                Err(fmt::Error)
++            }
++        }
++        let mut matcher = Matcher {
++            pattern: &self.pattern,
++        };
++
++        // Try to "write" the value's `fmt::Debug` output to a `Matcher`. This
++        // returns an error if the `fmt::Debug` implementation wrote any
++        // characters that did not match the expected pattern.
++        write!(matcher, "{:?}", d).is_ok()
++    }
++}
++
++impl fmt::Display for MatchDebug {
++    #[inline]
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        fmt::Display::fmt(&*self.pattern, f)
++    }
++}
++
++impl AsRef<str> for MatchDebug {
++    #[inline]
++    fn as_ref(&self) -> &str {
++        self.pattern.as_ref()
++    }
++}
++
++impl PartialEq for MatchDebug {
++    #[inline]
++    fn eq(&self, other: &Self) -> bool {
++        self.pattern == other.pattern
++    }
++}
++
++impl Eq for MatchDebug {}
++
++impl PartialOrd for MatchDebug {
++    #[inline]
++    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
++        Some(self.pattern.cmp(&other.pattern))
++    }
++}
++
++impl Ord for MatchDebug {
++    #[inline]
++    fn cmp(&self, other: &Self) -> Ordering {
++        self.pattern.cmp(&other.pattern)
++    }
++}
++
+ // === impl BadName ===
+ 
+ impl Error for BadName {}
+@@ -401,6 +552,9 @@ impl<'a> Visit for MatchVisitor<'a> {
+             Some((ValueMatch::Pat(ref e), ref matched)) if e.str_matches(&value) => {
+                 matched.store(true, Release);
+             }
++            Some((ValueMatch::Debug(ref e), ref matched)) if e.debug_matches(&value) => {
++                matched.store(true, Release)
++            }
+             _ => {}
+         }
+     }
+@@ -410,7 +564,63 @@ impl<'a> Visit for MatchVisitor<'a> {
+             Some((ValueMatch::Pat(ref e), ref matched)) if e.debug_matches(&value) => {
+                 matched.store(true, Release);
+             }
++            Some((ValueMatch::Debug(ref e), ref matched)) if e.debug_matches(&value) => {
++                matched.store(true, Release)
++            }
+             _ => {}
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[derive(Debug)]
++    #[allow(dead_code)]
++    struct MyStruct {
++        answer: usize,
++        question: &'static str,
++    }
++
++    #[test]
++    fn debug_struct_match() {
++        let my_struct = MyStruct {
++            answer: 42,
++            question: "life, the universe, and everything",
++        };
++
++        let pattern = "MyStruct { answer: 42, question: \"life, the universe, and everything\" }";
++
++        assert_eq!(
++            format!("{:?}", my_struct),
++            pattern,
++            "`MyStruct`'s `Debug` impl doesn't output the expected string"
++        );
++
++        let matcher = MatchDebug {
++            pattern: pattern.into(),
++        };
++        assert!(matcher.debug_matches(&my_struct))
++    }
++
++    #[test]
++    fn debug_struct_not_match() {
++        let my_struct = MyStruct {
++            answer: 42,
++            question: "what shall we have for lunch?",
++        };
++
++        let pattern = "MyStruct { answer: 42, question: \"life, the universe, and everything\" }";
++
++        assert_eq!(
++            format!("{:?}", my_struct),
++            "MyStruct { answer: 42, question: \"what shall we have for lunch?\" }",
++            "`MyStruct`'s `Debug` impl doesn't output the expected string"
++        );
++
++        let matcher = MatchDebug {
++            pattern: pattern.into(),
++        };
++        assert!(!matcher.debug_matches(&my_struct))
++    }
++}
+diff --git a/tracing-subscriber/src/filter/env/mod.rs b/tracing-subscriber/src/filter/env/mod.rs
+index 11dc92cb..e59ba012 100644
+--- a/tracing-subscriber/src/filter/env/mod.rs
++++ b/tracing-subscriber/src/filter/env/mod.rs
+@@ -4,7 +4,8 @@
+ // these are publicly re-exported, but the compiler doesn't realize
+ // that for some reason.
+ #[allow(unreachable_pub)]
+-pub use self::{directive::Directive, field::BadName as BadFieldName};
++pub use self::{builder::Builder, directive::Directive, field::BadName as BadFieldName};
++mod builder;
+ mod directive;
+ mod field;
+ 
+@@ -63,10 +64,27 @@ use tracing_core::{
+ ///    and will match on any [`Span`] or [`Event`] that has a field with that name.
+ ///    For example: `[span{field=\"value\"}]=debug`, `[{field}]=trace`.
+ /// - `value` matches on the value of a span's field. If a value is a numeric literal or a bool,
+-///    it will match _only_ on that value. Otherwise, this filter acts as a regex on
+-///    the `std::fmt::Debug` output from the value.
++///    it will match _only_ on that value. Otherwise, this filter matches the
++///    [`std::fmt::Debug`] output from the value.
+ /// - `level` sets a maximum verbosity level accepted by this directive.
+ ///
++/// When a field value directive (`[{<FIELD NAME>=<FIELD_VALUE>}]=...`) matches a
++/// value's [`std::fmt::Debug`] output (i.e., the field value in the directive
++/// is not a `bool`, `i64`, `u64`, or `f64` literal), the matched pattern may be
++/// interpreted as either a regular expression or as the precise expected
++/// output of the field's [`std::fmt::Debug`] implementation. By default, these
++/// filters are interpreted as regular expressions, but this can be disabled
++/// using the [`Builder::with_regex`] builder method to use precise matching
++/// instead.
++///
++/// When field value filters are interpreted as regular expressions, the
++/// [`regex-automata` crate's regular expression syntax][re-syntax] is
++/// supported.
++///
++/// **Note**: When filters are constructed from potentially untrusted inputs,
++/// [disabling regular expression matching](Builder::with_regex) is strongly
++/// recommended.
++///
+ /// ## Usage Notes
+ ///
+ /// - The portion of the directive which is included within the square brackets is `tracing`-specific.
+@@ -148,6 +166,20 @@ use tracing_core::{
+ ///     .with(unfiltered_layer)
+ ///     .init();
+ /// ```
++/// # Constructing `EnvFilter`s
++///
++/// An `EnvFilter` is be constructed by parsing a string containing one or more
++/// directives. The [`EnvFilter::new`] constructor parses an `EnvFilter` from a
++/// string, ignoring any invalid directives, while [`EnvFilter::try_new`]
++/// returns an error if invalid directives are encountered. Similarly, the
++/// [`EnvFilter::from_env`] and [`EnvFilter::try_from_env`] constructors parse
++/// an `EnvFilter` from the value of the provided environment variable, with
++/// lossy and strict validation, respectively.
++///
++/// A [builder](EnvFilter::builder) interface is available to set additional
++/// configuration options prior to parsing an `EnvFilter`. See the [`Builder`
++/// type's documentation](Builder) for details on the options that can be
++/// configured using the builder.
+ ///
+ /// [`Span`]: tracing_core::span
+ /// [fields]: tracing_core::Field
+@@ -169,6 +201,7 @@ pub struct EnvFilter {
+     by_id: RwLock<HashMap<span::Id, directive::SpanMatcher>>,
+     by_cs: RwLock<HashMap<callsite::Identifier, directive::CallsiteMatcher>>,
+     scope: ThreadLocal<RefCell<Vec<LevelFilter>>>,
++    regex: bool,
+ }
+ 
+ type FieldMap<T> = HashMap<Field, T>;
+@@ -195,54 +228,175 @@ impl EnvFilter {
+     /// [`EnvFilter::try_from_default_env`]: #method.try_from_default_env
+     pub const DEFAULT_ENV: &'static str = "RUST_LOG";
+ 
++    /// Returns a [builder] that can be used to configure a new [`EnvFilter`]
++    /// instance.
++    ///
++    /// The [`Builder`] type is used to set additional configurations, such as
++    /// [whether regular expressions are enabled](Builder::with_regex) or [the
++    /// default directive](Builder::with_default_directive) before parsing an
++    /// [`EnvFilter`] from a string or environment variable.
++    ///
++    /// [builder]: https://rust-unofficial.github.io/patterns/patterns/creational/builder.html
++    pub fn builder() -> Builder {
++        Builder::default()
++    }
++
+     /// Returns a new `EnvFilter` from the value of the `RUST_LOG` environment
+     /// variable, ignoring any invalid filter directives.
++    ///
++    /// If the environment variable is empty or not set, or if it contains only
++    /// invalid directives, a default directive enabling the [`ERROR`] level is
++    /// added.
++    ///
++    /// To set additional configuration options prior to parsing the filter, use
++    /// the [`Builder`] type instead.
++    ///
++    /// This function is equivalent to the following:
++    ///
++    /// ```rust
++    /// use tracing_subscriber::filter::{EnvFilter, LevelFilter};
++    ///
++    /// # fn docs() -> EnvFilter {
++    /// EnvFilter::builder()
++    ///     .with_default_directive(LevelFilter::ERROR.into())
++    ///     .from_env_lossy()
++    /// # }
++    /// ```
++    ///
++    /// [`ERROR`]: tracing::Level::ERROR
+     pub fn from_default_env() -> Self {
+-        Self::from_env(Self::DEFAULT_ENV)
++        Self::builder()
++            .with_default_directive(LevelFilter::ERROR.into())
++            .from_env_lossy()
+     }
+ 
+     /// Returns a new `EnvFilter` from the value of the given environment
+     /// variable, ignoring any invalid filter directives.
++    ///
++    /// If the environment variable is empty or not set, or if it contains only
++    /// invalid directives, a default directive enabling the [`ERROR`] level is
++    /// added.
++    ///
++    /// To set additional configuration options prior to parsing the filter, use
++    /// the [`Builder`] type instead.
++    ///
++    /// This function is equivalent to the following:
++    ///
++    /// ```rust
++    /// use tracing_subscriber::filter::{EnvFilter, LevelFilter};
++    ///
++    /// # fn docs() -> EnvFilter {
++    /// # let env = "";
++    /// EnvFilter::builder()
++    ///     .with_default_directive(LevelFilter::ERROR.into())
++    ///     .with_env_var(env)
++    ///     .from_env_lossy()
++    /// # }
++    /// ```
++    ///
++    /// [`ERROR`]: tracing::Level::ERROR
+     pub fn from_env<A: AsRef<str>>(env: A) -> Self {
+-        env::var(env.as_ref()).map(Self::new).unwrap_or_default()
++        Self::builder()
++            .with_default_directive(LevelFilter::ERROR.into())
++            .with_env_var(env.as_ref())
++            .from_env_lossy()
+     }
+ 
+     /// Returns a new `EnvFilter` from the directives in the given string,
+     /// ignoring any that are invalid.
+-    pub fn new<S: AsRef<str>>(dirs: S) -> Self {
+-        let directives = dirs.as_ref().split(',').filter_map(|s| match s.parse() {
+-            Ok(d) => Some(d),
+-            Err(err) => {
+-                eprintln!("ignoring `{}`: {}", s, err);
+-                None
+-            }
+-        });
+-        Self::from_directives(directives)
++    ///
++    /// If the string is empty or contains only invalid directives, a default
++    /// directive enabling the [`ERROR`] level is added.
++    ///
++    /// To set additional configuration options prior to parsing the filter, use
++    /// the [`Builder`] type instead.
++    ///
++    /// This function is equivalent to the following:
++    ///
++    /// ```rust
++    /// use tracing_subscriber::filter::{EnvFilter, LevelFilter};
++    ///
++    /// # fn docs() -> EnvFilter {
++    /// # let directives = "";
++    /// EnvFilter::builder()
++    ///     .with_default_directive(LevelFilter::ERROR.into())
++    ///     .parse_lossy(directives)
++    /// # }
++    /// ```
++    ///
++    /// [`ERROR`]: tracing::Level::ERROR
++    pub fn new<S: AsRef<str>>(directives: S) -> Self {
++        Self::builder()
++            .with_default_directive(LevelFilter::ERROR.into())
++            .parse_lossy(directives)
+     }
+ 
+     /// Returns a new `EnvFilter` from the directives in the given string,
+     /// or an error if any are invalid.
++    ///
++    /// If the string is empty, a default directive enabling the [`ERROR`] level
++    /// is added.
++    ///
++    /// To set additional configuration options prior to parsing the filter, use
++    /// the [`Builder`] type instead.
++    ///
++    /// This function is equivalent to the following:
++    ///
++    /// ```rust
++    /// use tracing_subscriber::filter::{EnvFilter, LevelFilter};
++    ///
++    /// # fn docs() -> Result<EnvFilter, tracing_subscriber::filter::ParseError> {
++    /// # let directives = "";
++    /// EnvFilter::builder()
++    ///     .with_default_directive(LevelFilter::ERROR.into())
++    ///     .parse(directives)
++    /// # }
++    /// ```
++    ///
++    /// [`ERROR`]: tracing::Level::ERROR
+     pub fn try_new<S: AsRef<str>>(dirs: S) -> Result<Self, directive::ParseError> {
+-        let directives = dirs
+-            .as_ref()
+-            .split(',')
+-            .map(|s| s.parse())
+-            .collect::<Result<Vec<_>, _>>()?;
+-        Ok(Self::from_directives(directives))
++        Self::builder().parse(dirs)
+     }
+ 
+     /// Returns a new `EnvFilter` from the value of the `RUST_LOG` environment
+-    /// variable, or an error if the environment variable contains any invalid
+-    /// filter directives.
++    /// variable, or an error if the environment variable is unset or contains
++    /// any invalid filter directives.
++    ///
++    /// To set additional configuration options prior to parsing the filter, use
++    /// the [`Builder`] type instead.
++    ///
++    /// This function is equivalent to the following:
++    ///
++    /// ```rust
++    /// use tracing_subscriber::EnvFilter;
++    ///
++    /// # fn docs() -> Result<EnvFilter, tracing_subscriber::filter::FromEnvError> {
++    /// EnvFilter::builder().try_from_env()
++    /// # }
++    /// ```
+     pub fn try_from_default_env() -> Result<Self, FromEnvError> {
+-        Self::try_from_env(Self::DEFAULT_ENV)
++        Self::builder().try_from_env()
+     }
+ 
+     /// Returns a new `EnvFilter` from the value of the given environment
+     /// variable, or an error if the environment variable is unset or contains
+     /// any invalid filter directives.
++    ///
++    /// To set additional configuration options prior to parsing the filter, use
++    /// the [`Builder`] type instead.
++    ///
++    /// This function is equivalent to the following:
++    ///
++    /// ```rust
++    /// use tracing_subscriber::EnvFilter;
++    ///
++    /// # fn docs() -> Result<EnvFilter, tracing_subscriber::filter::FromEnvError> {
++    /// # let env = "";
++    /// EnvFilter::builder().with_env_var(env).try_from_env()
++    /// # }
++    /// ```
+     pub fn try_from_env<A: AsRef<str>>(env: A) -> Result<Self, FromEnvError> {
+-        env::var(env.as_ref())?.parse().map_err(Into::into)
++        Self::builder().with_env_var(env.as_ref()).try_from_env()
+     }
+ 
+     /// Add a filtering directive to this `EnvFilter`.
+@@ -265,7 +419,7 @@ impl EnvFilter {
+     /// # Examples
+     ///
+     /// From [`LevelFilter`]:
+-    ////
++    ///
+     /// ```rust
+     /// use tracing_subscriber::filter::{EnvFilter, LevelFilter};
+     /// let mut filter = EnvFilter::from_default_env()
+@@ -280,9 +434,9 @@ impl EnvFilter {
+     /// let mut filter = EnvFilter::from_default_env()
+     ///     .add_directive(Level::INFO.into());
+     /// ```
+-    ////
++    ///
+     /// Parsed from a string:
+-    ////
++    ///
+     /// ```rust
+     /// use tracing_subscriber::filter::{EnvFilter, Directive};
+     ///
+@@ -293,7 +447,10 @@ impl EnvFilter {
+     /// # Ok(())
+     /// # }
+     /// ```
+-    pub fn add_directive(mut self, directive: Directive) -> Self {
++    pub fn add_directive(mut self, mut directive: Directive) -> Self {
++        if !self.regex {
++            directive.deregexify();
++        }
+         if let Some(stat) = directive.to_static() {
+             self.statics.add(stat)
+         } else {
+@@ -303,116 +460,6 @@ impl EnvFilter {
+         self
+     }
+ 
+-    fn from_directives(directives: impl IntoIterator<Item = Directive>) -> Self {
+-        use tracing::level_filters::STATIC_MAX_LEVEL;
+-        use tracing::Level;
+-
+-        let directives: Vec<_> = directives.into_iter().collect();
+-
+-        let disabled: Vec<_> = directives
+-            .iter()
+-            .filter(|directive| directive.level > STATIC_MAX_LEVEL)
+-            .collect();
+-
+-        if !disabled.is_empty() {
+-            #[cfg(feature = "ansi_term")]
+-            use ansi_term::{Color, Style};
+-            // NOTE: We can't use a configured `MakeWriter` because the EnvFilter
+-            // has no knowledge of any underlying subscriber or subscriber, which
+-            // may or may not use a `MakeWriter`.
+-            let warn = |msg: &str| {
+-                #[cfg(not(feature = "ansi_term"))]
+-                let msg = format!("warning: {}", msg);
+-                #[cfg(feature = "ansi_term")]
+-                let msg = {
+-                    let bold = Style::new().bold();
+-                    let mut warning = Color::Yellow.paint("warning");
+-                    warning.style_ref_mut().is_bold = true;
+-                    format!("{}{} {}", warning, bold.paint(":"), bold.paint(msg))
+-                };
+-                eprintln!("{}", msg);
+-            };
+-            let ctx_prefixed = |prefix: &str, msg: &str| {
+-                #[cfg(not(feature = "ansi_term"))]
+-                let msg = format!("{} {}", prefix, msg);
+-                #[cfg(feature = "ansi_term")]
+-                let msg = {
+-                    let mut equal = Color::Fixed(21).paint("="); // dark blue
+-                    equal.style_ref_mut().is_bold = true;
+-                    format!(" {} {} {}", equal, Style::new().bold().paint(prefix), msg)
+-                };
+-                eprintln!("{}", msg);
+-            };
+-            let ctx_help = |msg| ctx_prefixed("help:", msg);
+-            let ctx_note = |msg| ctx_prefixed("note:", msg);
+-            let ctx = |msg: &str| {
+-                #[cfg(not(feature = "ansi_term"))]
+-                let msg = format!("note: {}", msg);
+-                #[cfg(feature = "ansi_term")]
+-                let msg = {
+-                    let mut pipe = Color::Fixed(21).paint("|");
+-                    pipe.style_ref_mut().is_bold = true;
+-                    format!(" {} {}", pipe, msg)
+-                };
+-                eprintln!("{}", msg);
+-            };
+-            warn("some trace filter directives would enable traces that are disabled statically");
+-            for directive in disabled {
+-                let target = if let Some(target) = &directive.target {
+-                    format!("the `{}` target", target)
+-                } else {
+-                    "all targets".into()
+-                };
+-                let level = directive
+-                    .level
+-                    .into_level()
+-                    .expect("=off would not have enabled any filters");
+-                ctx(&format!(
+-                    "`{}` would enable the {} level for {}",
+-                    directive, level, target
+-                ));
+-            }
+-            ctx_note(&format!("the static max level is `{}`", STATIC_MAX_LEVEL));
+-            let help_msg = || {
+-                let (feature, filter) = match STATIC_MAX_LEVEL.into_level() {
+-                    Some(Level::TRACE) => unreachable!(
+-                        "if the max level is trace, no static filtering features are enabled"
+-                    ),
+-                    Some(Level::DEBUG) => ("max_level_debug", Level::TRACE),
+-                    Some(Level::INFO) => ("max_level_info", Level::DEBUG),
+-                    Some(Level::WARN) => ("max_level_warn", Level::INFO),
+-                    Some(Level::ERROR) => ("max_level_error", Level::WARN),
+-                    None => return ("max_level_off", String::new()),
+-                };
+-                (feature, format!("{} ", filter))
+-            };
+-            let (feature, earlier_level) = help_msg();
+-            ctx_help(&format!(
+-                "to enable {}logging, remove the `{}` feature",
+-                earlier_level, feature
+-            ));
+-        }
+-
+-        let (dynamics, mut statics) = Directive::make_tables(directives);
+-        let has_dynamics = !dynamics.is_empty();
+-
+-        if statics.is_empty() && !has_dynamics {
+-            statics.add(directive::StaticDirective::default());
+-        }
+-
+-        Self {
+-            statics,
+-            dynamics,
+-            has_dynamics,
+-            by_id: RwLock::new(HashMap::new()),
+-            by_cs: RwLock::new(HashMap::new()),
+-            // TODO(eliza): maybe worth allocating capacity for `num_cpus`
+-            // threads or something (assuming we're running in Tokio)? or
+-            // `num_cpus * 2` or something?
+-            scope: ThreadLocal::new(),
+-        }
+-    }
+-
+     fn cares_about_span(&self, span: &span::Id) -> bool {
+         let spans = try_lock!(self.by_id.read(), else return false);
+         spans.contains_key(span)
+@@ -640,7 +687,7 @@ where
+ 
+ impl Default for EnvFilter {
+     fn default() -> Self {
+-        Self::from_directives(std::iter::empty())
++        Builder::default().from_directives(std::iter::empty())
+     }
+ }
+ 
+diff --git a/tracing-subscriber/src/filter/layer_filters/mod.rs b/tracing-subscriber/src/filter/layer_filters/mod.rs
+index c2e6d8b7..9432cf19 100644
+--- a/tracing-subscriber/src/filter/layer_filters/mod.rs
++++ b/tracing-subscriber/src/filter/layer_filters/mod.rs
+@@ -504,6 +504,44 @@ impl<L, F, S> Filtered<L, F, S> {
+     pub fn filter_mut(&mut self) -> &mut F {
+         &mut self.filter
+     }
++
++    /// Borrows the inner [`Layer`] wrapped by this `Filtered` layer.
++    pub fn inner(&self) -> &L {
++        &self.layer
++    }
++
++    /// Mutably borrows the inner [`Layer`] wrapped by this `Filtered` layer.
++    ///
++    /// This method is primarily expected to be used with the
++    /// [`reload::Handle::modify`](crate::reload::Handle::modify) method.
++    ///
++    /// # Examples
++    ///
++    /// ```
++    /// # use tracing::info;
++    /// # use tracing_subscriber::{filter,fmt,reload,Registry,prelude::*};
++    /// # fn non_blocking<T: std::io::Write>(writer: T) -> (fn() -> std::io::Stdout) {
++    /// #   std::io::stdout
++    /// # }
++    /// # fn main() {
++    /// let filtered_layer = fmt::layer().with_writer(non_blocking(std::io::stderr())).with_filter(filter::LevelFilter::INFO);
++    /// let (filtered_layer, reload_handle) = reload::Layer::new(filtered_layer);
++    /// #
++    /// # // specifying the Registry type is required
++    /// # let _: &reload::Handle<filter::Filtered<fmt::Layer<Registry, _, _, fn() -> std::io::Stdout>,
++    /// # filter::LevelFilter, Registry>, _>
++    /// # = &reload_handle;
++    /// #
++    /// info!("This will be logged to stderr");
++    /// reload_handle.modify(|layer| *layer.inner_mut().writer_mut() = non_blocking(std::io::stdout()));
++    /// info!("This will be logged to stdout");
++    /// # }
++    /// ```
++    ///
++    /// [subscriber]: Subscribe
++    pub fn inner_mut(&mut self) -> &mut L {
++        &mut self.layer
++    }
+ }
+ 
+ impl<S, L, F> Layer<S> for Filtered<L, F, S>
+diff --git a/tracing-subscriber/src/fmt/fmt_layer.rs b/tracing-subscriber/src/fmt/fmt_layer.rs
+index e557f9f0..19eccf5f 100644
+--- a/tracing-subscriber/src/fmt/fmt_layer.rs
++++ b/tracing-subscriber/src/fmt/fmt_layer.rs
+@@ -185,7 +185,57 @@ impl<S, N, E, W> Layer<S, N, E, W> {
+         }
+     }
+ 
+-    /// Configures the subscriber to support [`libtest`'s output capturing][capturing] when used in
++    /// Borrows the [writer] for this [`Layer`].
++    ///
++    /// [writer]: MakeWriter
++    pub fn writer(&self) -> &W {
++        &self.make_writer
++    }
++
++    /// Mutably borrows the [writer] for this [`Layer`].
++    ///
++    /// This method is primarily expected to be used with the
++    /// [`reload::Handle::modify`](crate::reload::Handle::modify) method.
++    ///
++    /// # Examples
++    ///
++    /// ```
++    /// # use tracing::info;
++    /// # use tracing_subscriber::{fmt,reload,Registry,prelude::*};
++    /// # fn non_blocking<T: std::io::Write>(writer: T) -> (fn() -> std::io::Stdout) {
++    /// #   std::io::stdout
++    /// # }
++    /// # fn main() {
++    /// let layer = fmt::layer().with_writer(non_blocking(std::io::stderr()));
++    /// let (layer, reload_handle) = reload::Layer::new(layer);
++    /// #
++    /// # // specifying the Registry type is required
++    /// # let _: &reload::Handle<fmt::Layer<Registry, _, _, _>, Registry> = &reload_handle;
++    /// #
++    /// info!("This will be logged to stderr");
++    /// reload_handle.modify(|layer| *layer.writer_mut() = non_blocking(std::io::stdout()));
++    /// info!("This will be logged to stdout");
++    /// # }
++    /// ```
++    ///
++    /// [writer]: MakeWriter
++    pub fn writer_mut(&mut self) -> &mut W {
++        &mut self.make_writer
++    }
++
++    /// Sets whether this layer should use ANSI terminal formatting
++    /// escape codes (such as colors).
++    ///
++    /// This method is primarily expected to be used with the
++    /// [`reload::Handle::modify`](crate::reload::Handle::modify) method when changing
++    /// the writer.
++    #[cfg(feature = "ansi")]
++    #[cfg_attr(docsrs, doc(cfg(feature = "ansi")))]
++    pub fn set_ansi(&mut self, ansi: bool) {
++        self.is_ansi = ansi;
++    }
++
++    /// Configures the layer to support [`libtest`'s output capturing][capturing] when used in
+     /// unit tests.
+     ///
+     /// See [`TestWriter`] for additional details.
+diff --git a/tracing-subscriber/src/layer/mod.rs b/tracing-subscriber/src/layer/mod.rs
+index 3b1cb3bd..7cc365f7 100644
+--- a/tracing-subscriber/src/layer/mod.rs
++++ b/tracing-subscriber/src/layer/mod.rs
+@@ -215,11 +215,11 @@
+ //! ```
+ //!
+ //! If a [`Layer`] may be one of several different types, note that [`Box<dyn
+-//! Layer<C> + Send + Sync>` implements `Layer`][box-impl].
++//! Layer<S> + Send + Sync>` implements `Layer`][box-impl].
+ //! This may be used to erase the type of a [`Layer`].
+ //!
+ //! For example, a function that configures a [`Layer`] to log to one of
+-//! several outputs might return a `Box<dyn Layer<C> + Send + Sync + 'static>`:
++//! several outputs might return a `Box<dyn Layer<S> + Send + Sync + 'static>`:
+ //! ```
+ //! use tracing_subscriber::{
+ //!     Layer,
+@@ -267,6 +267,107 @@
+ //! The [`Layer::boxed`] method is provided to make boxing a `Layer`
+ //! more convenient, but [`Box::new`] may be used as well.
+ //!
++//! When the number of `Layer`s varies at runtime, note that a
++//! [`Vec<L> where L: `Layer`` also implements `Layer`][vec-impl]. This
++//! can be used to add a variable number of `Layer`s to a `Subscriber`:
++//!
++//! ```
++//! use tracing_subscriber::{Layer, prelude::*};
++//! struct MyLayer {
++//!     // ...
++//! }
++//! # impl MyLayer { fn new() -> Self { Self {} }}
++//!
++//! impl<S: tracing_core::Subscriber> Layer<S> for MyLayer {
++//!     // ...
++//! }
++//!
++//! /// Returns how many layers we need
++//! fn how_many_layers() -> usize {
++//!     // ...
++//!     # 3
++//! }
++//!
++//! // Create a variable-length `Vec` of layers
++//! let mut layers = Vec::new();
++//! for _ in 0..how_many_layers() {
++//!     layers.push(MyLayer::new());
++//! }
++//!
++//! tracing_subscriber::registry()
++//!     .with(layers)
++//!     .init();
++//! ```
++//!
++//! If a variable number of `Layer` is needed and those `Layer`s have
++//! different types, a `Vec` of [boxed `Layer` trait objects][box-impl] may
++//! be used. For example:
++//!
++//! ```
++//! use tracing_subscriber::{filter::LevelFilter, Layer, prelude::*};
++//! use std::fs::File;
++//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
++//! struct Config {
++//!     enable_log_file: bool,
++//!     enable_stdout: bool,
++//!     enable_stderr: bool,
++//!     // ...
++//! }
++//! # impl Config {
++//! #    fn from_config_file()-> Result<Self, Box<dyn std::error::Error>> {
++//! #         // don't enable the log file so that the example doesn't actually create it
++//! #         Ok(Self { enable_log_file: false, enable_stdout: true, enable_stderr: true })
++//! #    }
++//! # }
++//!
++//! let cfg = Config::from_config_file()?;
++//!
++//! // Based on our dynamically loaded config file, create any number of layers:
++//! let mut layers = Vec::new();
++//!
++//! if cfg.enable_log_file {
++//!     let file = File::create("myapp.log")?;
++//!     let layer = tracing_subscriber::fmt::layer()
++//!         .with_thread_names(true)
++//!         .with_target(true)
++//!         .json()
++//!         .with_writer(file)
++//!         // Box the layer as a type-erased trait object, so that it can
++//!         // be pushed to the `Vec`.
++//!         .boxed();
++//!     layers.push(layer);
++//! }
++//!
++//! if cfg.enable_stdout {
++//!     let layer = tracing_subscriber::fmt::layer()
++//!         .pretty()
++//!         .with_filter(LevelFilter::INFO)
++//!         // Box the layer as a type-erased trait object, so that it can
++//!         // be pushed to the `Vec`.
++//!         .boxed();
++//!     layers.push(layer);
++//! }
++//!
++//! if cfg.enable_stdout {
++//!     let layer = tracing_subscriber::fmt::layer()
++//!         .with_target(false)
++//!         .with_filter(LevelFilter::WARN)
++//!         // Box the layer as a type-erased trait object, so that it can
++//!         // be pushed to the `Vec`.
++//!         .boxed();
++//!     layers.push(layer);
++//! }
++//!
++//! tracing_subscriber::registry()
++//!     .with(layers)
++//!     .init();
++//!# Ok(()) }
++//! ```
++//!
++//! Finally, if the number of layers _changes_ at runtime, a `Vec` of
++//! subscribers can be used alongside the [`reload`](crate::reload) module to
++//! add or remove subscribers dynamically at runtime.
++//!
+ //! [option-impl]: Layer#impl-Layer<S>-for-Option<L>
+ //! [box-impl]: Layer#impl-Layer%3CS%3E-for-Box%3Cdyn%20Layer%3CS%3E%20+%20Send%20+%20Sync%3E
+ //! [prelude]: crate::prelude
+@@ -1060,6 +1161,7 @@ where
+ 
+ feature! {
+     #![all(feature = "registry", feature = "std")]
++
+     /// A per-[`Layer`] filter that determines whether a span or event is enabled
+     /// for an individual layer.
+     ///
+@@ -1406,6 +1508,8 @@ where
+ 
+ feature! {
+     #![any(feature = "std", feature = "alloc")]
++    #[cfg(not(feature = "std"))]
++    use alloc::vec::Vec;
+ 
+     macro_rules! layer_impl_body {
+         () => {
+@@ -1491,6 +1595,120 @@ feature! {
+     {
+         layer_impl_body! {}
+     }
++
++
++
++    impl<S, L> Layer<S> for Vec<L>
++    where
++        L: Layer<S>,
++        S: Subscriber,
++    {
++
++        fn on_layer(&mut self, subscriber: &mut S) {
++            for l in self {
++                l.on_layer(subscriber);
++            }
++        }
++
++        fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
++            // Return highest level of interest.
++            let mut interest = Interest::never();
++            for l in self {
++                let new_interest = l.register_callsite(metadata);
++                if (interest.is_sometimes() && new_interest.is_always())
++                    || (interest.is_never() && !new_interest.is_never())
++                {
++                    interest = new_interest;
++                }
++            }
++
++            interest
++        }
++
++        fn enabled(&self, metadata: &Metadata<'_>, ctx: Context<'_, S>) -> bool {
++            self.iter().all(|l| l.enabled(metadata, ctx.clone()))
++        }
++
++        fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
++            for l in self {
++                l.on_new_span(attrs, id, ctx.clone());
++            }
++        }
++
++        fn max_level_hint(&self) -> Option<LevelFilter> {
++            let mut max_level = LevelFilter::ERROR;
++            for l in self {
++                // NOTE(eliza): this is slightly subtle: if *any* layer
++                // returns `None`, we have to return `None`, assuming there is
++                // no max level hint, since that particular layer cannot
++                // provide a hint.
++                let hint = l.max_level_hint()?;
++                max_level = core::cmp::max(hint, max_level);
++            }
++            Some(max_level)
++        }
++
++        fn on_record(&self, span: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
++            for l in self {
++                l.on_record(span, values, ctx.clone())
++            }
++        }
++
++        fn on_follows_from(&self, span: &span::Id, follows: &span::Id, ctx: Context<'_, S>) {
++            for l in self {
++                l.on_follows_from(span, follows, ctx.clone());
++            }
++        }
++
++        fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
++            for l in self {
++                l.on_event(event, ctx.clone());
++            }
++        }
++
++        fn on_enter(&self, id: &span::Id, ctx: Context<'_, S>) {
++            for l in self {
++                l.on_enter(id, ctx.clone());
++            }
++        }
++
++        fn on_exit(&self, id: &span::Id, ctx: Context<'_, S>) {
++            for l in self {
++                l.on_exit(id, ctx.clone());
++            }
++        }
++
++        fn on_close(&self, id: span::Id, ctx: Context<'_, S>) {
++            for l in self {
++                l.on_close(id.clone(), ctx.clone());
++            }
++        }
++
++        #[doc(hidden)]
++        unsafe fn downcast_raw(&self, id: TypeId) -> Option<*const ()> {
++            // If downcasting to `Self`, return a pointer to `self`.
++            if id == TypeId::of::<Self>() {
++                return Some(self as *const _ as *const ());
++            }
++
++            // Someone is looking for per-layer filters. But, this `Vec`
++            // might contain layers with per-layer filters *and*
++            // layers without filters. It should only be treated as a
++            // per-layer-filtered layer if *all* its layers have
++            // per-layer filters.
++            // XXX(eliza): it's a bummer we have to do this linear search every
++            // time. It would be nice if this could be cached, but that would
++            // require replacing the `Vec` impl with an impl for a newtype...
++            if filter::is_plf_downcast_marker(id) && self.iter().any(|s| s.downcast_raw(id).is_none()) {
++                return None;
++            }
++
++            // Otherwise, return the first child of `self` that downcaasts to
++            // the selected type, if any.
++            // XXX(eliza): hope this is reasonable lol
++            self.iter().find_map(|l| l.downcast_raw(id))
++        }
++    }
+ }
+ 
+ // === impl SubscriberExt ===
+diff --git a/tracing/src/macros.rs b/tracing/src/macros.rs
+index 0d52c4cd..0a599c6b 100644
+--- a/tracing/src/macros.rs
++++ b/tracing/src/macros.rs
+@@ -807,6 +807,70 @@ macro_rules! event {
+     );
+ }
+ 
++/// Tests whether an event with the specified level and target would be enabled.
++///
++/// This is similar to [`enabled!`], but queries the current subscriber specifically for
++/// an event, whereas [`enabled!`] queries for an event _or_ span.
++///
++/// See the documentation for [`enabled!]` for more details on using this macro.
++/// See also [`span_enabled!`].
++///
++/// # Examples
++///
++/// ```rust
++/// # use tracing::{event_enabled, Level};
++/// if event_enabled!(target: "my_crate", Level::DEBUG) {
++///     // some expensive work...
++/// }
++/// // simpler
++/// if event_enabled!(Level::DEBUG) {
++///     // some expensive work...
++/// }
++/// // with fields
++/// if event_enabled!(Level::DEBUG, foo_field) {
++///     // some expensive work...
++/// }
++/// ```
++///
++#[macro_export]
++macro_rules! event_enabled {
++    ($($rest:tt)*)=> (
++        $crate::enabled!(kind: $crate::metadata::Kind::EVENT, $($rest)*)
++    )
++}
++
++/// Tests whether a span with the specified level and target would be enabled.
++///
++/// This is similar to [`enabled!`], but queries the current subscriber specifically for
++/// an event, whereas [`enabled!`] queries for an event _or_ span.
++///
++/// See the documentation for [`enabled!]` for more details on using this macro.
++/// See also [`span_enabled!`].
++///
++/// # Examples
++///
++/// ```rust
++/// # use tracing::{span_enabled, Level};
++/// if span_enabled!(target: "my_crate", Level::DEBUG) {
++///     // some expensive work...
++/// }
++/// // simpler
++/// if span_enabled!(Level::DEBUG) {
++///     // some expensive work...
++/// }
++/// // with fields
++/// if span_enabled!(Level::DEBUG, foo_field) {
++///     // some expensive work...
++/// }
++/// ```
++///
++#[macro_export]
++macro_rules! span_enabled {
++    ($($rest:tt)*)=> (
++        $crate::enabled!(kind: $crate::metadata::Kind::SPAN, $($rest)*)
++    )
++}
++
+ /// Checks whether a span or event is [enabled] based on the provided [metadata].
+ ///
+ /// [enabled]: crate::Subscriber::enabled
+@@ -884,9 +948,21 @@ macro_rules! event {
+ /// }
+ /// ```
+ ///
++/// # Alternatives
++///
++/// `enabled!` queries subscribers with [`Metadata`] where
++/// [`is_event`] and [`is_span`] both return `false`. Alternatively,
++/// use [`event_enabled!`] or [`span_enabled!`] to ensure one of these
++/// returns true.
++///
++///
++/// [`Metadata`]: crate::Metadata
++/// [`is_event`]: crate::Metadata::is_event
++/// [`is_span`]: crate::Metadata::is_span
++///
+ #[macro_export]
+ macro_rules! enabled {
+-    (target: $target:expr, $lvl:expr, { $($fields:tt)* } )=> ({
++    (kind: $kind:expr, target: $target:expr, $lvl:expr, { $($fields:tt)* } )=> ({
+         if $crate::level_enabled!($lvl) {
+             use $crate::__macro_support::Callsite as _;
+             static CALLSITE: $crate::__macro_support::MacroCallsite = $crate::callsite2! {
+@@ -896,7 +972,7 @@ macro_rules! enabled {
+                     ":",
+                     line!()
+                 ),
+-                kind: $crate::metadata::Kind::HINT,
++                kind: $kind.hint(),
+                 target: $target,
+                 level: $lvl,
+                 fields: $($fields)*
+@@ -913,20 +989,35 @@ macro_rules! enabled {
+         }
+     });
+     // Just target and level
++    (kind: $kind:expr, target: $target:expr, $lvl:expr ) => (
++        $crate::enabled!(kind: $kind, target: $target, $lvl, { })
++    );
+     (target: $target:expr, $lvl:expr ) => (
+-        $crate::enabled!(target: $target, $lvl, { })
++        $crate::enabled!(kind: $crate::metadata::Kind::HINT, target: $target, $lvl, { })
+     );
+ 
+-    // These two cases handle fields with no values
++    // These four cases handle fields with no values
++    (kind: $kind:expr, target: $target:expr, $lvl:expr, $($field:tt)*) => (
++        $crate::enabled!(
++            kind: $kind,
++            target: $target,
++            $lvl,
++            { $($field)*}
++        )
++    );
+     (target: $target:expr, $lvl:expr, $($field:tt)*) => (
+         $crate::enabled!(
++            kind: $crate::metadata::Kind::HINT,
+             target: $target,
+             $lvl,
+             { $($field)*}
+         )
+     );
+-    ($lvl:expr, $($field:tt)*) => (
++
++    // Level and field case
++    (kind: $kind:expr, $lvl:expr, $($field:tt)*) => (
+         $crate::enabled!(
++            kind: $kind,
+             target: module_path!(),
+             $lvl,
+             { $($field)*}
+@@ -934,8 +1025,21 @@ macro_rules! enabled {
+     );
+ 
+     // Simplest `enabled!` case
+-    ( $lvl:expr ) => (
+-        $crate::enabled!(target: module_path!(), $lvl, { })
++    (kind: $kind:expr, $lvl:expr) => (
++        $crate::enabled!(kind: $kind, target: module_path!(), $lvl, { })
++    );
++    ($lvl:expr) => (
++        $crate::enabled!(kind: $crate::metadata::Kind::HINT, target: module_path!(), $lvl, { })
++    );
++
++    // Fallthrough from above
++    ($lvl:expr, $($field:tt)*) => (
++        $crate::enabled!(
++            kind: $crate::metadata::Kind::HINT,
++            target: module_path!(),
++            $lvl,
++            { $($field)*}
++        )
+     );
+ }
+ 

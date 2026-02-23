@@ -1,0 +1,529 @@
+diff --git a/tracing-attributes/src/attr.rs b/tracing-attributes/src/attr.rs
+index 2e2ef150..ff875e17 100644
+--- a/tracing-attributes/src/attr.rs
++++ b/tracing-attributes/src/attr.rs
+@@ -11,6 +11,8 @@ pub(crate) struct InstrumentArgs {
+     level: Option<Level>,
+     pub(crate) name: Option<LitStr>,
+     target: Option<LitStr>,
++    pub(crate) parent: Option<Expr>,
++    pub(crate) follows_from: Option<Expr>,
+     pub(crate) skips: HashSet<Ident>,
+     pub(crate) skip_all: bool,
+     pub(crate) fields: Option<Fields>,
+@@ -123,6 +125,18 @@ impl Parse for InstrumentArgs {
+                 }
+                 let target = input.parse::<StrArg<kw::target>>()?.value;
+                 args.target = Some(target);
++            } else if lookahead.peek(kw::parent) {
++                if args.target.is_some() {
++                    return Err(input.error("expected only a single `parent` argument"));
++                }
++                let parent = input.parse::<ExprArg<kw::parent>>()?;
++                args.parent = Some(parent.value);
++            } else if lookahead.peek(kw::follows_from) {
++                if args.target.is_some() {
++                    return Err(input.error("expected only a single `follows_from` argument"));
++                }
++                let follows_from = input.parse::<ExprArg<kw::follows_from>>()?;
++                args.follows_from = Some(follows_from.value);
+             } else if lookahead.peek(kw::level) {
+                 if args.level.is_some() {
+                     return Err(input.error("expected only a single `level` argument"));
+@@ -193,6 +207,23 @@ impl<T: Parse> Parse for StrArg<T> {
+     }
+ }
+ 
++struct ExprArg<T> {
++    value: Expr,
++    _p: std::marker::PhantomData<T>,
++}
++
++impl<T: Parse> Parse for ExprArg<T> {
++    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
++        let _ = input.parse::<T>()?;
++        let _ = input.parse::<Token![=]>()?;
++        let value = input.parse()?;
++        Ok(Self {
++            value,
++            _p: std::marker::PhantomData,
++        })
++    }
++}
++
+ struct Skips(HashSet<Ident>);
+ 
+ impl Parse for Skips {
+@@ -374,6 +405,8 @@ mod kw {
+     syn::custom_keyword!(skip_all);
+     syn::custom_keyword!(level);
+     syn::custom_keyword!(target);
++    syn::custom_keyword!(parent);
++    syn::custom_keyword!(follows_from);
+     syn::custom_keyword!(name);
+     syn::custom_keyword!(err);
+     syn::custom_keyword!(ret);
+diff --git a/tracing-attributes/src/expand.rs b/tracing-attributes/src/expand.rs
+index 3928441e..b563d4bb 100644
+--- a/tracing-attributes/src/expand.rs
++++ b/tracing-attributes/src/expand.rs
+@@ -88,6 +88,13 @@ fn gen_block<B: ToTokens>(
+ 
+     let level = args.level();
+ 
++    let follows_from = args.follows_from.iter();
++    let follows_from = quote! {
++        #(for cause in #follows_from {
++            __tracing_attr_span.follows_from(cause);
++        })*
++    };
++
+     // generate this inside a closure, so we can return early on errors.
+     let span = (|| {
+         // Pull out the arguments-to-be-skipped first, so we can filter results
+@@ -135,6 +142,8 @@ fn gen_block<B: ToTokens>(
+ 
+         let target = args.target();
+ 
++        let parent = args.parent.iter();
++
+         // filter out skipped fields
+         let quoted_fields: Vec<_> = param_names
+             .iter()
+@@ -182,6 +191,7 @@ fn gen_block<B: ToTokens>(
+ 
+         quote!(tracing::span!(
+             target: #target,
++            #(parent: #parent,)*
+             #level,
+             #span_name,
+             #(#quoted_fields,)*
+@@ -217,7 +227,7 @@ fn gen_block<B: ToTokens>(
+         let mk_fut = match (err_event, ret_event) {
+             (Some(err_event), Some(ret_event)) => quote_spanned!(block.span()=>
+                 async move {
+-                    match async move { #block }.await {
++                    match async move #block.await {
+                         #[allow(clippy::unit_arg)]
+                         Ok(x) => {
+                             #ret_event;
+@@ -232,7 +242,7 @@ fn gen_block<B: ToTokens>(
+             ),
+             (Some(err_event), None) => quote_spanned!(block.span()=>
+                 async move {
+-                    match async move { #block }.await {
++                    match async move #block.await {
+                         #[allow(clippy::unit_arg)]
+                         Ok(x) => Ok(x),
+                         Err(e) => {
+@@ -244,13 +254,13 @@ fn gen_block<B: ToTokens>(
+             ),
+             (None, Some(ret_event)) => quote_spanned!(block.span()=>
+                 async move {
+-                    let x = async move { #block }.await;
++                    let x = async move #block.await;
+                     #ret_event;
+                     x
+                 }
+             ),
+             (None, None) => quote_spanned!(block.span()=>
+-                async move { #block }
++                async move #block
+             ),
+         };
+ 
+@@ -258,6 +268,7 @@ fn gen_block<B: ToTokens>(
+             let __tracing_attr_span = #span;
+             let __tracing_instrument_future = #mk_fut;
+             if !__tracing_attr_span.is_disabled() {
++                #follows_from
+                 tracing::Instrument::instrument(
+                     __tracing_instrument_future,
+                     __tracing_attr_span
+@@ -284,6 +295,7 @@ fn gen_block<B: ToTokens>(
+         let __tracing_attr_guard;
+         if tracing::level_enabled!(#level) {
+             __tracing_attr_span = #span;
++            #follows_from
+             __tracing_attr_guard = __tracing_attr_span.enter();
+         }
+     );
+diff --git a/tracing-attributes/src/lib.rs b/tracing-attributes/src/lib.rs
+index 0c562468..115da884 100644
+--- a/tracing-attributes/src/lib.rs
++++ b/tracing-attributes/src/lib.rs
+@@ -345,6 +345,47 @@ mod expand;
+ ///     // ...
+ /// }
+ /// ```
++/// Overriding the generated span's parent:
++/// ```
++/// # use tracing_attributes::instrument;
++/// #[instrument(parent = None)]
++/// pub fn my_function() {
++///     // ...
++/// }
++/// ```
++/// ```
++/// # use tracing_attributes::instrument;
++/// // A struct which owns a span handle.
++/// struct MyStruct
++/// {
++///     span: tracing::Span
++/// }
++///
++/// impl MyStruct
++/// {
++///     // Use the struct's `span` field as the parent span
++///     #[instrument(parent = &self.span, skip(self))]
++///     fn my_method(&self) {}
++/// }
++/// ```
++/// Specifying [`follows_from`] relationships:
++/// ```
++/// # use tracing_attributes::instrument;
++/// #[instrument(follows_from = causes)]
++/// pub fn my_function(causes: &[tracing::Id]) {
++///     // ...
++/// }
++/// ```
++/// Any expression of type `impl IntoIterator<Item = impl Into<Option<Id>>>`
++/// may be provided to `follows_from`; e.g.:
++/// ```
++/// # use tracing_attributes::instrument;
++/// #[instrument(follows_from = [cause])]
++/// pub fn my_function(cause: &tracing::span::EnteredSpan) {
++///     // ...
++/// }
++/// ```
++///
+ ///
+ /// To skip recording an argument, pass the argument's name to the `skip`:
+ ///
+@@ -501,6 +542,8 @@ mod expand;
+ /// [`INFO`]: https://docs.rs/tracing/latest/tracing/struct.Level.html#associatedconstant.INFO
+ /// [empty field]: https://docs.rs/tracing/latest/tracing/field/struct.Empty.html
+ /// [field syntax]: https://docs.rs/tracing/latest/tracing/#recording-fields
++/// [`follows_from`]: https://docs.rs/tracing/latest/tracing/struct.Span.html#method.follows_from
++/// [`tracing`]: https://github.com/tokio-rs/tracing
+ /// [`fmt::Debug`]: std::fmt::Debug
+ #[proc_macro_attribute]
+ pub fn instrument(
+diff --git a/tracing-core/src/callsite.rs b/tracing-core/src/callsite.rs
+index 273fecec..55728821 100644
+--- a/tracing-core/src/callsite.rs
++++ b/tracing-core/src/callsite.rs
+@@ -1,5 +1,85 @@
+ //! Callsites represent the source locations from which spans or events
+ //! originate.
++//!
++//! # What Are Callsites?
++//!
++//! Every span or event in `tracing` is associated with a [`Callsite`]. A
++//! callsite is a small `static` value that is responsible for the following:
++//!
++//! * Storing the span or event's [`Metadata`],
++//! * Uniquely [identifying](Identifier) the span or event definition,
++//! * Caching the subscriber's [`Interest`][^1] in that span or event, to avoid
++//!   re-evaluating filters,
++//! * Storing a [`Registration`] that allows the callsite to be part of a global
++//!   list of all callsites in the program.
++//!
++//! # Registering Callsites
++//!
++//! When a span or event is recorded for the first time, its callsite
++//! [`register`]s itself with the global callsite registry. Registering a
++//! callsite calls the [`Subscriber::register_callsite`][`register_callsite`]
++//! method with that callsite's [`Metadata`] on every currently active
++//! subscriber. This serves two primary purposes: informing subscribers of the
++//! callsite's existence, and performing static filtering.
++//!
++//! ## Callsite Existence
++//!
++//! If a [`Subscriber`] implementation wishes to allocate storage for each
++//! unique span/event location in the program, or pre-compute some value
++//! that will be used to record that span or event in the future, it can
++//! do so in its [`register_callsite`] method.
++//!
++//! ## Performing Static Filtering
++//!
++//! The [`register_callsite`] method returns an [`Interest`] value,
++//! which indicates that the subscriber either [always] wishes to record
++//! that span or event, [sometimes] wishes to record it based on a
++//! dynamic filter evaluation, or [never] wishes to record it.
++//!
++//! When registering a new callsite, the [`Interest`]s returned by every
++//! currently active subscriber are combined, and the result is stored at
++//! each callsite. This way, when the span or event occurs in the
++//! future, the cached [`Interest`] value can be checked efficiently
++//! to determine if the span or event should be recorded, without
++//! needing to perform expensive filtering (i.e. calling the
++//! [`Subscriber::enabled`] method every time a span or event occurs).
++//!
++//! ### Rebuilding Cached Interest
++//!
++//! When a new [`Dispatch`] is created (i.e. a new subscriber becomes
++//! active), any previously cached [`Interest`] values are re-evaluated
++//! for all callsites in the program. This way, if the new subscriber
++//! will enable a callsite that was not previously enabled, the
++//! [`Interest`] in that callsite is updated. Similarly, when a
++//! subscriber is dropped, the interest cache is also re-evaluated, so
++//! that any callsites enabled only by that subscriber are disabled.
++//!
++//! In addition, the [`rebuild_interest_cache`] function in this module can be
++//! used to manually invalidate all cached interest and re-register those
++//! callsites. This function is useful in situations where a subscriber's
++//! interest can change, but it does so relatively infrequently. The subscriber
++//! may wish for its interest to be cached most of the time, and return
++//! [`Interest::always`][always] or [`Interest::never`][never] in its
++//! [`register_callsite`] method, so that its [`Subscriber::enabled`] method
++//! doesn't need to be evaluated every time a span or event is recorded.
++//! However, when the configuration changes, the subscriber can call
++//! [`rebuild_interest_cache`] to re-evaluate the entire interest cache with its
++//! new configuration. This is a relatively costly operation, but if the
++//! configuration changes infrequently, it may be more efficient than calling
++//! [`Subscriber::enabled`] frequently.
++//!
++//! [^1]: Returned by the [`Subscriber::register_callsite`][`register_callsite`]
++//!     method.
++//!
++//! [`Metadata`]: crate::metadata::Metadata
++//! [`Interest`]: crate::subscriber::Interest
++//! [`Subscriber`]: crate::subscriber::Subscriber
++//! [`register_callsite`]: crate::subscriber::Subscriber::register_callsite
++//! [`Subscriber::enabled`]: crate::subscriber::Subscriber::enabled
++//! [always]: crate::subscriber::Interest::always
++//! [sometimes]: crate::subscriber::Interest::sometimes
++//! [never]: crate::subscriber::Interest::never
++//! [`Dispatch`]: crate::dispatch::Dispatch
+ use crate::stdlib::{
+     any::TypeId,
+     fmt,
+@@ -23,10 +103,17 @@ use self::dispatchers::Dispatchers;
+ ///
+ /// These functions are only intended to be called by the callsite registry, which
+ /// correctly handles determining the common interest between all subscribers.
++///
++/// See the [module-level documentation](crate::callsite) for details on
++/// callsites.
+ pub trait Callsite: Sync {
+     /// Sets the [`Interest`] for this callsite.
+     ///
++    /// See the [documentation on callsite interest caching][cache-docs] for
++    /// details.
++    ///
+     /// [`Interest`]: super::subscriber::Interest
++    /// [cache-docs]: crate::callsite#performing-static-filtering
+     fn set_interest(&self, interest: Interest);
+ 
+     /// Returns the [metadata] associated with the callsite.
+@@ -98,19 +185,29 @@ pub struct DefaultCallsite {
+ /// implementation at runtime, then it **must** call this function after that
+ /// value changes, in order for the change to be reflected.
+ ///
++/// See the [documentation on callsite interest caching][cache-docs] for
++/// additional information on this function's usage.
++///
+ /// [`max_level_hint`]: super::subscriber::Subscriber::max_level_hint
+ /// [`Callsite`]: super::callsite::Callsite
+ /// [`enabled`]: super::subscriber::Subscriber#tymethod.enabled
+ /// [`Interest::sometimes()`]: super::subscriber::Interest::sometimes
+ /// [`Subscriber`]: super::subscriber::Subscriber
++/// [cache-docs]: crate::callsite#rebuilding-cached-interest
+ pub fn rebuild_interest_cache() {
+     CALLSITES.rebuild_interest(DISPATCHERS.rebuilder());
+ }
+ 
+-/// Register a new `Callsite` with the global registry.
++/// Register a new [`Callsite`] with the global registry.
+ ///
+ /// This should be called once per callsite after the callsite has been
+ /// constructed.
++///
++/// See the [documentation on callsite registration][reg-docs] for details
++/// on the global callsite registry.
++///
++/// [`Callsite`]: crate::callsite::Callsite
++/// [reg-docs]: crate::callsite#registering-callsites
+ pub fn register(callsite: &'static dyn Callsite) {
+     rebuild_callsite_interest(callsite, &DISPATCHERS.rebuilder());
+ 
+@@ -177,6 +274,12 @@ impl DefaultCallsite {
+     ///
+     /// Other callsite implementations will generally ensure that
+     /// callsites are not re-registered through another mechanism.
++    ///
++    /// See the [documentation on callsite registration][reg-docs] for details
++    /// on the global callsite registry.
++    ///
++    /// [`Callsite`]: crate::callsite::Callsite
++    /// [reg-docs]: crate::callsite#registering-callsites
+     #[inline(never)]
+     // This only happens once (or if the cached interest value was corrupted).
+     #[cold]
+diff --git a/tracing-core/src/subscriber.rs b/tracing-core/src/subscriber.rs
+index 65d49a51..501cce73 100644
+--- a/tracing-core/src/subscriber.rs
++++ b/tracing-core/src/subscriber.rs
+@@ -56,6 +56,10 @@ use crate::stdlib::{
+ ///   Additionally, subscribers which wish to perform a behaviour once for each
+ ///   callsite, such as allocating storage for data related to that callsite,
+ ///   can perform it in `register_callsite`.
++///
++///   See also the [documentation on the callsite registry][cs-reg] for details
++///   on [`register_callsite`].
++///
+ /// - [`clone_span`] is called every time a span ID is cloned, and [`try_close`]
+ ///   is called when a span ID is dropped. By default, these functions do
+ ///   nothing. However, they can be used to implement reference counting for
+@@ -70,10 +74,11 @@ use crate::stdlib::{
+ /// [`enabled`]: Subscriber::enabled
+ /// [`clone_span`]: Subscriber::clone_span
+ /// [`try_close`]: Subscriber::try_close
++/// [cs-reg]: crate::callsite#registering-callsites
+ pub trait Subscriber: 'static {
+     // === Span registry methods ==============================================
+ 
+-    /// Registers a new callsite with this subscriber, returning whether or not
++    /// Registers a new [callsite] with this subscriber, returning whether or not
+     /// the subscriber is interested in being notified about the callsite.
+     ///
+     /// By default, this function assumes that the subscriber's [filter]
+@@ -127,6 +132,9 @@ pub trait Subscriber: 'static {
+     /// return `Interest::Never`, as a new subscriber may be added that _is_
+     /// interested.
+     ///
++    /// See the [documentation on the callsite registry][cs-reg] for more
++    /// details on how and when the `register_callsite` method is called.
++    ///
+     /// # Notes
+     /// This function may be called again when a new subscriber is created or
+     /// when the registry is invalidated.
+@@ -135,10 +143,12 @@ pub trait Subscriber: 'static {
+     /// _may_ still see spans and events originating from that callsite, if
+     /// another subscriber expressed interest in it.
+     ///
+-    /// [filter]: Subscriber::enabled()
++    /// [callsite]: crate::callsite
++    /// [filter]: Self::enabled
+     /// [metadata]: super::metadata::Metadata
+     /// [`enabled`]: Subscriber::enabled()
+     /// [`rebuild_interest_cache`]: super::callsite::rebuild_interest_cache
++    /// [cs-reg]: crate::callsite#registering-callsites
+     fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
+         if self.enabled(metadata) {
+             Interest::always()
+diff --git a/tracing-mock/src/subscriber.rs b/tracing-mock/src/subscriber.rs
+index 17e1a7ed..32f27ada 100644
+--- a/tracing-mock/src/subscriber.rs
++++ b/tracing-mock/src/subscriber.rs
+@@ -23,6 +23,10 @@ use tracing::{
+ #[derive(Debug, Eq, PartialEq)]
+ pub enum Expect {
+     Event(MockEvent),
++    FollowsFrom {
++        consequence: MockSpan,
++        cause: MockSpan,
++    },
+     Enter(MockSpan),
+     Exit(MockSpan),
+     CloneSpan(MockSpan),
+@@ -35,6 +39,7 @@ pub enum Expect {
+ struct SpanState {
+     name: &'static str,
+     refs: usize,
++    meta: &'static Metadata<'static>,
+ }
+ 
+ struct Running<F: Fn(&Metadata<'_>) -> bool> {
+@@ -97,6 +102,12 @@ where
+         self
+     }
+ 
++    pub fn follows_from(mut self, consequence: MockSpan, cause: MockSpan) -> Self {
++        self.expected
++            .push_back(Expect::FollowsFrom { consequence, cause });
++        self
++    }
++
+     pub fn event(mut self, event: MockEvent) -> Self {
+         self.expected.push_back(Expect::Event(event));
+         self
+@@ -250,8 +261,37 @@ where
+         }
+     }
+ 
+-    fn record_follows_from(&self, _span: &Id, _follows: &Id) {
+-        // TODO: it should be possible to expect spans to follow from other spans
++    fn record_follows_from(&self, consequence_id: &Id, cause_id: &Id) {
++        let spans = self.spans.lock().unwrap();
++        if let Some(consequence_span) = spans.get(consequence_id) {
++            if let Some(cause_span) = spans.get(cause_id) {
++                println!(
++                    "[{}] record_follows_from: {} (id={:?}) follows {} (id={:?})",
++                    self.name, consequence_span.name, consequence_id, cause_span.name, cause_id,
++                );
++                match self.expected.lock().unwrap().pop_front() {
++                    None => {}
++                    Some(Expect::FollowsFrom {
++                        consequence: ref expected_consequence,
++                        cause: ref expected_cause,
++                    }) => {
++                        if let Some(name) = expected_consequence.name() {
++                            assert_eq!(name, consequence_span.name);
++                        }
++                        if let Some(name) = expected_cause.name() {
++                            assert_eq!(name, cause_span.name);
++                        }
++                    }
++                    Some(ex) => ex.bad(
++                        &self.name,
++                        format_args!(
++                            "consequence {:?} followed cause {:?}",
++                            consequence_span.name, cause_span.name
++                        ),
++                    ),
++                }
++            }
++        };
+     }
+ 
+     fn new_span(&self, span: &Attributes<'_>) -> Id {
+@@ -284,6 +324,7 @@ where
+             id.clone(),
+             SpanState {
+                 name: meta.name(),
++                meta,
+                 refs: 1,
+             },
+         );
+@@ -415,6 +456,18 @@ where
+             }
+         }
+     }
++
++    fn current_span(&self) -> tracing_core::span::Current {
++        let stack = self.current.lock().unwrap();
++        match stack.last() {
++            Some(id) => {
++                let spans = self.spans.lock().unwrap();
++                let state = spans.get(id).expect("state for current span");
++                tracing_core::span::Current::new(id.clone(), state.meta)
++            }
++            None => tracing_core::span::Current::none(),
++        }
++    }
+ }
+ 
+ impl MockHandle {
+@@ -442,6 +495,10 @@ impl Expect {
+                 "\n[{}] expected event {}\n[{}] but instead {}",
+                 name, e, name, what,
+             ),
++            Expect::FollowsFrom { consequence, cause } => panic!(
++                "\n[{}] expected consequence {} to follow cause {} but instead {}",
++                name, consequence, cause, what,
++            ),
+             Expect::Enter(e) => panic!(
+                 "\n[{}] expected to enter {}\n[{}] but instead {}",
+                 name, e, name, what,

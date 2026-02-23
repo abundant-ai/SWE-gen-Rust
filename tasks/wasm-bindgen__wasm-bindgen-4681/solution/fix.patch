@@ -1,0 +1,904 @@
+diff --git a/crates/cli-support/src/externref.rs b/crates/cli-support/src/externref.rs
+index 19e6b1a3a..7b186c0d0 100644
+--- a/crates/cli-support/src/externref.rs
++++ b/crates/cli-support/src/externref.rs
+@@ -37,11 +37,8 @@ pub fn process(module: &mut Module) -> Result<()> {
+                 &mut adapter.params,
+                 &mut adapter.results,
+             );
+-            continue;
+-        }
+-        if let Some(id) = find_call_export(instructions) {
+-            export_xform(&mut cfg, id, instructions);
+-            continue;
++        } else {
++            export_xform(&mut cfg, instructions);
+         }
+     }
+ 
+@@ -113,30 +110,6 @@ pub fn process(module: &mut Module) -> Result<()> {
+     Ok(())
+ }
+ 
+-fn find_call_export(instrs: &[InstructionData]) -> Option<Export> {
+-    instrs
+-        .iter()
+-        .enumerate()
+-        .find_map(|(i, instr)| match instr.instr {
+-            Instruction::CallExport(e) => Some(Export::Export(e)),
+-            Instruction::CallTableElement(e) => Some(Export::TableElement {
+-                idx: e,
+-                call_idx: i,
+-            }),
+-            _ => None,
+-        })
+-}
+-
+-enum Export {
+-    Export(walrus::ExportId),
+-    TableElement {
+-        /// Table element that we're calling
+-        idx: u32,
+-        /// Index in the instruction stream where the call instruction is found
+-        call_idx: usize,
+-    },
+-}
+-
+ /// Adapts the `instrs` given which are an implementation of the import of `id`.
+ ///
+ /// This function will pattern match outgoing arguments and update the
+@@ -233,7 +206,7 @@ fn import_xform(
+ /// pattern matched below to pass off to the externref transformation pass. The
+ /// signature of the adapter doesn't change (it remains as externref-aware) but the
+ /// signature of the export we're calling will change during the transformation.
+-fn export_xform(cx: &mut Context, export: Export, instrs: &mut Vec<InstructionData>) {
++fn export_xform(cx: &mut Context, instrs: &mut Vec<InstructionData>) {
+     let mut to_delete = Vec::new();
+     let mut iter = instrs.iter().enumerate();
+     let mut args = Vec::new();
+@@ -245,34 +218,38 @@ fn export_xform(cx: &mut Context, export: Export, instrs: &mut Vec<InstructionDa
+     //
+     // Note that we're going to delete the `I32FromExternref*` instructions, so we
+     // also maintain indices of the instructions to delete.
+-    for (i, instr) in iter.by_ref() {
+-        match instr.instr {
+-            Instruction::CallExport(_) | Instruction::CallTableElement(_) => break,
+-            Instruction::I32FromExternrefOwned => {
+-                args.pop();
+-                args.push(Some(true));
+-                to_delete.push(i);
+-            }
+-            Instruction::I32FromExternrefBorrow => {
+-                args.pop();
+-                args.push(Some(false));
+-                to_delete.push(i);
+-            }
+-            _ => match instr.stack_change {
+-                StackChange::Modified { pushed, popped } => {
+-                    for _ in 0..popped {
+-                        args.pop();
+-                    }
+-                    for _ in 0..pushed {
+-                        args.push(None);
+-                    }
++    let export = iter
++        .by_ref()
++        .find_map(|(i, instr)| {
++            match instr.instr {
++                Instruction::CallExport(export) => return Some(export),
++                Instruction::I32FromExternrefOwned => {
++                    args.pop();
++                    args.push(Some(true));
++                    to_delete.push(i);
+                 }
+-                StackChange::Unknown => {
+-                    panic!("must have stack change data");
++                Instruction::I32FromExternrefBorrow => {
++                    args.pop();
++                    args.push(Some(false));
++                    to_delete.push(i);
+                 }
+-            },
+-        }
+-    }
++                _ => match instr.stack_change {
++                    StackChange::Modified { pushed, popped } => {
++                        for _ in 0..popped {
++                            args.pop();
++                        }
++                        for _ in 0..pushed {
++                            args.push(None);
++                        }
++                    }
++                    StackChange::Unknown => {
++                        panic!("must have stack change data");
++                    }
++                },
++            }
++            None
++        })
++        .expect("must call an export");
+ 
+     // If one of the instructions after the call is an `ExternrefLoadOwned`,
+     // and a retptr isn't used, the function must return an externref.
+@@ -301,16 +278,7 @@ fn export_xform(cx: &mut Context, export: Export, instrs: &mut Vec<InstructionDa
+ 
+     // ... and register this entire transformation with the externref
+     // transformation pass.
+-    match export {
+-        Export::Export(id) => {
+-            cx.export_xform(id, &args, ret_externref);
+-        }
+-        Export::TableElement { idx, call_idx } => {
+-            if let Some(new_idx) = cx.table_element_xform(idx, &args, ret_externref) {
+-                instrs[call_idx].instr = Instruction::CallTableElement(new_idx);
+-            }
+-        }
+-    }
++    cx.export_xform(export, &args, ret_externref);
+ 
+     // Delete all unnecessary externref management instructions. We're going to
+     // sink these instructions into the Wasm module itself.
+diff --git a/crates/cli-support/src/js/binding.rs b/crates/cli-support/src/js/binding.rs
+index b51bee3c0..689d19c1f 100644
+--- a/crates/cli-support/src/js/binding.rs
++++ b/crates/cli-support/src/js/binding.rs
+@@ -784,7 +784,6 @@ fn instruction(
+ 
+         Instruction::CallExport(_)
+         | Instruction::CallAdapter(_)
+-        | Instruction::CallTableElement(_)
+         | Instruction::DeferFree { .. } => {
+             let invoc = Invocation::from(instr, js.cx.module)?;
+             let (mut params, results) = invoc.params_results(js.cx);
+@@ -1395,7 +1394,7 @@ fn instruction(
+             adapter,
+             nargs,
+             mutable,
+-            dtor_idx_if_persistent,
++            dtor_if_persistent,
+         } => {
+             let b = js.pop();
+             let a = js.pop();
+@@ -1404,7 +1403,7 @@ fn instruction(
+             // TODO: further merge the heap and stack closure handling as
+             // they're almost identical (by nature) except for ownership
+             // integration.
+-            if let Some(dtor) = dtor_idx_if_persistent {
++            if let Some(dtor) = dtor_if_persistent {
+                 let make_closure = if *mutable {
+                     js.cx.expose_make_mut_closure()?;
+                     "makeMutClosure"
+@@ -1413,7 +1412,9 @@ fn instruction(
+                     "makeClosure"
+                 };
+ 
+-                js.push(format!("{make_closure}({a}, {b}, {dtor}, {wrapper})"));
++                let dtor = &js.cx.module.exports.get(*dtor).name;
++
++                js.push(format!("{make_closure}({a}, {b}, wasm.{dtor}, {wrapper})"));
+             } else {
+                 let i = js.tmp();
+                 js.prelude(&format!("var state{i} = {{a: {a}, b: {b}}};"));
+@@ -1587,13 +1588,6 @@ impl Invocation {
+                 _ => panic!("can only call exported function"),
+             },
+ 
+-            // The function table never changes right now, so we can statically
+-            // look up the desired function.
+-            CallTableElement(idx) => {
+-                let id = crate::wasm_conventions::get_function_table_entry(module, *idx)?;
+-                Invocation::Core { id, defer: false }
+-            }
+-
+             CallAdapter(id) => Invocation::Adapter(*id),
+ 
+             // this function is only called for the above instructions
+diff --git a/crates/cli-support/src/js/mod.rs b/crates/cli-support/src/js/mod.rs
+index fcd6bf9a5..cb75db37a 100644
+--- a/crates/cli-support/src/js/mod.rs
++++ b/crates/cli-support/src/js/mod.rs
+@@ -18,7 +18,7 @@ use std::fmt::Write;
+ use std::fs;
+ use std::path::{Path, PathBuf};
+ use walrus::{FunctionId, ImportId, MemoryId, Module, TableId, ValType};
+-use wasm_bindgen_shared::identifier::is_valid_ident;
++use wasm_bindgen_shared::identifier::{is_valid_ident, to_valid_ident};
+ 
+ mod binding;
+ 
+@@ -2367,8 +2367,6 @@ wasm = wasmInstance.exports;
+             return Ok(());
+         }
+ 
+-        let table = self.export_function_table()?;
+-
+         self.expose_closure_finalization()?;
+ 
+         // For mutable closures they can't be invoked recursively.
+@@ -2405,7 +2403,7 @@ wasm = wasmInstance.exports;
+                         return f(a, state.b, ...args);
+                     }} finally {{
+                         if (--state.cnt === 0) {{
+-                            wasm.{table}.get(state.dtor)(a, state.b);
++                            state.dtor(a, state.b);
+                             CLOSURE_DTORS.unregister(state);
+                         }} else {{
+                             state.a = a;
+@@ -2427,8 +2425,6 @@ wasm = wasmInstance.exports;
+             return Ok(());
+         }
+ 
+-        let table = self.export_function_table()?;
+-
+         self.expose_closure_finalization()?;
+ 
+         // For shared closures they can be invoked recursively so we
+@@ -2463,7 +2459,7 @@ wasm = wasmInstance.exports;
+                         return f(state.a, state.b, ...args);
+                     }} finally {{
+                         if (--state.cnt === 0) {{
+-                            wasm.{table}.get(state.dtor)(state.a, state.b); state.a = 0;
++                            state.dtor(state.a, state.b); state.a = 0;
+                             CLOSURE_DTORS.unregister(state);
+                         }}
+                     }}
+@@ -2482,26 +2478,18 @@ wasm = wasmInstance.exports;
+         if !self.should_write_global("closure_finalization") {
+             return Ok(());
+         }
+-        let table = self.export_function_table()?;
+ 
+         let finalization_callback = if self.config.generate_reset_state {
+-            format!(
+-                "
+-                state => {{
+-                    if (state.instance === __wbg_instance_id) {{
+-                        wasm.{table}.get(state.dtor)(state.a, state.b);
+-                    }}
++            "
++            state => {{
++                if (state.instance === __wbg_instance_id) {{
++                    state.dtor(state.a, state.b);
+                 }}
+-                "
+-            )
++            }}
++            "
++            .to_owned()
+         } else {
+-            format!(
+-                "
+-                state => {{
+-                    wasm.{table}.get(state.dtor)(state.a, state.b);
+-                }}
+-                "
+-            )
++            "state => state.dtor(state.a, state.b)".to_owned()
+         };
+ 
+         self.global(&format!(
+@@ -3138,7 +3126,7 @@ wasm = wasmInstance.exports;
+                         call = Some(id);
+                     }
+                 }
+-                Instruction::CallExport(_) | Instruction::CallTableElement(_) => return Ok(false),
++                Instruction::CallExport(_) => return Ok(false),
+                 _ => {}
+             }
+         }
+@@ -4237,7 +4225,7 @@ wasm = wasmInstance.exports;
+             }
+             walrus::ExportItem::Function(f) => match &self.module.funcs.get(f).name {
+                 Some(s) => {
+-                    let mut name = to_js_identifier(s);
++                    let mut name = to_valid_ident(s);
+ 
+                     // Account for duplicate export names.
+                     // See https://github.com/wasm-bindgen/wasm-bindgen/issues/4371.
+@@ -4252,20 +4240,7 @@ wasm = wasmInstance.exports;
+             _ => default_name,
+         };
+         self.module.exports.add(&name, id);
+-        return name;
+-
+-        // Not really an exhaustive list, but works for our purposes.
+-        fn to_js_identifier(name: &str) -> String {
+-            name.chars()
+-                .map(|c| {
+-                    if c.is_ascii() && (c.is_alphabetic() || c.is_numeric()) {
+-                        c
+-                    } else {
+-                        '_'
+-                    }
+-                })
+-                .collect()
+-        }
++        name
+     }
+ 
+     fn adapter_name(&self, id: AdapterId) -> String {
+diff --git a/crates/cli-support/src/multivalue.rs b/crates/cli-support/src/multivalue.rs
+index 8dad49c66..f512831bf 100644
+--- a/crates/cli-support/src/multivalue.rs
++++ b/crates/cli-support/src/multivalue.rs
+@@ -3,8 +3,7 @@ use crate::wasm_conventions;
+ use crate::wit::{Adapter, NonstandardWitSection};
+ use crate::wit::{AdapterKind, Instruction, WasmBindgenAux};
+ use anyhow::{anyhow, Error};
+-use walrus::ir::Value;
+-use walrus::{ConstExpr, FunctionId, Module};
++use walrus::Module;
+ 
+ pub fn run(module: &mut Module) -> Result<(), Error> {
+     let mut adapters = module
+@@ -12,10 +11,10 @@ pub fn run(module: &mut Module) -> Result<(), Error> {
+         .delete_typed::<NonstandardWitSection>()
+         .unwrap();
+     let mut to_xform = Vec::new();
+-    let mut slots = Vec::new();
++    let mut exports = Vec::new();
+ 
+     for adapter in adapters.adapters.values_mut() {
+-        extract_xform(module, adapter, &mut to_xform, &mut slots);
++        extract_xform(module, adapter, &mut to_xform, &mut exports);
+     }
+     if to_xform.is_empty() {
+         // Early exit to avoid failing if we don't have a memory or stack
+@@ -34,11 +33,8 @@ pub fn run(module: &mut Module) -> Result<(), Error> {
+     let memory = wasm_conventions::get_memory(module)?;
+     let wrappers = multi_value_xform::run(module, memory, stack_pointer, &to_xform)?;
+ 
+-    for (slot, id) in slots.into_iter().zip(wrappers) {
+-        match slot {
+-            Slot::Export(e) => module.exports.get_mut(e).item = id.into(),
+-            Slot::TableElement(index) => set_table_entry(module, index, id),
+-        }
++    for (export, id) in exports.into_iter().zip(wrappers) {
++        module.exports.get_mut(export).item = id.into();
+     }
+ 
+     module.customs.add(*adapters);
+@@ -46,16 +42,11 @@ pub fn run(module: &mut Module) -> Result<(), Error> {
+     Ok(())
+ }
+ 
+-enum Slot {
+-    Export(walrus::ExportId),
+-    TableElement(u32),
+-}
+-
+ fn extract_xform(
+     module: &Module,
+     adapter: &mut Adapter,
+     to_xform: &mut Vec<(walrus::FunctionId, usize, Vec<walrus::ValType>)>,
+-    slots: &mut Vec<Slot>,
++    exports: &mut Vec<walrus::ExportId>,
+ ) {
+     let instructions = match &mut adapter.kind {
+         AdapterKind::Local { instructions } => instructions,
+@@ -75,26 +66,22 @@ fn extract_xform(
+             }
+             _ => true,
+         });
+-        let slot = instructions
++        let export = instructions
+             .iter_mut()
+-            .find_map(|i| match &mut i.instr {
+-                Instruction::CallExport(e) => Some(Slot::Export(*e)),
+-                Instruction::CallTableElement(index) => Some(Slot::TableElement(*index)),
++            .find_map(|i| match i.instr {
++                Instruction::CallExport(e) => Some(e),
+                 _ => None,
+             })
+             .expect("adapter never calls the underlying function");
+ 
+         // LLVM currently always uses the first parameter for the return
+         // pointer. We hard code that here, since we have no better option.
+-        let id = match &slot {
+-            Slot::Export(e) => match module.exports.get(*e).item {
+-                walrus::ExportItem::Function(f) => f,
+-                _ => panic!("found call to non-function export"),
+-            },
+-            Slot::TableElement(func_index) => resolve_table_entry(module, *func_index),
++        let id = match module.exports.get(export).item {
++            walrus::ExportItem::Function(f) => f,
++            _ => panic!("found call to non-function export"),
+         };
+         to_xform.push((id, 0, types));
+-        slots.push(slot);
++        exports.push(export);
+     }
+ 
+     // If the last instruction is a `StoreRetptr`, then this must be an adapter
+@@ -103,96 +90,3 @@ fn extract_xform(
+     // FIXME(#1872) handle this
+     // if let Some(Instruction::StoreRetptr { .. }) = instructions.last() {}
+ }
+-
+-/// Resolves an index in the function table to a function ID.
+-fn resolve_table_entry(module: &Module, func_index: u32) -> FunctionId {
+-    let table_id = module
+-        .tables
+-        .main_function_table()
+-        .ok()
+-        .flatten()
+-        .expect("there should only be one function table");
+-    module
+-        .tables
+-        .get(table_id)
+-        .elem_segments
+-        .iter()
+-        .find_map(|&id| {
+-            let elem = module.elements.get(id);
+-            let offset = match elem.kind {
+-                walrus::ElementKind::Active { offset, .. } => match offset {
+-                    ConstExpr::Value(Value::I32(value)) => value as u32,
+-                    _ => panic!("table offset was not an i32 value"),
+-                },
+-                _ => panic!("found non-active element section for function table"),
+-            };
+-
+-            let find = |(i, func_id): (usize, Option<&FunctionId>)| {
+-                let table_index = i as u32 + offset;
+-                if table_index == func_index {
+-                    func_id.cloned()
+-                } else {
+-                    None
+-                }
+-            };
+-            match &elem.items {
+-                walrus::ElementItems::Functions(items) => {
+-                    items.iter().map(Some).enumerate().find_map(find)
+-                }
+-                walrus::ElementItems::Expressions(_, items) => items
+-                    .iter()
+-                    .map(|expr| {
+-                        if let ConstExpr::RefFunc(id) = expr {
+-                            Some(id)
+-                        } else {
+-                            None
+-                        }
+-                    })
+-                    .enumerate()
+-                    .find_map(find),
+-            }
+-        })
+-        .expect("function in function table is not initialized")
+-}
+-
+-/// Changes the function ID at an index in the function table.
+-fn set_table_entry(module: &mut Module, func_index: u32, new_id: FunctionId) {
+-    let table_id = module
+-        .tables
+-        .main_function_table()
+-        .ok()
+-        .flatten()
+-        .expect("there should only be one function table");
+-    for &id in module.tables.get(table_id).elem_segments.iter() {
+-        let elem = module.elements.get_mut(id);
+-        let offset = match elem.kind {
+-            walrus::ElementKind::Active { offset, .. } => match offset {
+-                ConstExpr::Value(Value::I32(value)) => value as u32,
+-                _ => panic!("table offset was not an i32 value"),
+-            },
+-            _ => panic!("found non-active element section for function table"),
+-        };
+-        match &mut elem.items {
+-            walrus::ElementItems::Functions(items) => {
+-                items.iter_mut().enumerate().for_each(|(i, func_id)| {
+-                    let table_index = i as u32 + offset;
+-                    if table_index == func_index {
+-                        *func_id = new_id;
+-                    }
+-                })
+-            }
+-            walrus::ElementItems::Expressions(_, items) => {
+-                items.iter_mut().enumerate().for_each(|(i, func_id)| {
+-                    let table_index = i as u32 + offset;
+-                    if table_index == func_index {
+-                        assert!(
+-                            matches!(func_id, ConstExpr::RefFunc(_)),
+-                            "didn't find a function at the expected position"
+-                        );
+-                        *func_id = ConstExpr::RefFunc(new_id);
+-                    }
+-                })
+-            }
+-        }
+-    }
+-}
+diff --git a/crates/cli-support/src/transforms/externref/mod.rs b/crates/cli-support/src/transforms/externref/mod.rs
+index d0f2e10b9..bb58a98eb 100644
+--- a/crates/cli-support/src/transforms/externref/mod.rs
++++ b/crates/cli-support/src/transforms/externref/mod.rs
+@@ -177,21 +177,6 @@ impl Context {
+         self
+     }
+ 
+-    /// Store information about a function pointer that needs to be transformed.
+-    /// The actual transformation happens later during `run`. Returns an index
+-    /// that the new wrapped function pointer will be injected at.
+-    pub fn table_element_xform(
+-        &mut self,
+-        idx: u32,
+-        externref: &[(usize, bool)],
+-        ret_externref: bool,
+-    ) -> Option<u32> {
+-        self.function(externref, ret_externref).map(|f| {
+-            self.new_elements.push((idx, f));
+-            self.new_elements.len() as u32 + self.new_element_offset - 1
+-        })
+-    }
+-
+     fn function(&self, externref: &[(usize, bool)], ret_externref: bool) -> Option<Function> {
+         if !ret_externref && externref.is_empty() {
+             return None;
+diff --git a/crates/cli-support/src/wit/mod.rs b/crates/cli-support/src/wit/mod.rs
+index b623b6e8a..664848e60 100644
+--- a/crates/cli-support/src/wit/mod.rs
++++ b/crates/cli-support/src/wit/mod.rs
+@@ -4,7 +4,7 @@ use crate::descriptors::WasmBindgenDescriptorsSection;
+ use crate::intrinsic::Intrinsic;
+ use crate::transforms::threads::ThreadCount;
+ use crate::{decode, wasm_conventions, Bindgen, PLACEHOLDER_MODULE};
+-use anyhow::{anyhow, bail, Error};
++use anyhow::{anyhow, bail, ensure, Error};
+ use std::collections::{BTreeSet, HashMap};
+ use std::hash::{DefaultHasher, Hash, Hasher};
+ use std::str;
+@@ -28,8 +28,6 @@ struct Context<'a> {
+     function_exports: HashMap<String, (ExportId, FunctionId)>,
+     /// All of the Wasm module's imported functions.
+     function_imports: HashMap<String, (ImportId, FunctionId)>,
+-    /// A map from the signature of a function in the function table to its adapter, if we've already created it.
+-    table_adapters: HashMap<Function, AdapterId>,
+     memory: Option<MemoryId>,
+     vendor_prefixes: HashMap<String, Vec<String>>,
+     unique_crate_identifier: &'a str,
+@@ -59,7 +57,6 @@ pub fn process(
+         aux: Default::default(),
+         function_exports: Default::default(),
+         function_imports: Default::default(),
+-        table_adapters: Default::default(),
+         vendor_prefixes: Default::default(),
+         descriptors: Default::default(),
+         unique_crate_identifier: "",
+@@ -166,10 +163,6 @@ impl<'a> Context<'a> {
+             // access to them while processing programs.
+             self.descriptors.extend(descriptors);
+ 
+-            // If any closures exist we need to prevent the function table from
+-            // getting gc'd
+-            self.aux.function_table = self.module.tables.main_function_table()?;
+-
+             for (descriptor, orig_func_ids) in cast_imports {
+                 let signature = descriptor.unwrap_function();
+                 let [arg] = &signature.arguments[..] else {
+@@ -1225,16 +1218,14 @@ impl<'a> Context<'a> {
+             bail!("import map is larger than the number of imports");
+         }
+ 
+-        // Make sure the export map and export adapters map contain the same
+-        // number of entries.
+-        for (_, id) in self.adapters.exports.iter() {
+-            if !self.aux.export_map.contains_key(id) {
+-                bail!("adapters map has an entry that the export map does not");
+-            }
+-        }
+-
+-        if self.adapters.exports.len() != self.aux.export_map.len() {
+-            bail!("export map and export adapters map have different sizes");
++        // Make sure all entries in the export map have an adapter.
++        // The adapter may not be in the statically known exports list if it's
++        // generated by us from a closure table entry.
++        for id in self.aux.export_map.keys() {
++            ensure!(
++                self.adapters.adapters.contains_key(id),
++                "export map has an entry that the adapters map does not"
++            );
+         }
+ 
+         Ok(())
+@@ -1345,53 +1336,6 @@ impl<'a> Context<'a> {
+         Ok(id)
+     }
+ 
+-    fn table_element_adapter(
+-        &mut self,
+-        idx: u32,
+-        mut signature: Function,
+-    ) -> Result<AdapterId, Error> {
+-        fn strip_externref_names(descriptor: &mut Descriptor) {
+-            match descriptor {
+-                Descriptor::NamedExternref(_) => *descriptor = Descriptor::Externref,
+-
+-                Descriptor::Function(function) => strip_function_externref_names(function),
+-                Descriptor::Closure(closure) => {
+-                    strip_function_externref_names(&mut closure.function)
+-                }
+-                Descriptor::Ref(descriptor)
+-                | Descriptor::RefMut(descriptor)
+-                | Descriptor::Slice(descriptor)
+-                | Descriptor::Vector(descriptor)
+-                | Descriptor::Option(descriptor)
+-                | Descriptor::Result(descriptor) => strip_externref_names(descriptor),
+-
+-                _ => {}
+-            }
+-        }
+-
+-        fn strip_function_externref_names(descriptor: &mut Function) {
+-            descriptor
+-                .arguments
+-                .iter_mut()
+-                .for_each(strip_externref_names);
+-            strip_externref_names(&mut descriptor.ret);
+-            descriptor.inner_ret.as_mut().map(strip_externref_names);
+-        }
+-
+-        // We don't care about the names of externrefs here; we only care whether
+-        // the compiler will actually keep them as separate functions.
+-        strip_function_externref_names(&mut signature);
+-
+-        if let Some(&id) = self.table_adapters.get(&signature) {
+-            return Ok(id);
+-        }
+-        let call = Instruction::CallTableElement(idx);
+-        // like above, largely just defer the work elsewhere
+-        let id = self.register_export_adapter(call, signature.clone())?;
+-        self.table_adapters.insert(signature, id);
+-        Ok(id)
+-    }
+-
+     fn register_export_adapter(
+         &mut self,
+         call: Instruction,
+diff --git a/crates/cli-support/src/wit/outgoing.rs b/crates/cli-support/src/wit/outgoing.rs
+index 479eec804..40c624142 100644
+--- a/crates/cli-support/src/wit/outgoing.rs
++++ b/crates/cli-support/src/wit/outgoing.rs
+@@ -1,8 +1,10 @@
+ use crate::descriptor::{Descriptor, Function};
++use crate::wasm_conventions::get_function_table_entry;
+ use crate::wit::{AdapterType, Instruction, InstructionBuilder};
+ use crate::wit::{InstructionData, StackChange};
+ use anyhow::{bail, format_err, Error};
+-use walrus::ValType;
++use walrus::{ExportId, ValType};
++use wasm_bindgen_shared::identifier::to_valid_ident;
+ 
+ impl InstructionBuilder<'_, '_> {
+     /// Processes one more `Descriptor` as an argument to a JS function that
+@@ -236,11 +238,30 @@ impl InstructionBuilder<'_, '_> {
+         Ok(())
+     }
+ 
++    // The function table never changes right now, so we can statically
++    // look up the desired function.
++    fn export_table_element(&mut self, idx: u32) -> ExportId {
++        let module = &mut *self.cx.module;
++        let func_id = get_function_table_entry(module, idx).unwrap();
++        if let Some(export) = module
++            .exports
++            .iter()
++            .find(|e| matches!(e.item, walrus::ExportItem::Function(id) if id == func_id))
++        {
++            return export.id();
++        }
++        let name = match &module.funcs.get(func_id).name {
++            Some(name) => to_valid_ident(name),
++            None => format!("__wasm_bindgen_func_elem_{}", func_id.index()),
++        };
++        module.exports.add(&name, func_id)
++    }
++
+     fn outgoing_function(
+         &mut self,
+         mutable: bool,
+         descriptor: &Function,
+-        dtor_idx_if_persistent: Option<u32>,
++        dtor_if_persistent: Option<u32>,
+     ) -> Result<(), Error> {
+         let mut descriptor = descriptor.clone();
+         // synthesize the a/b arguments that aren't present in the
+@@ -248,16 +269,16 @@ impl InstructionBuilder<'_, '_> {
+         let nargs = descriptor.arguments.len();
+         descriptor.arguments.insert(0, Descriptor::I32);
+         descriptor.arguments.insert(0, Descriptor::I32);
+-        let adapter = self
+-            .cx
+-            .table_element_adapter(descriptor.shim_idx, descriptor)?;
++        let shim = self.export_table_element(descriptor.shim_idx);
++        let dtor_if_persistent = dtor_if_persistent.map(|i| self.export_table_element(i));
++        let adapter = self.cx.export_adapter(shim, descriptor)?;
+         self.instruction(
+             &[AdapterType::I32, AdapterType::I32],
+             Instruction::Closure {
+                 adapter,
+                 nargs,
+                 mutable,
+-                dtor_idx_if_persistent,
++                dtor_if_persistent,
+             },
+             &[AdapterType::Function],
+         );
+diff --git a/crates/cli-support/src/wit/standard.rs b/crates/cli-support/src/wit/standard.rs
+index 35a28581a..60fffc0c8 100644
+--- a/crates/cli-support/src/wit/standard.rs
++++ b/crates/cli-support/src/wit/standard.rs
+@@ -108,8 +108,6 @@ pub enum Instruction {
+     CallAdapter(AdapterId),
+     /// Call an exported function in the core module
+     CallExport(walrus::ExportId),
+-    /// Call an element in the function table of the core module
+-    CallTableElement(u32),
+ 
+     /// Gets an argument by its index.
+     ArgGet(u32),
+@@ -333,7 +331,7 @@ pub enum Instruction {
+         adapter: AdapterId,
+         nargs: usize,
+         mutable: bool,
+-        dtor_idx_if_persistent: Option<u32>,
++        dtor_if_persistent: Option<walrus::ExportId>,
+     },
+     /// pops two i32 data pointers, pushes a vector view
+     View {
+diff --git a/crates/shared/src/identifier.rs b/crates/shared/src/identifier.rs
+index 51ebcc81f..8b3179641 100644
+--- a/crates/shared/src/identifier.rs
++++ b/crates/shared/src/identifier.rs
+@@ -1,4 +1,6 @@
+-/// Returns whether a character has the Unicode `ID_Start` properly.
++use alloc::string::String;
++
++/// Returns whether a character is a valid JS identifier start character.
+ ///
+ /// This is only ever-so-slightly different from `XID_Start` in a few edge
+ /// cases, so we handle those edge cases manually and delegate everything else
+@@ -9,11 +11,12 @@ fn is_id_start(c: char) -> bool {
+         | '\u{FC5F}' | '\u{FC60}' | '\u{FC61}' | '\u{FC62}' | '\u{FC63}' | '\u{FDFA}'
+         | '\u{FDFB}' | '\u{FE70}' | '\u{FE72}' | '\u{FE74}' | '\u{FE76}' | '\u{FE78}'
+         | '\u{FE7A}' | '\u{FE7C}' | '\u{FE7E}' | '\u{FF9E}' | '\u{FF9F}' => true,
++        '$' | '_' => true,
+         _ => unicode_ident::is_xid_start(c),
+     }
+ }
+ 
+-/// Returns whether a character has the Unicode `ID_Continue` properly.
++/// Returns whether a character is a valid JS identifier continue character.
+ ///
+ /// This is only ever-so-slightly different from `XID_Continue` in a few edge
+ /// cases, so we handle those edge cases manually and delegate everything else
+@@ -24,19 +27,35 @@ fn is_id_continue(c: char) -> bool {
+         | '\u{FC61}' | '\u{FC62}' | '\u{FC63}' | '\u{FDFA}' | '\u{FDFB}' | '\u{FE70}'
+         | '\u{FE72}' | '\u{FE74}' | '\u{FE76}' | '\u{FE78}' | '\u{FE7A}' | '\u{FE7C}'
+         | '\u{FE7E}' => true,
++        '$' | '\u{200C}' | '\u{200D}' => true,
+         _ => unicode_ident::is_xid_continue(c),
+     }
+ }
+ 
++fn maybe_valid_chars(name: &str) -> impl Iterator<Item = Option<char>> + '_ {
++    let mut chars = name.chars();
++    // Always emit at least one `None` item - that way `is_valid_ident` can fail without
++    // a separate check for empty strings, and `to_valid_ident` will always produce at least
++    // one underscore.
++    core::iter::once(chars.next().filter(|&c| is_id_start(c))).chain(chars.map(|c| {
++        if is_id_continue(c) {
++            Some(c)
++        } else {
++            None
++        }
++    }))
++}
++
+ /// Returns whether a string is a valid JavaScript identifier.
+ /// Defined at https://tc39.es/ecma262/#prod-IdentifierName.
+ pub fn is_valid_ident(name: &str) -> bool {
+-    !name.is_empty()
+-        && name.chars().enumerate().all(|(i, char)| {
+-            if i == 0 {
+-                is_id_start(char) || char == '$' || char == '_'
+-            } else {
+-                is_id_continue(char) || char == '$' || char == '\u{200C}' || char == '\u{200D}'
+-            }
+-        })
++    maybe_valid_chars(name).all(|opt| opt.is_some())
++}
++
++/// Converts a string to a valid JavaScript identifier by replacing invalid
++/// characters with underscores.
++pub fn to_valid_ident(name: &str) -> String {
++    maybe_valid_chars(name)
++        .map(|opt| opt.unwrap_or('_'))
++        .collect()
+ }
+diff --git a/src/closure.rs b/src/closure.rs
+index 40354d264..e9660371b 100644
+--- a/src/closure.rs
++++ b/src/closure.rs
+@@ -396,6 +396,18 @@ struct OwnedClosure<T: ?Sized> {
+     inner: ManuallyDrop<Box<T>>,
+ }
+ 
++unsafe extern "C" fn destroy<T: ?Sized>(a: usize, b: usize) {
++    // This can be called by the JS glue in erroneous situations
++    // such as when the closure has already been destroyed. If
++    // that's the case let's not make things worse by
++    // segfaulting and/or asserting, so just ignore null
++    // pointers.
++    if a == 0 {
++        return;
++    }
++    drop(mem::transmute_copy::<_, Box<T>>(&(a, b)));
++}
++
+ impl<T> WasmDescribe for &OwnedClosure<T>
+ where
+     T: WasmClosure + ?Sized,
+@@ -403,20 +415,7 @@ where
+     #[cfg_attr(wasm_bindgen_unstable_test_coverage, coverage(off))]
+     fn describe() {
+         inform(CLOSURE);
+-
+-        unsafe extern "C" fn destroy<T: ?Sized>(a: usize, b: usize) {
+-            // This can be called by the JS glue in erroneous situations
+-            // such as when the closure has already been destroyed. If
+-            // that's the case let's not make things worse by
+-            // segfaulting and/or asserting, so just ignore null
+-            // pointers.
+-            if a == 0 {
+-                return;
+-            }
+-            drop(mem::transmute_copy::<_, Box<T>>(&(a, b)));
+-        }
+         inform(destroy::<T> as usize as u32);
+-
+         inform(T::IS_MUT as u32);
+         T::describe();
+     }
+diff --git a/crates/cli-support/src/transforms/externref/tests/table.wat b/crates/cli-support/src/transforms/externref/tests/table.wat
+deleted file mode 100644
+index 3f651ddb8..000000000
+--- a/crates/cli-support/src/transforms/externref/tests/table.wat
++++ /dev/null
+@@ -1,37 +0,0 @@
+-;; @xform table 0 (externref_owned)
+-
+-(module
+-  (func $foo (param i32))
+-  (table (export "func") 0 funcref)
+-  (elem (i32.const 0) 0)
+-  (func $alloc (export "__externref_table_alloc") (result i32)
+-    i32.const 0)
+-  (func $dealloc (export "__externref_table_dealloc") (param i32))
+-)
+-
+-(; CHECK-ALL:
+-(module
+-  (type (;0;) (func (result i32)))
+-  (type (;1;) (func (param i32)))
+-  (type (;2;) (func (param externref)))
+-  (func $"closure0 externref shim" (;0;) (type 2) (param externref)
+-    (local i32)
+-    call $alloc
+-    local.tee 1
+-    local.get 0
+-    table.set 1
+-    local.get 1
+-    call $foo
+-  )
+-  (func $alloc (;1;) (type 0) (result i32)
+-    i32.const 0
+-  )
+-  (func $foo (;2;) (type 1) (param i32))
+-  (table (;0;) 2 funcref)
+-  (table (;1;) 128 externref)
+-  (export "func" (table 0))
+-  (elem (;0;) (i32.const 0) func $foo)
+-  (elem (;1;) (i32.const 1) funcref (ref.func $"closure0 externref shim"))
+-  (@custom "target_features" (after code) "\01+\0freference-types")
+-)
+-;)

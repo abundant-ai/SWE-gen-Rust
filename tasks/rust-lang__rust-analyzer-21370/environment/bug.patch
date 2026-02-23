@@ -1,0 +1,269 @@
+diff --git a/crates/hir-def/src/attrs.rs b/crates/hir-def/src/attrs.rs
+index 83df11f2d2..e91d72a701 100644
+--- a/crates/hir-def/src/attrs.rs
++++ b/crates/hir-def/src/attrs.rs
+@@ -99,20 +99,6 @@ fn extract_ra_completions(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
+     }
+ }
+ 
+-fn extract_ra_macro_style(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
+-    let tt = TokenTreeChildren::new(&tt);
+-    if let Ok(NodeOrToken::Token(option)) = Itertools::exactly_one(tt)
+-        && option.kind().is_any_identifier()
+-    {
+-        match option.text() {
+-            "braces" => attr_flags.insert(AttrFlags::MACRO_STYLE_BRACES),
+-            "brackets" => attr_flags.insert(AttrFlags::MACRO_STYLE_BRACKETS),
+-            "parentheses" => attr_flags.insert(AttrFlags::MACRO_STYLE_PARENTHESES),
+-            _ => {}
+-        }
+-    }
+-}
+-
+ fn extract_rustc_skip_during_method_dispatch(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
+     let iter = TokenTreeChildren::new(&tt);
+     for kind in iter {
+@@ -177,7 +163,6 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: Meta) -> ControlFlow<Infal
+             2 => match path.segments[0].text() {
+                 "rust_analyzer" => match path.segments[1].text() {
+                     "completions" => extract_ra_completions(attr_flags, tt),
+-                    "macro_style" => extract_ra_macro_style(attr_flags, tt),
+                     _ => {}
+                 },
+                 _ => {}
+@@ -306,10 +291,6 @@ bitflags::bitflags! {
+         const RUSTC_COINDUCTIVE = 1 << 43;
+         const RUSTC_FORCE_INLINE = 1 << 44;
+         const IS_POINTEE = 1 << 45;
+-
+-        const MACRO_STYLE_BRACES = 1 << 46;
+-        const MACRO_STYLE_BRACKETS = 1 << 47;
+-        const MACRO_STYLE_PARENTHESES = 1 << 48;
+     }
+ }
+ 
+diff --git a/crates/hir/src/lib.rs b/crates/hir/src/lib.rs
+index 1ab57c4489..6a19603923 100644
+--- a/crates/hir/src/lib.rs
++++ b/crates/hir/src/lib.rs
+@@ -3429,50 +3429,6 @@ impl Macro {
+     pub fn is_derive(&self, db: &dyn HirDatabase) -> bool {
+         matches!(self.kind(db), MacroKind::Derive | MacroKind::DeriveBuiltIn)
+     }
+-
+-    pub fn preferred_brace_style(&self, db: &dyn HirDatabase) -> Option<MacroBraces> {
+-        let attrs = self.attrs(db);
+-        MacroBraces::extract(attrs.attrs)
+-    }
+-}
+-
+-// Feature: Macro Brace Style Attribute
+-// Crate authors can declare the preferred brace style for their macro. This will affect how completion
+-// insert calls to it.
+-//
+-// This is only supported on function-like macros.
+-//
+-// To do that, insert the `#[rust_analyzer::macro_style(style)]` attribute on the macro (for proc macros,
+-// insert it for the macro's function). `style` can be one of:
+-//
+-//  - `braces` for `{...}` style.
+-//  - `brackets` for `[...]` style.
+-//  - `parentheses` for `(...)` style.
+-//
+-// Malformed attributes will be ignored without warnings.
+-//
+-// Note that users have no way to override this attribute, so be careful and only include things
+-// users definitely do not want to be completed!
+-
+-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+-pub enum MacroBraces {
+-    Braces,
+-    Brackets,
+-    Parentheses,
+-}
+-
+-impl MacroBraces {
+-    fn extract(attrs: AttrFlags) -> Option<Self> {
+-        if attrs.contains(AttrFlags::MACRO_STYLE_BRACES) {
+-            Some(Self::Braces)
+-        } else if attrs.contains(AttrFlags::MACRO_STYLE_BRACKETS) {
+-            Some(Self::Brackets)
+-        } else if attrs.contains(AttrFlags::MACRO_STYLE_PARENTHESES) {
+-            Some(Self::Parentheses)
+-        } else {
+-            None
+-        }
+-    }
+ }
+ 
+ #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+diff --git a/crates/ide-completion/src/render/macro_.rs b/crates/ide-completion/src/render/macro_.rs
+index 8cdeb8abbf..6efa8a8455 100644
+--- a/crates/ide-completion/src/render/macro_.rs
++++ b/crates/ide-completion/src/render/macro_.rs
+@@ -1,6 +1,6 @@
+ //! Renderer for macro invocations.
+ 
+-use hir::{HirDisplay, db::HirDatabase};
++use hir::HirDisplay;
+ use ide_db::{SymbolKind, documentation::Documentation};
+ use syntax::{SmolStr, ToSmolStr, format_smolstr};
+ 
+@@ -46,15 +46,17 @@ fn render(
+         ctx.source_range()
+     };
+ 
+-    let (name, escaped_name) =
+-        (name.as_str(), name.display(ctx.db(), completion.edition).to_smolstr());
++    let orig_name = macro_.name(ctx.db());
++    let (name, orig_name, escaped_name) = (
++        name.as_str(),
++        orig_name.as_str(),
++        name.display(ctx.db(), completion.edition).to_smolstr(),
++    );
+     let docs = ctx.docs(macro_);
++    let docs_str = docs.as_ref().map(Documentation::as_str).unwrap_or_default();
+     let is_fn_like = macro_.is_fn_like(completion.db);
+-    let (bra, ket) = if is_fn_like {
+-        guess_macro_braces(ctx.db(), macro_, name, docs.as_ref())
+-    } else {
+-        ("", "")
+-    };
++    let (bra, ket) =
++        if is_fn_like { guess_macro_braces(name, orig_name, docs_str) } else { ("", "") };
+ 
+     let needs_bang = is_fn_like && !is_use_path && !has_macro_bang;
+ 
+@@ -113,24 +115,12 @@ fn banged_name(name: &str) -> SmolStr {
+ }
+ 
+ fn guess_macro_braces(
+-    db: &dyn HirDatabase,
+-    macro_: hir::Macro,
+     macro_name: &str,
+-    docs: Option<&Documentation<'_>>,
++    orig_name: &str,
++    docs: &str,
+ ) -> (&'static str, &'static str) {
+-    if let Some(style) = macro_.preferred_brace_style(db) {
+-        return match style {
+-            hir::MacroBraces::Braces => (" {", "}"),
+-            hir::MacroBraces::Brackets => ("[", "]"),
+-            hir::MacroBraces::Parentheses => ("(", ")"),
+-        };
+-    }
+-
+-    let orig_name = macro_.name(db);
+-    let docs = docs.map(Documentation::as_str).unwrap_or_default();
+-
+     let mut votes = [0, 0, 0];
+-    for (idx, s) in docs.match_indices(macro_name).chain(docs.match_indices(orig_name.as_str())) {
++    for (idx, s) in docs.match_indices(macro_name).chain(docs.match_indices(orig_name)) {
+         let (before, after) = (&docs[..idx], &docs[idx + s.len()..]);
+         // Ensure to match the full word
+         if after.starts_with('!')
+@@ -209,57 +199,6 @@ fn main() {
+         );
+     }
+ 
+-    #[test]
+-    fn preferred_macro_braces() {
+-        check_edit(
+-            "vec!",
+-            r#"
+-#[rust_analyzer::macro_style(brackets)]
+-macro_rules! vec { () => {} }
+-
+-fn main() { v$0 }
+-"#,
+-            r#"
+-#[rust_analyzer::macro_style(brackets)]
+-macro_rules! vec { () => {} }
+-
+-fn main() { vec![$0] }
+-"#,
+-        );
+-
+-        check_edit(
+-            "foo!",
+-            r#"
+-#[rust_analyzer::macro_style(braces)]
+-macro_rules! foo { () => {} }
+-fn main() { $0 }
+-"#,
+-            r#"
+-#[rust_analyzer::macro_style(braces)]
+-macro_rules! foo { () => {} }
+-fn main() { foo! {$0} }
+-"#,
+-        );
+-
+-        check_edit(
+-            "bar!",
+-            r#"
+-#[macro_export]
+-#[rust_analyzer::macro_style(brackets)]
+-macro_rules! foo { () => {} }
+-pub use crate::foo as bar;
+-fn main() { $0 }
+-"#,
+-            r#"
+-#[macro_export]
+-#[rust_analyzer::macro_style(brackets)]
+-macro_rules! foo { () => {} }
+-pub use crate::foo as bar;
+-fn main() { bar![$0] }
+-"#,
+-        );
+-    }
+-
+     #[test]
+     fn guesses_macro_braces() {
+         check_edit(
+diff --git a/crates/ide-completion/src/tests/flyimport.rs b/crates/ide-completion/src/tests/flyimport.rs
+index aad881f8ce..c9755525a5 100644
+--- a/crates/ide-completion/src/tests/flyimport.rs
++++ b/crates/ide-completion/src/tests/flyimport.rs
+@@ -79,7 +79,6 @@ fn macro_fuzzy_completion() {
+         r#"
+ //- /lib.rs crate:dep
+ /// Please call me as macro_with_curlies! {}
+-#[rust_analyzer::macro_style(braces)]
+ #[macro_export]
+ macro_rules! macro_with_curlies {
+     () => {}
+diff --git a/crates/tt/src/lib.rs b/crates/tt/src/lib.rs
+index 72b0d762ef..a59fc2e089 100644
+--- a/crates/tt/src/lib.rs
++++ b/crates/tt/src/lib.rs
+@@ -129,7 +129,7 @@ impl Subtree {
+     }
+ }
+ 
+-#[rust_analyzer::macro_style(braces)]
++/// `dispatch_ref! {}`
+ macro_rules! dispatch_ref {
+     (
+         match $scrutinee:expr => $tt:ident => $body:expr
+diff --git a/crates/tt/src/storage.rs b/crates/tt/src/storage.rs
+index 4dd02d875a..62d2e20016 100644
+--- a/crates/tt/src/storage.rs
++++ b/crates/tt/src/storage.rs
+@@ -353,7 +353,7 @@ const _: () = {
+     assert!(size_of::<TokenTree<SpanStorage96>>() == 32);
+ };
+ 
+-#[rust_analyzer::macro_style(braces)]
++/// `dispatch! {}`
+ macro_rules! dispatch {
+     (
+         match $scrutinee:expr => $tt:ident => $body:expr
+@@ -561,7 +561,7 @@ impl TopSubtree {
+     }
+ }
+ 
+-#[rust_analyzer::macro_style(braces)]
++/// `dispatch_builder! {}`
+ macro_rules! dispatch_builder {
+     (
+         match $scrutinee:expr => $tt:ident => $body:expr

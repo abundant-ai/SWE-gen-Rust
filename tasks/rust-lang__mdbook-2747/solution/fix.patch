@@ -1,0 +1,261 @@
+diff --git a/guide/src/format/configuration/renderers.md b/guide/src/format/configuration/renderers.md
+index a827d293..7c1129e3 100644
+--- a/guide/src/format/configuration/renderers.md
++++ b/guide/src/format/configuration/renderers.md
+@@ -310,13 +310,21 @@ This is useful when you move, rename, or remove a page to ensure that links to t
+ [output.html.redirect]
+ "/appendices/bibliography.html" = "https://rustc-dev-guide.rust-lang.org/appendix/bibliography.html"
+ "/other-installation-methods.html" = "../infra/other-installation-methods.html"
++
++# Fragment redirects also work.
++"/some-existing-page.html#old-fragment" = "some-existing-page.html#new-fragment"
++
++# Fragment redirects also work for deleted pages.
++"/old-page.html" = "new-page.html"
++"/old-page.html#old-fragment" = "new-page.html#new-fragment"
+ ```
+ 
+ The table contains key-value pairs where the key is where the redirect file needs to be created, as an absolute path from the build directory, (e.g. `/appendices/bibliography.html`).
+ The value can be any valid URI the browser should navigate to (e.g. `https://rust-lang.org/`, `/overview.html`, or `../bibliography.html`).
+ 
+ This will generate an HTML page which will automatically redirect to the given location.
+-Note that the source location does not support `#` anchor redirects.
++
++When fragment redirects are specified, the page must use JavaScript to redirect to the correct location. This is useful if you rename or move a section header. Fragment redirects work with existing pages and deleted pages.
+ 
+ ## Markdown Renderer
+ 
+diff --git a/src/front-end/templates/index.hbs b/src/front-end/templates/index.hbs
+index 13950326..ae929655 100644
+--- a/src/front-end/templates/index.hbs
++++ b/src/front-end/templates/index.hbs
+@@ -341,6 +341,21 @@
+         {{/if}}
+         {{/if}}
+ 
++        {{#if fragment_map}}
++        <script>
++            document.addEventListener('DOMContentLoaded', function() {
++                const fragmentMap =
++                    {{{fragment_map}}}
++                ;
++                const target = fragmentMap[window.location.hash];
++                if (target) {
++                    let url = new URL(target, window.location.href);
++                    window.location.replace(url.href);
++                }
++            });
++        </script>
++        {{/if}}
++
+     </div>
+     </body>
+ </html>
+diff --git a/src/front-end/templates/redirect.hbs b/src/front-end/templates/redirect.hbs
+index d0532a50..86f53bcd 100644
+--- a/src/front-end/templates/redirect.hbs
++++ b/src/front-end/templates/redirect.hbs
+@@ -8,5 +8,29 @@
+   </head>
+   <body>
+       <p>Redirecting to... <a href="{{url}}">{{url}}</a>.</p>
++
++<script>
++    // This handles redirects that involve fragments.
++    document.addEventListener('DOMContentLoaded', function() {
++        const fragmentMap =
++            {{{fragment_map}}}
++        ;
++        const fragment = window.location.hash;
++        if (fragment) {
++            let redirectUrl = "{{url}}";
++            const target = fragmentMap[fragment];
++            if (target) {
++                let url = new URL(target, window.location.href);
++                redirectUrl = url.href;
++            } else {
++                let url = new URL(redirectUrl, window.location.href);
++                url.hash = window.location.hash;
++                redirectUrl = url.href;
++            }
++            window.location.replace(redirectUrl);
++        }
++        // else redirect handled by http-equiv
++    });
++</script>
+   </body>
+ </html>
+diff --git a/src/renderer/html_handlebars/hbs_renderer.rs b/src/renderer/html_handlebars/hbs_renderer.rs
+index a144b32b..f93aeacf 100644
+--- a/src/renderer/html_handlebars/hbs_renderer.rs
++++ b/src/renderer/html_handlebars/hbs_renderer.rs
+@@ -111,6 +111,14 @@ impl HtmlHandlebars {
+                 .insert("section".to_owned(), json!(section.to_string()));
+         }
+ 
++        let redirects = collect_redirects_for_path(&filepath, &ctx.html_config.redirect)?;
++        if !redirects.is_empty() {
++            ctx.data.insert(
++                "fragment_map".to_owned(),
++                json!(serde_json::to_string(&redirects)?),
++            );
++        }
++
+         // Render the handlebars template with the data
+         debug!("Render template");
+         let rendered = ctx.handlebars.render("index", &ctx.data)?;
+@@ -266,15 +274,27 @@ impl HtmlHandlebars {
+         }
+ 
+         log::debug!("Emitting redirects");
++        let redirects = combine_fragment_redirects(redirects);
+ 
+-        for (original, new) in redirects {
+-            log::debug!("Redirecting \"{}\" → \"{}\"", original, new);
++        for (original, (dest, fragment_map)) in redirects {
+             // Note: all paths are relative to the build directory, so the
+             // leading slash in an absolute path means nothing (and would mess
+             // up `root.join(original)`).
+             let original = original.trim_start_matches('/');
+             let filename = root.join(original);
+-            self.emit_redirect(handlebars, &filename, new)?;
++            if filename.exists() {
++                // This redirect is handled by the in-page fragment mapper.
++                continue;
++            }
++            if dest.is_empty() {
++                bail!(
++                    "redirect entry for `{original}` only has source paths with `#` fragments\n\
++                     There must be an entry without the `#` fragment to determine the default \
++                     destination."
++                );
++            }
++            log::debug!("Redirecting \"{}\" → \"{}\"", original, dest);
++            self.emit_redirect(handlebars, &filename, &dest, &fragment_map)?;
+         }
+ 
+         Ok(())
+@@ -285,23 +305,17 @@ impl HtmlHandlebars {
+         handlebars: &Handlebars<'_>,
+         original: &Path,
+         destination: &str,
++        fragment_map: &BTreeMap<String, String>,
+     ) -> Result<()> {
+-        if original.exists() {
+-            // sanity check to avoid accidentally overwriting a real file.
+-            let msg = format!(
+-                "Not redirecting \"{}\" to \"{}\" because it already exists. Are you sure it needs to be redirected?",
+-                original.display(),
+-                destination,
+-            );
+-            return Err(Error::msg(msg));
+-        }
+-
+         if let Some(parent) = original.parent() {
+             std::fs::create_dir_all(parent)
+                 .with_context(|| format!("Unable to ensure \"{}\" exists", parent.display()))?;
+         }
+ 
++        let js_map = serde_json::to_string(fragment_map)?;
++
+         let ctx = json!({
++            "fragment_map": js_map,
+             "url": destination,
+         });
+         let f = File::create(original)?;
+@@ -934,6 +948,62 @@ struct RenderItemContext<'a> {
+     chapter_titles: &'a HashMap<PathBuf, String>,
+ }
+ 
++/// Redirect mapping.
++///
++/// The key is the source path (like `foo/bar.html`). The value is a tuple
++/// `(destination_path, fragment_map)`. The `destination_path` is the page to
++/// redirect to. `fragment_map` is the map of fragments that override the
++/// destination. For example, a fragment `#foo` could redirect to any other
++/// page or site.
++type CombinedRedirects = BTreeMap<String, (String, BTreeMap<String, String>)>;
++fn combine_fragment_redirects(redirects: &HashMap<String, String>) -> CombinedRedirects {
++    let mut combined: CombinedRedirects = BTreeMap::new();
++    // This needs to extract the fragments to generate the fragment map.
++    for (original, new) in redirects {
++        if let Some((source_path, source_fragment)) = original.rsplit_once('#') {
++            let e = combined.entry(source_path.to_string()).or_default();
++            if let Some(old) = e.1.insert(format!("#{source_fragment}"), new.clone()) {
++                log::error!(
++                    "internal error: found duplicate fragment redirect \
++                     {old} for {source_path}#{source_fragment}"
++                );
++            }
++        } else {
++            let e = combined.entry(original.to_string()).or_default();
++            e.0 = new.clone();
++        }
++    }
++    combined
++}
++
++/// Collects fragment redirects for an existing page.
++///
++/// The returned map has keys like `#foo` and the value is the new destination
++/// path or URL.
++fn collect_redirects_for_path(
++    path: &Path,
++    redirects: &HashMap<String, String>,
++) -> Result<BTreeMap<String, String>> {
++    let path = format!("/{}", path.display().to_string().replace('\\', "/"));
++    if redirects.contains_key(&path) {
++        bail!(
++            "redirect found for existing chapter at `{path}`\n\
++            Either delete the redirect or remove the chapter."
++        );
++    }
++
++    let key_prefix = format!("{path}#");
++    let map = redirects
++        .iter()
++        .filter_map(|(source, dest)| {
++            source
++                .strip_prefix(&key_prefix)
++                .map(|fragment| (format!("#{fragment}"), dest.to_string()))
++        })
++        .collect();
++    Ok(map)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use crate::config::TextDirection;
+diff --git a/test_book/book.toml b/test_book/book.toml
+index c89a3e51..854b5e7d 100644
+--- a/test_book/book.toml
++++ b/test_book/book.toml
+@@ -25,4 +25,27 @@ expand = true
+ heading-split-level = 2
+ 
+ [output.html.redirect]
+-"/format/config.html" = "configuration/index.html"
++"/format/config.html" = "../prefix.html"
++
++# This is a source without a fragment, and one with a fragment that goes to
++# the same place. The redirect with the fragment is not necessary, since that
++# is the default behavior.
++"/pointless-fragment.html" = "prefix.html"
++"/pointless-fragment.html#foo" = "prefix.html#foo"
++
++"/rename-page-and-fragment.html" = "prefix.html"
++"/rename-page-and-fragment.html#orig" = "prefix.html#new"
++
++"/rename-page-fragment-elsewhere.html" = "prefix.html"
++"/rename-page-fragment-elsewhere.html#orig" = "suffix.html#new"
++
++# Rename fragment on an existing page.
++"/prefix.html#orig" = "prefix.html#new"
++# Rename fragment on an existing page to another page.
++"/prefix.html#orig-new-page" = "suffix.html#new"
++
++"/full-url-with-fragment.html" = "https://www.rust-lang.org/#fragment"
++
++"/full-url-with-fragment-map.html" = "https://www.rust-lang.org/"
++"/full-url-with-fragment-map.html#a" = "https://www.rust-lang.org/#new1"
++"/full-url-with-fragment-map.html#b" = "https://www.rust-lang.org/#new2"

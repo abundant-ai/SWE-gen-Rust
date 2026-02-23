@@ -1,0 +1,585 @@
+diff --git a/src/cargo/core/compiler/build_context/target_info.rs b/src/cargo/core/compiler/build_context/target_info.rs
+index 170a67658..f52d06770 100644
+--- a/src/cargo/core/compiler/build_context/target_info.rs
++++ b/src/cargo/core/compiler/build_context/target_info.rs
+@@ -200,9 +200,7 @@ impl TargetInfo {
+                 process.inherit_jobserver(client);
+             }
+ 
+-            if let CompileKind::Target(target) = kind {
+-                process.arg("--target").arg(target.rustc_target());
+-            }
++            kind.add_target_arg(&mut process);
+ 
+             let crate_type_process = process.clone();
+             const KNOWN_CRATE_TYPES: &[CrateType] = &[
+@@ -331,11 +329,7 @@ impl TargetInfo {
+                     .args(&rustflags)
+                     .env_remove("RUSTC_LOG");
+ 
+-                if let CompileKind::Target(target) = kind {
+-                    target_spec_process
+-                        .arg("--target")
+-                        .arg(target.rustc_target());
+-                }
++                kind.add_target_arg(&mut target_spec_process);
+ 
+                 #[derive(Deserialize)]
+                 struct Metadata {
+@@ -965,7 +959,7 @@ impl<'gctx> RustcTargetData<'gctx> {
+         let mut target_config = HashMap::new();
+         let mut target_info = HashMap::new();
+         let target_applies_to_host = gctx.target_applies_to_host()?;
+-        let host_target = CompileTarget::new(&rustc.host)?;
++        let host_target = CompileTarget::new(&rustc.host, gctx.cli_unstable().json_target_spec)?;
+         let host_info = TargetInfo::new(gctx, requested_kinds, &rustc, CompileKind::Host)?;
+ 
+         // This config is used for link overrides and choosing a linker.
+diff --git a/src/cargo/core/compiler/compile_kind.rs b/src/cargo/core/compiler/compile_kind.rs
+index 100ae1682..f9e53950a 100644
+--- a/src/cargo/core/compiler/compile_kind.rs
++++ b/src/cargo/core/compiler/compile_kind.rs
+@@ -5,6 +5,8 @@ use crate::util::errors::CargoResult;
+ use crate::util::interning::InternedString;
+ use crate::util::{GlobalContext, StableHasher, try_canonicalize};
+ use anyhow::Context as _;
++use anyhow::bail;
++use cargo_util::ProcessBuilder;
+ use serde::Serialize;
+ use std::collections::BTreeSet;
+ use std::fs;
+@@ -92,9 +94,15 @@ impl CompileKind {
+ 
+                     if value.as_str() == "host-tuple" {
+                         let host_triple = env!("RUST_HOST_TARGET");
+-                        Ok(CompileKind::Target(CompileTarget::new(host_triple)?))
++                        Ok(CompileKind::Target(CompileTarget::new(
++                            host_triple,
++                            gctx.cli_unstable().json_target_spec,
++                        )?))
+                     } else {
+-                        Ok(CompileKind::Target(CompileTarget::new(value.as_str())?))
++                        Ok(CompileKind::Target(CompileTarget::new(
++                            value.as_str(),
++                            gctx.cli_unstable().json_target_spec,
++                        )?))
+                     }
+                 })
+                 // First collect into a set to deduplicate any `--target` passed
+@@ -132,6 +140,17 @@ impl CompileKind {
+             CompileKind::Target(target) => target.fingerprint_hash(),
+         }
+     }
++
++    /// Adds the `--target` flag to the given [`ProcessBuilder`] if this is a
++    /// non-host build.
++    pub fn add_target_arg(&self, builder: &mut ProcessBuilder) {
++        if let CompileKind::Target(target) = self {
++            builder.arg("--target").arg(target.rustc_target());
++            if matches!(target, CompileTarget::Json { .. }) {
++                builder.arg("-Zunstable-options");
++            }
++        }
++    }
+ }
+ 
+ impl serde::ser::Serialize for CompileKind {
+@@ -141,7 +160,7 @@ impl serde::ser::Serialize for CompileKind {
+     {
+         match self {
+             CompileKind::Host => None::<&str>.serialize(s),
+-            CompileKind::Target(t) => Some(t.name).serialize(s),
++            CompileKind::Target(t) => Some(t.rustc_target()).serialize(s),
+         }
+     }
+ }
+@@ -164,31 +183,39 @@ impl serde::ser::Serialize for CompileKind {
+ /// file stem of JSON target files. For built-in rustc targets this is just an
+ /// uninterpreted string basically.
+ #[derive(PartialEq, Eq, Hash, Debug, Clone, Copy, PartialOrd, Ord, Serialize)]
+-pub struct CompileTarget {
+-    name: InternedString,
++pub enum CompileTarget {
++    Tuple(InternedString),
++    Json {
++        short: InternedString,
++        path: InternedString,
++    },
+ }
+ 
+ impl CompileTarget {
+-    pub fn new(name: &str) -> CargoResult<CompileTarget> {
++    pub fn new(name: &str, unstable_json: bool) -> CargoResult<CompileTarget> {
+         let name = name.trim();
+         if name.is_empty() {
+-            anyhow::bail!("target was empty");
++            bail!("target was empty");
+         }
+         if !name.ends_with(".json") {
+-            return Ok(CompileTarget { name: name.into() });
++            return Ok(CompileTarget::Tuple(name.into()));
++        }
++
++        if !unstable_json {
++            bail!("`.json` target specs require -Zjson-target-spec");
+         }
+ 
+         // If `name` ends in `.json` then it's likely a custom target
+         // specification. Canonicalize the path to ensure that different builds
+         // with different paths always produce the same result.
+-        let path = try_canonicalize(Path::new(name))
+-            .with_context(|| format!("target path {:?} is not a valid file", name))?;
+-
+-        let name = path
+-            .into_os_string()
+-            .into_string()
+-            .map_err(|_| anyhow::format_err!("target path is not valid unicode"))?;
+-        Ok(CompileTarget { name: name.into() })
++        let p = try_canonicalize(Path::new(name))
++            .with_context(|| format!("target path `{name}` is not a valid file"))?;
++        let path = p
++            .to_str()
++            .ok_or_else(|| anyhow::format_err!("target path `{name}` is not valid unicode"))?
++            .into();
++        let short = p.file_stem().unwrap().to_str().unwrap().into();
++        Ok(CompileTarget::Json { short, path })
+     }
+ 
+     /// Returns the full unqualified name of this target, suitable for passing
+@@ -198,7 +225,10 @@ impl CompileTarget {
+     /// of JSON target files this will be a full canonicalized path name for the
+     /// current filesystem.
+     pub fn rustc_target(&self) -> InternedString {
+-        self.name
++        match self {
++            CompileTarget::Tuple(name) => *name,
++            CompileTarget::Json { path, .. } => *path,
++        }
+     }
+ 
+     /// Returns a "short" version of the target name suitable for usage within
+@@ -208,34 +238,25 @@ impl CompileTarget {
+     /// JSON target files this returns just the file stem (e.g. `foo` out of
+     /// `foo.json`) instead of the full path.
+     pub fn short_name(&self) -> &str {
+-        // Flexible target specifications often point at json files, so if it
+-        // looks like we've got one of those just use the file stem (the file
+-        // name without ".json") as a short name for this target. Note that the
+-        // `unwrap()` here should never trigger since we have a nonempty name
+-        // and it starts as utf-8 so it's always utf-8
+-        if self.name.ends_with(".json") {
+-            Path::new(&self.name).file_stem().unwrap().to_str().unwrap()
+-        } else {
+-            &self.name
++        match self {
++            CompileTarget::Tuple(name) => name,
++            CompileTarget::Json { short, .. } => short,
+         }
+     }
+ 
+     /// See [`CompileKind::fingerprint_hash`].
+     pub fn fingerprint_hash(&self) -> u64 {
+         let mut hasher = StableHasher::new();
+-        match self
+-            .name
+-            .ends_with(".json")
+-            .then(|| fs::read_to_string(self.name))
+-        {
+-            Some(Ok(contents)) => {
++        match self {
++            CompileTarget::Tuple(name) => name.hash(&mut hasher),
++            CompileTarget::Json { path, .. } => {
+                 // This may have some performance concerns, since it is called
+                 // fairly often. If that ever seems worth fixing, consider
+                 // embedding this in `CompileTarget`.
+-                contents.hash(&mut hasher);
+-            }
+-            _ => {
+-                self.name.hash(&mut hasher);
++                match fs::read_to_string(path) {
++                    Ok(contents) => contents.hash(&mut hasher),
++                    Err(_) => path.hash(&mut hasher),
++                }
+             }
+         }
+         Hasher::finish(&hasher)
+diff --git a/src/cargo/core/compiler/mod.rs b/src/cargo/core/compiler/mod.rs
+index e8b25e8ad..34cab04b1 100644
+--- a/src/cargo/core/compiler/mod.rs
++++ b/src/cargo/core/compiler/mod.rs
+@@ -864,9 +864,7 @@ fn prepare_rustdoc(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> CargoResu
+     add_path_args(bcx.ws, unit, &mut rustdoc);
+     add_cap_lints(bcx, unit, &mut rustdoc);
+ 
+-    if let CompileKind::Target(target) = unit.kind {
+-        rustdoc.arg("--target").arg(target.rustc_target());
+-    }
++    unit.kind.add_target_arg(&mut rustdoc);
+     let doc_dir = build_runner.files().out_dir(unit);
+     rustdoc.arg("-o").arg(&doc_dir);
+     rustdoc.args(&features_args(unit));
+@@ -1414,9 +1412,7 @@ fn build_base_args(
+         }
+     }
+ 
+-    if let CompileKind::Target(n) = unit.kind {
+-        cmd.arg("--target").arg(n.rustc_target());
+-    }
++    unit.kind.add_target_arg(cmd);
+ 
+     opt(
+         cmd,
+diff --git a/src/cargo/core/dependency.rs b/src/cargo/core/dependency.rs
+index 38377e8fa..db421dd0c 100644
+--- a/src/cargo/core/dependency.rs
++++ b/src/cargo/core/dependency.rs
+@@ -496,6 +496,7 @@ impl Artifact {
+         artifacts: &[impl AsRef<str>],
+         is_lib: bool,
+         target: Option<&str>,
++        unstable_json: bool,
+     ) -> CargoResult<Self> {
+         let kinds = ArtifactKind::validate(
+             artifacts
+@@ -506,7 +507,9 @@ impl Artifact {
+         Ok(Artifact {
+             inner: Arc::new(kinds),
+             is_lib,
+-            target: target.map(ArtifactTarget::parse).transpose()?,
++            target: target
++                .map(|name| ArtifactTarget::parse(name, unstable_json))
++                .transpose()?,
+         })
+     }
+ 
+@@ -536,10 +539,10 @@ pub enum ArtifactTarget {
+ }
+ 
+ impl ArtifactTarget {
+-    pub fn parse(target: &str) -> CargoResult<ArtifactTarget> {
++    pub fn parse(target: &str, unstable_json: bool) -> CargoResult<ArtifactTarget> {
+         Ok(match target {
+             "target" => ArtifactTarget::BuildDependencyAssumeTarget,
+-            name => ArtifactTarget::Force(CompileTarget::new(name)?),
++            name => ArtifactTarget::Force(CompileTarget::new(name, unstable_json)?),
+         })
+     }
+ 
+diff --git a/src/cargo/core/features.rs b/src/cargo/core/features.rs
+index d2f59ea86..0a4835ccd 100644
+--- a/src/cargo/core/features.rs
++++ b/src/cargo/core/features.rs
+@@ -870,6 +870,7 @@ unstable_cli_options!(
+     #[serde(deserialize_with = "deserialize_gitoxide_features")]
+     gitoxide: Option<GitoxideFeatures> = ("Use gitoxide for the given git interactions, or all of them if no argument is given"),
+     host_config: bool = ("Enable the `[host]` section in the .cargo/config.toml file"),
++    json_target_spec: bool = ("Enable `.json` target spec files"),
+     lockfile_path: bool = ("Enable the `resolver.lockfile-path` config option"),
+     minimal_versions: bool = ("Resolve minimal dependency versions instead of maximum"),
+     msrv_policy: bool = ("Enable rust-version aware policy within cargo"),
+@@ -1409,6 +1410,7 @@ impl CliUnstable {
+                 )?
+             }
+             "host-config" => self.host_config = parse_empty(k, v)?,
++            "json-target-spec" => self.json_target_spec = parse_empty(k, v)?,
+             "lockfile-path" => self.lockfile_path = parse_empty(k, v)?,
+             "next-lockfile-bump" => self.next_lockfile_bump = parse_empty(k, v)?,
+             "minimal-versions" => self.minimal_versions = parse_empty(k, v)?,
+diff --git a/src/cargo/core/resolver/features.rs b/src/cargo/core/resolver/features.rs
+index 2d554b6e9..6d45edc66 100644
+--- a/src/cargo/core/resolver/features.rs
++++ b/src/cargo/core/resolver/features.rs
+@@ -811,6 +811,7 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
+             pkg_id: PackageId,
+             dep: &Dependency,
+             lib_fk: FeaturesFor,
++            unstable_json_spec: bool,
+         ) -> CargoResult<Vec<FeaturesFor>> {
+             let Some(artifact) = dep.artifact() else {
+                 return Ok(vec![lib_fk]);
+@@ -844,7 +845,9 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
+                     ArtifactTarget::BuildDependencyAssumeTarget => {
+                         for kind in this.requested_targets {
+                             let target = match kind {
+-                                CompileKind::Host => CompileTarget::new(&host_triple).unwrap(),
++                                CompileKind::Host => {
++                                    CompileTarget::new(&host_triple, unstable_json_spec).unwrap()
++                                }
+                                 CompileKind::Target(target) => *target,
+                             };
+                             activate_target(target)?;
+@@ -859,6 +862,7 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
+             Ok(result)
+         }
+ 
++        let unstable_json_spec = self.ws.gctx().cli_unstable().json_target_spec;
+         self.resolve
+             .deps(pkg_id)
+             .map(|(dep_id, deps)| {
+@@ -915,7 +919,8 @@ impl<'a, 'gctx> FeatureResolver<'a, 'gctx> {
+                             fk
+                         };
+ 
+-                        let dep_fks = artifact_features_for(self, pkg_id, dep, lib_fk)?;
++                        let dep_fks =
++                            artifact_features_for(self, pkg_id, dep, lib_fk, unstable_json_spec)?;
+                         Ok(dep_fks.into_iter().map(move |dep_fk| (dep, dep_fk)))
+                     })
+                     .flatten_ok()
+diff --git a/src/cargo/ops/cargo_compile/mod.rs b/src/cargo/ops/cargo_compile/mod.rs
+index bd5c80bb7..f0540891a 100644
+--- a/src/cargo/ops/cargo_compile/mod.rs
++++ b/src/cargo/ops/cargo_compile/mod.rs
+@@ -221,9 +221,7 @@ pub fn print<'a>(
+         if let Some(args) = target_rustc_args {
+             process.args(args);
+         }
+-        if let CompileKind::Target(t) = kind {
+-            process.arg("--target").arg(t.rustc_target());
+-        }
++        kind.add_target_arg(&mut process);
+         process.arg("--print").arg(print_opt_value);
+         process.exec()?;
+     }
+@@ -400,7 +398,10 @@ pub fn create_bcx<'a, 'gctx>(
+     // If `--target` has not been specified, then the unit graph is built
+     // assuming `--target $HOST` was specified. See
+     // `rebuild_unit_graph_shared` for more on why this is done.
+-    let explicit_host_kind = CompileKind::Target(CompileTarget::new(&target_data.rustc.host)?);
++    let explicit_host_kind = CompileKind::Target(CompileTarget::new(
++        &target_data.rustc.host,
++        gctx.cli_unstable().json_target_spec,
++    )?);
+     let explicit_host_kinds: Vec<_> = build_config
+         .requested_kinds
+         .iter()
+diff --git a/src/cargo/sources/registry/index/mod.rs b/src/cargo/sources/registry/index/mod.rs
+index db77bcab4..e8f7e4fae 100644
+--- a/src/cargo/sources/registry/index/mod.rs
++++ b/src/cargo/sources/registry/index/mod.rs
+@@ -20,8 +20,8 @@
+ //!
+ //! To learn the rationale behind this multi-layer index metadata loading,
+ //! see [the documentation of the on-disk index cache](cache).
+-use crate::core::Dependency;
+ use crate::core::dependency::{Artifact, DepKind};
++use crate::core::{CliUnstable, Dependency};
+ use crate::core::{PackageId, SourceId, Summary};
+ use crate::sources::registry::{LoadResponse, RegistryData};
+ use crate::util::IntoUrl;
+@@ -195,14 +195,18 @@ impl IndexSummary {
+     }
+ }
+ 
+-fn index_package_to_summary(pkg: &IndexPackage<'_>, source_id: SourceId) -> CargoResult<Summary> {
++fn index_package_to_summary(
++    pkg: &IndexPackage<'_>,
++    source_id: SourceId,
++    cli_unstable: &CliUnstable,
++) -> CargoResult<Summary> {
+     // ****CAUTION**** Please be extremely careful with returning errors, see
+     // `IndexSummary::parse` for details
+     let pkgid = PackageId::new(pkg.name.as_ref().into(), pkg.vers.clone(), source_id);
+     let deps = pkg
+         .deps
+         .iter()
+-        .map(|dep| registry_dependency_into_dep(dep.clone(), source_id))
++        .map(|dep| registry_dependency_into_dep(dep.clone(), source_id, cli_unstable))
+         .collect::<CargoResult<Vec<_>>>()?;
+     let mut features = pkg.features.clone();
+     if let Some(features2) = pkg.features2.clone() {
+@@ -289,7 +293,7 @@ impl<'gctx> RegistryIndex<'gctx> {
+     where
+         'a: 'b,
+     {
+-        let bindeps = self.gctx.cli_unstable().bindeps;
++        let cli_unstable = self.gctx.cli_unstable();
+ 
+         let source_id = self.source_id;
+ 
+@@ -308,7 +312,7 @@ impl<'gctx> RegistryIndex<'gctx> {
+             .iter_mut()
+             .filter_map(move |(k, v)| if req.matches(k) { Some(v) } else { None })
+             .filter_map(move |maybe| {
+-                match maybe.parse(raw_data, source_id, bindeps) {
++                match maybe.parse(raw_data, source_id, cli_unstable) {
+                     Ok(sum) => Some(sum),
+                     Err(e) => {
+                         info!("failed to parse `{}` registry package: {}", name, e);
+@@ -354,7 +358,7 @@ impl<'gctx> RegistryIndex<'gctx> {
+             &name,
+             self.source_id,
+             load,
+-            self.gctx.cli_unstable().bindeps,
++            self.gctx.cli_unstable(),
+             &self.cache_manager,
+         ))?
+         .unwrap_or_default();
+@@ -474,7 +478,7 @@ impl Summaries {
+         name: &str,
+         source_id: SourceId,
+         load: &mut dyn RegistryData,
+-        bindeps: bool,
++        cli_unstable: &CliUnstable,
+         cache_manager: &CacheManager<'_>,
+     ) -> Poll<CargoResult<Option<Summaries>>> {
+         // This is the file we're loading from cache or the index data.
+@@ -524,7 +528,7 @@ impl Summaries {
+                     // allow future cargo implementations to break the
+                     // interpretation of each line here and older cargo will simply
+                     // ignore the new lines.
+-                    let summary = match IndexSummary::parse(line, source_id, bindeps) {
++                    let summary = match IndexSummary::parse(line, source_id, cli_unstable) {
+                         Ok(summary) => summary,
+                         Err(e) => {
+                             // This should only happen when there is an index
+@@ -611,13 +615,13 @@ impl MaybeIndexSummary {
+         &mut self,
+         raw_data: &[u8],
+         source_id: SourceId,
+-        bindeps: bool,
++        cli_unstable: &CliUnstable,
+     ) -> CargoResult<&IndexSummary> {
+         let (start, end) = match self {
+             MaybeIndexSummary::Unparsed { start, end } => (*start, *end),
+             MaybeIndexSummary::Parsed(summary) => return Ok(summary),
+         };
+-        let summary = IndexSummary::parse(&raw_data[start..end], source_id, bindeps)?;
++        let summary = IndexSummary::parse(&raw_data[start..end], source_id, cli_unstable)?;
+         *self = MaybeIndexSummary::Parsed(summary);
+         match self {
+             MaybeIndexSummary::Unparsed { .. } => unreachable!(),
+@@ -638,7 +642,11 @@ impl IndexSummary {
+     ///
+     /// The `line` provided is expected to be valid JSON. It is supposed to be
+     /// a [`IndexPackage`].
+-    fn parse(line: &[u8], source_id: SourceId, bindeps: bool) -> CargoResult<IndexSummary> {
++    fn parse(
++        line: &[u8],
++        source_id: SourceId,
++        cli_unstable: &CliUnstable,
++    ) -> CargoResult<IndexSummary> {
+         // ****CAUTION**** Please be extremely careful with returning errors
+         // from this function. Entries that error are not included in the
+         // index cache, and can cause cargo to get confused when switching
+@@ -647,7 +655,7 @@ impl IndexSummary {
+         // values carefully when making changes here.
+         let index_summary = (|| {
+             let index = serde_json::from_slice::<IndexPackage<'_>>(line)?;
+-            let summary = index_package_to_summary(&index, source_id)?;
++            let summary = index_package_to_summary(&index, source_id, cli_unstable)?;
+             Ok((index, summary))
+         })();
+         let (index, summary, valid) = match index_summary {
+@@ -679,14 +687,14 @@ impl IndexSummary {
+                     links: Default::default(),
+                     pubtime: Default::default(),
+                 };
+-                let summary = index_package_to_summary(&index, source_id)?;
++                let summary = index_package_to_summary(&index, source_id, cli_unstable)?;
+                 (index, summary, false)
+             }
+         };
+         let v = index.v.unwrap_or(1);
+         tracing::trace!("json parsed registry {}/{}", index.name, index.vers);
+ 
+-        let v_max = if bindeps {
++        let v_max = if cli_unstable.bindeps {
+             INDEX_V_MAX + 1
+         } else {
+             INDEX_V_MAX
+@@ -708,6 +716,7 @@ impl IndexSummary {
+ fn registry_dependency_into_dep(
+     dep: RegistryDependency<'_>,
+     default: SourceId,
++    cli_unstable: &CliUnstable,
+ ) -> CargoResult<Dependency> {
+     let RegistryDependency {
+         name,
+@@ -764,7 +773,12 @@ fn registry_dependency_into_dep(
+     }
+ 
+     if let Some(artifacts) = artifact {
+-        let artifact = Artifact::parse(&artifacts, lib, bindep_target.as_deref())?;
++        let artifact = Artifact::parse(
++            &artifacts,
++            lib,
++            bindep_target.as_deref(),
++            cli_unstable.json_target_spec,
++        )?;
+         dep.set_artifact(artifact);
+     }
+ 
+diff --git a/src/cargo/util/toml/mod.rs b/src/cargo/util/toml/mod.rs
+index a20b43129..c31faf1ae 100644
+--- a/src/cargo/util/toml/mod.rs
++++ b/src/cargo/util/toml/mod.rs
+@@ -1792,13 +1792,13 @@ note: only a feature named `default` will be enabled by default"
+     let default_kind = normalized_package
+         .default_target
+         .as_ref()
+-        .map(|t| CompileTarget::new(&*t))
++        .map(|t| CompileTarget::new(&*t, gctx.cli_unstable().json_target_spec))
+         .transpose()?
+         .map(CompileKind::Target);
+     let forced_kind = normalized_package
+         .forced_target
+         .as_ref()
+-        .map(|t| CompileTarget::new(&*t))
++        .map(|t| CompileTarget::new(&*t, gctx.cli_unstable().json_target_spec))
+         .transpose()?
+         .map(CompileKind::Target);
+     let include = normalized_package
+@@ -2311,7 +2311,12 @@ fn dep_to_dependency<P: ResolveToPath + Clone>(
+         orig.target.as_deref(),
+     ) {
+         if manifest_ctx.gctx.cli_unstable().bindeps {
+-            let artifact = Artifact::parse(&artifact.0, is_lib, target)?;
++            let artifact = Artifact::parse(
++                &artifact.0,
++                is_lib,
++                target,
++                manifest_ctx.gctx.cli_unstable().json_target_spec,
++            )?;
+             if dep.kind() != DepKind::Build
+                 && artifact.target() == Some(ArtifactTarget::BuildDependencyAssumeTarget)
+             {
+diff --git a/src/doc/src/reference/unstable.md b/src/doc/src/reference/unstable.md
+index 76e595281..6ca6f1080 100644
+--- a/src/doc/src/reference/unstable.md
++++ b/src/doc/src/reference/unstable.md
+@@ -100,6 +100,7 @@ Each new feature described below should explain how to use it.
+     * [panic-immediate-abort](#panic-immediate-abort) --- Passes `-Cpanic=immediate-abort` to the compiler.
+     * [compile-time-deps](#compile-time-deps) --- Perma-unstable feature for rust-analyzer
+     * [fine-grain-locking](#fine-grain-locking) --- Use fine grain locking instead of locking the entire build cache
++    * [target-spec-json](#target-spec-json) --- Allows the use of `.json` custom target specs.
+ * rustdoc
+     * [rustdoc-map](#rustdoc-map) --- Provides mappings for documentation to link to external sites like [docs.rs](https://docs.rs/).
+     * [scrape-examples](#scrape-examples) --- Shows examples within documentation.
+@@ -2028,7 +2029,7 @@ cargo +nightly build --compile-time-deps -Z unstable-options
+ cargo +nightly check --compile-time-deps --all-targets -Z unstable-options
+ ```
+ 
+-# `rustc-unicode`
++## `rustc-unicode`
+ * Tracking Issue: [rust#148607](https://github.com/rust-lang/rust/issues/148607)
+ 
+ Enable `rustc`'s unicode error format in Cargo's error messages
+@@ -2045,6 +2046,17 @@ so that `cargo doc` can merge cross-crate information
+ from separate output directories,
+ and run `rustdoc` in parallel.
+ 
++## target-spec-json
++* Tracking Issue: [rust-lang/rust#151528](https://github.com/rust-lang/rust/issues/151528)
++
++The `-Z target-spec-json` CLI flag enables the ability to use [custom target spec JSON files](https://doc.rust-lang.org/nightly/rustc/targets/custom.html) as a target.
++
++```console
++cargo +nightly build --target my-target.json -Z target-spec-json
++```
++
++This usually must be combined with [build-std](#build-std).
++
+ # Stabilized and removed features
+ 
+ ## Compile progress

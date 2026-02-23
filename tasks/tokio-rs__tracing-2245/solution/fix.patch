@@ -1,0 +1,169 @@
+diff --git a/tracing-subscriber/src/filter/subscriber_filters/combinator.rs b/tracing-subscriber/src/filter/subscriber_filters/combinator.rs
+index 92e768d3..1af7edc2 100644
+--- a/tracing-subscriber/src/filter/subscriber_filters/combinator.rs
++++ b/tracing-subscriber/src/filter/subscriber_filters/combinator.rs
+@@ -137,6 +137,11 @@ where
+         cmp::min(self.a.max_level_hint(), self.b.max_level_hint())
+     }
+ 
++    #[inline]
++    fn event_enabled(&self, event: &tracing_core::Event<'_>, cx: &Context<'_, S>) -> bool {
++        self.a.event_enabled(event, cx) && self.b.event_enabled(event, cx)
++    }
++
+     #[inline]
+     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+         self.a.on_new_span(attrs, id, ctx.clone());
+@@ -324,6 +329,11 @@ where
+         Some(cmp::max(self.a.max_level_hint()?, self.b.max_level_hint()?))
+     }
+ 
++    #[inline]
++    fn event_enabled(&self, event: &tracing_core::Event<'_>, cx: &Context<'_, S>) -> bool {
++        self.a.event_enabled(event, cx) || self.b.event_enabled(event, cx)
++    }
++
+     #[inline]
+     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+         self.a.on_new_span(attrs, id, ctx.clone());
+@@ -393,7 +403,16 @@ where
+     /// If the wrapped filter would enable a span or event, it will be disabled. If
+     /// it would disable a span or event, that span or event will be enabled.
+     ///
++    /// This inverts the values returned by the [`enabled`] and [`callsite_enabled`]
++    /// methods on the wrapped filter; it does *not* invert [`event_enabled`], as
++    /// implementing that method is optional, and filters which do not implement
++    /// filtering on event field values will return `true` even for events that their
++    /// [`enabled`] method would disable.
++    ///
+     /// [`Filter`]: crate::subscribe::Filter
++    /// [`enabled`]: crate::subscribe::Filter::enabled
++    /// [`event_enabled`]: crate::subscribe::Filter::event_enabled
++    /// [`callsite_enabled`]: crate::subscribe::Filter::callsite_enabled
+     pub(crate) fn new(a: A) -> Self {
+         Self { a, _s: PhantomData }
+     }
+@@ -421,6 +440,14 @@ where
+         None
+     }
+ 
++    #[inline]
++    fn event_enabled(&self, event: &tracing_core::Event<'_>, cx: &Context<'_, S>) -> bool {
++        // Never disable based on event_enabled; we "disabled" it in `enabled`,
++        // so the `not` has already been applied and filtered this not out.
++        let _ = (event, cx);
++        true
++    }
++
+     #[inline]
+     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+         self.a.on_new_span(attrs, id, ctx);
+diff --git a/tracing-subscriber/src/filter/subscriber_filters/mod.rs b/tracing-subscriber/src/filter/subscriber_filters/mod.rs
+index 463122a5..ade200dc 100644
+--- a/tracing-subscriber/src/filter/subscriber_filters/mod.rs
++++ b/tracing-subscriber/src/filter/subscriber_filters/mod.rs
+@@ -298,6 +298,17 @@ pub trait FilterExt<S>: subscribe::Filter<S> {
+ 
+     /// Inverts `self`, returning a filter that enables spans and events only if
+     /// `self` would *not* enable them.
++    ///
++    /// This inverts the values returned by the [`enabled`] and [`callsite_enabled`]
++    /// methods on the wrapped filter; it does *not* invert [`event_enabled`], as
++    /// implementing that method is optional, and filters which do not implement
++    /// filtering on event field values will return `true` even for events that their
++    /// [`enabled`] method would disable.
++    ///
++    /// [`Filter`]: crate::subscribe::Filter
++    /// [`enabled`]: crate::subscribe::Filter::enabled
++    /// [`event_enabled`]: crate::subscribe::Filter::event_enabled
++    /// [`callsite_enabled`]: crate::subscribe::Filter::callsite_enabled
+     fn not(self) -> combinator::Not<Self, S>
+     where
+         Self: Sized,
+@@ -639,6 +650,22 @@ where
+         }
+     }
+ 
++    fn event_enabled(&self, event: &Event<'_>, cx: Context<'_, C>) -> bool {
++        let cx = cx.with_filter(self.id());
++        let enabled = FILTERING
++            .with(|filtering| filtering.and(self.id(), || self.filter.event_enabled(event, &cx)));
++
++        if enabled {
++            // If the filter enabled this event, ask the wrapped subscriber if
++            // _it_ wants it --- it might have a global filter.
++            self.subscriber.event_enabled(event, cx)
++        } else {
++            // Otherwise, return `true`. See the comment in `enabled` for why this
++            // is necessary.
++            true
++        }
++    }
++
+     fn on_event(&self, event: &Event<'_>, cx: Context<'_, C>) {
+         self.did_enable(|| {
+             self.subscriber.on_event(event, cx.with_filter(self.id()));
+@@ -1006,6 +1033,14 @@ impl FilterState {
+         }
+     }
+ 
++    /// Run a second filtering pass, e.g. for Subscribe::event_enabled.
++    fn and(&self, filter: FilterId, f: impl FnOnce() -> bool) -> bool {
++        let map = self.enabled.get();
++        let enabled = map.is_enabled(filter) && f();
++        self.enabled.set(map.set(filter, enabled));
++        enabled
++    }
++
+     /// Clears the current in-progress filter state.
+     ///
+     /// This resets the [`FilterMap`] and current [`Interest`] as well as
+diff --git a/tracing-subscriber/src/registry/sharded.rs b/tracing-subscriber/src/registry/sharded.rs
+index 1f79b153..b1d1838b 100644
+--- a/tracing-subscriber/src/registry/sharded.rs
++++ b/tracing-subscriber/src/registry/sharded.rs
+@@ -275,6 +275,13 @@ impl Collect for Registry {
+ 
+     fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+ 
++    fn event_enabled(&self, _event: &Event<'_>) -> bool {
++        if self.has_per_subscriber_filters() {
++            return FilterState::event_enabled();
++        }
++        true
++    }
++
+     /// This is intentionally not implemented, as recording events
+     /// is the responsibility of subscribers atop of this registry.
+     fn event(&self, _: &Event<'_>) {}
+diff --git a/tracing-subscriber/src/subscribe/mod.rs b/tracing-subscriber/src/subscribe/mod.rs
+index 47bec360..d947a6a1 100644
+--- a/tracing-subscriber/src/subscribe/mod.rs
++++ b/tracing-subscriber/src/subscribe/mod.rs
+@@ -1382,6 +1382,26 @@ pub trait Filter<S> {
+         None
+     }
+ 
++    /// Called before the filtered subscribers' [`on_event`], to determine if
++    /// `on_event` should be called.
++    ///
++    /// This gives a chance to filter events based on their fields. Note,
++    /// however, that this *does not* override [`enabled`], and is not even
++    /// called if [`enabled`] returns `false`.
++    ///
++    /// ## Default Implementation
++    ///
++    /// By default, this method returns `true`, indicating that no events are
++    /// filtered out based on their fields.
++    ///
++    /// [`enabled`]: crate::subscribe::Filter::enabled
++    /// [`on_event`]: crate::subscribe::Subscribe::on_event
++    #[inline] // collapse this to a constant please mrs optimizer
++    fn event_enabled(&self, event: &Event<'_>, cx: &Context<'_, S>) -> bool {
++        let _ = (event, cx);
++        true
++    }
++
+     /// Notifies this filter that a new span was constructed with the given
+     /// `Attributes` and `Id`.
+     ///

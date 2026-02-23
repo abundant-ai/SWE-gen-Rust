@@ -1,0 +1,454 @@
+diff --git a/src/renderer/html_handlebars/hbs_renderer.rs b/src/renderer/html_handlebars/hbs_renderer.rs
+index 080b12da..54004066 100644
+--- a/src/renderer/html_handlebars/hbs_renderer.rs
++++ b/src/renderer/html_handlebars/hbs_renderer.rs
+@@ -528,6 +528,11 @@ impl Renderer for HtmlHandlebars {
+         debug!("Register the header handlebars template");
+         handlebars.register_partial("header", String::from_utf8(theme.header.clone())?)?;
+ 
++        debug!("Register the toc handlebars template");
++        handlebars.register_template_string("toc_js", String::from_utf8(theme.toc_js.clone())?)?;
++        handlebars
++            .register_template_string("toc_html", String::from_utf8(theme.toc_html.clone())?)?;
++
+         debug!("Register handlebars helpers");
+         self.register_hbs_helpers(&mut handlebars, &html_config);
+ 
+@@ -583,6 +588,18 @@ impl Renderer for HtmlHandlebars {
+             debug!("Creating print.html ✓");
+         }
+ 
++        debug!("Render toc");
++        {
++            let rendered_toc = handlebars.render("toc_js", &data)?;
++            utils::fs::write_file(destination, "toc.js", rendered_toc.as_bytes())?;
++            debug!("Creating toc.js ✓");
++            data.insert("is_toc_html".to_owned(), json!(true));
++            let rendered_toc = handlebars.render("toc_html", &data)?;
++            utils::fs::write_file(destination, "toc.html", rendered_toc.as_bytes())?;
++            debug!("Creating toc.html ✓");
++            data.remove("is_toc_html");
++        }
++
+         debug!("Copy static files");
+         self.copy_static_files(destination, &theme, &html_config)
+             .with_context(|| "Unable to copy across static files")?;
+diff --git a/src/renderer/html_handlebars/helpers/toc.rs b/src/renderer/html_handlebars/helpers/toc.rs
+index aabea028..d43c617f 100644
+--- a/src/renderer/html_handlebars/helpers/toc.rs
++++ b/src/renderer/html_handlebars/helpers/toc.rs
+@@ -1,8 +1,7 @@
+ use std::path::Path;
+ use std::{cmp::Ordering, collections::BTreeMap};
+ 
+-use crate::utils;
+-use crate::utils::bracket_escape;
++use crate::utils::special_escape;
+ 
+ use handlebars::{
+     Context, Handlebars, Helper, HelperDef, Output, RenderContext, RenderError, RenderErrorReason,
+@@ -32,21 +31,6 @@ impl HelperDef for RenderToc {
+                     RenderErrorReason::Other("Could not decode the JSON data".to_owned()).into()
+                 })
+         })?;
+-        let current_path = rc
+-            .evaluate(ctx, "@root/path")?
+-            .as_json()
+-            .as_str()
+-            .ok_or_else(|| {
+-                RenderErrorReason::Other("Type error for `path`, string expected".to_owned())
+-            })?
+-            .replace('\"', "");
+-
+-        let current_section = rc
+-            .evaluate(ctx, "@root/section")?
+-            .as_json()
+-            .as_str()
+-            .map(str::to_owned)
+-            .unwrap_or_default();
+ 
+         let fold_enable = rc
+             .evaluate(ctx, "@root/fold_enable")?
+@@ -64,31 +48,27 @@ impl HelperDef for RenderToc {
+                 RenderErrorReason::Other("Type error for `fold_level`, u64 expected".to_owned())
+             })?;
+ 
++        // If true, then this is the iframe and we need target="_parent"
++        let is_toc_html = rc
++            .evaluate(ctx, "@root/is_toc_html")?
++            .as_json()
++            .as_bool()
++            .unwrap_or(false);
++
+         out.write("<ol class=\"chapter\">")?;
+ 
+         let mut current_level = 1;
+-        // The "index" page, which has this attribute set, is supposed to alias the first chapter in
+-        // the book, i.e. the first link. There seems to be no easy way to determine which chapter
+-        // the "index" is aliasing from within the renderer, so this is used instead to force the
+-        // first link to be active. See further below.
+-        let mut is_first_chapter = ctx.data().get("is_index").is_some();
+ 
+         for item in chapters {
+-            let (section, level) = if let Some(s) = item.get("section") {
++            let (_section, level) = if let Some(s) = item.get("section") {
+                 (s.as_str(), s.matches('.').count())
+             } else {
+                 ("", 1)
+             };
+ 
+-            let is_expanded =
+-                if !fold_enable || (!section.is_empty() && current_section.starts_with(section)) {
+-                    // Expand if folding is disabled, or if the section is an
+-                    // ancestor or the current section itself.
+-                    true
+-                } else {
+-                    // Levels that are larger than this would be folded.
+-                    level - 1 < fold_level as usize
+-                };
++            // Expand if folding is disabled, or if levels that are larger than this would not
++            // be folded.
++            let is_expanded = !fold_enable || level - 1 < (fold_level as usize);
+ 
+             match level.cmp(&current_level) {
+                 Ordering::Greater => {
+@@ -121,7 +101,7 @@ impl HelperDef for RenderToc {
+             // Part title
+             if let Some(title) = item.get("part") {
+                 out.write("<li class=\"part-title\">")?;
+-                out.write(&bracket_escape(title))?;
++                out.write(&special_escape(title))?;
+                 out.write("</li>")?;
+                 continue;
+             }
+@@ -139,16 +119,12 @@ impl HelperDef for RenderToc {
+                         .replace('\\', "/");
+ 
+                     // Add link
+-                    out.write(&utils::fs::path_to_root(&current_path))?;
+                     out.write(&tmp)?;
+-                    out.write("\"")?;
+-
+-                    if path == &current_path || is_first_chapter {
+-                        is_first_chapter = false;
+-                        out.write(" class=\"active\"")?;
+-                    }
+-
+-                    out.write(">")?;
++                    out.write(if is_toc_html {
++                        "\" target=\"_parent\">"
++                    } else {
++                        "\">"
++                    })?;
+                     path_exists = true;
+                 }
+                 _ => {
+@@ -167,7 +143,7 @@ impl HelperDef for RenderToc {
+             }
+ 
+             if let Some(name) = item.get("name") {
+-                out.write(&bracket_escape(name))?
++                out.write(&special_escape(name))?
+             }
+ 
+             if path_exists {
+diff --git a/src/theme/css/chrome.css b/src/theme/css/chrome.css
+index 83b7969b..e62056b0 100644
+--- a/src/theme/css/chrome.css
++++ b/src/theme/css/chrome.css
+@@ -399,6 +399,22 @@ ul#searchresults span.teaser em {
+     background-color: var(--sidebar-bg);
+     color: var(--sidebar-fg);
+ }
++.sidebar-iframe-inner {
++    background-color: var(--sidebar-bg);
++    color: var(--sidebar-fg);
++    padding: 10px 10px;
++    margin: 0;
++    font-size: 1.4rem;
++}
++.sidebar-iframe-outer {
++    border: none;
++    height: 100%;
++    position: absolute;
++    top: 0;
++    bottom: 0;
++    left: 0;
++    right: 0;
++}
+ [dir=rtl] .sidebar { left: unset; right: 0; }
+ .sidebar-resizing {
+     -moz-user-select: none;
+diff --git a/src/theme/index.hbs b/src/theme/index.hbs
+index 080b7851..97f59a13 100644
+--- a/src/theme/index.hbs
++++ b/src/theme/index.hbs
+@@ -109,35 +109,17 @@
+         </script>
+ 
+         <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+-            <div class="sidebar-scrollbox">
+-                {{#toc}}{{/toc}}
+-            </div>
++            <!-- populated by js -->
++            <div class="sidebar-scrollbox"></div>
++            <noscript>
++                <iframe class="sidebar-iframe-outer" src="{{ path_to_root }}toc.html"></iframe>
++            </noscript>
+             <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                 <div class="sidebar-resize-indicator"></div>
+             </div>
+         </nav>
+ 
+-        <!-- Track and set sidebar scroll position -->
+-        <script>
+-            var sidebarScrollbox = document.querySelector('#sidebar .sidebar-scrollbox');
+-            sidebarScrollbox.addEventListener('click', function(e) {
+-                if (e.target.tagName === 'A') {
+-                    sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
+-                }
+-            }, { passive: true });
+-            var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
+-            sessionStorage.removeItem('sidebar-scroll');
+-            if (sidebarScrollTop) {
+-                // preserve sidebar scroll position when navigating via links within sidebar
+-                sidebarScrollbox.scrollTop = sidebarScrollTop;
+-            } else {
+-                // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
+-                var activeSection = document.querySelector('#sidebar .active');
+-                if (activeSection) {
+-                    activeSection.scrollIntoView({ block: 'center' });
+-                }
+-            }
+-        </script>
++        <script async src="{{ path_to_root }}toc.js"></script>
+ 
+         <div id="page-wrapper" class="page-wrapper">
+ 
+diff --git a/src/theme/mod.rs b/src/theme/mod.rs
+index 1c108d62..b173bd4a 100644
+--- a/src/theme/mod.rs
++++ b/src/theme/mod.rs
+@@ -17,6 +17,8 @@ pub static INDEX: &[u8] = include_bytes!("index.hbs");
+ pub static HEAD: &[u8] = include_bytes!("head.hbs");
+ pub static REDIRECT: &[u8] = include_bytes!("redirect.hbs");
+ pub static HEADER: &[u8] = include_bytes!("header.hbs");
++pub static TOC_JS: &[u8] = include_bytes!("toc.js.hbs");
++pub static TOC_HTML: &[u8] = include_bytes!("toc.html.hbs");
+ pub static CHROME_CSS: &[u8] = include_bytes!("css/chrome.css");
+ pub static GENERAL_CSS: &[u8] = include_bytes!("css/general.css");
+ pub static PRINT_CSS: &[u8] = include_bytes!("css/print.css");
+@@ -50,6 +52,8 @@ pub struct Theme {
+     pub head: Vec<u8>,
+     pub redirect: Vec<u8>,
+     pub header: Vec<u8>,
++    pub toc_js: Vec<u8>,
++    pub toc_html: Vec<u8>,
+     pub chrome_css: Vec<u8>,
+     pub general_css: Vec<u8>,
+     pub print_css: Vec<u8>,
+@@ -85,6 +89,8 @@ impl Theme {
+                 (theme_dir.join("head.hbs"), &mut theme.head),
+                 (theme_dir.join("redirect.hbs"), &mut theme.redirect),
+                 (theme_dir.join("header.hbs"), &mut theme.header),
++                (theme_dir.join("toc.js.hbs"), &mut theme.toc_js),
++                (theme_dir.join("toc.html.hbs"), &mut theme.toc_html),
+                 (theme_dir.join("book.js"), &mut theme.js),
+                 (theme_dir.join("css/chrome.css"), &mut theme.chrome_css),
+                 (theme_dir.join("css/general.css"), &mut theme.general_css),
+@@ -174,6 +180,8 @@ impl Default for Theme {
+             head: HEAD.to_owned(),
+             redirect: REDIRECT.to_owned(),
+             header: HEADER.to_owned(),
++            toc_js: TOC_JS.to_owned(),
++            toc_html: TOC_HTML.to_owned(),
+             chrome_css: CHROME_CSS.to_owned(),
+             general_css: GENERAL_CSS.to_owned(),
+             print_css: PRINT_CSS.to_owned(),
+@@ -232,6 +240,8 @@ mod tests {
+             "head.hbs",
+             "redirect.hbs",
+             "header.hbs",
++            "toc.js.hbs",
++            "toc.html.hbs",
+             "favicon.png",
+             "favicon.svg",
+             "css/chrome.css",
+@@ -263,6 +273,8 @@ mod tests {
+             head: Vec::new(),
+             redirect: Vec::new(),
+             header: Vec::new(),
++            toc_js: Vec::new(),
++            toc_html: Vec::new(),
+             chrome_css: Vec::new(),
+             general_css: Vec::new(),
+             print_css: Vec::new(),
+diff --git a/src/theme/toc.html.hbs b/src/theme/toc.html.hbs
+new file mode 100644
+index 00000000..f8fca873
+--- /dev/null
++++ b/src/theme/toc.html.hbs
+@@ -0,0 +1,43 @@
++<!DOCTYPE HTML>
++<html lang="{{ language }}" class="{{ default_theme }}" dir="{{ text_direction }}">
++    <head>
++        <!-- sidebar iframe generated using mdBook
++
++        This is a frame, and not included directly in the page, to control the total size of the
++        book. The TOC contains an entry for each page, so if each page includes a copy of the TOC,
++        the total size of the page becomes O(n**2).
++
++        The frame is only used as a fallback when JS is turned off. When it's on, the sidebar is
++        instead added to the main page by `toc.js` instead. The JavaScript mode is better
++        because, when running in a `file:///` URL, the iframed page would not be Same-Origin as
++        the rest of the page, so the sidebar and the main page theme would fall out of sync.
++        -->
++        <meta charset="UTF-8">
++        <meta name="robots" content="noindex">
++        {{#if base_url}}
++        <base href="{{ base_url }}">
++        {{/if}}
++        <!-- Custom HTML head -->
++        {{> head}}
++        <meta name="viewport" content="width=device-width, initial-scale=1">
++        <meta name="theme-color" content="#ffffff">
++        <link rel="stylesheet" href="{{ path_to_root }}css/variables.css">
++        <link rel="stylesheet" href="{{ path_to_root }}css/general.css">
++        <link rel="stylesheet" href="{{ path_to_root }}css/chrome.css">
++        {{#if print_enable}}
++        <link rel="stylesheet" href="{{ path_to_root }}css/print.css" media="print">
++        {{/if}}
++        <!-- Fonts -->
++        <link rel="stylesheet" href="{{ path_to_root }}FontAwesome/css/font-awesome.css">
++        {{#if copy_fonts}}
++        <link rel="stylesheet" href="{{ path_to_root }}fonts/fonts.css">
++        {{/if}}
++        <!-- Custom theme stylesheets -->
++        {{#each additional_css}}
++        <link rel="stylesheet" href="{{ ../path_to_root }}{{ this }}">
++        {{/each}}
++    </head>
++    <body class="sidebar-iframe-inner">
++        {{#toc}}{{/toc}}
++    </body>
++</html>
+diff --git a/src/theme/toc.js.hbs b/src/theme/toc.js.hbs
+new file mode 100644
+index 00000000..eb48c8ba
+--- /dev/null
++++ b/src/theme/toc.js.hbs
+@@ -0,0 +1,54 @@
++// Populate the sidebar
++//
++// This is a script, and not included directly in the page, to control the total size of the book.
++// The TOC contains an entry for each page, so if each page includes a copy of the TOC,
++// the total size of the page becomes O(n**2).
++var sidebarScrollbox = document.querySelector("#sidebar .sidebar-scrollbox");
++sidebarScrollbox.innerHTML = '{{#toc}}{{/toc}}';
++(function() {
++    let current_page = document.location.href.toString();
++    if (current_page.endsWith("/")) {
++        current_page += "index.html";
++    }
++    var links = sidebarScrollbox.querySelectorAll("a");
++    var l = links.length;
++    for (var i = 0; i < l; ++i) {
++        var link = links[i];
++        var href = link.getAttribute("href");
++        if (href && !href.startsWith("#") && !/^(?:[a-z+]+:)?\/\//.test(href)) {
++            link.href = path_to_root + href;
++        }
++        // The "index" page is supposed to alias the first chapter in the book.
++        if (link.href === current_page || (i === 0 && path_to_root === "" && current_page.endsWith("/index.html"))) {
++            link.classList.add("active");
++            var parent = link.parentElement;
++            while (parent) {
++                if (parent.tagName === "LI" && parent.previousElementSibling) {
++                    if (parent.previousElementSibling.classList.contains("chapter-item")) {
++                        parent.previousElementSibling.classList.add("expanded");
++                    }
++                }
++                parent = parent.parentElement;
++            }
++        }
++    }
++})();
++
++// Track and set sidebar scroll position
++sidebarScrollbox.addEventListener('click', function(e) {
++    if (e.target.tagName === 'A') {
++        sessionStorage.setItem('sidebar-scroll', sidebarScrollbox.scrollTop);
++    }
++}, { passive: true });
++var sidebarScrollTop = sessionStorage.getItem('sidebar-scroll');
++sessionStorage.removeItem('sidebar-scroll');
++if (sidebarScrollTop) {
++    // preserve sidebar scroll position when navigating via links within sidebar
++    sidebarScrollbox.scrollTop = sidebarScrollTop;
++} else {
++    // scroll sidebar to current active section when navigating via "next/previous chapter" buttons
++    var activeSection = document.querySelector('#sidebar .active');
++    if (activeSection) {
++        activeSection.scrollIntoView({ block: 'center' });
++    }
++}
+diff --git a/src/utils/mod.rs b/src/utils/mod.rs
+index 2b17cc7d..f8215fed 100644
+--- a/src/utils/mod.rs
++++ b/src/utils/mod.rs
+@@ -265,6 +265,25 @@ pub fn log_backtrace(e: &Error) {
+     }
+ }
+ 
++pub(crate) fn special_escape(mut s: &str) -> String {
++    let mut escaped = String::with_capacity(s.len());
++    let needs_escape: &[char] = &['<', '>', '\'', '\\', '&'];
++    while let Some(next) = s.find(needs_escape) {
++        escaped.push_str(&s[..next]);
++        match s.as_bytes()[next] {
++            b'<' => escaped.push_str("&lt;"),
++            b'>' => escaped.push_str("&gt;"),
++            b'\'' => escaped.push_str("&#39;"),
++            b'\\' => escaped.push_str("&#92;"),
++            b'&' => escaped.push_str("&amp;"),
++            _ => unreachable!(),
++        }
++        s = &s[next + 1..];
++    }
++    escaped.push_str(s);
++    escaped
++}
++
+ pub(crate) fn bracket_escape(mut s: &str) -> String {
+     let mut escaped = String::with_capacity(s.len());
+     let needs_escape: &[char] = &['<', '>'];
+@@ -283,7 +302,7 @@ pub(crate) fn bracket_escape(mut s: &str) -> String {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::bracket_escape;
++    use super::{bracket_escape, special_escape};
+ 
+     mod render_markdown {
+         use super::super::render_markdown;
+@@ -506,5 +525,20 @@ more text with spaces
+         assert_eq!(bracket_escape("<>"), "&lt;&gt;");
+         assert_eq!(bracket_escape("<test>"), "&lt;test&gt;");
+         assert_eq!(bracket_escape("a<test>b"), "a&lt;test&gt;b");
++        assert_eq!(bracket_escape("'"), "'");
++        assert_eq!(bracket_escape("\\"), "\\");
++    }
++
++    #[test]
++    fn escaped_special() {
++        assert_eq!(special_escape(""), "");
++        assert_eq!(special_escape("<"), "&lt;");
++        assert_eq!(special_escape(">"), "&gt;");
++        assert_eq!(special_escape("<>"), "&lt;&gt;");
++        assert_eq!(special_escape("<test>"), "&lt;test&gt;");
++        assert_eq!(special_escape("a<test>b"), "a&lt;test&gt;b");
++        assert_eq!(special_escape("'"), "&#39;");
++        assert_eq!(special_escape("\\"), "&#92;");
++        assert_eq!(special_escape("&"), "&amp;");
+     }
+ }

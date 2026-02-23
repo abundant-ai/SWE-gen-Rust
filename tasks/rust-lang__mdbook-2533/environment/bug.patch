@@ -1,0 +1,265 @@
+diff --git a/guide/src/format/configuration/renderers.md b/guide/src/format/configuration/renderers.md
+index 91281dc4..5efede66 100644
+--- a/guide/src/format/configuration/renderers.md
++++ b/guide/src/format/configuration/renderers.md
+@@ -281,20 +281,6 @@ copy-js = true           # include Javascript code for search
+ - **copy-js:** Copy JavaScript files for the search implementation to the output
+   directory. Defaults to `true`.
+ 
+-#### `[output.html.search.chapter]`
+-
+-The [`output.html.search.chapter`] table provides the ability to modify search settings per chapter or directory. Each key is the path to the chapter source file or directory, and the value is a table of settings to apply to that path. This will merge recursively, with more specific paths taking precedence.
+-
+-```toml
+-[output.html.search.chapter]
+-# Disables search indexing for all chapters in the `appendix` directory.
+-"appendix" = { enable = false }
+-# Enables search indexing for just this one appendix chapter.
+-"appendix/glossary.md" = { enable = true }
+-```
+-
+-- **enable:** Enables or disables search indexing for the given chapters. Defaults to `true`. This does not override the overall `output.html.search.enable` setting; that must be `true` for any search functionality to be enabled. Be cautious when disabling indexing for chapters because that can potentially lead to user confusion when they search for terms and expect them to be found. This should only be used in exceptional circumstances where keeping the chapter in the index will cause issues with the quality of the search results.
+-
+ ### `[output.html.redirect]`
+ 
+ The `[output.html.redirect]` table provides a way to add redirects.
+diff --git a/src/config.rs b/src/config.rs
+index 91129084..b87ad276 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -735,11 +735,6 @@ pub struct Search {
+     /// Copy JavaScript files for the search functionality to the output directory?
+     /// Default: `true`.
+     pub copy_js: bool,
+-    /// Specifies search settings for the given path.
+-    ///
+-    /// The path can be for a specific chapter, or a directory. This will
+-    /// merge recursively, with more specific paths taking precedence.
+-    pub chapter: HashMap<String, SearchChapterSettings>,
+ }
+ 
+ impl Default for Search {
+@@ -756,19 +751,10 @@ impl Default for Search {
+             expand: true,
+             heading_split_level: 3,
+             copy_js: true,
+-            chapter: HashMap::new(),
+         }
+     }
+ }
+ 
+-/// Search options for chapters (or paths).
+-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+-#[serde(default, rename_all = "kebab-case")]
+-pub struct SearchChapterSettings {
+-    /// Whether or not indexing is enabled, default `true`.
+-    pub enable: Option<bool>,
+-}
+-
+ /// Allows you to "update" any arbitrary field in a struct by round-tripping via
+ /// a `toml::Value`.
+ ///
+diff --git a/src/renderer/html_handlebars/search.rs b/src/renderer/html_handlebars/search.rs
+index 9715ce15..c03eb4f8 100644
+--- a/src/renderer/html_handlebars/search.rs
++++ b/src/renderer/html_handlebars/search.rs
+@@ -1,13 +1,13 @@
+ use std::borrow::Cow;
+ use std::collections::{HashMap, HashSet};
+-use std::path::{Path, PathBuf};
++use std::path::Path;
+ 
+ use elasticlunr::{Index, IndexBuilder};
+ use once_cell::sync::Lazy;
+ use pulldown_cmark::*;
+ 
+-use crate::book::{Book, BookItem, Chapter};
+-use crate::config::{Search, SearchChapterSettings};
++use crate::book::{Book, BookItem};
++use crate::config::Search;
+ use crate::errors::*;
+ use crate::theme::searcher;
+ use crate::utils;
+@@ -35,20 +35,8 @@ pub fn create_files(search_config: &Search, destination: &Path, book: &Book) ->
+ 
+     let mut doc_urls = Vec::with_capacity(book.sections.len());
+ 
+-    let chapter_configs = sort_search_config(&search_config.chapter);
+-    validate_chapter_config(&chapter_configs, book)?;
+-
+     for item in book.iter() {
+-        let chapter = match item {
+-            BookItem::Chapter(ch) if !ch.is_draft_chapter() => ch,
+-            _ => continue,
+-        };
+-        let chapter_settings =
+-            get_chapter_settings(&chapter_configs, chapter.source_path.as_ref().unwrap());
+-        if !chapter_settings.enable.unwrap_or(true) {
+-            continue;
+-        }
+-        render_item(&mut index, search_config, &mut doc_urls, chapter)?;
++        render_item(&mut index, search_config, &mut doc_urls, item)?;
+     }
+ 
+     let index = write_to_json(index, search_config, doc_urls)?;
+@@ -112,8 +100,13 @@ fn render_item(
+     index: &mut Index,
+     search_config: &Search,
+     doc_urls: &mut Vec<String>,
+-    chapter: &Chapter,
++    item: &BookItem,
+ ) -> Result<()> {
++    let chapter = match *item {
++        BookItem::Chapter(ref ch) if !ch.is_draft_chapter() => ch,
++        _ => return Ok(()),
++    };
++
+     let chapter_path = chapter
+         .path
+         .as_ref()
+@@ -320,81 +313,3 @@ fn clean_html(html: &str) -> String {
+     });
+     AMMONIA.clean(html).to_string()
+ }
+-
+-fn validate_chapter_config(
+-    chapter_configs: &[(PathBuf, SearchChapterSettings)],
+-    book: &Book,
+-) -> Result<()> {
+-    for (path, _) in chapter_configs {
+-        let found = book
+-            .iter()
+-            .filter_map(|item| match item {
+-                BookItem::Chapter(ch) if !ch.is_draft_chapter() => Some(ch),
+-                _ => None,
+-            })
+-            .any(|chapter| {
+-                let ch_path = chapter.source_path.as_ref().unwrap();
+-                ch_path.starts_with(path)
+-            });
+-        if !found {
+-            bail!(
+-                "[output.html.search.chapter] key `{}` does not match any chapter paths",
+-                path.display()
+-            );
+-        }
+-    }
+-    Ok(())
+-}
+-
+-fn sort_search_config(
+-    map: &HashMap<String, SearchChapterSettings>,
+-) -> Vec<(PathBuf, SearchChapterSettings)> {
+-    let mut settings: Vec<_> = map
+-        .iter()
+-        .map(|(key, value)| (PathBuf::from(key), value.clone()))
+-        .collect();
+-    // Note: This is case-sensitive, and assumes the author uses the same case
+-    // as the actual filename.
+-    settings.sort_by(|a, b| a.0.cmp(&b.0));
+-    settings
+-}
+-
+-fn get_chapter_settings(
+-    chapter_configs: &[(PathBuf, SearchChapterSettings)],
+-    source_path: &Path,
+-) -> SearchChapterSettings {
+-    let mut result = SearchChapterSettings::default();
+-    for (path, config) in chapter_configs {
+-        if source_path.starts_with(path) {
+-            result.enable = config.enable.or(result.enable);
+-        }
+-    }
+-    result
+-}
+-
+-#[test]
+-fn chapter_settings_priority() {
+-    let cfg = r#"
+-        [output.html.search.chapter]
+-        "cli/watch.md" = { enable = true }
+-        "cli" = { enable = false }
+-        "cli/inner/foo.md" = { enable = false }
+-        "cli/inner" = { enable = true }
+-        "foo" = {} # Just to make sure empty table is allowed.
+-    "#;
+-    let cfg: crate::Config = toml::from_str(cfg).unwrap();
+-    let html = cfg.html_config().unwrap();
+-    let chapter_configs = sort_search_config(&html.search.unwrap().chapter);
+-    for (path, enable) in [
+-        ("foo.md", None),
+-        ("cli/watch.md", Some(true)),
+-        ("cli/index.md", Some(false)),
+-        ("cli/inner/index.md", Some(true)),
+-        ("cli/inner/foo.md", Some(false)),
+-    ] {
+-        assert_eq!(
+-            get_chapter_settings(&chapter_configs, Path::new(path)),
+-            SearchChapterSettings { enable }
+-        );
+-    }
+-}
+diff --git a/tests/rendered_output.rs b/tests/rendered_output.rs
+index 31606220..707b997d 100644
+--- a/tests/rendered_output.rs
++++ b/tests/rendered_output.rs
+@@ -736,7 +736,6 @@ fn failure_on_missing_theme_directory() {
+ #[cfg(feature = "search")]
+ mod search {
+     use crate::dummy_book::DummyBook;
+-    use mdbook::utils::fs::write_file;
+     use mdbook::MDBook;
+     use std::fs::{self, File};
+     use std::path::Path;
+@@ -811,51 +810,6 @@ mod search {
+         );
+     }
+ 
+-    #[test]
+-    fn can_disable_individual_chapters() {
+-        let temp = DummyBook::new().build().unwrap();
+-        let book_toml = r#"
+-            [book]
+-            title = "Search Test"
+-
+-            [output.html.search.chapter]
+-            "second" = { enable = false }
+-            "first/unicode.md" = { enable = false }
+-            "#;
+-        write_file(temp.path(), "book.toml", book_toml.as_bytes()).unwrap();
+-        let md = MDBook::load(temp.path()).unwrap();
+-        md.build().unwrap();
+-        let index = read_book_index(temp.path());
+-        let doc_urls = index["doc_urls"].as_array().unwrap();
+-        let contains = |path| {
+-            doc_urls
+-                .iter()
+-                .any(|p| p.as_str().unwrap().starts_with(path))
+-        };
+-        assert!(contains("second.html"));
+-        assert!(!contains("second/"));
+-        assert!(!contains("first/unicode.html"));
+-        assert!(contains("first/markdown.html"));
+-    }
+-
+-    #[test]
+-    fn chapter_settings_validation_error() {
+-        let temp = DummyBook::new().build().unwrap();
+-        let book_toml = r#"
+-            [book]
+-            title = "Search Test"
+-
+-            [output.html.search.chapter]
+-            "does-not-exist" = { enable = false }
+-            "#;
+-        write_file(temp.path(), "book.toml", book_toml.as_bytes()).unwrap();
+-        let md = MDBook::load(temp.path()).unwrap();
+-        let err = md.build().unwrap_err();
+-        assert!(format!("{err:?}").contains(
+-            "[output.html.search.chapter] key `does-not-exist` does not match any chapter paths"
+-        ));
+-    }
+-
+     // Setting this to `true` may cause issues with `cargo watch`,
+     // since it may not finish writing the fixture before the tests
+     // are run again.

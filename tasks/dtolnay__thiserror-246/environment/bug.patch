@@ -1,0 +1,415 @@
+diff --git a/build.rs b/build.rs
+index 4862b0c..004dfb0 100644
+--- a/build.rs
++++ b/build.rs
+@@ -4,40 +4,22 @@ use std::path::Path;
+ use std::process::{Command, ExitStatus, Stdio};
+ use std::str;
+ 
+-// This code exercises the surface area that we expect of the Error generic
+-// member access API. If the current toolchain is able to compile it, then
+-// thiserror is able to provide backtrace support.
++// This code exercises the surface area that we expect of the Provider API. If
++// the current toolchain is able to compile it, then thiserror is able to use
++// providers for backtrace support.
+ const PROBE: &str = r#"
+-    #![feature(error_generic_member_access)]
++    #![feature(provide_any)]
+ 
+-    use std::error::{Error, Request};
+-    use std::fmt::{self, Debug, Display};
++    use std::any::{Demand, Provider};
+ 
+-    struct MyError(Thing);
+-    struct Thing;
+-
+-    impl Debug for MyError {
+-        fn fmt(&self, _formatter: &mut fmt::Formatter) -> fmt::Result {
+-            unimplemented!()
+-        }
+-    }
+-
+-    impl Display for MyError {
+-        fn fmt(&self, _formatter: &mut fmt::Formatter) -> fmt::Result {
+-            unimplemented!()
+-        }
+-    }
+-
+-    impl Error for MyError {
+-        fn provide<'a>(&'a self, request: &mut Request<'a>) {
+-            request.provide_ref(&self.0);
+-        }
++    fn _f<'a, P: Provider>(p: &'a P, demand: &mut Demand<'a>) {
++        p.provide(demand);
+     }
+ "#;
+ 
+ fn main() {
+     match compile_probe() {
+-        Some(status) if status.success() => println!("cargo:rustc-cfg=error_generic_member_access"),
++        Some(status) if status.success() => println!("cargo:rustc-cfg=provide_any"),
+         _ => {}
+     }
+ }
+diff --git a/impl/src/expand.rs b/impl/src/expand.rs
+index f6822b2..ef8eaf3 100644
+--- a/impl/src/expand.rs
++++ b/impl/src/expand.rs
+@@ -60,19 +60,19 @@ fn impl_struct(input: Struct) -> TokenStream {
+     });
+ 
+     let provide_method = input.backtrace_field().map(|backtrace_field| {
+-        let request = quote!(request);
++        let demand = quote!(demand);
+         let backtrace = &backtrace_field.member;
+         let body = if let Some(source_field) = input.source_field() {
+             let source = &source_field.member;
+             let source_provide = if type_is_option(source_field.ty) {
+                 quote_spanned! {source.span()=>
+                     if let std::option::Option::Some(source) = &self.#source {
+-                        source.thiserror_provide(#request);
++                        source.thiserror_provide(#demand);
+                     }
+                 }
+             } else {
+                 quote_spanned! {source.span()=>
+-                    self.#source.thiserror_provide(#request);
++                    self.#source.thiserror_provide(#demand);
+                 }
+             };
+             let self_provide = if source == backtrace {
+@@ -80,12 +80,12 @@ fn impl_struct(input: Struct) -> TokenStream {
+             } else if type_is_option(backtrace_field.ty) {
+                 Some(quote! {
+                     if let std::option::Option::Some(backtrace) = &self.#backtrace {
+-                        #request.provide_ref::<std::backtrace::Backtrace>(backtrace);
++                        #demand.provide_ref::<std::backtrace::Backtrace>(backtrace);
+                     }
+                 })
+             } else {
+                 Some(quote! {
+-                    #request.provide_ref::<std::backtrace::Backtrace>(&self.#backtrace);
++                    #demand.provide_ref::<std::backtrace::Backtrace>(&self.#backtrace);
+                 })
+             };
+             quote! {
+@@ -96,16 +96,16 @@ fn impl_struct(input: Struct) -> TokenStream {
+         } else if type_is_option(backtrace_field.ty) {
+             quote! {
+                 if let std::option::Option::Some(backtrace) = &self.#backtrace {
+-                    #request.provide_ref::<std::backtrace::Backtrace>(backtrace);
++                    #demand.provide_ref::<std::backtrace::Backtrace>(backtrace);
+                 }
+             }
+         } else {
+             quote! {
+-                #request.provide_ref::<std::backtrace::Backtrace>(&self.#backtrace);
++                #demand.provide_ref::<std::backtrace::Backtrace>(&self.#backtrace);
+             }
+         };
+         quote! {
+-            fn provide<'_request>(&'_request self, #request: &mut std::error::Request<'_request>) {
++            fn provide<'_demand>(&'_demand self, #demand: &mut std::any::Demand<'_demand>) {
+                 #body
+             }
+         }
+@@ -246,7 +246,7 @@ fn impl_enum(input: Enum) -> TokenStream {
+     };
+ 
+     let provide_method = if input.has_backtrace() {
+-        let request = quote!(request);
++        let demand = quote!(demand);
+         let arms = input.variants.iter().map(|variant| {
+             let ident = &variant.ident;
+             match (variant.backtrace_field(), variant.source_field()) {
+@@ -259,23 +259,23 @@ fn impl_enum(input: Enum) -> TokenStream {
+                     let source_provide = if type_is_option(source_field.ty) {
+                         quote_spanned! {source.span()=>
+                             if let std::option::Option::Some(source) = #varsource {
+-                                source.thiserror_provide(#request);
++                                source.thiserror_provide(#demand);
+                             }
+                         }
+                     } else {
+                         quote_spanned! {source.span()=>
+-                            #varsource.thiserror_provide(#request);
++                            #varsource.thiserror_provide(#demand);
+                         }
+                     };
+                     let self_provide = if type_is_option(backtrace_field.ty) {
+                         quote! {
+                             if let std::option::Option::Some(backtrace) = backtrace {
+-                                #request.provide_ref::<std::backtrace::Backtrace>(backtrace);
++                                #demand.provide_ref::<std::backtrace::Backtrace>(backtrace);
+                             }
+                         }
+                     } else {
+                         quote! {
+-                            #request.provide_ref::<std::backtrace::Backtrace>(backtrace);
++                            #demand.provide_ref::<std::backtrace::Backtrace>(backtrace);
+                         }
+                     };
+                     quote! {
+@@ -298,12 +298,12 @@ fn impl_enum(input: Enum) -> TokenStream {
+                     let source_provide = if type_is_option(source_field.ty) {
+                         quote_spanned! {backtrace.span()=>
+                             if let std::option::Option::Some(source) = #varsource {
+-                                source.thiserror_provide(#request);
++                                source.thiserror_provide(#demand);
+                             }
+                         }
+                     } else {
+                         quote_spanned! {backtrace.span()=>
+-                            #varsource.thiserror_provide(#request);
++                            #varsource.thiserror_provide(#demand);
+                         }
+                     };
+                     quote! {
+@@ -318,12 +318,12 @@ fn impl_enum(input: Enum) -> TokenStream {
+                     let body = if type_is_option(backtrace_field.ty) {
+                         quote! {
+                             if let std::option::Option::Some(backtrace) = backtrace {
+-                                #request.provide_ref::<std::backtrace::Backtrace>(backtrace);
++                                #demand.provide_ref::<std::backtrace::Backtrace>(backtrace);
+                             }
+                         }
+                     } else {
+                         quote! {
+-                            #request.provide_ref::<std::backtrace::Backtrace>(backtrace);
++                            #demand.provide_ref::<std::backtrace::Backtrace>(backtrace);
+                         }
+                     };
+                     quote! {
+@@ -338,7 +338,7 @@ fn impl_enum(input: Enum) -> TokenStream {
+             }
+         });
+         Some(quote! {
+-            fn provide<'_request>(&'_request self, #request: &mut std::error::Request<'_request>) {
++            fn provide<'_demand>(&'_demand self, #demand: &mut std::any::Demand<'_demand>) {
+                 #[allow(deprecated)]
+                 match self {
+                     #(#arms)*
+diff --git a/src/lib.rs b/src/lib.rs
+index 11f825f..13e1f91 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -236,11 +236,11 @@
+     clippy::return_self_not_must_use,
+     clippy::wildcard_imports,
+ )]
+-#![cfg_attr(error_generic_member_access, feature(error_generic_member_access))]
++#![cfg_attr(provide_any, feature(provide_any))]
+ 
+ mod aserror;
+ mod display;
+-#[cfg(error_generic_member_access)]
++#[cfg(provide_any)]
+ mod provide;
+ 
+ pub use thiserror_impl::*;
+@@ -250,6 +250,6 @@ pub use thiserror_impl::*;
+ pub mod __private {
+     pub use crate::aserror::AsDynError;
+     pub use crate::display::{DisplayAsDisplay, PathAsDisplay};
+-    #[cfg(error_generic_member_access)]
++    #[cfg(provide_any)]
+     pub use crate::provide::ThiserrorProvide;
+ }
+diff --git a/src/provide.rs b/src/provide.rs
+index d0d4b3d..524e743 100644
+--- a/src/provide.rs
++++ b/src/provide.rs
+@@ -1,18 +1,15 @@
+-use std::error::{Error, Request};
++use std::any::{Demand, Provider};
+ 
+ pub trait ThiserrorProvide: Sealed {
+-    fn thiserror_provide<'a>(&'a self, request: &mut Request<'a>);
++    fn thiserror_provide<'a>(&'a self, demand: &mut Demand<'a>);
+ }
+ 
+-impl<T> ThiserrorProvide for T
+-where
+-    T: Error + ?Sized,
+-{
++impl<T: Provider + ?Sized> ThiserrorProvide for T {
+     #[inline]
+-    fn thiserror_provide<'a>(&'a self, request: &mut Request<'a>) {
+-        self.provide(request);
++    fn thiserror_provide<'a>(&'a self, demand: &mut Demand<'a>) {
++        self.provide(demand);
+     }
+ }
+ 
+ pub trait Sealed {}
+-impl<T: Error + ?Sized> Sealed for T {}
++impl<T: Provider + ?Sized> Sealed for T {}
+diff --git a/tests/test_backtrace.rs b/tests/test_backtrace.rs
+index 5a26104..43f68b8 100644
+--- a/tests/test_backtrace.rs
++++ b/tests/test_backtrace.rs
+@@ -1,4 +1,7 @@
+-#![cfg_attr(thiserror_nightly_testing, feature(error_generic_member_access))]
++#![cfg_attr(
++    thiserror_nightly_testing,
++    feature(error_generic_member_access, provide_any)
++)]
+ 
+ use thiserror::Error;
+ 
+@@ -16,8 +19,9 @@ pub struct InnerBacktrace {
+ #[cfg(thiserror_nightly_testing)]
+ pub mod structs {
+     use super::{Inner, InnerBacktrace};
++    use std::any;
+     use std::backtrace::Backtrace;
+-    use std::error::{self, Error};
++    use std::error::Error;
+     use std::sync::Arc;
+     use thiserror::Error;
+ 
+@@ -102,56 +106,75 @@ pub mod structs {
+         let error = PlainBacktrace {
+             backtrace: Backtrace::capture(),
+         };
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+ 
+         let error = ExplicitBacktrace {
+             backtrace: Backtrace::capture(),
+         };
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+ 
+         let error = OptBacktrace {
+             backtrace: Some(Backtrace::capture()),
+         };
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+ 
+         let error = ArcBacktrace {
+             backtrace: Arc::new(Backtrace::capture()),
+         };
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+ 
+         let error = BacktraceFrom::from(Inner);
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+ 
+         let error = CombinedBacktraceFrom::from(InnerBacktrace {
+             backtrace: Backtrace::capture(),
+         });
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+ 
+         let error = OptBacktraceFrom::from(Inner);
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+ 
+         let error = ArcBacktraceFrom::from(Inner);
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+ 
+         let error = AnyhowBacktrace {
+             source: anyhow::Error::msg("..."),
+         };
+-        assert!(error::request_ref::<Backtrace>(&error).is_some() || true); // FIXME
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+ 
+         let error = BoxDynErrorBacktrace {
+             source: Box::new(PlainBacktrace {
+                 backtrace: Backtrace::capture(),
+             }),
+         };
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
++    }
++
++    // https://github.com/dtolnay/thiserror/issues/185 -- std::error::Error and
++    // std::any::Provide both have a method called 'provide', so directly
++    // calling it from generated code could be ambiguous.
++    #[test]
++    fn test_provide_name_collision() {
++        use std::any::Provider;
++
++        #[derive(Error, Debug)]
++        #[error("...")]
++        struct MyError {
++            #[source]
++            #[backtrace]
++            x: std::io::Error,
++        }
++
++        let _: dyn Error;
++        let _: dyn Provider;
+     }
+ }
+ 
+ #[cfg(thiserror_nightly_testing)]
+ pub mod enums {
+     use super::{Inner, InnerBacktrace};
++    use std::any;
+     use std::backtrace::Backtrace;
+-    use std::error;
+     use std::sync::Arc;
+     use thiserror::Error;
+ 
+@@ -236,36 +259,36 @@ pub mod enums {
+         let error = PlainBacktrace::Test {
+             backtrace: Backtrace::capture(),
+         };
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+ 
+         let error = ExplicitBacktrace::Test {
+             backtrace: Backtrace::capture(),
+         };
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+ 
+         let error = OptBacktrace::Test {
+             backtrace: Some(Backtrace::capture()),
+         };
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+ 
+         let error = ArcBacktrace::Test {
+             backtrace: Arc::new(Backtrace::capture()),
+         };
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+ 
+         let error = BacktraceFrom::from(Inner);
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+ 
+         let error = CombinedBacktraceFrom::from(InnerBacktrace {
+             backtrace: Backtrace::capture(),
+         });
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+ 
+         let error = OptBacktraceFrom::from(Inner);
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+ 
+         let error = ArcBacktraceFrom::from(Inner);
+-        assert!(error::request_ref::<Backtrace>(&error).is_some());
++        assert!(any::request_ref::<Backtrace>(&error).is_some());
+     }
+ }
+ 
+diff --git a/tests/test_option.rs b/tests/test_option.rs
+index 232e5a3..ed5287d 100644
+--- a/tests/test_option.rs
++++ b/tests/test_option.rs
+@@ -1,4 +1,7 @@
+-#![cfg_attr(thiserror_nightly_testing, feature(error_generic_member_access))]
++#![cfg_attr(
++    thiserror_nightly_testing,
++    feature(error_generic_member_access, provide_any)
++)]
+ 
+ #[cfg(thiserror_nightly_testing)]
+ pub mod structs {

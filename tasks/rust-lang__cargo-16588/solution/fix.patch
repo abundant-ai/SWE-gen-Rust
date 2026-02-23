@@ -1,0 +1,237 @@
+diff --git a/src/cargo/core/workspace.rs b/src/cargo/core/workspace.rs
+index d7d0170e1..84975beee 100644
+--- a/src/cargo/core/workspace.rs
++++ b/src/cargo/core/workspace.rs
+@@ -25,6 +25,7 @@ use crate::lints::analyze_cargo_lints_table;
+ use crate::lints::rules::blanket_hint_mostly_unused;
+ use crate::lints::rules::check_im_a_teapot;
+ use crate::lints::rules::implicit_minimum_version_req;
++use crate::lints::rules::missing_lints_inheritance;
+ use crate::lints::rules::non_kebab_case_bins;
+ use crate::lints::rules::non_kebab_case_features;
+ use crate::lints::rules::non_kebab_case_packages;
+@@ -1413,6 +1414,14 @@ impl<'gctx> Workspace<'gctx> {
+                 &mut run_error_count,
+                 self.gctx,
+             )?;
++            missing_lints_inheritance(
++                self,
++                pkg,
++                &path,
++                &cargo_lints,
++                &mut run_error_count,
++                self.gctx,
++            )?;
+ 
+             if run_error_count > 0 {
+                 let plural = if run_error_count == 1 { "" } else { "s" };
+diff --git a/src/cargo/lints/rules/missing_lints_inheritance.rs b/src/cargo/lints/rules/missing_lints_inheritance.rs
+new file mode 100644
+index 000000000..cde334110
+--- /dev/null
++++ b/src/cargo/lints/rules/missing_lints_inheritance.rs
+@@ -0,0 +1,126 @@
++use std::path::Path;
++
++use annotate_snippets::Group;
++use annotate_snippets::Level;
++use annotate_snippets::Origin;
++use annotate_snippets::Patch;
++use annotate_snippets::Snippet;
++use cargo_util_schemas::manifest::TomlToolLints;
++
++use crate::CargoResult;
++use crate::GlobalContext;
++use crate::core::Package;
++use crate::core::Workspace;
++use crate::lints::Lint;
++use crate::lints::LintLevel;
++use crate::lints::SUSPICIOUS;
++use crate::lints::rel_cwd_manifest_path;
++
++pub const LINT: Lint = Lint {
++    name: "missing_lints_inheritance",
++    desc: "missing `[lints]` to inherit `[workspace.lints]`",
++    primary_group: &SUSPICIOUS,
++    edition_lint_opts: None,
++    feature_gate: None,
++    docs: Some(
++        r#"
++### What it does
++
++Checks for packages without a `lints` table while `workspace.lints` is present.
++
++### Why it is bad
++
++Many people mistakenly think that `workspace.lints` is implicitly inherited when it is not.
++
++### Drawbacks
++
++### Example
++
++```toml
++[workspace.lints.cargo]
++```
++
++Should be written as:
++
++```toml
++[workspace.lints.cargo]
++
++[lints]
++workspace = true
++```
++"#,
++    ),
++};
++
++pub fn missing_lints_inheritance(
++    ws: &Workspace<'_>,
++    pkg: &Package,
++    manifest_path: &Path,
++    cargo_lints: &TomlToolLints,
++    error_count: &mut usize,
++    gctx: &GlobalContext,
++) -> CargoResult<()> {
++    let (lint_level, reason) = LINT.level(
++        cargo_lints,
++        pkg.manifest().edition(),
++        pkg.manifest().unstable_features(),
++    );
++
++    if lint_level == LintLevel::Allow {
++        return Ok(());
++    }
++
++    let root = ws.root_maybe();
++    // `normalized_toml` normally isn't guaranteed to include inheritance information except
++    // `workspace.lints` is used outside of inheritance for workspace-level lints.
++    let ws_lints = root
++        .normalized_toml()
++        .workspace
++        .as_ref()
++        .map(|ws| ws.lints.is_some())
++        .unwrap_or(false);
++    if !ws_lints {
++        return Ok(());
++    }
++    if pkg.manifest().normalized_toml().lints.is_some() {
++        return Ok(());
++    }
++
++    let manifest = pkg.manifest();
++    let contents = manifest.contents();
++    let level = lint_level.to_diagnostic_level();
++    let emitted_source = LINT.emitted_source(lint_level, reason);
++    let manifest_path = rel_cwd_manifest_path(manifest_path, gctx);
++
++    let mut primary = Group::with_title(level.primary_title(LINT.desc));
++    primary = primary.element(Origin::path(&manifest_path));
++    primary = primary.element(Level::NOTE.message(emitted_source));
++    let mut report = vec![primary];
++    if let Some(contents) = contents {
++        let span = contents.len()..contents.len();
++        let mut help =
++            Group::with_title(Level::HELP.secondary_title("to inherit `workspace.lints, add:"));
++        help = help.element(
++            Snippet::source(contents)
++                .path(&manifest_path)
++                .patch(Patch::new(span.clone(), "\n[lints]\nworkspace = true")),
++        );
++        report.push(help);
++        let mut help = Group::with_title(
++            Level::HELP.secondary_title("to clarify your intent to not inherit, add:"),
++        );
++        help = help.element(
++            Snippet::source(contents)
++                .path(&manifest_path)
++                .patch(Patch::new(span, "\n[lints]")),
++        );
++        report.push(help);
++    }
++
++    if lint_level.is_error() {
++        *error_count += 1;
++    }
++    gctx.shell().print_report(&report, lint_level.force())?;
++
++    Ok(())
++}
+diff --git a/src/cargo/lints/rules/mod.rs b/src/cargo/lints/rules/mod.rs
+index 731354524..610a535c6 100644
+--- a/src/cargo/lints/rules/mod.rs
++++ b/src/cargo/lints/rules/mod.rs
+@@ -1,6 +1,7 @@
+ mod blanket_hint_mostly_unused;
+ mod im_a_teapot;
+ mod implicit_minimum_version_req;
++mod missing_lints_inheritance;
+ mod non_kebab_case_bins;
+ mod non_kebab_case_features;
+ mod non_kebab_case_packages;
+@@ -15,6 +16,7 @@ mod unused_workspace_package_fields;
+ pub use blanket_hint_mostly_unused::blanket_hint_mostly_unused;
+ pub use im_a_teapot::check_im_a_teapot;
+ pub use implicit_minimum_version_req::implicit_minimum_version_req;
++pub use missing_lints_inheritance::missing_lints_inheritance;
+ pub use non_kebab_case_bins::non_kebab_case_bins;
+ pub use non_kebab_case_features::non_kebab_case_features;
+ pub use non_kebab_case_packages::non_kebab_case_packages;
+@@ -30,6 +32,7 @@ pub const LINTS: &[crate::lints::Lint] = &[
+     blanket_hint_mostly_unused::LINT,
+     implicit_minimum_version_req::LINT,
+     im_a_teapot::LINT,
++    missing_lints_inheritance::LINT,
+     non_kebab_case_bins::LINT,
+     non_kebab_case_features::LINT,
+     non_kebab_case_packages::LINT,
+diff --git a/src/doc/src/reference/lints.md b/src/doc/src/reference/lints.md
+index fff50e379..7d52c7c52 100644
+--- a/src/doc/src/reference/lints.md
++++ b/src/doc/src/reference/lints.md
+@@ -29,6 +29,7 @@ These lints are all set to the 'allow' level by default.
+ 
+ These lints are all set to the 'warn' level by default.
+ - [`blanket_hint_mostly_unused`](#blanket_hint_mostly_unused)
++- [`missing_lints_inheritance`](#missing_lints_inheritance)
+ - [`non_kebab_case_bins`](#non_kebab_case_bins)
+ - [`redundant_homepage`](#redundant_homepage)
+ - [`redundant_readme`](#redundant_readme)
+@@ -117,6 +118,37 @@ serde = "1.0.219"
+ ```
+ 
+ 
++## `missing_lints_inheritance`
++Group: `suspicious`
++
++Level: `warn`
++
++### What it does
++
++Checks for packages without a `lints` table while `workspace.lints` is present.
++
++### Why it is bad
++
++Many people mistakenly think that `workspace.lints` is implicitly inherited when it is not.
++
++### Drawbacks
++
++### Example
++
++```toml
++[workspace.lints.cargo]
++```
++
++Should be written as:
++
++```toml
++[workspace.lints.cargo]
++
++[lints]
++workspace = true
++```
++
++
+ ## `non_kebab_case_bins`
+ Group: `style`
+ 
