@@ -1,0 +1,363 @@
+diff --git a/src/cargo/core/compiler/build_context/mod.rs b/src/cargo/core/compiler/build_context/mod.rs
+index 355e32c16..4ba3bb668 100644
+--- a/src/cargo/core/compiler/build_context/mod.rs
++++ b/src/cargo/core/compiler/build_context/mod.rs
+@@ -78,6 +78,9 @@ pub struct BuildContext<'a, 'gctx> {
+     /// The dependency graph of units to compile.
+     pub unit_graph: UnitGraph,
+ 
++    /// A map from unit to index.
++    pub unit_to_index: HashMap<Unit, u64>,
++
+     /// Reverse-dependencies of documented units, used by the `rustdoc --scrape-examples` flag.
+     pub scrape_units: Vec<Unit>,
+ 
+@@ -96,6 +99,7 @@ impl<'a, 'gctx> BuildContext<'a, 'gctx> {
+         target_data: RustcTargetData<'gctx>,
+         roots: Vec<Unit>,
+         unit_graph: UnitGraph,
++        unit_to_index: HashMap<Unit, u64>,
+         scrape_units: Vec<Unit>,
+     ) -> CargoResult<BuildContext<'a, 'gctx>> {
+         let all_kinds = unit_graph
+@@ -116,6 +120,7 @@ impl<'a, 'gctx> BuildContext<'a, 'gctx> {
+             target_data,
+             roots,
+             unit_graph,
++            unit_to_index,
+             scrape_units,
+             all_kinds,
+         })
+diff --git a/src/cargo/core/compiler/timings/mod.rs b/src/cargo/core/compiler/timings/mod.rs
+index aaeb57c74..71f4d9997 100644
+--- a/src/cargo/core/compiler/timings/mod.rs
++++ b/src/cargo/core/compiler/timings/mod.rs
+@@ -17,7 +17,6 @@ use crate::util::{CargoResult, GlobalContext};
+ 
+ use cargo_util::paths;
+ use indexmap::IndexMap;
+-use itertools::Itertools as _;
+ use std::collections::HashMap;
+ use std::io::BufWriter;
+ use std::time::{Duration, Instant};
+@@ -53,9 +52,6 @@ pub struct Timings<'gctx> {
+     /// Total number of dirty units.
+     total_dirty: u32,
+     /// A map from unit to index.
+-    ///
+-    /// This for saving log size.
+-    /// Only the unit-started event needs to hold the entire unit information.
+     unit_to_index: HashMap<Unit, u64>,
+     /// Time tracking for each individual unit.
+     unit_times: Vec<UnitTime>,
+@@ -174,13 +170,6 @@ impl<'gctx> Timings<'gctx> {
+                 None
+             }
+         };
+-        let unit_to_index = bcx
+-            .unit_graph
+-            .keys()
+-            .sorted()
+-            .enumerate()
+-            .map(|(i, unit)| (unit.clone(), i as u64))
+-            .collect();
+ 
+         Timings {
+             gctx: bcx.gctx,
+@@ -193,7 +182,7 @@ impl<'gctx> Timings<'gctx> {
+             profile,
+             total_fresh: 0,
+             total_dirty: 0,
+-            unit_to_index,
++            unit_to_index: bcx.unit_to_index.clone(),
+             unit_times: Vec::new(),
+             active: HashMap::new(),
+             last_cpu_state,
+@@ -237,9 +226,6 @@ impl<'gctx> Timings<'gctx> {
+         };
+         if let Some(logger) = build_runner.bcx.logger {
+             logger.log(LogMessage::UnitStarted {
+-                package_id: unit_time.unit.pkg.package_id().to_spec(),
+-                target: (&unit_time.unit.target).into(),
+-                mode: unit_time.unit.mode,
+                 index: self.unit_to_index[&unit_time.unit],
+                 elapsed: start,
+             });
+diff --git a/src/cargo/ops/cargo_compile/mod.rs b/src/cargo/ops/cargo_compile/mod.rs
+index 92c801290..881fa0d9a 100644
+--- a/src/cargo/ops/cargo_compile/mod.rs
++++ b/src/cargo/ops/cargo_compile/mod.rs
+@@ -64,6 +64,7 @@ use annotate_snippets::{Group, Level, Origin};
+ pub use compile_filter::{CompileFilter, FilterRule, LibRule};
+ 
+ pub(super) mod unit_generator;
++use itertools::Itertools as _;
+ use unit_generator::UnitGenerator;
+ 
+ mod packages;
+@@ -304,6 +305,11 @@ pub fn create_bcx<'a, 'gctx>(
+         }
+     };
+     let dry_run = false;
++
++    if let Some(logger) = logger {
++        let elapsed = ws.gctx().creation_time().elapsed().as_secs_f64();
++        logger.log(LogMessage::ResolutionStarted { elapsed });
++    }
+     let resolve = ops::resolve_ws_with_opts(
+         ws,
+         &mut target_data,
+@@ -321,6 +327,11 @@ pub fn create_bcx<'a, 'gctx>(
+         specs_and_features,
+     } = resolve;
+ 
++    if let Some(logger) = logger {
++        let elapsed = ws.gctx().creation_time().elapsed().as_secs_f64();
++        logger.log(LogMessage::ResolutionFinished { elapsed });
++    }
++
+     let std_resolve_features = if let Some(crates) = &gctx.cli_unstable().build_std {
+         let (std_package_set, std_resolve, std_features) = standard_lib::resolve_std(
+             ws,
+@@ -397,10 +408,15 @@ pub fn create_bcx<'a, 'gctx>(
+         })
+         .collect();
+ 
+-    let mut units = Vec::new();
++    let mut root_units = Vec::new();
+     let mut unit_graph = HashMap::new();
+     let mut scrape_units = Vec::new();
+ 
++    if let Some(logger) = logger {
++        let elapsed = ws.gctx().creation_time().elapsed().as_secs_f64();
++        logger.log(LogMessage::UnitGraphStarted { elapsed });
++    }
++
+     for SpecsAndResolvedFeatures {
+         specs,
+         resolved_features,
+@@ -479,14 +495,14 @@ pub fn create_bcx<'a, 'gctx>(
+             &profiles,
+             interner,
+         )?);
+-        units.extend(targeted_root_units);
++        root_units.extend(targeted_root_units);
+         scrape_units.extend(targeted_scrape_units);
+     }
+ 
+     // TODO: In theory, Cargo should also dedupe the roots, but I'm uncertain
+     // what heuristics to use in that case.
+     if build_config.intent.wants_deps_docs() {
+-        remove_duplicate_doc(build_config, &units, &mut unit_graph);
++        remove_duplicate_doc(build_config, &root_units, &mut unit_graph);
+     }
+ 
+     let host_kind_requested = build_config
+@@ -496,18 +512,39 @@ pub fn create_bcx<'a, 'gctx>(
+     // Rebuild the unit graph, replacing the explicit host targets with
+     // CompileKind::Host, removing `artifact_target_for_features` and merging any dependencies
+     // shared with build and artifact dependencies.
+-    (units, scrape_units, unit_graph) = rebuild_unit_graph_shared(
++    (root_units, scrape_units, unit_graph) = rebuild_unit_graph_shared(
+         interner,
+         unit_graph,
+-        &units,
++        &root_units,
+         &scrape_units,
+         host_kind_requested.then_some(explicit_host_kind),
+         build_config.compile_time_deps_only,
+     );
+ 
++    // unit_graph must be immutable after this point.
++    let unit_graph = unit_graph;
++    let units: Vec<_> = unit_graph.keys().sorted().collect();
++    let unit_to_index: HashMap<_, _> = units
++        .iter()
++        .enumerate()
++        .map(|(i, &unit)| (unit.clone(), i as u64))
++        .collect();
++    if let Some(logger) = logger {
++        for (i, unit) in units.into_iter().enumerate() {
++            logger.log(LogMessage::UnitRegistered {
++                package_id: unit.pkg.package_id().to_spec(),
++                target: (&unit.target).into(),
++                mode: unit.mode,
++                index: i as u64,
++            });
++        }
++        let elapsed = ws.gctx().creation_time().elapsed().as_secs_f64();
++        logger.log(LogMessage::UnitGraphFinished { elapsed });
++    }
++
+     let mut extra_compiler_args = HashMap::new();
+     if let Some(args) = extra_args {
+-        if units.len() != 1 {
++        if root_units.len() != 1 {
+             anyhow::bail!(
+                 "extra arguments to `{}` can only be passed to one \
+                  target, consider filtering\nthe package by passing, \
+@@ -515,10 +552,10 @@ pub fn create_bcx<'a, 'gctx>(
+                 extra_args_name
+             );
+         }
+-        extra_compiler_args.insert(units[0].clone(), args);
++        extra_compiler_args.insert(root_units[0].clone(), args);
+     }
+ 
+-    for unit in units
++    for unit in root_units
+         .iter()
+         .filter(|unit| unit.mode.is_doc() || unit.mode.is_doc_test())
+         .filter(|unit| rustdoc_document_private_items || unit.target.is_bin())
+@@ -541,7 +578,7 @@ pub fn create_bcx<'a, 'gctx>(
+ 
+     // Validate target src path for each root unit
+     let mut error_count: usize = 0;
+-    for unit in &units {
++    for unit in &root_units {
+         if let Some(target_src_path) = unit.target.src_path().path() {
+             validate_target_path_as_source_file(
+                 gctx,
+@@ -619,8 +656,9 @@ where `<compatible-ver>` is the latest version supporting rustc {rustc_version}"
+         profiles,
+         extra_compiler_args,
+         target_data,
+-        units,
++        root_units,
+         unit_graph,
++        unit_to_index,
+         scrape_units,
+     )?;
+ 
+diff --git a/src/cargo/ops/cargo_report/timings.rs b/src/cargo/ops/cargo_report/timings.rs
+index 666dc8467..c17a84f68 100644
+--- a/src/cargo/ops/cargo_report/timings.rs
++++ b/src/cargo/ops/cargo_report/timings.rs
+@@ -1,5 +1,6 @@
+ //! The `cargo report timings` command.
+ 
++use std::collections::HashMap;
+ use std::ffi::OsStr;
+ use std::fs::File;
+ use std::io::BufReader;
+@@ -178,6 +179,8 @@ fn prepare_context(log: &Path, run_id: &RunId) -> CargoResult<RenderContext<'sta
+     };
+     let mut units: IndexMap<_, UnitEntry> = IndexMap::new();
+ 
++    let mut unit_by_index: HashMap<u64, _> = HashMap::new();
++
+     for (log_index, result) in serde_json::Deserializer::from_reader(reader)
+         .into_iter::<LogMessage>()
+         .enumerate()
+@@ -208,13 +211,17 @@ fn prepare_context(log: &Path, run_id: &RunId) -> CargoResult<RenderContext<'sta
+                 ctx.profile = profile;
+                 ctx.rustc_version = rustc_version;
+             }
+-            LogMessage::UnitStarted {
++            LogMessage::UnitRegistered {
+                 package_id,
+                 target,
+                 mode,
+                 index,
+-                elapsed,
+             } => {
++                unit_by_index.insert(index, (package_id, target, mode));
++            }
++            LogMessage::UnitStarted { index, elapsed } => {
++                let (package_id, target, mode) = unit_by_index.get(&index).unwrap();
++
+                 let version = package_id
+                     .version()
+                     .map(|v| v.to_string())
+@@ -223,7 +230,7 @@ fn prepare_context(log: &Path, run_id: &RunId) -> CargoResult<RenderContext<'sta
+                 // This is pretty similar to how the current `core::compiler::timings`
+                 // renders `core::manifest::Target`. However, our target is
+                 // a simplified type so we cannot reuse the same logic here.
+-                let mut target_str = if target.kind == "lib" && mode == CompileMode::Build {
++                let mut target_str = if target.kind == "lib" && mode == &CompileMode::Build {
+                     // Special case for brevity, since most dependencies hit this path.
+                     "".to_string()
+                 } else if target.kind == "build-script" {
+diff --git a/src/cargo/util/log_message.rs b/src/cargo/util/log_message.rs
+index e91833a56..3f04cd202 100644
+--- a/src/cargo/util/log_message.rs
++++ b/src/cargo/util/log_message.rs
+@@ -39,8 +39,30 @@ pub enum LogMessage {
+         /// Workspace root directory.
+         workspace_root: PathBuf,
+     },
+-    /// Emitted when a compilation unit starts.
+-    UnitStarted {
++    /// Emitted when resolving dependencies starts.
++    ResolutionStarted {
++        /// Seconds elapsed from build start.
++        elapsed: f64,
++    },
++    /// Emitted when resolving dependencies finishes.
++    ResolutionFinished {
++        /// Seconds elapsed from build start.
++        elapsed: f64,
++    },
++    /// Emitted when unit graph generation starts.
++    UnitGraphStarted {
++        /// Seconds elapsed from build start.
++        elapsed: f64,
++    },
++    /// Emitted when unit graph generation finishes.
++    UnitGraphFinished {
++        /// Seconds elapsed from build start.
++        elapsed: f64,
++    },
++    /// Emitted when a compilation unit is registered in the unit graph,
++    /// right before [`LogMessage::UnitGraphFinished`] that Cargo finalizes
++    /// the unit graph.
++    UnitRegistered {
+         /// Package ID specification.
+         package_id: PackageIdSpec,
+         /// Cargo target (lib, bin, example, etc.).
+@@ -49,12 +71,17 @@ pub enum LogMessage {
+         mode: CompileMode,
+         /// Unit index for compact reference in subsequent events.
+         index: u64,
++    },
++    /// Emitted when a compilation unit starts.
++    UnitStarted {
++        /// Unit index from the associated unit-registered event.
++        index: u64,
+         /// Seconds elapsed from build start.
+         elapsed: f64,
+     },
+     /// Emitted when a section (e.g., rmeta, link) of the compilation unit finishes.
+     UnitRmetaFinished {
+-        /// Unit index from the associated unit-started event.
++        /// Unit index from the associated unit-registered event.
+         index: u64,
+         /// Seconds elapsed from build start.
+         elapsed: f64,
+@@ -66,7 +93,7 @@ pub enum LogMessage {
+     ///
+     /// Requires `-Zsection-timings` to be enabled.
+     UnitSectionStarted {
+-        /// Unit index from the associated unit-started event.
++        /// Unit index from the associated unit-registered event.
+         index: u64,
+         /// Seconds elapsed from build start.
+         elapsed: f64,
+@@ -77,7 +104,7 @@ pub enum LogMessage {
+     ///
+     /// Requires `-Zsection-timings` to be enabled.
+     UnitSectionFinished {
+-        /// Unit index from the associated unit-started event.
++        /// Unit index from the associated unit-registered event.
+         index: u64,
+         /// Seconds elapsed from build start.
+         elapsed: f64,
+@@ -86,7 +113,7 @@ pub enum LogMessage {
+     },
+     /// Emitted when a compilation unit finishes.
+     UnitFinished {
+-        /// Unit index from the associated unit-started event.
++        /// Unit index from the associated unit-registered event.
+         index: u64,
+         /// Seconds elapsed from build start.
+         elapsed: f64,
